@@ -13,6 +13,11 @@ on:
     branches: [main]
     paths: ["cmd/**", "internal/**", "go.mod", "go.sum", ".github/workflows/release.yml"]
   workflow_dispatch:
+  # TEMP — validate this workflow end-to-end on the PR before merge.
+  # REMOVE this pull_request trigger (and delete the test 'latest' release) before merging.
+  pull_request:
+    branches: [main]
+    paths: ["cmd/**", "internal/**", "go.mod", "go.sum", ".github/workflows/release.yml"]
 
 permissions:
   contents: write
@@ -81,6 +86,5 @@ jobs:
           gh release view latest >/dev/null 2>&1 || \
             gh release create latest --latest \
               --title "latest" \
-              --notes "Rolling release — current mcp-3gpp binaries + indexed 3GPP DB. Always exactly one version; assets are replaced in place." \
-              --target "${GITHUB_SHA}"
+              --notes "Rolling release — current mcp-3gpp binaries + indexed 3GPP DB. Always exactly one version; assets are replaced in place."
           gh release upload latest dist/*.tar.zst dist/*.sha256 --clobber
