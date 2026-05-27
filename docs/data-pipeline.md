@@ -74,6 +74,23 @@ mcp-3gpp serve         # MCP over stdio, offline from here
 `install.sh` and `bootstrap` resolve `releases/latest/download/…` — a stable URL
 that always points at the one current version.
 
+### Auto-update: the `.sha256` is the version signal
+
+The DB has no version number — its **sha256 is its identity**. `corpus-sync`
+publishes `3gpp.duckdb.zst` plus `3gpp.duckdb.sha256` (hash of the *decompressed*
+DB). At `serve` **startup** (never at query time — local-first):
+
+1. Best-effort GET the tiny `3gpp.duckdb.sha256` from `latest`.
+2. Compare to the hash of the cached DB.
+   - differs / no cache → pull the new `3gpp.duckdb.zst`, verify, atomic swap;
+   - same → use cache, **no download** (the 0.8 GB moves only when it changed);
+   - offline / fetch error → keep the cached DB (degrade-don't-block).
+3. Opt-out via `--no-update` / `MCP3GPP_NO_UPDATE=1` (air-gapped).
+
+`internal/bootstrap.Fetch` already skips the download when the cached file's
+sha256 matches the `Artifact.SHA256`, so this is a thin `CheckAndUpdateDB` on
+top.
+
 ## Open items
 
 - Implement `ingest --append` + wire `corpus-sync.yml` (C4).
