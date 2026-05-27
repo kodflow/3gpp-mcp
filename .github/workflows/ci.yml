@@ -35,9 +35,9 @@ jobs:
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then echo "not gofmt-clean:"; echo "$unformatted"; exit 1; fi
       - run: go vet ./...
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
-          args: --timeout 5m
+          version: v2.12.2 # must be built with Go >= go.mod (1.25); v1 is rejected
 
   test:
     strategy:
