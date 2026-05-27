@@ -1,0 +1,73 @@
+[
+  {
+    "id": "amf-registration",
+    "query": "what is the registration event reported by the AMF over LI_X2",
+    "intent": "hybrid",
+    "domain": "5GC",
+    "tags": ["paraphrase", "li", "x2", "nf:AMF"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.2.2.2", "grade": 2 },
+      { "spec_id": "33.128", "clause": "6.2.2.2", "grade": 1 }
+    ],
+    "release": "Rel-17",
+    "notes": "AMFRegistration. Heading wording differs from query -> dense+rerank target."
+  },
+  {
+    "id": "amf-location-update",
+    "query": "AMF location update interception event",
+    "intent": "hybrid",
+    "domain": "5GC",
+    "tags": ["li", "x2", "nf:AMF"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.2.2.4", "grade": 2 },
+      { "spec_id": "33.128", "clause": "6.2.2.2", "grade": 1 }
+    ],
+    "release": "Rel-17"
+  },
+  {
+    "id": "amf-section",
+    "query": "events the AMF reports over X2",
+    "intent": "hybrid",
+    "domain": "5GC",
+    "tags": ["paraphrase", "section", "li", "nf:AMF"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.2.2", "grade": 2 }
+    ],
+    "release": "Rel-17",
+    "notes": "Section-level analyst question BM25 tends to miss."
+  },
+  {
+    "id": "smf-pdu-session",
+    "query": "SMF PDU session establishment xIRI",
+    "intent": "hybrid",
+    "domain": "5GC",
+    "tags": ["li", "x2", "nf:SMF"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.3.2", "grade": 1 }
+    ],
+    "release": "Rel-17"
+  },
+  {
+    "id": "lexical-clause-ref",
+    "query": "TS 33.128 clause 6.2.2.2.3",
+    "intent": "spec_lookup",
+    "domain": "5GC",
+    "tags": ["lexical-control", "nf:AMF"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.2.2.3", "grade": 2 }
+    ],
+    "release": "Rel-17",
+    "notes": "Lexical control: BM25 already nails this; guards against dense regressing easy cases."
+  },
+  {
+    "id": "udm-events",
+    "query": "what lawful interception events does the UDM generate",
+    "intent": "hybrid",
+    "domain": "5GC",
+    "tags": ["paraphrase", "section", "nf:UDM"],
+    "relevant": [
+      { "spec_id": "33.128", "clause": "6.2.5.2", "grade": 1 }
+    ],
+    "release": "Rel-17"
+  }
+]

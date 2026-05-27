@@ -1,208 +1,178 @@
-# devcontainer-template
+# 3gpp-mcp
 
-Coquille DevContainer universelle fournissant un ecosysteme IA complet — 35 agents specialistes, 11 commandes slash, workflows auto-correctifs — pour bootstrapper et developper n'importe quel projet avec une qualite maximale. Fiabilite d'abord : les agents raisonnent en profondeur, recoupent les sources officielles, et s'auto-corrigent jusqu'a ce que le resultat respecte les standards.
+> Serveur **MCP (Model Context Protocol)** exposant l'intégralité du corpus 3GPP (Phase 1 → dernière Release) à Claude Code, en local, sans hallucination.
 
-## Installation Rapide
-
-### One-Liner (Machine Hôte ou Projet Existant)
-
-Installez Claude Code avec **TOUS les assets** (35 agents, 11 commands, 11 scripts, 155+ patterns) en une seule commande :
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kodflow/devcontainer-template/main/.devcontainer/install.sh | bash
-```
-
-**Ce qui est installé :**
-- ✅ Claude CLI (si pas déjà installé)
-- ✅ 35 agents spécialisés (Go, Python, Rust, Node.js, etc.)
-- ✅ 11 commandes slash (`/git`, `/review`, `/plan`, `/do`, etc.)
-- ✅ 11 scripts de hooks (security, lint, format, test)
-- ✅ 155+ design patterns (GoF, Cloud, DDD, Enterprise)
-- ✅ Outils additionnels (rtk, status-line)
-
-**Total :** 239 fichiers (~3.2MB) en 1-2 minutes
-
-**Installation minimale (sans documentation) :**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kodflow/devcontainer-template/main/.devcontainer/install.sh | bash -s -- --minimal
-```
-
-**Installation avec target personnalisé :**
-
-```bash
-DC_TARGET=/path/to/project curl -fsSL https://raw.githubusercontent.com/kodflow/devcontainer-template/main/.devcontainer/install.sh | bash
-```
-
-**Emplacements d'installation :**
-- **Machine hôte :** `~/.claude/`
-- **DevContainer :** `/workspace/.devcontainer/images/.claude/`
-
-**Mise à jour ultérieure :**
-
-```bash
-# Dans Claude Code
-/update
-
-# Ou manuellement (dans DevContainer)
-bash .devcontainer/install.sh
-```
+Le serveur retourne des **fragments de spécification cités** (`spec_id`, `release`, `version`, `clause`, `url`) — jamais des résumés. Claude raisonne, l'index sert.
 
 ---
 
-## Outils inclus
+## TL;DR architectural
 
-### Base
-- **Ubuntu 24.04 LTS**
-- **Zsh + Oh My Zsh + Powerlevel10k**
-- **Git, jq, yq, curl, build-essential**
+> **Stack figée — voir [`CLAUDE.md`](./CLAUDE.md) pour le verdict détaillé et les verrouillages.**
 
-### Cloud & DevOps
-| Outil | Description |
-|-------|-------------|
-| **AWS CLI v2** | Amazon Web Services |
-| **gcloud** | Google Cloud SDK |
-| **az** | Azure CLI |
-| **terraform** | Infrastructure as Code |
-| **vault, consul, nomad, packer** | HashiCorp Suite |
-| **kubectl, helm** | Kubernetes |
-| **ansible** | Configuration Management |
+| Couche | Choix |
+|---|---|
+| Langage | **Go** 1.23+, CGO autorisé |
+| Stockage | **DuckDB** (FTS + HNSW VSS) |
+| Graph (V2) | **KuzuDB** embedded |
+| Embeddings | **BGE-M3** via ONNX Runtime |
+| MCP SDK | `github.com/mark3labs/mcp-go` |
+| Parsing | `archive/zip` + `encoding/xml` (DOCX natif) |
+| Distribution | Binaire statique unique (`mcp-3gpp`) |
 
-### Development
-| Outil | Description |
-|-------|-------------|
-| **gh** | GitHub CLI |
-| **claude** | Claude Code CLI |
-| **op** | 1Password CLI |
-| **bazel** | Build System |
-| **task** | Taskwarrior |
-| **status-line** | Claude Code status bar |
+Routing par intention : la majorité des requêtes (TS, IE, NF nominaux) finissent en BM25 à ~10 ms. Hybrid (BM25 + vecteurs + RRF) en fallback. KuzuDB pour les relations NE↔NF.
 
-### Langages
-Les langages sont ajoutés via **DevContainer Features** selon vos besoins :
+---
 
-```jsonc
-// Dans devcontainer.json, décommenter les langages souhaités :
-"features": {
-  "ghcr.io/kodflow/devcontainer-features/go:1": {},
-  "ghcr.io/kodflow/devcontainer-features/python:1": {},
-  "ghcr.io/kodflow/devcontainer-features/rust:1": {}
+## Prérequis
+
+- **VS Code + DevContainer** (le projet est livré avec sa propre configuration DevContainer)
+- Docker / Docker Desktop
+- Optionnel : 1Password Service Account (pour `/secret` et VPN)
+
+Le devcontainer apporte tout le reste : Go, Python (pour scripts batch), Claude Code, ktn-linter, RTK (token savings), hooks IA, etc. Voir [`.devcontainer/CLAUDE.md`](./.devcontainer/CLAUDE.md).
+
+## Démarrage
+
+```bash
+# 1. Cloner
+git clone https://github.com/kodflow/3gpp-mcp.git
+cd 3gpp-mcp
+
+# 2. Renseigner les secrets locaux (gitignorés)
+$EDITOR .devcontainer/.env       # OP_SERVICE_ACCOUNT_TOKEN, GIT_USER, GIT_EMAIL
+
+# 3. Ouvrir dans VS Code et rebuild devcontainer
+code .
+# Command Palette → "Dev Containers: Rebuild and Reopen in Container"
+```
+
+Une fois dans le container :
+
+```bash
+# Build
+make build                    # → ./bin/mcp-3gpp
+
+# Ingestion (one-shot, écrit data/3gpp.duckdb)
+make ingest ARGS="--spec 33.128,33.127,21.905"       # sous-ensemble LI (rapide)
+make ingest ARGS=""                                   # TOUT le corpus (5414 HTML)
+EMBEDDER=local make ingest ARGS="--series 33"         # + vecteurs HNSW (sémantique)
+
+# Lancer le MCP en stdio
+make serve
+
+# TESTER soi-même
+make poc                      # test E2E : events LI X2→MDF2 par NE/NF (TS 33.128)
+make demo                     # interroge les 8 tools en vrai (JSON-RPC) et affiche
+
+# Backend sémantique ONNX réel (optionnel, ~2.3 Go)
+make model                    # bootstrap BGE-M3 + ONNX Runtime, puis build -tags onnx
+```
+
+> **Comment c'est indexé et les relations entre éléments** : voir
+> [`docs/INDEXING.md`](./docs/INDEXING.md) (tables, index FTS/HNSW/b-tree,
+> hiérarchie `clause_path`, cross-refs, CR multi-spec, évolutions NE↔NF).
+
+## Brancher sur Claude Code
+
+`mcp.json` est **gitignoré** (peut contenir des PAT ou chemins sensibles).
+Créer un fichier local — soit `~/.claude/mcp.json`, soit `mcp.json` à la
+racine du repo si tu utilises le devcontainer — avec :
+
+```json
+{
+  "mcpServers": {
+    "3gpp": {
+      "command": "/workspace/bin/mcp-3gpp",
+      "args": ["serve"]
+    }
+  }
 }
 ```
 
-25 langages disponibles sur `ghcr.io/kodflow/devcontainer-features/`
+Claude Code redémarre, le serveur apparaît, les 8 tools sont disponibles.
 
-## Installation
+## Surface MCP
 
-### Nouveau projet
+| Tool | Rôle |
+|---|---|
+| `search_spec` | Retrieval hybride (BM25 + vecteurs + RRF) avec citations |
+| `get_spec` | Fetch d'une spec ou d'une clause précise |
+| `get_changelog` | CRs entre deux releases (depuis Change History Annex) |
+| `list_releases` | Versions, freeze dates |
+| `resolve_term` | Glossaire 3GPP (seed TS 21.905) |
+| `trace_evolution` | Évolutions NE↔NF (V2, via KuzuDB) |
+| `find_cross_references` | Specs/clauses référencées |
+| `list_specs` | Catalogue filtré par release/série/WG |
 
-```bash
-gh repo create mon-projet --template kodflow/devcontainer-template --public
-cd mon-projet
-code .
-```
+Chaque réponse contient un bloc `citations: [{spec_id, release, version, clause, url}]`. Pas de citation possible = pas de réponse.
 
-### Projet existant
+## État d'implémentation (V1)
 
-Copiez le dossier `.devcontainer/` dans votre projet.
+Les 8 phases du moteur de retrieval sont implémentées et le service build/serve.
 
-## Configuration MCP
+| Phase | État | Paquet |
+|---|---|---|
+| 1 — Modèle + schéma + store DuckDB | ✅ | `internal/model`, `internal/store` |
+| 2 — Parsing HTML → clauses | ✅ | `internal/htmlparse` |
+| 3 — Indexation FTS BM25 + filtres | ✅ (HNSW câblé, attend les vecteurs) | `internal/store` |
+| 4 — Embeddings BGE-M3 | ⚙️ interface + dégradable ; backend ONNX derrière `-tags onnx` | `internal/embed` |
+| 5 — Glossaire (21.905) | ✅ seeder câblé (best-effort) | `internal/ingest` |
+| 6 — Changelog (Change History) | ✅ | `internal/htmlparse` |
+| 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
+| 8 — Serveur MCP + 8 tools | ✅ | `internal/mcp`, `cmd/server` |
 
-Le template inclut des serveurs MCP pré-configurés pour Claude Code.
+**Deux écarts assumés avec l'archi figée (à régulariser en MR `arch-change`) :**
 
-### Serveurs MCP inclus
+1. **Parsing HTML, pas DOCX natif** — ~55 % du corpus est du `.doc` binaire ; `scripts/corpus.sh` convertit tout en HTML via LibreOffice et l'ingestion parse ce HTML (couvre 100 % du corpus). Contredit CLAUDE.md §13.
+2. **Embeddings désactivés par défaut** — le mono-binaire build sans le runtime ONNX ni le modèle ~2 Go ; la recherche dégrade en lexical (BM25/LIKE), visible jamais bloquant. Backend réel à brancher avec `-tags onnx`.
 
-| Serveur | Description |
-|---------|-------------|
-| **github** | Intégration GitHub (PR, Issues) |
-| **gitlab** | Intégration GitLab (MR, Pipelines) |
-| **context7** | Documentation à jour (fragment image) |
-| **ktn-linter** | Linting de code (fragment image) |
-| **playwright** | Tests E2E, navigateur (feature browser) |
+### POC — question cible (Lawful Interception)
 
-### Configuration des tokens
+> *« Combien d'events chaque NE/NF remonte-t-il en LI_X2 vers le MDF2 ? »*
 
-**Option 1 : Variables d'environnement**
-
-```bash
-export GITHUB_API_TOKEN="ghp_xxx"
-```
-
-**Option 2 : 1Password**
-
-Configurez `OP_SERVICE_ACCOUNT_TOKEN` et les items correspondants dans votre vault.
-
-### Fichiers MCP
-
-| Fichier | Description |
-|---------|-------------|
-| `mcp.json` | Config MCP projet (ignoré par git) |
-| `.devcontainer/images/mcp.json.tpl` | Template MCP |
-
-### ktn-linter & Claude Code Hooks
-
-Le template intègre `ktn-linter` comme serveur MCP **et** fournisseur de hooks Claude Code. Le template déclare 3 scripts wrapper qui appellent les endpoints HTTP de ktn-linter. Dégradation gracieuse si ktn-linter n'est pas en cours d'exécution.
-
-| Hook | Événement | Timeout | Rôle |
-|------|-----------|---------|------|
-| PreToolUse | Write/Edit | 5s | Contexte package avant édition |
-| PostToolUse | Write/Edit | 15s | Scan fichier + blocage si violation |
-| Stop | * | 30s | Validation finale des packages modifiés |
-
-**Vérification rapide :**
+Prouvé de bout en bout par un test E2E (ingest → DuckDB → serveur MCP → client → `get_spec` → recomposition citée) :
 
 ```bash
-which ktn-linter && curl -sf http://localhost:7717/health && echo "OK"
+go test ./tests/e2e -run LIEvents -v     # ou: make test
 ```
 
-Voir [docs/ktn-linter-integration.md](docs/ktn-linter-integration.md) pour le contrat complet.
+Réponse sur **TS 33.128** (Rel-19, 19.6.0), extraite des sous-clauses « Generation of xIRI over LI_X2 » :
 
-## Structure
+| NE/NF | Events X2→MDF2 | Clause |
+|---|---|---|
+| AMF | 13 | 6.2.2.2 |
+| SMF | 9 | 6.2.3.2 |
+| UPF | 4 | 6.2.3.5 |
+| MME | 10 | 6.3.2.2 |
+| SGW/PGW+ePDG | 8 | 6.3.3.2 |
 
-```
-.devcontainer/
-├── devcontainer.json          # Configuration DevContainer
-├── docker-compose.yml         # Services Docker
-├── Dockerfile                 # Extends l'image de base
-├── hooks/
-│   └── lifecycle/
-│       └── initialize.sh      # Avant création (hôte : Ollama, .env)
-└── images/
-    ├── Dockerfile.base        # Layer stable (apt, Cloud CLIs) — hebdo
-    ├── Dockerfile             # Layer dynamique (Claude, outils) — quotidien
-    ├── mcp.json.tpl           # Template MCP (+ fragments par feature)
-    └── hooks/lifecycle/       # Hooks embarqués dans l'image
-```
+Chaque ligne est citée (`TS 33.128 v19.6.0 §<clause>` + URL d'archive).
 
-## Commandes
+## Périmètre MVP
 
-### Rebuild container
+- **V1** : Rel-17 / 18 / 19, séries 23, 24, 29, 33, 38 (~150 specs)
+- **V2** : KuzuDB pour les relations NE↔NF, CR pipeline complet, ingestion historique → Rel-15
+- **V3** : reranker, ingestion Phase 1 → Rel-16, multi-utilisateurs Halys
 
-```bash
-# VS Code
-Cmd+Shift+P > "Dev Containers: Rebuild Container"
-```
+## Workflow dev (assumé AI-first)
 
-### Claude avec MCP
+Le projet est développé **avec** Claude Code. Les skills `/plan`, `/do`, `/review`, `/lint`, `/git`, `/secret`, `/update` sont les commandes principales.
 
-```bash
-# Alias configuré automatiquement
-super-claude
-```
+| Commande | Usage |
+|---|---|
+| `/warmup` | Charge le contexte projet |
+| `/plan "..."` | Planifie une feature (RLM decomposition) |
+| `/do` | Exécute le plan, itère jusqu'à succès |
+| `/review` | Revue de code par 5 agents specialists en parallèle |
+| `/lint` | Linting Go via ktn-linter |
+| `/git --commit` | Commit conventionnel |
+| `/git --pr` | Pull request GitHub (auto-détecté depuis l'origine) |
+| `/git --commit` | Commit conventionnel + push |
+| `/update` | Sync devcontainer-template (`devcontainer.local.json` préservé) |
 
-### Nettoyer
+Voir [`CLAUDE.md`](./CLAUDE.md) pour les verrouillages architecturaux et les pièges identifiés.
 
-```bash
-docker compose -f .devcontainer/docker-compose.yml down -v
-```
+## Licence
 
-## Volumes persistants
-
-- `zsh-history` : Historique shell
-- `package-cache` : Caches packages (npm, pip, cargo, etc.)
-- `claude-config` : Configuration Claude (credentials, sessions)
-- `cloud-config` : Config cloud (AWS, GCP, Azure, 1Password)
-
-## License
-
-MIT
+Propriétaire — Halys.
