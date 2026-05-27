@@ -1,0 +1,22 @@
+# RTK (Rust Token Killer) Configuration
+# Synced from /etc/rtk/config.toml at container start via postStart.sh
+# See: https://github.com/rtk-ai/rtk
+
+[hooks]
+# Skip rewrite for safe-trivial builtins where rewrite is meaningless or
+# breaks shell semantics (cd/pwd/set/export are shell builtins; echo is a
+# trivial passthrough). Keep this list minimal: each addition weakens RTK's
+# default coverage. Per-project additions (e.g. make/terraform/helm) should
+# go into the project's local filters.toml, not here. See ~/.claude/RTK.md
+# for the full rationale.
+exclude_commands = ["cd", "pwd", "set", "export", "echo"]
+
+[tee]
+enabled = true
+mode = "failures"
+max_files = 20
+# rtk ≥ 0.38 requires this field. 1 MB is sensible for tee-on-failure (longer
+# captures are usually a sign of a different problem). Override per-host via
+# ~/.config/rtk/config.toml after the postStart sync; the user-customized hash
+# tracking in init_rtk preserves overrides.
+max_file_size = 1048576

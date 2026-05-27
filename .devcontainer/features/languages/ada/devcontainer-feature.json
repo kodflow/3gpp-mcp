@@ -1,0 +1,13 @@
+{
+  "id": "ada",
+  "version": "1.0.1",
+  "name": "Ada Development Environment",
+  "description": "Installs GNAT, GPRbuild, and Alire package manager",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["AdaCore.ada"]
+    }
+  },
+  "installsAfter": []
+}

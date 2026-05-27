@@ -1,0 +1,12 @@
+# Skills Architecture v1.3 — allowlist of skills migrated to the router.
+# Format: one skill name per line, '#'-prefixed comments allowed.
+# PR4 (W4) adds: /ktn, /search, /warmup
+# PR7 (W7) adds: /plan, /feature, /test, /infra, /comment
+/ktn
+/search
+/warmup
+/plan
+/feature
+/test
+/infra
+/comment

@@ -1,0 +1,102 @@
+{
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.expand": false,
+  "explorer.fileNesting.patterns": {
+    "CLAUDE.md": "AGENTS.md, agent.toml, agent.yaml, agent.yml, .pr_agent.toml, .codacy.yaml, .codacy.yml, .coderabbit.yaml, .coderabbit.yml, mcp.json, mcp.json.tpl, RTK.md, MEMORY.md",
+    "README.md": "README.*.md, CHANGELOG.md, CHANGELOG, CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, LICENSE, LICENSE.*, AUTHORS, NOTICE, CITATION.cff",
+    ".gitignore": ".gitattributes, .gitmodules, .gitkeep, .mailmap, .dockerignore, .helmignore, .npmignore, .prettierignore, .eslintignore, .rsyncignore, .stylelintignore, .fdignore, .rgignore",
+    ".env": ".env.*, .envrc, .env.example, .flaskenv",
+    "Makefile": "*.mk, GNUmakefile, makefile, justfile, Justfile, Taskfile.yml, Taskfile.yaml",
+    "Dockerfile": "Dockerfile.*, .dockerignore, docker-compose.yml, docker-compose.*.yml, compose.yml, compose.*.yml, .docker-env",
+    "package.json": "package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb, .npmrc, .yarnrc, .yarnrc.yml, .pnpmrc, .nvmrc, .node-version",
+    "tsconfig.json": "tsconfig.*.json, tsconfig-*.json, .swcrc, .babelrc, .babelrc.json, babel.config.*, tsup.config.*, vite.config.*, vitest.config.*, jest.config.*, rollup.config.*, webpack.config.*, esbuild.config.*",
+    "Cargo.toml": "Cargo.lock, rust-toolchain, rust-toolchain.toml, clippy.toml, rustfmt.toml, .cargo/*",
+    "go.mod": "go.sum, go.work, go.work.sum, .golangci.yml, .golangci.yaml, .golangci.toml",
+    "pyproject.toml": "poetry.lock, uv.lock, requirements*.txt, setup.py, setup.cfg, Pipfile, Pipfile.lock, tox.ini, pytest.ini, .python-version, ruff.toml, .ruff.toml, mypy.ini, .pylintrc",
+    "Gemfile": "Gemfile.lock, .ruby-version, .rubocop.yml, .rspec",
+    "composer.json": "composer.lock, phpunit.xml, phpunit.xml.dist, phpstan.neon, .php-cs-fixer.php",
+    "pubspec.yaml": "pubspec.lock, analysis_options.yaml, .metadata, .flutter-plugins, .flutter-plugins-dependencies",
+    "build.gradle": "build.gradle.kts, settings.gradle, settings.gradle.kts, gradle.properties, gradlew, gradlew.bat, gradle-wrapper.*",
+    "pom.xml": "*.iml, mvnw, mvnw.cmd, .mvn/*",
+    "mix.exs": "mix.lock, .formatter.exs, .credo.exs",
+    "deno.json": "deno.jsonc, deno.lock, import_map.json",
+    "*.ts": "${capture}.js, ${capture}.d.ts, ${capture}.d.ts.map, ${capture}.js.map, ${capture}.test.ts, ${capture}.spec.ts, ${capture}.stories.ts, ${capture}.stories.tsx, ${capture}.test.tsx, ${capture}.spec.tsx",
+    "*.tsx": "${capture}.ts, ${capture}.js, ${capture}.jsx, ${capture}.test.tsx, ${capture}.spec.tsx, ${capture}.stories.tsx, ${capture}.module.css, ${capture}.module.scss, ${capture}.styles.ts",
+    "*.jsx": "${capture}.js, ${capture}.test.jsx, ${capture}.spec.jsx, ${capture}.stories.jsx",
+    "*.js": "${capture}.js.map, ${capture}.min.js, ${capture}.test.js, ${capture}.spec.js, ${capture}.d.ts",
+    "*.go": "${capture}_test.go, ${capture}_internal_test.go, ${capture}_external_test.go, ${capture}_bench_test.go, ${capture}_compliance.go, ${capture}_mock.go, ${capture}_generated.go, ${capture}.pb.go, ${capture}_grpc.pb.go",
+    "*.rs": "${capture}.test.rs, ${capture}_test.rs",
+    "*.py": "${capture}_test.py, test_${capture}.py, ${capture}.pyi, ${capture}.pyc",
+    "*.rb": "${capture}_test.rb, ${capture}_spec.rb",
+    "*.java": "${capture}Test.java, ${capture}Tests.java, ${capture}IT.java",
+    "*.kt": "${capture}Test.kt, ${capture}Tests.kt",
+    "*.cs": "${capture}.Tests.cs, ${capture}Tests.cs, ${capture}.Designer.cs",
+    "*.cpp": "${capture}.h, ${capture}.hpp, ${capture}_test.cpp, ${capture}.test.cpp",
+    "*.c": "${capture}.h, ${capture}_test.c, ${capture}.test.c",
+    "*.h": "${capture}.c, ${capture}.cpp",
+    "*.hpp": "${capture}.cpp, ${capture}.cc",
+    "*.swift": "${capture}Tests.swift, ${capture}.test.swift",
+    "*.dart": "${capture}_test.dart, ${capture}.g.dart, ${capture}.freezed.dart",
+    "*.php": "${capture}Test.php, ${capture}.test.php",
+    "*.ex": "${capture}_test.exs, ${capture}.exs",
+    "*.scala": "${capture}Test.scala, ${capture}Spec.scala",
+    "*.lua": "${capture}_test.lua, ${capture}_spec.lua",
+    "*.sh": "${capture}.bats, ${capture}_test.sh, ${capture}.bash, ${capture}.zsh",
+    "*.bash": "${capture}_test.sh, ${capture}.bats",
+    "install.sh": "devcontainer-feature.json, mcp.json, README.md, NOTES.md",
+    "devcontainer.json": "devcontainer.local.json, devcontainer.*.json, .template-version, docker-compose.yml, docker-compose.*.yml, Dockerfile, Dockerfile.*, .env, .env.*",
+    "Dockerfile.base": "Dockerfile, .dockerignore, docker-compose.yml, mcp.json.tpl, .p10k.zsh, rtk.config.toml"
+  },
+  "files.exclude": {
+    "**/.git": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/node_modules": true,
+    "**/.rtk": true,
+    "**/.claude/logs": true,
+    "bazel-*": true
+  },
+  "search.exclude": {
+    "**/.git": true,
+    "**/node_modules": true,
+    "**/dist": true,
+    "docs/site": true,
+    "**/.claude/logs": true,
+    "**/.claude/contexts": true,
+    "**/.claude/plans": true,
+    "**/coverage": true,
+    "**/vendor": true,
+    "**/target": true,
+    "bazel-*": true
+  },
+  "files.associations": {
+    "*.toml": "toml",
+    "*.tpl": "plaintext",
+    "mcp.json.tpl": "jsonc",
+    ".env.*": "dotenv",
+    "Dockerfile.*": "dockerfile",
+    "CLAUDE.md": "markdown",
+    "AGENTS.md": "markdown"
+  },
+  "editor.rulers": [100, 120],
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "[go]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": false
+  },
+  "[python]": {
+    "editor.tabSize": 4
+  },
+  "[makefile]": {
+    "editor.insertSpaces": false
+  },
+  "[shellscript]": {
+    "editor.tabSize": 2
+  }
+}

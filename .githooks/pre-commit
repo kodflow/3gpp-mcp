@@ -1,0 +1,25 @@
+#!/bin/bash
+# ============================================================================
+# pre-commit hook - Project-level pre-commit checks
+# ============================================================================
+
+WORKSPACE="${CLAUDE_PROJECT_DIR:-/workspace}"
+
+# Prefer workspace source over live deployment: in the template repo, the
+# workspace IS the canonical source — the live ~/.claude/scripts/ copy is a
+# deployment artifact of a previous image build that may lag behind in-flight
+# source fixes (e.g. #363 declare-A initialiser). Consumer repos lack the
+# workspace path and fall back to the live deployment transparently.
+SCRIPT="$WORKSPACE/.devcontainer/images/.claude/scripts/pre-commit-checks.sh"
+
+# Fallback to live deployment when the workspace source is absent (consumers).
+if [ ! -f "$SCRIPT" ]; then
+    SCRIPT="$HOME/.claude/scripts/pre-commit-checks.sh"
+fi
+
+if [ -f "$SCRIPT" ]; then
+    bash "$SCRIPT" "$WORKSPACE"
+    exit $?
+fi
+
+exit 0

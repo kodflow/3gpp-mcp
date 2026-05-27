@@ -1,0 +1,19 @@
+# Exclude everything by default
+*
+
+# Include only what's needed for the build
+!Dockerfile
+!docker-compose.yml
+!devcontainer.json
+
+# Include all hooks (lifecycle scripts and shared configs)
+!hooks/
+!hooks/**
+
+# Include all features
+!features/
+!features/**
+
+# Exclude sensitive files even if in hooks/
+hooks/shared/.env
+.env

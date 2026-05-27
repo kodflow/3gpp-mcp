@@ -1,0 +1,16 @@
+{
+  "id": "vbnet",
+  "version": "1.0.1",
+  "name": "Visual Basic .NET Development Environment",
+  "description": "Installs .NET SDK for Visual Basic .NET development (shares runtime with C#)",
+  "options": {},
+  "containerEnv": {
+    "DOTNET_ROOT": "/usr/share/dotnet"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-dotnettools.csharp"]
+    }
+  },
+  "installsAfter": []
+}
