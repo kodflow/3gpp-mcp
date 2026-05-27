@@ -1,0 +1,125 @@
+# Corpus Matrix — FULL consolidation via a DYNAMIC matrix (POC).
+#
+# Beats the 14 GB / 6 h single-runner limit by sharding the corpus across
+# parallel runners, then fusing the partial DBs. The shard axis is the 3GPP
+# SERIES, because the archive is physically organised by series
+# (33_series/33.128/…) so series shards are DISJOINT with zero download overlap
+# (release shards would re-download, since release is a per-file attribute).
+#
+#   discover  → detects the series list from 3gpp.org → emits a JSON matrix
+#   build-shard (matrix) → one runner per series: download → convert → ingest → partial DB
+#   merge     → fuse all partial DBs (cmd/merge) → one consolidated DB
+#
+# POC: bounded scope + artifact output (does not publish to `latest`).
+
+name: Corpus Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      series_scope:
+        description: "Space-separated series to shard (empty = ALL series detected on 3gpp.org)."
+        type: string
+        default: "21 24"
+      release_floor:
+        description: "Lowest release to ingest."
+        type: string
+        default: "Rel-17"
+  # TEMP — validate the matrix+merge on the PR (tiny scope). REMOVE before merge.
+  pull_request:
+    branches: [main]
+    paths: [".github/workflows/corpus-matrix.yml", "cmd/merge/**"]
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "1"
+  BASE: "https://www.3gpp.org/ftp/Specs/archive"
+
+jobs:
+  # ---- 1. dynamic discovery → matrix ---------------------------------------
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      floor: ${{ steps.set.outputs.floor }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            scope="21 24"; floor="Rel-19"
+          else
+            scope="${{ github.event.inputs.series_scope }}"; floor="${{ github.event.inputs.release_floor }}"
+          fi
+          # Empty scope → detect ALL series dynamically from the 3GPP archive.
+          if [ -z "$scope" ]; then
+            scope=$(curl -fsSL -A "mcp-3gpp-discover" "$BASE/" \
+              | grep -oE '[0-9]{2}_series' | sed 's/_series//' | sort -u | tr '\n' ' ')
+          fi
+          echo "Series scope: $scope"
+          matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "floor=$floor" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix"
+
+  # ---- 2. one shard per series (parallel) ----------------------------------
+  build-shard:
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        series: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install deps (LibreOffice + build)
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
+      - name: Build ingest
+        run: go build -trimpath -o bin/ingest ./cmd/ingest
+      - name: Download + convert series ${{ matrix.series }}
+        run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ matrix.series }}" --jobs 2
+      - name: Ingest shard ${{ matrix.series }}
+        run: |
+          mkdir -p dist
+          ./bin/ingest --series "${{ matrix.series }}" --out "dist/shard-${{ matrix.series }}.duckdb"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shard-${{ matrix.series }}
+          path: dist/shard-${{ matrix.series }}.duckdb
+          retention-days: 1
+
+  # ---- 3. fuse the partial DBs ---------------------------------------------
+  merge:
+    needs: build-shard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install deps
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd
+      - uses: actions/download-artifact@v8
+        with:
+          path: shards
+          pattern: shard-*
+          merge-multiple: true
+      - name: Merge shards → consolidated DB
+        run: |
+          ls -lh shards/
+          go build -trimpath -o bin/merge ./cmd/merge
+          mkdir -p data
+          ./bin/merge --out data/3gpp.duckdb shards/*.duckdb
+          echo "=== consolidated ===" && ls -lh data/3gpp.duckdb
+          zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
+      - uses: actions/upload-artifact@v7
+        with:
+          name: 3gpp-duckdb-merged
+          path: data/3gpp.duckdb.zst
+          retention-days: 7
