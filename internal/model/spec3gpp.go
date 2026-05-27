@@ -48,6 +48,25 @@ func ReleaseFromMajor(major int) string {
 	return fmt.Sprintf("Rel-%d", major)
 }
 
+// ReleaseOrdinal maps a release label to its comparable ordinal (the version
+// major): "Rel-99" -> 3, "Rel-4".."Rel-20" -> 4..20. Returns (0,false) for
+// drafts / unparseable labels (majors 0/1/2 are pre-Rel-99 drafts, not releases).
+// Inverse of ReleaseFromMajor; used to compare releases against a floor.
+func ReleaseOrdinal(rel string) (int, bool) {
+	if rel == "Rel-99" {
+		return 3, true
+	}
+	s, ok := strings.CutPrefix(rel, "Rel-")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 4 {
+		return 0, false
+	}
+	return n, true
+}
+
 // DecodeVersionCode turns a 3-char code ("i60") into its release ("Rel-18")
 // and dotted version ("18.6.0"). ok is false when the code is malformed.
 func DecodeVersionCode(code string) (release, version string, ok bool) {
