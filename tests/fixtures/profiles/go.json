@@ -1,0 +1,18 @@
+{
+  "languages": [{ "name": "go", "marker": "go.mod", "primary": true }],
+  "build_system": { "makefile": true, "targets": ["test", "lint", "build"] },
+  "tools": {
+    "golangci_lint": true,
+    "ktn_linter": true,
+    "react": false,
+    "playwright": false
+  },
+  "cloud": [],
+  "container": ["docker"],
+  "k8s": false,
+  "os": "linux",
+  "ci": "github",
+  "test_frameworks": [],
+  "project_root": "/tmp/fake-go-repo",
+  "project_type": "code"
+}

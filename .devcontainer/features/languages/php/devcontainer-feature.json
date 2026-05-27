@@ -1,0 +1,13 @@
+{
+  "id": "php",
+  "version": "1.0.1",
+  "name": "PHP Development Environment",
+  "description": "Installs PHP, Composer, and common development tools",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["bmewburn.vscode-intelephense-client"]
+    }
+  },
+  "installsAfter": []
+}

@@ -1,0 +1,17 @@
+{
+  "id": "swift",
+  "version": "1.0.1",
+  "name": "Swift Development Environment",
+  "description": "Installs Swift toolchain, SwiftFormat, and SwiftLint",
+  "options": {},
+  "containerEnv": {
+    "SWIFT_HOME": "/usr/share/swift",
+    "PATH": "/usr/share/swift/usr/bin:${PATH}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["swiftlang.swift-vscode"]
+    }
+  },
+  "installsAfter": []
+}

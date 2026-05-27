@@ -1,0 +1,99 @@
+{
+  "name": "${localWorkspaceFolderBasename} Dev Environment",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+  // Features - additional languages (tools are already in base image)
+  "features": {
+    // ========== LANGUAGES ==========
+    // Node.js enabled by default (required for MCP servers)
+    "ghcr.io/kodflow/devcontainer-features/nodejs:1": {},
+    // Uncomment other languages as needed
+    // "ghcr.io/kodflow/devcontainer-features/c:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/cpp:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/java:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/csharp:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/python:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/go:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/rust:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/ruby:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/php:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/elixir:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/scala:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/dart-flutter:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/kotlin:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/swift:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/r:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/perl:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/lua:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/fortran:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/ada:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/cobol:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/pascal:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/vbnet:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/matlab:1": {},
+    // "ghcr.io/kodflow/devcontainer-features/assembly:1": {},
+    // ========== BROWSER ==========
+    // Browser automation with Playwright (chromium + MCP server)
+    // "ghcr.io/kodflow/devcontainer-features/browser:1": {},
+    // ========== KUBERNETES ==========
+    // Local Kubernetes development with kind (requires docker-outside-of-docker)
+    "ghcr.io/kodflow/devcontainer-features/kubernetes:1": {},
+    // ========== INFRASTRUCTURE ==========
+    // Infra tools: terragrunt, tflint, infracost, cfssl, ansible-lint, molecule
+    // Recommended companions: python (for ansible-lint/molecule), go (for Terratest)
+    // "ghcr.io/kodflow/devcontainer-features/infrastructure:1": {},
+    // ========== NETWORKING ==========
+    // VPN clients (OpenVPN, WireGuard, IPsec, PPTP) are built into the base image
+    // Configure credentials in .env with op:// references (see .env.example)
+    // ========== EXTERNAL ==========
+    // Docker support
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false,
+      "installDockerBuildx": true,
+      "dockerDashComposeVersion": "v2"
+    }
+  },
+  // Configure tool-specific properties
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/bin/zsh"
+          }
+        },
+        "editor.formatOnSave": true,
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "files.exclude": {
+          "**/.git": true,
+          "bazel-*": true
+        }
+      },
+      "extensions": [
+        "vscode-icons-team.vscode-icons",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml",
+        "bierner.markdown-mermaid",
+        "ms-azuretools.vscode-docker",
+        "hashicorp.terraform"
+      ]
+    }
+  },
+  // ========== LIFECYCLE COMMANDS ==========
+  // Hooks are embedded in the Docker image at /etc/devcontainer-hooks/
+  // Only initialize.sh runs on the host (before container build)
+  "waitFor": "onCreateCommand",
+  "initializeCommand": "[ -f \"${localWorkspaceFolder}/.devcontainer/hooks/lifecycle/initialize.sh\" ] && bash \"${localWorkspaceFolder}/.devcontainer/hooks/lifecycle/initialize.sh\" || true",
+  "onCreateCommand": "/etc/devcontainer-hooks/lifecycle/onCreate.sh",
+  "updateContentCommand": "/etc/devcontainer-hooks/lifecycle/updateContent.sh",
+  "postCreateCommand": "/etc/devcontainer-hooks/lifecycle/postCreate.sh",
+  "postStartCommand": "/etc/devcontainer-hooks/lifecycle/postStart.sh",
+  "postAttachCommand": "/etc/devcontainer-hooks/lifecycle/postAttach.sh",
+  "forwardPorts": [],
+  "remoteUser": "vscode",
+  "shutdownAction": "none"
+}

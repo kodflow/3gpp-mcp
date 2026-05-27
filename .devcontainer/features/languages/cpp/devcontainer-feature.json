@@ -1,0 +1,13 @@
+{
+  "id": "cpp",
+  "version": "1.0.1",
+  "name": "C/C++ Development Environment",
+  "description": "Installs GCC, Clang, CMake, and common C/C++ development tools",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["llvm-vs-code-extensions.vscode-clangd"]
+    }
+  },
+  "installsAfter": []
+}

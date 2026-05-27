@@ -1,0 +1,16 @@
+{
+  "id": "r",
+  "version": "1.0.1",
+  "name": "R Development Environment",
+  "description": "Installs R, r-base-dev, and common development packages (lintr, styler, testthat)",
+  "options": {},
+  "containerEnv": {
+    "R_HOME": "/usr/lib/R"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["REditorSupport.r"]
+    }
+  },
+  "installsAfter": []
+}

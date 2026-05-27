@@ -1,0 +1,17 @@
+{
+  "languages": [
+    { "name": "go", "marker": "go.mod", "primary": true },
+    { "name": "python", "marker": "pyproject.toml", "primary": false },
+    { "name": "nodejs", "marker": "package.json", "primary": false }
+  ],
+  "build_system": { "makefile": true, "targets": ["test"] },
+  "tools": { "react": false, "playwright": false },
+  "cloud": [],
+  "container": [],
+  "k8s": false,
+  "os": "linux",
+  "ci": "github",
+  "test_frameworks": [],
+  "project_root": "/tmp/fake-multi-repo",
+  "project_type": "code"
+}
