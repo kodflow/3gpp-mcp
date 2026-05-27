@@ -1,31 +1,121 @@
-# Corpus sync — refreshes the indexed 3GPP DB and publishes it to the single
-# rolling "latest" release (plan Part C4). NOT YET IMPLEMENTED — stub.
+# Corpus Sync — download 3GPP specs, convert (LibreOffice), ingest, and publish
+# the consolidated DuckDB to the rolling "latest" release.
 #
-# Model (decided): the DB *is* the state. No version history, no dated releases.
-# Each run:
-#   1. pull the current 3gpp.duckdb.zst from the `latest` release,
-#   2. diff the live 3gpp.org listing against what the DB already contains,
-#   3. download ONLY the missing specs, convert (LibreOffice), ingest-append,
-#   4. re-publish: `gh release upload latest 3gpp.duckdb.zst --clobber`
-#      (replaces the single asset; old one gone — no disk-space accumulation).
+# This is the REAL pipeline (no longer a stub). It is SCOPE-BOUNDED: a hosted
+# runner has ~14 GB disk, so it cannot build the full ~20 GB corpus in one job.
+# It downloads/consolidates a configurable subset (series + release floor). The
+# full back-catalogue consolidation runs locally / on a large runner; this CI
+# job covers incremental, bounded, or MVP-scope refreshes and proves the chain
+# end-to-end (3gpp.org → HTML → DuckDB → latest).
 #
-# Incremental by construction (delta only) so it fits a hosted runner's 14 GB
-# disk — full rebuild of the ~20 GB corpus never runs in CI. Kept deliberately
-# simple: no elaborate delta machinery beyond "download missing + append".
-# Blocked on an `ingest --append` path in cmd/ingest (next coding phase).
+# publish_to_latest=false (default) → DB uploaded as a workflow artifact only,
+# so a small/test run never shrinks the canonical DB on `latest`.
 
 name: Corpus Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      series:
+        description: "Space-separated 3GPP series (e.g. '23 24 29 33 38')."
+        type: string
+        default: "23 24 29 33 38"
+      release_floor:
+        description: "Lowest release to ingest (e.g. Rel-17)."
+        type: string
+        default: "Rel-17"
+      publish_to_latest:
+        description: "Clobber the DB on the 'latest' release (else: artifact only)."
+        type: boolean
+        default: false
+  # TEMP — validate the pipeline on the PR (small scope, never publishes).
+  # REMOVE before merging.
+  pull_request:
+    branches: [main]
+    paths: [".github/workflows/corpus-sync.yml"]
   # schedule:
   #   - cron: "17 4 * * 1"  # weekly, off-peak, non-round minute
 
 permissions:
   contents: write # to clobber the DB asset on the 'latest' release
 
+concurrency:
+  group: corpus-sync
+  cancel-in-progress: false
+
+env:
+  CGO_ENABLED: "1"
+
 jobs:
-  sync:
+  build-db:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "::notice::corpus-sync stub — needs cmd/ingest --append + 'latest' DB publish (plan C4)."
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install deps (build + LibreOffice + zstd)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config zstd libreoffice-writer-nogui
+
+      - name: Resolve scope
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Fast, bounded validation: vocabulary series only, newest releases.
+            echo "series=21"        >> "$GITHUB_OUTPUT"
+            echo "floor=Rel-19"     >> "$GITHUB_OUTPUT"
+            echo "publish=false"    >> "$GITHUB_OUTPUT"
+          else
+            echo "series=${{ github.event.inputs.series }}"            >> "$GITHUB_OUTPUT"
+            echo "floor=${{ github.event.inputs.release_floor }}"      >> "$GITHUB_OUTPUT"
+            echo "publish=${{ github.event.inputs.publish_to_latest }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build ingest
+        run: go build -trimpath -o bin/ingest ./cmd/ingest
+
+      - name: Download + convert 3GPP specs (3gpp.org → HTML)
+        run: |
+          ./scripts/corpus.sh --set "${{ steps.scope.outputs.floor }}" \
+            --series "${{ steps.scope.outputs.series }}" --jobs 2
+          echo "converted HTML files:"
+          find data/sources/convert -name '*.html' | wc -l
+
+      - name: Consolidate → DuckDB
+        run: |
+          series_csv=$(echo "${{ steps.scope.outputs.series }}" | tr ' ' ',')
+          ./bin/ingest --series "$series_csv" --out data/3gpp.duckdb
+          echo "=== built DB ===" && ls -lh data/3gpp.duckdb
+
+      - name: Package
+        run: |
+          zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
+          sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
+          ls -lh data/3gpp.duckdb.zst
+
+      # Test/bounded run → artifact only (never shrink the canonical 'latest' DB).
+      - name: Upload DB artifact
+        if: steps.scope.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: 3gpp-duckdb
+          path: |
+            data/3gpp.duckdb.zst
+            data/3gpp.duckdb.sha256
+          retention-days: 7
+
+      # Real run → clobber the single DB asset on 'latest'.
+      - name: Publish DB to 'latest' (clobber)
+        if: steps.scope.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --latest --title "latest" \
+              --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
+          gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber
