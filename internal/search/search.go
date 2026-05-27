@@ -84,6 +84,16 @@ func New(st *store.Store) *Engine {
 	return &Engine{st: st, emb: embed.New(), rr: rerank.New()}
 }
 
+// EmbedderEnabled reports whether this engine can vectorise a query (so the
+// server can tell, and report, whether semantic search is actually reachable).
+func (e *Engine) EmbedderEnabled() bool { return e.emb.Enabled() }
+
+// EmbedderModelID is the model id of the query embedder ("" when disabled).
+func (e *Engine) EmbedderModelID() string { return e.emb.ModelID() }
+
+// RerankerEnabled reports whether the cross-encoder reranker is available.
+func (e *Engine) RerankerEnabled() bool { return e.rr.Enabled() }
+
 // Request parameterises a search. Mode selects which retrieval arms run:
 // "" / "hybrid" = lexical ⊕ vector, "lexical" = BM25 only, "semantic" = vector
 // only (degrades to lexical when no embedder/vectors — never returns nothing).

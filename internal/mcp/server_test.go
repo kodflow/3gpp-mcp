@@ -76,8 +76,11 @@ func TestMCPTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 10 { // 8 core (CLAUDE.md §5) + li_events + search_api
-		t.Errorf("want 10 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 11 { // 8 core (CLAUDE.md §5) + li_events + search_api + server_info
+		t.Errorf("want 11 tools, got %d", len(tools.Tools))
+	}
+	if got := call(t, c, ctx, "server_info", map[string]any{}); got["lexical"] != true {
+		t.Errorf("server_info lexical = %v, want true", got["lexical"])
 	}
 
 	if got := call(t, c, ctx, "get_spec", map[string]any{"spec_id": "33.128", "clause": "6.2.2.2"}); got["count"].(float64) < 2 {

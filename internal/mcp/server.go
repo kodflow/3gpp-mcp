@@ -43,7 +43,7 @@ func New(st *store.Store, version, baseline string) *server.MCPServer {
 				"pinned to the baseline release; get_spec also reports new_in_baseline "+
 				"(vs previous release) and added_in_later_releases (annex)."),
 	)
-	h := &handlers{st: st, eng: eng, reg: registry.Default(), baseline: baseline}
+	h := &handlers{st: st, eng: eng, reg: registry.Default(), baseline: baseline, version: version}
 
 	s.AddTool(mcp.NewTool("search_spec",
 		mcp.WithDescription("Hybrid lexical retrieval over clauses, with citations."),
@@ -120,6 +120,11 @@ func New(st *store.Store, version, baseline string) *server.MCPServer {
 		mcp.WithNumber("top_k", mcp.Description("max results (default 10)")),
 	), h.searchAPI)
 
+	s.AddTool(mcp.NewTool("server_info",
+		mcp.WithDescription("Report the server's retrieval capabilities and why semantic search is on/off "+
+			"(so a client knows whether to use mode=semantic). Read-only, no arguments."),
+	), h.serverInfo)
+
 	registerResources(s, h)
 
 	// Domain subjects contribute their own tools (li_events, …). The core knows
@@ -137,6 +142,7 @@ type handlers struct {
 	eng      *search.Engine
 	reg      *subject.Registry
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
+	version  string
 }
 
 // ---- response shapes ----------------------------------------------------
@@ -169,6 +175,50 @@ type clauseOut struct {
 const snippetLimit = 600
 
 // ---- handlers -----------------------------------------------------------
+
+// serverInfo reports retrieval capabilities + WHY semantic is on/off, so a
+// client (or a human reading the result) isn't left guessing why mode=semantic
+// behaves like lexical. It recomputes the reason independently of the serve-time
+// coherence guard (which may already have disabled VSS on a model mismatch).
+func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dbModel := h.st.GetMeta(ctx, "embedding_model")
+	clientModel := h.eng.EmbedderModelID()
+	vss := h.st.VSSAvailable()
+
+	semantic := false
+	reason := ""
+	switch {
+	case !h.eng.EmbedderEnabled():
+		reason = "embedder_disabled (lexical binary or EMBEDDER=off)"
+	case dbModel == "":
+		reason = "no_vectors_in_db"
+	case dbModel != clientModel:
+		reason = "model_mismatch (db=" + dbModel + " client=" + clientModel + ")"
+	case !vss:
+		reason = "hnsw_unavailable (exact-scan fallback)"
+	default:
+		semantic = true
+	}
+	baseline := h.baseline
+	if baseline == "" {
+		baseline = "latest"
+	}
+	info := map[string]any{
+		"version":                h.version,
+		"baseline":               baseline,
+		"lexical":                true,
+		"fts":                    h.st.FTSAvailable(),
+		"semantic":               semantic,
+		"reason":                 reason,
+		"hnsw":                   vss,
+		"reranker":               h.eng.RerankerEnabled(),
+		"embedding_model_db":     dbModel,
+		"embedding_model_client": clientModel,
+		"embed_floor":            h.st.GetMeta(ctx, "embed_floor"),
+	}
+	b, _ := json.MarshalIndent(info, "", "  ")
+	return mcp.NewToolResultText(string(b)), nil
+}
 
 func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	q, err := r.RequireString("query")
