@@ -35,6 +35,8 @@ func main() {
 		quiet   = flag.Bool("quiet", false, "suppress per-spec progress")
 		count   = flag.Bool("count-only", false, "Phase-0: open -out read-only, print clause embedded/null counts by series as JSON, then exit")
 		embFlr  = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-15); empty = embed all. Lexical coverage is unaffected.")
+		reqSem  = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1) — guards against publishing a NULL-vector DB")
+		report  = flag.String("report", "text", "end-of-run summary format: text | json")
 	)
 	flag.Parse()
 
@@ -64,11 +66,42 @@ func main() {
 		Logf:       logf,
 	}
 
+	// Hard contract: when semantic is required, refuse to silently produce a
+	// NULL-vector DB (e.g. a non-onnx build or a missing model degraded to Disabled).
+	if (*reqSem || os.Getenv("SEMANTIC_REQUIRED") == "1") && !opt.Embedder.Enabled() {
+		fmt.Fprintln(os.Stderr, "semantic required but the embedder is disabled "+
+			"(need a -tags onnx build + model, or EMBEDDER=local) — refusing to write a NULL-vector DB")
+		os.Exit(1)
+	}
+
 	start := time.Now()
 	st, err := ingest.Run(context.Background(), *out, opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ingest failed: %v\n", err)
 		os.Exit(1)
+	}
+	if *report == "json" {
+		// Machine summary for CI gates (e.g. jq '.model=="bge-m3" and .embedded_clauses>0').
+		// null_embeddings is the TOTAL null count — with --embed-floor it legitimately
+		// includes below-floor clauses, so gate on embedded_clauses>0 + model, not null==0.
+		nullEmb := 0
+		if rdb, e := store.OpenReadOnly(*out); e == nil {
+			nullEmb, _ = rdb.CountNullEmbeddings(context.Background())
+			_ = rdb.Close()
+		}
+		rep := map[string]any{
+			"embedder_enabled": opt.Embedder.Enabled(),
+			"model":            opt.Embedder.ModelID(),
+			"clauses":          st.Clauses,
+			"embedded_clauses": st.Clauses - nullEmb,
+			"null_embeddings":  nullEmb,
+			"fts":              st.FTS,
+			"hnsw":             st.HNSW,
+			"version":          Version,
+		}
+		b, _ := json.MarshalIndent(rep, "", "  ")
+		fmt.Println(string(b))
+		return
 	}
 	fmt.Printf("ingest done in %s (version=%s)\n", time.Since(start).Round(time.Millisecond), Version)
 	fmt.Printf("  db=%s\n  specs=%d versions=%d clauses=%d changes=%d evolutions=%d degraded=%d\n",
