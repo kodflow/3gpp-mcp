@@ -26,13 +26,20 @@ type Embedder interface {
 	// Embed returns one Dim-length vector per input text. When the embedder is
 	// disabled it returns (nil, nil) and the caller skips vector storage.
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
+	// ModelID identifies the model whose vectors this embedder produces, e.g.
+	// "bge-m3" or "hash-local" ("" when disabled). It is written to schema_meta
+	// at index build and re-checked at serve time: a client embedding queries
+	// with model B against a DB indexed with model A yields silently-wrong cosine
+	// scores, so the serve guard disables vector search on a mismatch.
+	ModelID() string
 }
 
 // Disabled is the no-op embedder used when no ONNX model is available.
 type Disabled struct{}
 
-func (Disabled) Enabled() bool { return false }
-func (Disabled) Dim() int      { return Dim }
+func (Disabled) Enabled() bool   { return false }
+func (Disabled) Dim() int        { return Dim }
+func (Disabled) ModelID() string { return "" }
 func (Disabled) Embed(context.Context, []string) ([][]float32, error) {
 	return nil, nil
 }
