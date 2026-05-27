@@ -147,6 +147,21 @@ out/
 # migration transition).
 .grepai/
 
+# ============================================
+# 3GPP corpus & RAG artifacts (NEVER committed — see docs/data-pipeline.md)
+# Raw sources (~37GB) + converted HTML (~37GB) -> mirrored to ghcr.io.
+# Index 3gpp.duckdb (~1.7GB) -> shipped via GitHub Releases.
+# Models (~2.3GB) -> fetched from HuggingFace.
+# Only corpus.lock (the manifest) is git-tracked.
+# ============================================
+/data/
+*.duckdb
+*.duckdb.wal
+*.kuzu/
+*.zst
+# Keep the manifest tracked even though it ends in .lock
+!corpus.lock
+
 # ktn-linter cache (generated at runtime)
 *.ktn-linter.cache.db
 

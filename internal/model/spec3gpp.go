@@ -1,0 +1,129 @@
+package model
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// 3GPP filename version codes are 3 chars: <major><v2><v3>, each char base-36-ish
+// where 0-9 = 0..9 and a-z = 10..35. The major IS the release ordinal:
+// f=15, g=16, h=17, i=18, j=19, k=20 ... and major 3 == Rel-99 (Release 1999).
+// See CLAUDE.md §8.1 and scripts/corpus.sh decode_char.
+
+// decodeChar maps a single code char to its numeric value, or -1 if invalid.
+func decodeChar(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'z':
+		return 10 + int(c-'a')
+	case c >= 'A' && c <= 'Z':
+		return 10 + int(c-'A')
+	default:
+		return -1
+	}
+}
+
+func encodeChar(n int) (byte, bool) {
+	switch {
+	case n >= 0 && n <= 9:
+		return byte('0' + n), true
+	case n >= 10 && n <= 35:
+		return byte('a' + (n - 10)), true
+	default:
+		return 0, false
+	}
+}
+
+// ReleaseFromMajor turns a major ordinal into a release label ("Rel-18",
+// and the special case major 3 -> "Rel-99").
+func ReleaseFromMajor(major int) string {
+	if major == 3 {
+		return "Rel-99"
+	}
+	return fmt.Sprintf("Rel-%d", major)
+}
+
+// DecodeVersionCode turns a 3-char code ("i60") into its release ("Rel-18")
+// and dotted version ("18.6.0"). ok is false when the code is malformed.
+func DecodeVersionCode(code string) (release, version string, ok bool) {
+	if len(code) != 3 {
+		return "", "", false
+	}
+	maj, v2, v3 := decodeChar(code[0]), decodeChar(code[1]), decodeChar(code[2])
+	if maj < 0 || v2 < 0 || v3 < 0 {
+		return "", "", false
+	}
+	return ReleaseFromMajor(maj), fmt.Sprintf("%d.%d.%d", maj, v2, v3), true
+}
+
+// EncodeVersionCode is the inverse of DecodeVersionCode: "18.6.0" -> "i60".
+func EncodeVersionCode(version string) (string, bool) {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	var out [3]byte
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return "", false
+		}
+		c, ok := encodeChar(n)
+		if !ok {
+			return "", false
+		}
+		out[i] = c
+	}
+	return string(out[:]), true
+}
+
+// ArchiveURL reconstructs the canonical 3GPP archive ZIP URL for a spec
+// version, e.g. ("33.128","18.6.0") ->
+// https://www.3gpp.org/ftp/Specs/archive/33_series/33.128/33128-i60.zip
+func ArchiveURL(specID, version string) string {
+	series := SeriesOf(specID)
+	num := strings.ReplaceAll(specID, ".", "")
+	code, ok := EncodeVersionCode(version)
+	if series == "" || num == "" || !ok {
+		return ""
+	}
+	return fmt.Sprintf("https://www.3gpp.org/ftp/Specs/archive/%s_series/%s/%s-%s.zip",
+		series, specID, num, code)
+}
+
+// ForgeRawURL builds the immutable 3GPP Forge raw-file URL for a 5G_APIs YAML
+// pinned to a commit SHA, e.g. ("TS29518_Namf_Communication.yaml","4e19b0…") ->
+// https://forge.3gpp.org/rep/all/5G_APIs/-/raw/4e19b0…/TS29518_Namf_Communication.yaml
+// An optional schema fragment appends #/components/schemas/<name>. Pinning to a
+// SHA (not a branch) is what makes the citation reproducible (CLAUDE.md §1).
+func ForgeRawURL(file, sha, schemaFragment string) string {
+	if file == "" || sha == "" {
+		return ""
+	}
+	u := fmt.Sprintf("https://forge.3gpp.org/rep/all/5G_APIs/-/raw/%s/%s", sha, file)
+	if schemaFragment != "" {
+		u += "#/components/schemas/" + schemaFragment
+	}
+	return u
+}
+
+// SeriesOf returns the 2-digit series of a spec id ("33.128" -> "33").
+func SeriesOf(specID string) string {
+	if i := strings.IndexByte(specID, '.'); i > 0 {
+		return specID[:i]
+	}
+	return ""
+}
+
+// seriesWG maps a series to its owning 3GPP working group. Best-effort: only
+// the well-known ones; unknown series yield "".
+var seriesWG = map[string]string{
+	"21": "SA", "22": "SA1", "23": "SA2", "24": "CT1", "25": "RAN",
+	"26": "SA4", "27": "CT", "28": "SA5", "29": "CT3", "31": "CT6",
+	"32": "SA5", "33": "SA3", "35": "SA3", "36": "RAN", "37": "RAN", "38": "RAN",
+}
+
+// WorkingGroupForSeries returns the owning WG for a series, or "".
+func WorkingGroupForSeries(series string) string { return seriesWG[series] }
