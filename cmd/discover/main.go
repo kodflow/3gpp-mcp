@@ -34,7 +34,7 @@ var rowRE = regexp.MustCompile(`(?s)<td>(?:TS|TR)</td>\s*<td><a[^>]*>(\d{2}\.\d{
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
-	floor := flag.String("floor", "Rel-4", "lowest release to consider (drops drafts/ancient below this major)")
+	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
 	flag.Parse()
 
@@ -115,7 +115,11 @@ func loadIndex(path string) map[string]string {
 }
 
 // major returns the leading integer of "Rel-19" or "19.6.0" (0 on parse error).
+// Special case: Rel-99 IS version major 3 (not 99) in 3GPP's scheme.
 func major(s string) int {
+	if s == "Rel-99" {
+		return 3
+	}
 	s = strings.TrimPrefix(s, "Rel-")
 	if i := strings.IndexAny(s, ".-"); i >= 0 {
 		s = s[:i]

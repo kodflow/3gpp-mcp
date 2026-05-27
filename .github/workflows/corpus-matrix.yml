@@ -11,7 +11,7 @@
 #                  Re-emits corpus-index.json and (opt-in) publishes to `latest`.
 #
 # Series sharding is disjoint (archive is series-structured); release is captured
-# by the floor (default Rel-4 = all modern releases) + future releases appear in
+# by the floor (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen) + future releases appear in
 # the listing automatically, so nothing is hard-frozen.
 
 name: Corpus Matrix
@@ -28,9 +28,9 @@ on:
         type: string
         default: ""
       release_floor:
-        description: "Lowest release to ingest (default Rel-4 = all modern releases)."
+        description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen)."
         type: string
-        default: "Rel-4"
+        default: "Rel-99"
       publish_to_latest:
         description: "Publish the consolidated DB + index to the rolling 'latest' release."
         type: boolean
