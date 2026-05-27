@@ -35,10 +35,6 @@ on:
         description: "Publish the consolidated DB + index to the rolling 'latest' release."
         type: boolean
         default: false
-  # TEMP — validate the delta+merge pipeline on the PR (scope 21 24, artifact). REMOVE before merge.
-  pull_request:
-    branches: [main]
-    paths: ["cmd/discover/**", "cmd/merge/**", ".github/workflows/corpus-matrix.yml"]
 
 permissions:
   contents: read # discover/build-shard read-only; merge elevates per-job
