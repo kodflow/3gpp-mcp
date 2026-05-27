@@ -25,10 +25,6 @@ on:
         description: "Lowest release to ingest."
         type: string
         default: "Rel-17"
-  # TEMP — validate the matrix+merge on the PR (tiny scope). REMOVE before merge.
-  pull_request:
-    branches: [main]
-    paths: [".github/workflows/corpus-matrix.yml", "cmd/merge/**"]
 
 permissions:
   contents: read
