@@ -68,9 +68,14 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		// schema/embedding-model change), the base is incompatible → rebuild fresh.
 		if len(inputs) > 0 {
 			basePV := metaValue(ctx, sqldb, base, "pipeline_version")
+			// All shards in one run come from the same ingest build, so they share a
+			// pipeline_version; inputs[0] is representative of "the current pipeline".
 			shardPV := metaValue(ctx, sqldb, inputs[0], "pipeline_version")
-			if basePV != "" && shardPV != "" && basePV != shardPV {
-				fmt.Fprintf(os.Stderr, "[merge] pipeline_version changed (base=%s shard=%s) — full rebuild, ignoring --base\n", basePV, shardPV)
+			// Strict compare: "" is a distinct value, so a base that predates
+			// pipeline_version (basePV=="") vs a versioned shard is a mismatch and is
+			// rebuilt. Only when BOTH are empty (all pre-feature) do we reuse the base.
+			if basePV != shardPV {
+				fmt.Fprintf(os.Stderr, "[merge] pipeline_version mismatch (base=%q shard=%q) — full rebuild, ignoring --base\n", basePV, shardPV)
 				incremental = false
 			}
 		}
