@@ -1,0 +1,85 @@
+name: Feature Version Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".devcontainer/features/**"
+
+jobs:
+  check-version-bumps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Check feature version bumps
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Collect unique feature directories changed in this PR vs main.
+          # Feature directories are 4 levels deep (languages) or 3 (root features).
+          changed=$(git diff origin/main...HEAD --name-only \
+            | grep '^\.devcontainer/features/' \
+            | awk -F/ '{
+                if ($3 == "languages" && NF >= 5) print $3"/"$4
+                else if ($3 != "languages" && NF >= 4) print $3
+              }' \
+            | sort -u || true)
+
+          if [ -z "$changed" ]; then
+            echo "No feature directories touched — gate passes trivially."
+            exit 0
+          fi
+
+          echo "Feature directories touched:"
+          echo "$changed" | sed 's/^/  - /'
+          echo
+
+          failed=0
+          while IFS= read -r dir_rel; do
+            [ -z "$dir_rel" ] && continue
+            # Skip shared utils (not a versioned feature).
+            [[ "$dir_rel" == "languages/shared" ]] && { echo "skip shared/"; continue; }
+            dir=".devcontainer/features/${dir_rel}"
+            meta="${dir}/devcontainer-feature.json"
+
+            if [ ! -f "$meta" ]; then
+              echo "  ${dir_rel}: no devcontainer-feature.json (new feature or removed) — skip"
+              continue
+            fi
+
+            # Non-doc changes? Anything under the dir excluding CLAUDE.md / README.md.
+            content_changed=$(git diff origin/main...HEAD --name-only -- "$dir" \
+              | grep -Ev '(CLAUDE\.md|README\.md)$' || true)
+            if [ -z "$content_changed" ]; then
+              echo "  ${dir_rel}: only docs changed — no bump required"
+              continue
+            fi
+
+            # Did "version" change in devcontainer-feature.json?
+            if git diff origin/main...HEAD -- "$meta" | grep -E '^\+[[:space:]]*"version"' >/dev/null; then
+              new_ver=$(jq -r '.version' "$meta")
+              echo "  ${dir_rel}: content changed + version bumped to ${new_ver}"
+            else
+              cur_ver=$(jq -r '.version' "$meta")
+              echo "  ${dir_rel}: FAIL — content changed but version still ${cur_ver}"
+              failed=1
+            fi
+          done <<< "$changed"
+
+          if [ "$failed" -eq 1 ]; then
+            echo
+            echo "Feature Version Gate FAILED."
+            echo "Bump the 'version' field in devcontainer-feature.json for every feature"
+            echo "whose install.sh or non-docs content changed. GHCR silently skips republish"
+            echo "when the version string already exists (devcontainers/cli#814)."
+            exit 1
+          fi
+
+          echo
+          echo "Feature Version Gate PASSED."

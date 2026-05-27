@@ -1,0 +1,13 @@
+{
+  "id": "ruby",
+  "version": "1.0.1",
+  "name": "Ruby Development Environment",
+  "description": "Installs Ruby via rbenv, bundler, and common development tools",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["Shopify.ruby-lsp"]
+    }
+  },
+  "installsAfter": []
+}

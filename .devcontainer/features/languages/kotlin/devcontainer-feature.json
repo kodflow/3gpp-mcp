@@ -1,0 +1,23 @@
+{
+  "id": "kotlin",
+  "version": "1.0.1",
+  "name": "Kotlin Development Environment",
+  "description": "Installs Kotlin via SDKMAN with common development tools",
+  "options": {
+    "version": {
+      "type": "string",
+      "default": "latest",
+      "description": "Kotlin version to install"
+    }
+  },
+  "containerEnv": {
+    "SDKMAN_DIR": "/home/vscode/.sdkman",
+    "PATH": "/home/vscode/.sdkman/candidates/kotlin/current/bin:/home/vscode/.local/bin:${PATH}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["fwcd.kotlin"]
+    }
+  },
+  "installsAfter": []
+}

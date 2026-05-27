@@ -1,0 +1,25 @@
+{
+  "id": "python",
+  "version": "1.0.1",
+  "name": "Python Development Environment",
+  "description": "Installs Python via pyenv, pip, poetry, and common development tools",
+  "options": {
+    "version": {
+      "type": "string",
+      "default": "3.14",
+      "description": "Python version to install"
+    }
+  },
+  "installsAfter": [],
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-python.vscode-pylance"]
+    }
+  },
+  "containerEnv": {
+    "PYENV_ROOT": "/home/vscode/.cache/pyenv",
+    "PIP_CACHE_DIR": "/home/vscode/.cache/pip",
+    "POETRY_CACHE_DIR": "/home/vscode/.cache/poetry",
+    "PATH": "/home/vscode/.cache/pyenv/bin:/home/vscode/.cache/pyenv/shims:${PATH}"
+  }
+}

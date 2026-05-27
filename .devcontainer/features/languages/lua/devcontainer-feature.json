@@ -1,0 +1,13 @@
+{
+  "id": "lua",
+  "version": "1.0.1",
+  "name": "Lua Development Environment",
+  "description": "Installs Lua 5.4, LuaRocks, StyLua, and Luacheck",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["sumneko.lua"]
+    }
+  },
+  "installsAfter": []
+}

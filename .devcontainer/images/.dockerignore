@@ -1,0 +1,12 @@
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Claude Code session/runtime artifacts (not needed in image)
+.claude/.claude.json
+.claude/contexts/
+.claude/plans/
+.claude/sessions/
+
+# Build context metadata
+CLAUDE.md

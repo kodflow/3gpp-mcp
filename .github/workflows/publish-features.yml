@@ -1,0 +1,54 @@
+name: Publish Dev Container Features
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/features/**"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Flatten features for OCI publishing
+        run: |
+          mkdir -p src
+
+          # Language features: flatten from languages/<name>/ to <name>/
+          for dir in .devcontainer/features/languages/*/; do
+            name=$(basename "$dir")
+            [ "$name" = "shared" ] && continue
+            [ ! -f "$dir/devcontainer-feature.json" ] && continue
+            cp -r "$dir" "src/$name"
+            # Embed shared utils so each feature is self-contained
+            cp .devcontainer/features/languages/shared/feature-utils.sh "src/$name/" 2>/dev/null || true
+          done
+
+          # Non-language features: copy directly
+          for dir in browser kubernetes infrastructure claude; do
+            if [ -d ".devcontainer/features/$dir" ] && [ -f ".devcontainer/features/$dir/devcontainer-feature.json" ]; then
+              cp -r ".devcontainer/features/$dir" "src/$dir"
+              # Embed shared utils for browser feature (uses same pattern)
+              cp .devcontainer/features/languages/shared/feature-utils.sh "src/$dir/" 2>/dev/null || true
+            fi
+          done
+
+          echo "Features prepared for publishing:"
+          ls -1 src/
+
+      - name: Publish Dev Container Features
+        uses: devcontainers/action@1082abd5d2bf3a11abccba70eef98df068277772 # v1.4.3
+        with:
+          publish-features: true
+          base-path-to-features: src
+          oci-registry: ghcr.io
+          features-namespace: kodflow/devcontainer-features
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

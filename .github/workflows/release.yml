@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    # Path filters: any change that gets bundled into claude-assets.tar.gz
+    # MUST trigger a re-release. The standalone install.sh fast-path downloads
+    # this archive — if it's stale, new users miss the latest patterns/agents.
+    paths:
+      - ".devcontainer/features/**"
+      - ".devcontainer/hooks/**"
+      - ".devcontainer/images/.claude/**"
+      - ".devcontainer/scripts/generate-assets-archive.sh"
+      - ".github/workflows/release.yml"
+  workflow_run:
+    # MUST match the `name:` field of docker-images.yml exactly. Was
+    # "Build Docker Image" (singular) — typo silently broke the chain so
+    # release was only refreshed when push paths matched. Now `Build Docker
+    # Images` (plural), matching `name: Build Docker Images` in
+    # docker-images.yml. Verified by grep on 2026-04-26.
+    workflows: ["Build Docker Images"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Only run on the original repo
+    # Skip if workflow_run triggered by schedule/dispatch (only release on push-triggered Docker builds)
+    # Skip if workflow_run concluded with failure
+    if: >-
+      github.repository == 'kodflow/devcontainer-template'
+      && (github.event_name != 'workflow_run'
+        || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      # workflow_run sets GITHUB_SHA to default branch HEAD, not the triggering commit
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.TARGET_SHA }}
+
+      - name: Generate assets archive
+        run: |
+          .devcontainer/scripts/generate-assets-archive.sh --output claude-assets.tar.gz
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(date -u +'%Y.%m.%d')-${TARGET_SHA::7}"
+
+          # Delete pre-existing release for THIS dated tag — same commit
+          # can produce TWO release.yml runs (push paths + workflow_run
+          # after Build Docker Images), and `gh release create $TAG`
+          # would fail on the second run because the tag already exists.
+          # Identified by Qodo on PR #333.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+
+          # Delete the legacy "latest" tag too (back-compat with the
+          # pre-dated-tag scheme some old releases still use).
+          gh release delete latest --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+
+          # Create new release tagged dated + flagged --latest. Idempotent
+          # now: a re-run for the same SHA/day will delete and recreate
+          # rather than fail.
+          gh release create "$TAG" \
+            claude-assets.tar.gz \
+            --title "Release $TAG" \
+            --notes "Auto-generated from commit ${TARGET_SHA::7} on $(date -u +'%Y-%m-%d %H:%M UTC')" \
+            --latest

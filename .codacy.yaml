@@ -1,0 +1,17 @@
+# Codacy Configuration
+# https://docs.codacy.com/repositories-configure/codacy-configuration-file/
+
+---
+exclude_paths:
+  # Root documentation files
+  - "CLAUDE.md"
+  - "AGENTS.md"
+  - "README.md"
+  # Project documentation
+  - "docs/**"
+  # DevContainer documentation and prompts
+  - ".devcontainer/docs/**"
+  - ".devcontainer/**/*.md"
+  # Claude agent and command files (Markdown used as prompts)
+  - ".claude/**/*.md"
+  - ".devcontainer/images/.claude/**/*.md"

@@ -1,0 +1,13 @@
+{
+  "id": "fortran",
+  "version": "1.0.1",
+  "name": "Fortran Development Environment",
+  "description": "Installs gfortran, fprettify, and Fortran Package Manager (fpm)",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["fortran-lang.linter-gfortran"]
+    }
+  },
+  "installsAfter": []
+}

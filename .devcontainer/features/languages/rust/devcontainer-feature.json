@@ -1,0 +1,13 @@
+{
+  "id": "rust",
+  "version": "1.0.3",
+  "name": "Rust Development Environment",
+  "description": "Installs Rust via rustup, cargo, and common development tools",
+  "options": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  },
+  "installsAfter": ["ghcr.io/kodflow/devcontainer-features/nodejs"]
+}

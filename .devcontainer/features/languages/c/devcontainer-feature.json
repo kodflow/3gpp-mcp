@@ -1,0 +1,20 @@
+{
+  "id": "c",
+  "version": "1.0.1",
+  "name": "C Development Environment",
+  "description": "Installs C compilers and common development tools",
+  "options": {
+    "version": {
+      "type": "string",
+      "default": "latest",
+      "description": "GCC version to install"
+    }
+  },
+  "containerEnv": {},
+  "customizations": {
+    "vscode": {
+      "extensions": ["llvm-vs-code-extensions.vscode-clangd"]
+    }
+  },
+  "installsAfter": []
+}

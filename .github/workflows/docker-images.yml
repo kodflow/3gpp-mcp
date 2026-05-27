@@ -1,0 +1,377 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/images/**"
+      - ".devcontainer/features/**"
+      - ".github/workflows/docker-images.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".devcontainer/images/**"
+      - ".devcontainer/features/**"
+      - ".github/workflows/docker-images.yml"
+  schedule:
+    # Daily build at 4:00 AM UTC (main image)
+    - cron: "0 4 * * *"
+    # Weekly base image rebuild (Sunday 3:00 AM UTC)
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      rebuild_base:
+        description: "Force rebuild base image"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [ktn-linter-release]
+
+# Cancel in-progress runs when a new run is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kodflow/devcontainer-template
+  BASE_IMAGE_NAME: kodflow/devcontainer-base
+
+jobs:
+  # =============================================================================
+  # Base image: stable layers (apt, PPA, Cloud CLIs) — rebuilt weekly
+  # =============================================================================
+  build-base:
+    if: >-
+      github.repository == 'kodflow/devcontainer-template' && (
+        github.event.schedule == '0 3 * * 0' ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.rebuild_base == 'true') ||
+        (github.event_name == 'push' && contains(github.event.head_commit.message, '[base]'))
+      )
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare platform pair
+        id: platform
+        run: |
+          platform=${{ matrix.platform }}
+          echo "pair=${platform//\//-}" >> $GITHUB_OUTPUT
+
+      - name: Build and push base by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .devcontainer/images
+          file: .devcontainer/images/Dockerfile.base
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=base-${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=base-${{ steps.platform.outputs.pair }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests-base
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests-base/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-base-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests-base/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Merge base architectures into multi-arch manifest
+  merge-base:
+    if: github.repository == 'kodflow/devcontainer-template'
+    runs-on: ubuntu-latest
+    needs: build-base
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests-base
+          pattern: digests-base-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests-base
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest \
+            -t ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:$(date +'%Y-%m-%d') \
+            $(printf '${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}@sha256:%s ' *)
+
+  # =============================================================================
+  # Main image: dynamic layers (Claude, rtk) — rebuilt daily
+  # =============================================================================
+  build:
+    # Wait for base image if it's being rebuilt; skip waiting otherwise
+    needs: merge-base
+    if: >-
+      always() &&
+      github.repository == 'kodflow/devcontainer-template' &&
+      github.event.schedule != '0 3 * * 0' &&
+      (needs.merge-base.result == 'success' || needs.merge-base.result == 'skipped') &&
+      !failure() && !cancelled()
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check base image availability
+        id: base-check
+        run: |
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest > /dev/null 2>&1; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "Base image available"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::warning::Base image ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest not found — skipping build. Trigger a base image rebuild first."
+          fi
+
+      - name: Extract metadata
+        if: steps.base-check.outputs.available == 'true'
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Prepare platform pair
+        if: steps.base-check.outputs.available == 'true'
+        id: platform
+        run: |
+          platform=${{ matrix.platform }}
+          echo "pair=${platform//\//-}" >> $GITHUB_OUTPUT
+
+      - name: Generate cache bust value
+        if: steps.base-check.outputs.available == 'true'
+        id: cachebust
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "value=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          else
+            echo "value=stable" >> $GITHUB_OUTPUT
+          fi
+
+      # Fetch the previous image's features manifest so the new manifest can
+      # carry up to 8 generations of previous_hashes per file. Best-effort:
+      # any fetch failure (first build, network blip, registry transient
+      # outage) yields an empty history and the sync falls back to current
+      # behaviour for stale-but-clean workspaces (one-build degradation,
+      # self-healing on the next successful fetch). See #367.
+      - name: Fetch previous manifest (best-effort)
+        id: prev-manifest
+        if: steps.base-check.outputs.available == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if docker pull ghcr.io/${{ github.repository }}:latest 2>/dev/null; then
+              cid=$(docker create ghcr.io/${{ github.repository }}:latest)
+              if docker cp "$cid:/etc/devcontainer-template/.template-files.json" \
+                   .devcontainer/images/prev-manifest.json 2>/dev/null; then
+                  echo "found=true" >> "$GITHUB_OUTPUT"
+              else
+                  echo "found=false" >> "$GITHUB_OUTPUT"
+                  echo "::warning::previous manifest not present in :latest image"
+              fi
+              docker rm "$cid" >/dev/null 2>&1 || true
+          else
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::could not pull :latest — previous_hashes will be empty"
+          fi
+
+      # Stage .devcontainer/features/ + image-template-version.json + the
+      # per-file sha256 manifest into the build context so the Dockerfile can
+      # embed them. Build context is .devcontainer/images/; features/ and the
+      # version markers live one level up.
+      # The version marker lets postStart skip the sync when the consumer has
+      # already pulled a newer template via /update (avoids /update regression).
+      # The files manifest powers postStart's 3-way merge: files whose current
+      # on-disk sha256 matches the previously-shipped manifest entry are
+      # eligible for safe overwrite (#334); files matching a previous_hashes
+      # entry are fast-forwarded silently (#367).
+      - name: Stage features, version + manifest
+        if: steps.base-check.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          cp -r .devcontainer/features .devcontainer/images/features
+          SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{"commit": "%s", "updated": "%s"}\n' "$SHA" "$NOW" \
+            > .devcontainer/images/image-template-version.json
+          PREV_ARG=()
+          if [ "${{ steps.prev-manifest.outputs.found }}" = "true" ] && \
+             [ -f .devcontainer/images/prev-manifest.json ]; then
+              PREV_ARG=(--prev-manifest .devcontainer/images/prev-manifest.json)
+          fi
+          python3 .devcontainer/scripts/build-features-manifest.py \
+            .devcontainer/images/features "$SHA" "$NOW" \
+            "${PREV_ARG[@]}" \
+            > .devcontainer/images/image-template-files.json
+
+      # PR: Build only (no push)
+      - name: Build image (PR)
+        if: github.event_name == 'pull_request' && steps.base-check.outputs.available == 'true'
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .devcontainer/images
+          file: .devcontainer/images/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CACHE_BUST_DYNAMIC=${{ steps.cachebust.outputs.value }}
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha,scope=build-${{ steps.platform.outputs.pair }}
+
+      # Push events: Build and push by digest
+      - name: Build and push by digest
+        if: github.event_name != 'pull_request' && steps.base-check.outputs.available == 'true'
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .devcontainer/images
+          file: .devcontainer/images/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CACHE_BUST_DYNAMIC=${{ steps.cachebust.outputs.value }}
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha,scope=build-${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=build-${{ steps.platform.outputs.pair }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: github.event_name != 'pull_request' && steps.base-check.outputs.available == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request' && steps.base-check.outputs.available == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-main-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # =============================================================================
+  # Merge main image architectures into multi-arch manifest
+  # =============================================================================
+  merge:
+    if: >-
+      always() &&
+      github.repository == 'kodflow/devcontainer-template' &&
+      github.event_name != 'pull_request' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digests-main-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate date tag
+        id: date
+        run: echo "tag=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.date.outputs.tag }}
+            type=sha,prefix=
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

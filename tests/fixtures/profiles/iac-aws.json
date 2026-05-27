@@ -1,0 +1,13 @@
+{
+  "languages": [],
+  "build_system": { "makefile": false, "targets": [] },
+  "tools": { "react": false, "playwright": false },
+  "cloud": ["aws"],
+  "container": [],
+  "k8s": false,
+  "os": "linux",
+  "ci": "github",
+  "test_frameworks": [],
+  "project_root": "/tmp/fake-iac-aws",
+  "project_type": "iac"
+}

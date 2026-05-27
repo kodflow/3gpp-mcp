@@ -1,0 +1,15 @@
+{
+  "id": "browser",
+  "version": "1.0.3",
+  "name": "Browser Automation (Playwright)",
+  "description": "Installs Playwright with Chromium for browser automation, E2E testing, and the Playwright MCP server",
+  "documentationURL": "https://playwright.dev/",
+  "options": {},
+  "installsAfter": ["ghcr.io/kodflow/devcontainer-features/nodejs"],
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-playwright.playwright"]
+    }
+  },
+  "privileged": false
+}

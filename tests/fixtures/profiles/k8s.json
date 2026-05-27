@@ -1,0 +1,13 @@
+{
+  "languages": [{ "name": "go", "marker": "go.mod", "primary": true }],
+  "build_system": { "makefile": false, "targets": [] },
+  "tools": { "react": false, "playwright": false },
+  "cloud": [],
+  "container": ["docker"],
+  "k8s": true,
+  "os": "linux",
+  "ci": "github",
+  "test_frameworks": [],
+  "project_root": "/tmp/fake-k8s",
+  "project_type": "code"
+}
