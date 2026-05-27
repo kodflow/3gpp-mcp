@@ -707,6 +707,15 @@ func (s *Store) count(ctx context.Context, table string) (int, error) {
 	return n, err
 }
 
+// CountNullEmbeddings returns how many clauses have no embedding (the authoritative
+// post-ingest check that the embedder actually populated vectors — st.Vectors is
+// only a write-side flag).
+func (s *Store) CountNullEmbeddings(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NULL`).Scan(&n)
+	return n, err
+}
+
 // vecOverFetch / vecMaxFetch bound how many extra neighbours SearchVectors pulls
 // when a SpecFilter is set, so the Go post-filter can still return topK.
 const (
