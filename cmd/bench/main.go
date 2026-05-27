@@ -19,6 +19,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -105,6 +106,13 @@ func main() {
 func runSynthHNSW(n int, outPath string, batch int) error {
 	if batch < 1 {
 		batch = 512
+	}
+	// --synth-out is operator input fed to os.Remove/store.Open; refuse anything
+	// that isn't a plain relative .duckdb path so a stray/hostile value can never
+	// delete or overwrite an unrelated file.
+	outPath = filepath.Clean(outPath)
+	if !strings.HasSuffix(outPath, ".duckdb") || filepath.IsAbs(outPath) || strings.HasPrefix(outPath, "..") {
+		return fmt.Errorf("--synth-out must be a relative *.duckdb path, got %q", outPath)
 	}
 	_ = os.Remove(outPath) // deterministic: no stale index
 	st, err := store.Open(outPath)

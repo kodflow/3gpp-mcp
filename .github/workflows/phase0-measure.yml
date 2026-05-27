@@ -63,7 +63,9 @@ jobs:
       - name: Install deps (build + time + zstd)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config time zstd
       - name: Build bench
-        run: go build -trimpath -o bin/bench ./cmd/bench
+        run: |
+          mkdir -p bin out
+          go build -trimpath -o bin/bench ./cmd/bench
       - name: Baseline (cores / RAM / disk)
         run: |
           { nproc; free -h; df -h /; } 2>&1 | tee baseline.txt
@@ -114,24 +116,33 @@ jobs:
       - name: Install deps (LibreOffice + build + time)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui time
       - name: Build ingest
-        run: go build -trimpath -o bin/ingest ./cmd/ingest
+        run: |
+          mkdir -p bin dist out
+          go build -trimpath -o bin/ingest ./cmd/ingest
       - name: Disk before
-        run: mkdir -p out && df -B1 / | tee out/df-before.txt
+        run: df -B1 / | tee out/df-before.txt
       - name: Download + convert series ${{ github.event.inputs.series }}
         run: |
           /usr/bin/time -v ./scripts/corpus.sh --set "${{ github.event.inputs.floor }}" \
-            --series "${{ github.event.inputs.series }}" --jobs 2 2> out/convert.time || true
+            --series "${{ github.event.inputs.series }}" --jobs 2 2> out/convert.time
+      - name: Disk after convert (always, for the artifact + gate)
+        if: always()
+        run: |
           df -B1 / | tee out/df-after-convert.txt
           du -sb data/sources 2>/dev/null | tee out/du-sources.txt || true
-      - name: Lexical ingest + count-only
+      - name: Lexical ingest
         run: |
           /usr/bin/time -v ./bin/ingest --series "${{ github.event.inputs.series }}" \
-            --out dist/shard.duckdb --quiet 2> out/ingest.time || true
+            --out dist/shard.duckdb --quiet 2> out/ingest.time
+      - name: Count-only + disk after ingest
+        run: |
           ./bin/ingest --out dist/shard.duckdb --count-only | tee out/count.json
           df -B1 / | tee out/df-after-ingest.txt
           ls -l dist/shard.duckdb | tee out/db-size.txt
       - name: Worst-shard disk summary + gate
+        if: always()
         run: |
+          test -f out/df-after-convert.txt || { echo "::error::no df snapshot — convert step failed before measuring."; exit 1; }
           FREE_AFTER=$(awk 'NR==2{print $4}' out/df-after-convert.txt)
           FREE_GIB=$(awk "BEGIN{printf \"%.2f\", $FREE_AFTER/1073741824}")
           echo "### disk-probe series=${{ github.event.inputs.series }} → free after convert ${FREE_GIB} GiB" >> "$GITHUB_STEP_SUMMARY"
@@ -171,7 +182,9 @@ jobs:
       - name: Fetch BGE-M3 + ONNX Runtime (~2.3 GB)
         run: ./scripts/fetch-model.sh
       - name: Build ingest WITH onnx
-        run: go build -trimpath -tags onnx -o bin/ingest-onnx ./cmd/ingest
+        run: |
+          mkdir -p bin dist out
+          go build -trimpath -tags onnx -o bin/ingest-onnx ./cmd/ingest
       - name: Download + convert series ${{ github.event.inputs.series }}
         run: ./scripts/corpus.sh --set "${{ github.event.inputs.floor }}" --series "${{ github.event.inputs.series }}" --jobs 2
       - name: Embed (fp32) under time -v
