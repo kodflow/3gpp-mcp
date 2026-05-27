@@ -1,10 +1,18 @@
-# Corpus sync — placeholder for the incremental index refresh (plan Part C4).
+# Corpus sync — refreshes the indexed 3GPP DB and publishes it to the single
+# rolling "latest" release (plan Part C4). NOT YET IMPLEMENTED — stub.
 #
-# Intentionally minimal: full corpus ingest (~20 GB) never runs on a hosted
-# runner (14 GB disk / 7 GB RAM). The real job will fetch only the delta of new
-# 3GPP versions, append to the last released DB, publish a dated zstd Release,
-# and open a PR on corpus.lock. Kept simple on purpose — wired up when the
-# `ingest` delta path lands.
+# Model (decided): the DB *is* the state. No version history, no dated releases.
+# Each run:
+#   1. pull the current 3gpp.duckdb.zst from the `latest` release,
+#   2. diff the live 3gpp.org listing against what the DB already contains,
+#   3. download ONLY the missing specs, convert (LibreOffice), ingest-append,
+#   4. re-publish: `gh release upload latest 3gpp.duckdb.zst --clobber`
+#      (replaces the single asset; old one gone — no disk-space accumulation).
+#
+# Incremental by construction (delta only) so it fits a hosted runner's 14 GB
+# disk — full rebuild of the ~20 GB corpus never runs in CI. Kept deliberately
+# simple: no elaborate delta machinery beyond "download missing + append".
+# Blocked on an `ingest --append` path in cmd/ingest (next coding phase).
 
 name: Corpus Sync
 
@@ -14,11 +22,10 @@ on:
   #   - cron: "17 4 * * 1"  # weekly, off-peak, non-round minute
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write # to clobber the DB asset on the 'latest' release
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "::notice::corpus-sync is a stub — incremental ingest path pending (plan C4)."
+      - run: echo "::notice::corpus-sync stub — needs cmd/ingest --append + 'latest' DB publish (plan C4)."
