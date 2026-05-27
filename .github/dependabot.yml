@@ -1,5 +1,18 @@
 version: 2
 updates:
+  # Go module dependencies (DuckDB, mcp-go, ONNX, …).
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+    groups:
+      go-deps:
+        patterns: ["*"]
+  # GitHub Actions used by ci.yml / release.yml / corpus-sync.yml.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

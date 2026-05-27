@@ -1,0 +1,19 @@
+{
+  "// note": "Project overrides — preserved by /update. Enables what the 3GPP MCP product needs to build/ingest: Go (DuckDB+ONNX CGO), LibreOffice (DOCX/DOC -> HTML for scripts/corpus.sh), Python (batch scripts).",
+  "features": {
+    "./features/languages/go": {},
+    "./features/libreoffice": {},
+    "ghcr.io/kodflow/devcontainer-features/python:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}

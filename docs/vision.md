@@ -1,70 +1,77 @@
-# Vision: devcontainer-template
+# Vision: 3gpp-mcp
 
 ## Purpose
 
-A universal DevContainer shell that provides a complete AI ecosystem — specialist agents, slash commands, and automated workflows — to bootstrap and develop any project with maximum quality. The developer writes intent; the system produces reliable, idiomatic, up-to-date code.
+A **Model Context Protocol (MCP) server** that exposes the entire 3GPP corpus —
+from Phase 1 (1992) to the latest published Release — as an instantly queryable
+index for Claude Code and any MCP client, **running locally, with zero
+hallucination**.
+
+The server never summarizes or paraphrases: it returns **cited specification
+fragments** (`spec_id`, `release`, `version`, `clause`, `url`). Claude reasons;
+the index serves.
 
 ## Problem Statement
 
-- Development environments lack deeply integrated AI that understands language-specific best practices
-- Workflows don't self-improve: the same mistakes repeat across projects
-- Generated code often follows outdated patterns instead of the latest stable version idioms
-- Solo developers waste time on boilerplate, tooling setup, and cross-referencing documentation
-- No feedback loop: code is produced without validation against official sources
+- Telecom engineers (EPC/5GC core, RAN, LI, IMS) need exact, dated, sourced spec
+  text — not a plausible approximation from a general LLM.
+- 3GPP specs live as ~37 GB of DOCX across thousands of versions on an FTP
+  archive; finding the right clause in the right release is slow and error-prone.
+- General LLMs hallucinate 3GPP terminology: they confuse releases, invent IEs,
+  and mix up N1/N2/N4 interfaces.
+- Versions are non-monotonic and acronyms are context-dependent (AMF = Access
+  and Mobility Management Function in 5GC, *or* a legacy IMS function).
 
 ## Target Users
 
-Solo developers who want to multiply their output by delegating to a reliable AI system that:
-- Produces production-quality code on first pass
-- Self-corrects when results don't meet standards
-- Cross-references multiple sources before committing to an approach
-- Stays current with the latest stable versions of every supported language
+Telecom engineers and tooling that need authoritative 3GPP retrieval inside an
+AI workflow: "what does TS 33.128 say about LI_X2 toward MDF2 in Rel-19", "diff
+TS 23.501 between Rel-18 and Rel-19", "what replaced the MME".
 
 ## Goals
 
-1. **Reliability over speed** — Every output must be correct and idiomatic before it's fast
-2. **Self-correction** — Agents detect their own mistakes and iterate until quality criteria are met
-3. **Source cross-referencing** — Consult official docs (context7), web search, and codebase context before producing code
-4. **Latest best practices** — Agents target the current stable version of each language, not legacy patterns
-5. **Universal shell** — Zero opinion on the final project; all project types bootstrap from the same base
-6. **Deep reasoning** — Apply Peek, Decompose, Parallelize, Synthesize before complex actions
+1. **No hallucination** — every response carries `{spec_id, release, version,
+   clause}` and the source URL. If it can't be cited, it isn't returned.
+2. **Local-first** — everything runs on the user's machine at query time; the
+   network is touched only during offline ingestion.
+3. **Single binary** — `mcp-3gpp` is one static Go binary; `bootstrap` pulls the
+   prebuilt index + models, then `serve` runs offline.
+4. **Reproducible ingestion** — a pinned corpus state produces a deterministic
+   index (stable hash), gated on retrieval-quality benchmarks.
+5. **MCP returns documents, never summaries** — the server is a retrieval
+   engine; synthesis happens client-side in Claude.
 
 ## Success Criteria
 
 | Criterion | Target |
 |-----------|--------|
-| Container startup | < 60s on cached rebuild |
-| Language support | Go, Python, Node.js, Rust, Elixir, Java, PHP, Ruby, Scala, Dart, C/C++, C#, Kotlin, Swift, Perl, Lua, R, Fortran, Ada, COBOL, Pascal, VB.NET, MATLAB, Assembly |
-| Specialist agents | 25 language + 6 dev executors + 9 devops + 6 platform executors + 22 OS + 9 docs analyzers + 2 orchestrators (79 total) |
-| MCP servers | GitHub, GitLab (core) + context7, ktn-linter (fragments) + Playwright (browser feature) |
-| Code quality | Passes language-specific strict linting on first generation |
-| Self-correction | Agents retry with fixes when linting/tests fail |
-| Source validation | Agents consult context7 or official docs before generating non-trivial code |
+| Query latency (BM25) | ~10 ms |
+| Query latency (HNSW vector) | ~3 ms |
+| Citation coverage | 100% of responses carry a citation block |
+| Client setup | `bootstrap` + `serve`, < 1 GB index download, no rebuild |
+| Index distribution | GitHub Release asset, SHA-256 verified |
+| Corpus durability | mirrored to ghcr.io, independent of 3gpp.org uptime |
+| Retrieval quality | `make bench` gate (Recall@k / nDCG@k) before any index ships |
 
-## Design Principles
+## Scope
 
-- **MCP-first** — Use structured MCP tools before CLI fallbacks; auth is pre-configured
-- **Reason then act** — Deep analysis before code generation; never guess when you can verify
-- **Fail forward** — When something breaks, auto-correct and learn; don't stop
-- **Progressive disclosure** — Basic info at root, details in subdirectories, full specs in agents
-- **Convention over configuration** — Sensible defaults that work out of the box
-- **Latest stable** — Always target the current stable version, never legacy
+- **V1**: Rel-17/18/19, series 23, 24, 29, 33, 38 (~150 specs); FTS BM25 + HNSW
+  vectors; glossary (TS 21.905 seed); changelog (Change History annex); 8 MCP
+  tools. Lawful Interception (TS 33.128) is the proving use case.
+- **V2**: KuzuDB NE↔NF evolution graph, full CR pipeline, historical ingestion
+  back to Rel-15, reranker enabled by default.
+- **V3**: Phase 1 → Rel-16 ingestion, multi-user deployment.
 
 ## Non-Goals
 
-- Not a deployment platform (development environment only)
-- Not prescriptive about application architecture (the project decides)
-- Not a monorepo solution (single project focus)
-- Not a replacement for human judgment on design decisions
+- Not a deployment platform — local-first MCP server.
+- No server-side summarization — Claude synthesizes.
+- No PDF parsing, no OCR — DOCX/HTML only.
+- No local LLM (Ollama/vLLM) in the query path.
 
 ## Key Decisions
 
-| Decision | Rationale |
-|----------|-----------|
-| Ubuntu 24.04 base | LTS stability, widest package support |
-| Named volumes for caches | Persist tooling state across container rebuilds |
-| MCP-first integrations | Structured auth, no manual token handling |
-| Specialist agents per language | Each agent knows current stable version and idiomatic patterns |
-| RLM decomposition | Recursive Language Model pattern for reliable multi-step reasoning |
-| context7 + WebSearch | Cross-reference official docs before generating code |
-| Iterative self-correction | Agents validate output and retry until quality criteria are met |
+See [`docs/architecture.md`](./architecture.md) for the frozen technical stack
+and [`docs/data-pipeline.md`](./data-pipeline.md) for the storage + CI/CD
+strategy. Both are migrated from the original GitLab project and adapted for
+GitHub distribution.

@@ -1,0 +1,8 @@
+{
+  "id": "libreoffice",
+  "version": "1.1.0",
+  "name": "LibreOffice headless (3GPP DOCX/DOC -> HTML)",
+  "description": "Installs libreoffice-writer headless, the only engine that reads the ~55% legacy binary .doc 3GPP specs while keeping structure (headings=clauses, tables). Used offline by scripts/corpus.sh; the query-path MCP binary stays pure-Go.",
+  "options": {},
+  "installsAfter": []
+}

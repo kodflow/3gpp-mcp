@@ -1,98 +1,111 @@
-# Architecture: devcontainer-template
+# Architecture: 3gpp-mcp
 
-## System Context
+> Migrated from the original GitLab project's `CLAUDE.md` architectural verdict.
+> The stack is **frozen**; deviations need a written justification and an
+> `arch-change` label on the PR.
 
-```
-Developer IDE (VS Code / Codespaces)
-        |
-.devcontainer/devcontainer.json
-        |
-docker-compose.yml → devcontainer service
-        |
-Base image (Ubuntu 24.04 + core tooling)
-        |
-Lifecycle hooks + language features
-        |
-Claude Code + MCP servers (github, gitlab, context7 + feature fragments)
-        |
-Specialist agents (25 language + 6 dev executor + 9 devops + 6 platform executor + 22 OS + 9 docs analyzers + 2 orchestrators)
-```
-
-## Key Components
-
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| DevContainer config | `.devcontainer/devcontainer.json` | VS Code entry point |
-| Docker Compose | `.devcontainer/docker-compose.yml` | Service definition, volumes |
-| Base image (stable) | `.devcontainer/images/Dockerfile.base` | System deps, Cloud CLIs (weekly) |
-| Main image (dynamic) | `.devcontainer/images/Dockerfile` | Claude, tools (daily) |
-| Lifecycle hooks | `/etc/devcontainer-hooks/lifecycle/` | Startup automation (image-embedded) |
-| Language features | `.devcontainer/features/languages/` | Per-language installers |
-| Specialist agents | `.devcontainer/images/.claude/agents/` | AI agent definitions |
-| Slash commands | `.claude/commands/` | Workflow entry points |
-| MCP template | `.devcontainer/images/mcp.json.tpl` | Server configuration |
-
-## Data Flow
-
-1. **Container creation** — VS Code reads `devcontainer.json`, builds and runs service
-2. **onCreate** — Provisions caches, injects CLAUDE.md, sets safe directories
-3. **postCreate** — Wires language managers (NVM, pyenv, rustup), creates aliases
-4. **postStart** — Restores Claude, injects secrets into `mcp.json`, validates setup
-5. **Development** — User invokes slash commands → orchestrators → specialists → output
-
-## Agent Architecture
+## Frozen stack
 
 ```
-User intent (slash command)
-        |
-   Orchestrator (developer/devops)
-        |
-   RLM Decomposition: Peek → Decompose → Parallelize → Synthesize
-        |
-   Specialist agents (language/infra/security)
-        |
-   Executor agents (correctness/security/design/quality/shell)
-        |
-   Validated output (code, review, plan)
+┌──────────────────────────────────────────────────────────────┐
+│  mcp-3gpp  (single static Go binary, CGO, ~25 MB)            │
+└──────────────────────────────────────────────────────────────┘
+
+Language    : Go 1.25+, CGO allowed
+Storage     : DuckDB (FTS BM25 + VSS HNSW + analytical SQL)
+Graph (V2)  : KuzuDB embedded (NE↔NF evolutions)
+Embeddings  : ONNX Runtime + BGE-M3 (1024-dim), behind `-tags onnx`
+Reranker    : BGE-reranker-v2-m3 ONNX (optional, V2)
+Doc parsing : HTML (LibreOffice-converted DOCX) + native DOCX (zip+xml)
+MCP SDK     : github.com/mark3labs/mcp-go
+Distribution: single binary; `bootstrap` pulls index + models
 ```
 
-## Technology Stack
+### Why these choices
 
-- **Base**: `mcr.microsoft.com/devcontainers/base:ubuntu-24.04`
-- **Cloud CLIs**: AWS v2, GCP SDK, Azure CLI
-- **IaC**: Terraform, Vault, Consul, Nomad, Packer, Ansible
-- **Containers**: kubectl, Helm, Docker Compose
-- **Languages**: Managed via devcontainer features (NVM, pyenv, rustup, etc.)
-- **AI**: Claude Code, MCP servers, RTK token-savings hook (PreToolUse rewrite)
+- **Go + CGO**: solo-dev velocity with a single distributable binary; CGO buys
+  real HNSW, BM25, and native ONNX. No Python runtime to manage.
+- **DuckDB over SQLite**: at corpus scale (millions of chunks projected) SQLite
+  + sqlite-vec degrades (brute-force vectors, slow analytics). DuckDB stays flat
+  (~3 ms HNSW, ~80–200 ms analytics) with native Parquet/Arrow export.
+- **KuzuDB over Neo4j** (V2): embedded, columnar, no JVM daemon, Cypher.
+- **No Ollama in the query path**: Claude is already the reasoning engine; a
+  second 7B–32B LLM adds latency and hallucinates 3GPP terminology. Local LLMs
+  are allowed *only* for offline batch entity extraction, never at query time.
 
-## External Dependencies
+## Retrieval (router-based)
 
-| Service | Tool | Purpose |
-|---------|------|---------|
-| GitHub | `ghcr.io/github/github-mcp-server` | PR automation, code search |
-| GitLab | `@zereight/mcp-gitlab` | MR automation, pipelines |
-| context7 | `@upstash/context7-mcp` | Official library documentation (image fragment) |
-| Playwright | `@playwright/mcp` | Browser automation, E2E testing (browser feature) |
-| ktn-linter | Local MCP | Code linting — MCP server + hook provider (Go feature fragment) |
-
-### ktn-linter Integration Model
-
-ktn-linter has a dual role: **MCP server** (linting tools) and **hook provider** (PreToolUse/PostToolUse/Stop).
-
-- **Template responsibility**: installs binary, registers MCP fragment, declares hook wrapper scripts in `settings.json`
-- **ktn-linter responsibility**: HTTP server with lint logic, ScanReport formatting, severity ordering
-- **Integration**: 3 wrapper scripts (`ktn-*.sh`) call ktn-linter HTTP endpoints with graceful degradation
-
-See [ktn-linter-integration.md](ktn-linter-integration.md) for the full contract.
-
-## Volumes
-
-```yaml
-volumes:
-  package-cache:    # npm, pip, cargo caches
-  npm-global:       # Global npm packages
-  claude-data:      # Claude CLI state
-  op-config:        # 1Password config
+```
+Claude query ──▶ Intent router (regex) ──▶ { BM25 FTS | HNSW vec | KuzuDB graph | SQL changelog }
+                                              └──────────────┬──────────────┘
+                                       Hybrid fusion (RRF k=60) + optional reranker
+                                                             │
+                              JSON [{spec_id, release, version, clause, heading, text, url, score}]
 ```
 
-See `.devcontainer/docker-compose.yml` for full configuration.
+| Detected pattern | Backend |
+|---|---|
+| `TS \d\d\.\d\d\d` | BM25 filtered by spec |
+| `(remplace\|évolution\|maps to)` | Graph (V2) |
+| `(diff\|change) entre Rel-\d+ et Rel-\d+` | SQL on `changes` |
+| definition + ALL-CAPS acronym | glossary lookup |
+| otherwise | hybrid BM25 + vector + RRF |
+
+## Data model (DuckDB)
+
+`specs`, `spec_versions`, `clauses` (clause-level chunks with `embedding
+FLOAT[1024]`, HNSW + FTS indexed), `changes` (CR-level, keyed by `cr_number`
+because one CR can touch many specs), `acronyms` (glossary), `evolutions`
+(NE↔NF). Plus additive overlays: `api_*` (5GC OpenAPI), `li_events` (TS 33.128).
+
+## MCP surface — 8 core tools
+
+`search_spec`, `get_spec`, `get_changelog`, `list_releases`, `resolve_term`,
+`trace_evolution`, `find_cross_references`, `list_specs`. Every response carries
+a `citations: [{spec_id, release, version, clause, url}]` block. Domain subjects
+(glossary, LI, 5GC API) register extra tools via `internal/registry` with zero
+core coupling.
+
+## Ingestion pipeline
+
+```
+1. Sync    : scripts/corpus.sh — download DOCX from 3gpp.org FTP (incremental)
+2. Convert : soffice --headless DOCX -> HTML
+3. Parse   : internal/htmlparse (or internal/ooxml native DOCX) -> clauses
+4. Embed   : internal/embed BGE-M3 (optional, -tags onnx)
+5. Glossary: seed TS 21.905 + regex mining
+6. Changelog: parse Change History annex
+7. Write   : DuckDB bulk insert + build FTS/HNSW indexes
+```
+
+The index ("R") is `data/3gpp.duckdb`. How it is mirrored, built in CI, and
+distributed is covered in [`docs/data-pipeline.md`](./data-pipeline.md).
+
+## Reconciled deviation from the original verdict
+
+The original `CLAUDE.md` locked **"native DOCX, no HTML"**. In practice ~55% of
+the corpus is legacy binary `.doc`; `scripts/corpus.sh` converts everything to
+HTML via LibreOffice and `internal/htmlparse` ingests that (100% corpus
+coverage). A native DOCX parser (`internal/ooxml`) also exists and produces the
+same `ParsedSpec`, so ingestion is swappable. **This document treats HTML
+conversion as the supported default**, with native DOCX as the alternative —
+superseding the original lock. Embeddings remain **disabled by default** (the
+binary builds without the ~2 GB ONNX model; search degrades to lexical) and are
+enabled with `-tags onnx`.
+
+## Explicit locks (carried over)
+
+❌ No Python · ❌ No Ollama/local LLM at query time · ❌ No bare KV store ·
+❌ No Neo4j (JVM) · ❌ No Elasticsearch · ❌ No PDF parsing · ❌ No OCR ·
+❌ No arbitrary token-window chunking (always clause-aware) · ❌ No server-side
+summaries.
+
+## External sources
+
+| Source | URL | Usage |
+|---|---|---|
+| 3GPP archive | `3gpp.org/ftp/Specs/archive` | all spec versions |
+| 3GPP DynaReport | `3gpp.org/dynareport` | release status, spec→WG, CR DB |
+| 3GPP Forge | `forge.3gpp.org/rep/all/5G_APIs` | 5GC OpenAPI YAML (pinned SHA) |
+| TS 21.905 | series 21 | canonical glossary seed |
+| HuggingFace | BAAI/bge-m3 | embedding + reranker models |
