@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+
+	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // TestSearchVectorsKNNAndFilter checks the bare-k-NN path returns the nearest
@@ -76,5 +78,50 @@ func TestSearchVectorsAmongBounded(t *testing.T) {
 	// Empty candidate set → no hits, no error.
 	if h, err := st.SearchVectorsAmong(ctx, oneHot(20), nil, 5); err != nil || len(h) != 0 {
 		t.Fatalf("empty candidates → want (nil,nil), got (%d,%v)", len(h), err)
+	}
+}
+
+// TestSearchVectorsDocTypeFilter guards the vector path against leaking a clause
+// of the wrong doc_type past an explicit SpecFilter.DocType (TS/TR), even when
+// that clause is the nearest neighbour.
+func TestSearchVectorsDocTypeFilter(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "dt.duckdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
+	_ = st.UpsertSpec(model.Spec{SpecID: "33.926", Series: "33", DocType: "TR"})
+	_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-19", Version: "19.6.0"})
+	_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.926", Release: "Rel-19", Version: "19.0.0"})
+	if err := st.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "33.128", Release: "Rel-19", Version: "19.6.0", ClausePath: "6.1", Heading: "TS", Text: "x"},
+		{ChunkID: 2, SpecID: "33.926", Release: "Rel-19", Version: "19.0.0", ClausePath: "4.1", Heading: "TR", Text: "y"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Both clauses share the SAME direction → the TR clause is an equally-near
+	// neighbour and would surface without the DocType post-filter.
+	v := oneHot(20)
+	for _, id := range []uint64{1, 2} {
+		if err := st.SetEmbedding(ctx, id, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.BuildAndFreezeHNSW(ctx, "bge-m3"); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := st.SearchVectors(ctx, v, SpecFilter{DocType: "TS"}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("expected a TS hit")
+	}
+	for _, h := range hits {
+		if h.Clause.SpecID == "33.926" {
+			t.Fatal("TR spec leaked past DocType=TS filter")
+		}
 	}
 }
