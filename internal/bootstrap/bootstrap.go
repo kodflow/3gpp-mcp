@@ -137,6 +137,10 @@ func FetchAll(ctx context.Context, arts []Artifact) error {
 	return nil
 }
 
+// SHA256File returns the lowercase hex SHA-256 of the file at path. Used to
+// compare a cached DB against the hash published alongside the rolling release.
+func SHA256File(path string) (string, error) { return sha256File(path) }
+
 func sha256File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

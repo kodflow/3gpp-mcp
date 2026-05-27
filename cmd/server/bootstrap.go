@@ -4,10 +4,85 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 )
+
+// The rolling "latest" GitHub release is the single source of the indexed DB.
+// There is no version history: the DB's identity is its sha256 sidecar.
+const (
+	defaultDBURL    = "https://github.com/kodflow/3gpp-mcp/releases/latest/download/3gpp.duckdb.zst"
+	defaultDBSHAURL = "https://github.com/kodflow/3gpp-mcp/releases/latest/download/3gpp.duckdb.sha256"
+)
+
+// remoteSHA fetches the published sha256 sidecar and returns its hash field
+// (lowercase). Best-effort: returns "" on any error so callers can degrade.
+func remoteSHA(ctx context.Context, url string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := bootstrap.HTTPClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return ""
+	}
+	if fields := strings.Fields(string(b)); len(fields) > 0 {
+		return strings.ToLower(fields[0])
+	}
+	return ""
+}
+
+// ensureDB guarantees the per-user cache holds a usable indexed DB, pulling it
+// from the rolling "latest" release when absent and refreshing it when the
+// published sha256 differs from the cached file (the DB *is* the state).
+//
+// Degrade-don't-block: any network failure is non-fatal when a cached DB is
+// already present — serve keeps working offline against what it has.
+func ensureDB(ctx context.Context, allowUpdate bool) (string, error) {
+	dbPath, err := bootstrap.DBPath()
+	if err != nil {
+		return "", err
+	}
+	have := fileExists(dbPath)
+
+	if have && !allowUpdate {
+		return dbPath, nil
+	}
+
+	want := remoteSHA(ctx, defaultDBSHAURL) // "" if unreachable
+	if have {
+		if want == "" {
+			return dbPath, nil // offline: keep cache
+		}
+		if cur, err := bootstrap.SHA256File(dbPath); err == nil && cur == want {
+			return dbPath, nil // already current
+		}
+		fmt.Fprintln(os.Stderr, "[3gpp-mcp] DB update available — pulling latest…")
+	} else {
+		fmt.Fprintln(os.Stderr, "[3gpp-mcp] no cached DB — pulling latest…")
+	}
+
+	if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: defaultDBURL, SHA256: want, Dest: dbPath}); err != nil {
+		if have { // degrade: prefer a stale-but-working DB over failing serve
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] DB update failed (%v) — using cached DB\n", err)
+			return dbPath, nil
+		}
+		return "", fmt.Errorf("pull DB from %s: %w", defaultDBURL, err)
+	}
+	return dbPath, nil
+}
 
 // runBootstrap implements `mcp-3gpp bootstrap`: provision the per-user cache
 // with the indexed DuckDB snapshot, and with --semantic the ONNX models +
@@ -32,14 +107,18 @@ func runBootstrap(args []string) error {
 	if err != nil {
 		return err
 	}
-	switch {
-	case *dbURL != "":
-		fmt.Fprintf(os.Stderr, "[bootstrap] DB → %s\n", dbPath)
-		if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: *dbURL, SHA256: *dbSHA, Dest: dbPath}); err != nil {
-			return err
+	// No --db-url? Default to the rolling "latest" release, resolving its
+	// published sha256 so the download is verified out of the box.
+	url, sha := *dbURL, *dbSHA
+	if url == "" {
+		url = defaultDBURL
+		if sha == "" {
+			sha = remoteSHA(ctx, defaultDBSHAURL)
 		}
-	case !fileExists(dbPath):
-		return fmt.Errorf("no --db-url given and no cached DB at %s", dbPath)
+	}
+	fmt.Fprintf(os.Stderr, "[bootstrap] DB %s → %s\n", url, dbPath)
+	if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: url, SHA256: sha, Dest: dbPath}); err != nil {
+		return err
 	}
 
 	if *semantic {
@@ -96,6 +175,9 @@ func setIfPresent(env, dir, sentinel string) {
 		_ = os.Setenv(env, dir)
 	}
 }
+
+// cachedDBPath is the per-user cache DB path (empty on resolution error).
+func cachedDBPath() string { p, _ := bootstrap.DBPath(); return p }
 
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)

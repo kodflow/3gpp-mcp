@@ -50,23 +50,35 @@ func serve(args []string) error {
 	dbPath := fs.String("db", "data/3gpp.duckdb", "DuckDB snapshot path")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
+	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
 	_ = fs.Parse(args)
 
 	// Let the (onnx) embedder/reranker transparently use cache-bootstrapped
 	// models when the user hasn't exported the paths. No-op on the lexical build.
 	pointModelsAtCache()
 
-	// Resolve the DB: the given path if present, else the cached snapshot, else
-	// an actionable error pointing at `mcp-3gpp bootstrap`.
-	effDB, err := resolveDB(*dbPath)
-	if err != nil {
-		return err
+	ctx := context.Background()
+
+	// Resolve the DB autonomously: an explicit/local path wins (dev); otherwise
+	// serve from the per-user cache, pulling it from the rolling 'latest' release
+	// when absent and refreshing it (best-effort, sha256-gated) when stale. A
+	// downloaded binary thus boots and provisions itself with no manual step.
+	effDB, rerr := resolveDB(*dbPath)
+	switch {
+	case rerr != nil:
+		var err error
+		if effDB, err = ensureDB(ctx, true); err != nil {
+			return err
+		}
+	case effDB == cachedDBPath() && !*noUpdate:
+		if up, e := ensureDB(ctx, true); e == nil {
+			effDB = up
+		}
 	}
 
 	// Serve is a pure reader: open read-only so there is no WAL and the
 	// unsupported "custom HNSW index + WAL replay" corruption path can't occur
 	// (axis #6 §4). --writable is an escape hatch for ad-hoc maintenance.
-	ctx := context.Background()
 	open := store.OpenReadOnly
 	if *writable {
 		open = store.Open
