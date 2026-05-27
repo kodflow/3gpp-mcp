@@ -25,9 +25,13 @@ on:
         description: "Lowest release to ingest."
         type: string
         default: "Rel-17"
+      publish_to_latest:
+        description: "Publish the consolidated DB to the rolling 'latest' release (else: artifact only)."
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write # to clobber the DB asset on 'latest' when publishing
 
 env:
   CGO_ENABLED: "1"
@@ -114,8 +118,23 @@ jobs:
           ./bin/merge --out data/3gpp.duckdb shards/*.duckdb
           echo "=== consolidated ===" && ls -lh data/3gpp.duckdb
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
+          sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
+      # Default: artifact only (won't touch the canonical 'latest' DB).
       - uses: actions/upload-artifact@v7
+        if: github.event.inputs.publish_to_latest != 'true'
         with:
           name: 3gpp-duckdb-merged
-          path: data/3gpp.duckdb.zst
+          path: |
+            data/3gpp.duckdb.zst
+            data/3gpp.duckdb.sha256
           retention-days: 7
+      # Opt-in: publish the consolidated DB to the rolling 'latest' release.
+      - name: Publish DB to 'latest' (clobber)
+        if: github.event.inputs.publish_to_latest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --latest --title "latest" \
+              --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
+          gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber

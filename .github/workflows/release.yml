@@ -1,18 +1,23 @@
-# Release — single rolling "latest" GitHub Release. NO version tags, ever.
-# One release holds the current binaries (linux/amd64, darwin/arm64) AND the
-# indexed DB (published by corpus-sync). Each run *clobbers* its own assets;
-# the release is never deleted (so it never wipes the DB asset), and old
-# versions never accumulate — exactly one of each artifact exists.
+# Release — single rolling "latest" GitHub Release, built with GoReleaser in a
+# NATIVE per-OS matrix. CGO can't cross-compile DuckDB (its prebuilt libs are
+# tied to each OS's C++ stdlib), so each runner builds its own targets with the
+# native toolchain; a final job publishes every archive to the `latest` release
+# (clobber). The DB asset (corpus-sync/corpus-matrix) is never touched here.
 #
-# CGO can't cross-compile DuckDB/ONNX → build natively per-OS.
+# Targets: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64.
+# (windows/arm64 absent — DuckDB ships no windows-arm64 lib.)
 
 name: Release (latest binaries)
 
 on:
   push:
     branches: [main]
-    paths: ["cmd/**", "internal/**", "go.mod", "go.sum", ".github/workflows/release.yml"]
+    paths: ["cmd/**", "internal/**", "go.mod", "go.sum", ".goreleaser*.yaml", ".github/workflows/release.yml"]
   workflow_dispatch:
+  # TEMP — validate the matrix (esp. native windows) on the PR. REMOVE before merge.
+  pull_request:
+    branches: [main]
+    paths: [".goreleaser*.yaml", ".github/workflows/release.yml"]
 
 permissions:
   contents: write
@@ -31,11 +36,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
+            config: .goreleaser.yaml
+            id: linux
           - os: macos-14
-            goos: darwin
-            goarch: arm64
+            config: .goreleaser.darwin.yaml
+            id: darwin
+          - os: windows-latest
+            config: .goreleaser.windows.yaml
+            id: windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -43,24 +51,24 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Install deps (linux)
+      - name: Install linux toolchains (native amd64 + GNU arm64 cross)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd
-      - name: Install deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install zstd
-      - name: Build + package
         run: |
-          name="mcp-3gpp_${{ matrix.goos }}_${{ matrix.goarch }}"
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w -X main.Version=latest-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" -o dist/mcp-3gpp ./cmd/server
-          tar -C dist -cf - mcp-3gpp | zstd -19 -o "dist/${name}.tar.zst"
-          rm dist/mcp-3gpp
-          ( cd dist && shasum -a 256 "${name}.tar.zst" > "${name}.tar.zst.sha256" )
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --skip=publish --clean --config ${{ matrix.config }}
       - uses: actions/upload-artifact@v7
         with:
-          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
+          name: dist-${{ matrix.id }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums-*.txt
           retention-days: 1
 
   publish:
@@ -69,17 +77,16 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: dist-*
           merge-multiple: true
-      - name: Upload binaries to the rolling 'latest' release (clobber)
+      - name: Publish binaries to the rolling 'latest' release (clobber)
         run: |
-          # Ensure the single 'latest' release exists; never delete it (would
-          # wipe the DB asset published by corpus-sync). Only clobber binaries.
-          gh release view latest >/dev/null 2>&1 || \
-            gh release create latest --latest \
-              --title "latest" \
-              --notes "Rolling release — current mcp-3gpp binaries + indexed 3GPP DB. Always exactly one version; assets are replaced in place."
-          gh release upload latest dist/*.tar.zst dist/*.sha256 --clobber
+          ls -lh dist/
+          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create latest --repo "$GITHUB_REPOSITORY" --latest \
+              --title "latest" --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
+          gh release upload latest --repo "$GITHUB_REPOSITORY" \
+            dist/*.tar.gz dist/*.zip dist/checksums-*.txt --clobber
