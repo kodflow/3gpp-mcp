@@ -84,28 +84,34 @@ func New(st *store.Store) *Engine {
 	return &Engine{st: st, emb: embed.New(), rr: rerank.New()}
 }
 
-// Request parameterises a search.
+// Request parameterises a search. Mode selects which retrieval arms run:
+// "" / "hybrid" = lexical ⊕ vector, "lexical" = BM25 only, "semantic" = vector
+// only (degrades to lexical when no embedder/vectors — never returns nothing).
 type Request struct {
 	Text   string
 	Filter store.SpecFilter
 	TopK   int
-	Rerank bool // when true and a reranker is enabled, re-score the fused window
+	Mode   string // "" | "hybrid" | "lexical" | "semantic"
+	Rerank bool   // when true and a reranker is enabled, re-score the fused window
 }
 
-// Search runs lexical retrieval (BM25/LIKE) for the request. When a vector
-// backend is wired, its ranked list is fused here via RRF; today there is one
-// list so RRF is a no-op identity.
+// Search retrieves and fuses (RRF) the lexical and/or vector ranked lists per
+// r.Mode. Each arm is best-effort; a "semantic" request with no usable vectors
+// degrades to lexical rather than returning nothing (degrade, never block).
 func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, error) {
 	topK := max(r.TopK, 10)
-	lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
-	if err != nil {
-		return nil, err
+	wantLex := r.Mode != "semantic"
+	wantVec := r.Mode != "lexical"
+
+	var lists [][]model.SearchHit
+	if wantLex {
+		lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
+		if err != nil {
+			return nil, err
+		}
+		lists = append(lists, lex)
 	}
-	lists := [][]model.SearchHit{lex}
-	// Hybrid: add the vector ranked list when embeddings are available. Both
-	// query embedding and HNSW search are best-effort — failures (no vectors,
-	// no VSS) just fall back to the lexical list.
-	if e.emb.Enabled() {
+	if wantVec && e.emb.Enabled() {
 		if vecs, err := e.emb.Embed(ctx, []string{r.Text}); err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
@@ -113,7 +119,7 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // HNSW fast path
 			} else {
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
-				// never a full-corpus scan. One extra wide lexical fetch.
+				// never a full-corpus scan.
 				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
 				if cerr == nil {
 					vhits, verr = e.st.SearchVectorsAmong(ctx, vecs[0], chunkIDsOf(cand), topK)
@@ -123,6 +129,15 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 				lists = append(lists, vhits)
 			}
 		}
+	}
+	// Degrade: a mode that produced no list (e.g. "semantic" with no embedder /
+	// vectors) falls back to lexical so a query never silently returns nothing.
+	if len(lists) == 0 {
+		lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
+		if err != nil {
+			return nil, err
+		}
+		lists = append(lists, lex)
 	}
 	hits := RRF(60, lists...)
 
