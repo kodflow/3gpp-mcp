@@ -16,11 +16,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -99,14 +96,14 @@ func main() {
 	_ = w.Flush()
 }
 
-// runSynthHNSW populates a throwaway DB with N random unit vectors (inserted
-// with the embedding inline, so no slow per-row columnar UPDATE) and then runs
-// BuildAndFreezeHNSW. The peak RSS is observed by the outer time(1); we also
-// print the build wall-time. The DB is removed on exit.
-func runSynthHNSW(n int, outPath string, batch int) error {
-	if batch < 1 {
-		batch = 512
-	}
+// runSynthHNSW populates a throwaway DB with N random Dim-d vectors generated
+// ENTIRELY inside DuckDB (random() is volatile → distinct per element and row),
+// so there is no Go float formatting and no multi-MB SQL — a single INSERT. It
+// then runs the real BuildAndFreezeHNSW; the outer `/usr/bin/time -v` captures
+// the build peak RSS (the go/no-go RAM gate). Vectors are NOT L2-normalised:
+// irrelevant for a build-RSS probe (the index stores the vectors either way).
+// The DB is removed on exit.
+func runSynthHNSW(n int, outPath string, _ int) error {
 	// --synth-out is operator input fed to os.Remove/store.Open; refuse anything
 	// that isn't a plain relative .duckdb path so a stray/hostile value can never
 	// delete or overwrite an unrelated file.
@@ -122,29 +119,16 @@ func runSynthHNSW(n int, outPath string, batch int) error {
 	defer func() { _ = st.Close(); _ = os.Remove(outPath) }()
 
 	ctx := context.Background()
-	rng := rand.New(rand.NewPCG(1, 2)) // fixed seed → reproducible peak RSS
 	db := st.DB()
 
-	const cols = "INSERT INTO clauses (chunk_id,spec_id,release,version,clause_path,heading,text,is_normative,embedding) VALUES "
 	insStart := time.Now()
-	for base := 0; base < n; base += batch {
-		end := base + batch
-		if end > n {
-			end = n
-		}
-		var sb strings.Builder
-		args := make([]any, 0, (end-base)*9)
-		sb.WriteString(cols)
-		for i := base; i < end; i++ {
-			if i > base {
-				sb.WriteByte(',')
-			}
-			sb.WriteString("(?,?,?,?,?,?,?,?,CAST(? AS FLOAT[1024]))")
-			args = append(args, uint64(i+1), "00.000", "Rel-18", "18.0.0", "1", "synth", "synth", false, randUnitLiteral(rng))
-		}
-		if _, err := db.ExecContext(ctx, sb.String(), args...); err != nil {
-			return fmt.Errorf("insert rows [%d,%d): %w", base, end, err)
-		}
+	q := fmt.Sprintf(`
+		INSERT INTO clauses (chunk_id, spec_id, release, version, clause_path, heading, text, is_normative, embedding)
+		SELECT i, '00.000', 'Rel-18', '18.0.0', '1', 'synth', 'synth', false,
+		       CAST([random()::FLOAT FOR x IN range(%d)] AS FLOAT[%d])
+		FROM range(1, CAST(? AS BIGINT) + 1) t(i)`, embed.Dim, embed.Dim)
+	if _, err := db.ExecContext(ctx, q, n); err != nil {
+		return fmt.Errorf("synth insert: %w", err)
 	}
 	fmt.Printf("synth-hnsw: inserted N=%d dim=%d in %s\n", n, embed.Dim, time.Since(insStart).Round(time.Millisecond))
 
@@ -155,26 +139,4 @@ func runSynthHNSW(n int, outPath string, batch int) error {
 	fmt.Printf("synth-hnsw: build+freeze N=%d in %s (peak RSS = /usr/bin/time -v Maximum resident set size)\n",
 		n, time.Since(buildStart).Round(time.Millisecond))
 	return nil
-}
-
-// randUnitLiteral returns a DuckDB array literal of Dim random L2-normalised
-// floats, e.g. "[0.01,-0.03,...]" — cast to FLOAT[1024] by the caller.
-func randUnitLiteral(rng *rand.Rand) string {
-	v := make([]float64, embed.Dim)
-	var norm float64
-	for i := range v {
-		v[i] = rng.NormFloat64()
-		norm += v[i] * v[i]
-	}
-	inv := 1.0 / math.Sqrt(norm)
-	var sb strings.Builder
-	sb.WriteByte('[')
-	for i := range v {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(strconv.FormatFloat(v[i]*inv, 'g', 6, 32))
-	}
-	sb.WriteByte(']')
-	return sb.String()
 }
