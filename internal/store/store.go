@@ -707,19 +707,67 @@ func (s *Store) count(ctx context.Context, table string) (int, error) {
 	return n, err
 }
 
-// SearchVectors runs HNSW cosine k-NN over clause embeddings (Phase 4). It needs
-// embeddings populated (EMBEDDER set during ingest) and the VSS/HNSW index built
-// (BuildHNSW); score is cosine similarity (1 - distance).
+// vecOverFetch / vecMaxFetch bound how many extra neighbours SearchVectors pulls
+// when a SpecFilter is set, so the Go post-filter can still return topK.
+const (
+	vecOverFetch = 8
+	vecMaxFetch  = 500
+)
+
+// SearchVectors runs HNSW cosine k-NN over clause embeddings (Phase 4). The SQL
+// is deliberately the bare `ORDER BY array_cosine_distance(col, q) ASC LIMIT n`
+// shape with NO WHERE: that is the ONLY form DuckDB VSS accelerates with the
+// HNSW index. A WHERE predicate or `1 - dist DESC` makes the planner fall back
+// to a full sequential scan over every vector — so the SpecFilter is applied as
+// a Go post-filter over an over-fetched neighbour set instead. NULL-embedding
+// rows are dropped in Go (they sort last and carry a NULL distance).
 func (s *Store) SearchVectors(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
 	if topK <= 0 {
 		topK = 10
 	}
-	where, args := filterClause(f)
+	fetch := topK
+	if !f.IsZero() {
+		if fetch = topK * vecOverFetch; fetch > vecMaxFetch {
+			fetch = vecMaxFetch
+		}
+	}
+	const q = `SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative,
+	       array_cosine_distance(embedding, CAST(? AS FLOAT[1024])) AS dist
+	      FROM clauses
+	      ORDER BY dist ASC
+	      LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, q, vecLiteral(vec), fetch)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanVecHits(rows, f, topK)
+}
+
+// SearchVectorsAmong ranks vec by exact cosine ONLY over candidateIDs (e.g. the
+// BM25 top-N chunk_ids). This is the no-HNSW fallback: O(len(candidateIDs)), a
+// bounded exact scan — never the full corpus. The WHERE+IN shape intentionally
+// does NOT use the HNSW index (none is available in this path).
+func (s *Store) SearchVectorsAmong(ctx context.Context, vec []float32, candidateIDs []uint64, topK int) ([]model.SearchHit, error) {
+	if topK <= 0 {
+		topK = 10
+	}
+	if len(candidateIDs) == 0 {
+		return nil, nil
+	}
+	ph := make([]string, len(candidateIDs))
+	args := make([]any, 0, len(candidateIDs)+2)
+	args = append(args, vecLiteral(vec))
+	for i, id := range candidateIDs {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, topK)
 	q := `SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative,
 	       1.0 - array_cosine_distance(embedding, CAST(? AS FLOAT[1024])) AS score
-	      FROM clauses WHERE embedding IS NOT NULL` + where + ` ORDER BY score DESC LIMIT ?`
-	args = append([]any{vecLiteral(vec)}, args...)
-	args = append(args, topK)
+	      FROM clauses
+	      WHERE embedding IS NOT NULL AND chunk_id IN (` + strings.Join(ph, ",") + `)
+	      ORDER BY score DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -768,6 +816,28 @@ func filterClause(f SpecFilter) (string, []any) {
 	return sb.String(), args
 }
 
+// IsZero reports whether the filter constrains nothing.
+func (f SpecFilter) IsZero() bool {
+	return f.SpecID == "" && f.Release == "" && f.Series == "" && f.DocType == "" && f.WorkingGroup == ""
+}
+
+// matchFilter applies a SpecFilter to a clause in Go (the vector k-NN path keeps
+// its SQL WHERE-free so the HNSW index fires; filtering happens after over-fetch).
+// DocType is NOT enforced here (it needs a specs join) — the lexical list + RRF
+// cover doc-type intent.
+func matchFilter(c model.Clause, f SpecFilter) bool {
+	if f.SpecID != "" && c.SpecID != f.SpecID {
+		return false
+	}
+	if f.Release != "" && c.Release != f.Release {
+		return false
+	}
+	if f.Series != "" && !strings.HasPrefix(c.SpecID, f.Series+".") {
+		return false
+	}
+	return true
+}
+
 // likeTokens lowercases a query and splits it into distinct word tokens (len>=2)
 // for the LIKE fallback, capped to keep the SQL bounded. Empty input falls back
 // to the whole (lowered) string.
@@ -814,6 +884,29 @@ func scanHits(rows *sql.Rows) ([]model.SearchHit, error) {
 			return nil, err
 		}
 		out = append(out, model.SearchHit{Clause: c, Score: score, Citation: c.Cite()})
+	}
+	return out, rows.Err()
+}
+
+// scanVecHits reads the bare-k-NN rows (distance, not score), drops NULL-embedding
+// rows (NULL distance), applies the SpecFilter in Go, converts distance→cosine
+// similarity, and stops at topK. See SearchVectors for why the SQL is WHERE-free.
+func scanVecHits(rows *sql.Rows, f SpecFilter, topK int) ([]model.SearchHit, error) {
+	out := make([]model.SearchHit, 0, topK)
+	for rows.Next() {
+		var c model.Clause
+		var dist sql.NullFloat64
+		if err := rows.Scan(&c.ChunkID, &c.SpecID, &c.Release, &c.Version,
+			&c.ClausePath, &c.Heading, &c.Text, &c.IsNormative, &dist); err != nil {
+			return nil, err
+		}
+		if !dist.Valid || !matchFilter(c, f) {
+			continue
+		}
+		out = append(out, model.SearchHit{Clause: c, Score: 1.0 - dist.Float64, Citation: c.Cite()})
+		if len(out) >= topK {
+			break
+		}
 	}
 	return out, rows.Err()
 }
