@@ -21,9 +21,9 @@ on:
         type: string
         default: "23 24 29 33 38"
       release_floor:
-        description: "Lowest release to ingest (e.g. Rel-17)."
+        description: "Lowest release to ingest (default Rel-4 = all modern releases; not frozen)."
         type: string
-        default: "Rel-17"
+        default: "Rel-4"
       publish_to_latest:
         description: "Clobber the DB on the 'latest' release (else: artifact only)."
         type: boolean
