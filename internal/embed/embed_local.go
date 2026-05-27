@@ -19,8 +19,9 @@ import (
 // overlap — enough to demonstrate ranking and HNSW recall.
 type Local struct{}
 
-func (Local) Enabled() bool { return true }
-func (Local) Dim() int      { return Dim }
+func (Local) Enabled() bool   { return true }
+func (Local) Dim() int        { return Dim }
+func (Local) ModelID() string { return "hash-local" }
 
 func (Local) Embed(_ context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
