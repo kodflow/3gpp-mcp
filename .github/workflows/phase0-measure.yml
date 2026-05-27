@@ -1,0 +1,205 @@
+# Phase-0 — semantic feasibility MEASUREMENT (throwaway, MR1).
+#
+# Produces the go/no-go numbers BEFORE any semantic activation. STRICT no-product-
+# change: never touches serve, the published DB, release workflows, `latest`, or
+# the binaries — it only emits measurement artifacts.
+#
+#   hnsw-probe  → peak RSS of the GLOBAL HNSW build at candidate scope (synthetic
+#                 vectors, NO model). HARD GATE: fail if peak RSS >= 13 GiB.
+#   disk-probe  → real series download→convert→cleanup→lexical-ingest→count-only;
+#                 df before/after = worst real shard disk (model adds a fixed
+#                 ~2.3 GiB on top). HARD GATE: fail if free disk < 1 GiB.
+#   embed-probe → (opt-in, needs the model) build -tags onnx, embed a real series,
+#                 derive fp32 clauses/s. CONSULTATIVE; never blocks.
+#
+# Decides: Rel-17+ vs Rel-15+ HNSW fits 16 GB? real disk under 14 GB? fp32 c/s?
+name: Phase-0 Measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      hnsw_vectors:
+        description: 'JSON array of vector counts to probe (Rel-17+ ~858k, Rel-15+ ~1.6M).'
+        type: string
+        default: '["858000","1600000"]'
+      series:
+        description: "Real series for disk/embed probe (biggest = 32)."
+        type: string
+        default: "32"
+      floor:
+        description: "Release floor for the real-shard dry-run."
+        type: string
+        default: "Rel-17"
+      with_embed:
+        description: "Also run the embed-probe (fetches the ~2.3 GB model; fp32 throughput)."
+        type: boolean
+        default: false
+
+# Read-only: this workflow MUST NOT publish anything.
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "1"
+  RSS_HARD_FAIL_KIB: "13631488" # 13 GiB = 13*1024*1024 KiB
+
+jobs:
+  # ---- A. global HNSW build peak RSS (synthetic, no model) -----------------
+  hnsw-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        vectors: ${{ fromJSON(github.event.inputs.hnsw_vectors) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install deps (build + time + zstd)
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config time zstd
+      - name: Build bench
+        run: |
+          mkdir -p bin out
+          go build -trimpath -o bin/bench ./cmd/bench
+      - name: Baseline (cores / RAM / disk)
+        run: |
+          { nproc; free -h; df -h /; } 2>&1 | tee baseline.txt
+      - name: Probe HNSW build peak RSS (N=${{ matrix.vectors }})
+        run: |
+          mkdir -p out
+          /usr/bin/time -v ./bin/bench --synth-hnsw "${{ matrix.vectors }}" \
+            --synth-out /tmp/phase0-synth.duckdb 2> "out/hnsw-${{ matrix.vectors }}.time" \
+            | tee "out/hnsw-${{ matrix.vectors }}.log"
+          PEAK_KIB=$(awk '/Maximum resident set size/{print $NF}' "out/hnsw-${{ matrix.vectors }}.time")
+          PEAK_GIB=$(awk "BEGIN{printf \"%.2f\", $PEAK_KIB/1048576}")
+          ZST=$(zstd -19 -T0 -c /tmp/phase0-synth.duckdb 2>/dev/null | wc -c || echo 0)
+          {
+            echo "vectors=${{ matrix.vectors }}"
+            echo "peak_rss_kib=$PEAK_KIB"
+            echo "peak_rss_gib=$PEAK_GIB"
+            echo "synth_db_zst_bytes=$ZST"
+          } | tee "out/hnsw-${{ matrix.vectors }}.report"
+          echo "### HNSW probe N=${{ matrix.vectors }} → peak RSS ${PEAK_GIB} GiB" >> "$GITHUB_STEP_SUMMARY"
+          # HARD GATE B: fail above the 13 GiB ceiling (no margin on a 16 GB runner).
+          if [ "$PEAK_KIB" -ge "$RSS_HARD_FAIL_KIB" ]; then
+            echo "::error::HNSW build peak RSS ${PEAK_GIB} GiB >= 13 GiB ceiling at N=${{ matrix.vectors }} → global HNSW does NOT fit; use Option B (fan-out)."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: phase0-hnsw-${{ matrix.vectors }}
+          path: |
+            out/
+            baseline.txt
+          retention-days: 14
+
+  # ---- B. real-shard disk dry-run (lexical, no model) ----------------------
+  disk-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CORPUS_DROP_ZIPS: "1" # CI default-on cleanup (plan §1.4)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install deps (LibreOffice + build + time)
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui time
+      - name: Build ingest
+        run: |
+          mkdir -p bin dist out
+          go build -trimpath -o bin/ingest ./cmd/ingest
+      - name: Disk before
+        run: df -B1 / | tee out/df-before.txt
+      - name: Download + convert series ${{ github.event.inputs.series }}
+        run: |
+          /usr/bin/time -v ./scripts/corpus.sh --set "${{ github.event.inputs.floor }}" \
+            --series "${{ github.event.inputs.series }}" --jobs 2 2> out/convert.time
+      - name: Disk after convert (always, for the artifact + gate)
+        if: always()
+        run: |
+          df -B1 / | tee out/df-after-convert.txt
+          du -sb data/sources 2>/dev/null | tee out/du-sources.txt || true
+      - name: Lexical ingest
+        run: |
+          /usr/bin/time -v ./bin/ingest --series "${{ github.event.inputs.series }}" \
+            --out dist/shard.duckdb --quiet 2> out/ingest.time
+      - name: Count-only + disk after ingest
+        run: |
+          ./bin/ingest --out dist/shard.duckdb --count-only | tee out/count.json
+          df -B1 / | tee out/df-after-ingest.txt
+          ls -l dist/shard.duckdb | tee out/db-size.txt
+      - name: Worst-shard disk summary + gate
+        if: always()
+        run: |
+          test -f out/df-after-convert.txt || { echo "::error::no df snapshot — convert step failed before measuring."; exit 1; }
+          FREE_AFTER=$(awk 'NR==2{print $4}' out/df-after-convert.txt)
+          FREE_GIB=$(awk "BEGIN{printf \"%.2f\", $FREE_AFTER/1073741824}")
+          echo "### disk-probe series=${{ github.event.inputs.series }} → free after convert ${FREE_GIB} GiB" >> "$GITHUB_STEP_SUMMARY"
+          # HARD GATE B': a real shard must leave headroom (model adds ~2.3 GiB on top).
+          if [ "$FREE_AFTER" -lt 1073741824 ]; then
+            echo "::error::free disk ${FREE_GIB} GiB < 1 GiB after convert → shard busts the 14 GB runner; split by single release / tighten cleanup."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: phase0-disk-${{ github.event.inputs.series }}
+          path: out/
+          retention-days: 14
+
+  # ---- C. embed throughput (opt-in: needs the model) -----------------------
+  embed-probe:
+    if: github.event.inputs.with_embed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    continue-on-error: true # CONSULTATIVE — never blocks the gate
+    env:
+      CORPUS_DROP_ZIPS: "1"
+      EMBEDDER: "bge-m3"
+      BGE_M3_DIR: data/models/bge-m3
+      ONNXRUNTIME_SHARED_LIBRARY_PATH: data/models/onnxruntime/lib/libonnxruntime.so
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install deps (LibreOffice + build + time)
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui time
+      - name: Fetch BGE-M3 + ONNX Runtime (~2.3 GB)
+        run: ./scripts/fetch-model.sh
+      - name: Build ingest WITH onnx
+        run: |
+          mkdir -p bin dist out
+          go build -trimpath -tags onnx -o bin/ingest-onnx ./cmd/ingest
+      - name: Download + convert series ${{ github.event.inputs.series }}
+        run: ./scripts/corpus.sh --set "${{ github.event.inputs.floor }}" --series "${{ github.event.inputs.series }}" --jobs 2
+      - name: Embed (fp32) under time -v
+        run: |
+          mkdir -p out
+          /usr/bin/time -v ./bin/ingest-onnx --series "${{ github.event.inputs.series }}" \
+            --out dist/shard-onnx.duckdb --quiet 2> out/embed-fp32.time
+          ./bin/ingest-onnx --out dist/shard-onnx.duckdb --count-only | tee out/count-onnx.json
+          SECS=$(awk -F': ' '/Elapsed .wall/{print $2}' out/embed-fp32.time)
+          EMB=$(jq -r '.embedded_clauses' out/count-onnx.json)
+          echo "embedded_clauses=$EMB wall=$SECS" | tee out/embed-fp32.report
+          echo "### embed-probe fp32 series=${{ github.event.inputs.series }} → $EMB clauses, wall $SECS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: phase0-embed-${{ github.event.inputs.series }}
+          path: out/
+          retention-days: 14
