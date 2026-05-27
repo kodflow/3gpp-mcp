@@ -34,6 +34,7 @@ func main() {
 		fts     = flag.Bool("fts", true, "build the BM25 FTS index after load")
 		quiet   = flag.Bool("quiet", false, "suppress per-spec progress")
 		count   = flag.Bool("count-only", false, "Phase-0: open -out read-only, print clause embedded/null counts by series as JSON, then exit")
+		embFlr  = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-15); empty = embed all. Lexical coverage is unaffected.")
 	)
 	flag.Parse()
 
@@ -58,6 +59,7 @@ func main() {
 		Series:     splitCSV(*series),
 		SpecIDs:    splitCSV(*spec),
 		EnableFTS:  *fts,
+		EmbedFloor: *embFlr,
 		Embedder:   embed.New(),
 		Logf:       logf,
 	}
