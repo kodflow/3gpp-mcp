@@ -197,73 +197,114 @@ func purgeShardSeries(ctx context.Context, sqldb *sql.DB) error {
 	return nil
 }
 
-// mergeOne folds the ATTACHed `src` DB into the main DB. first=true means this is
-// the first shard, so the curated global seeds (evolutions) are copied from it;
-// later shards skip them to avoid N-fold duplication.
+// tableSpec: idCol != "" => synthetic PK offset; conflict => dedup natural key.
+type tableSpec struct {
+	name     string
+	idCol    string
+	conflict bool
+}
+
+// mergeTables is the fold order. acronyms/evolutions are global (no spec_id).
+var mergeTables = []tableSpec{
+	{"specs", "", true},
+	{"spec_versions", "", true},
+	{"acronyms", "", true},
+	{"li_events", "", true},
+	{"li_event_fields", "", true},
+	{"li_nf_clauses", "", true},
+	{"asn1_types", "", true},
+	{"releases", "", true},
+	{"changes", "", false},
+	{"clauses", "chunk_id", false},
+	{"api_operations", "op_id", false},
+	{"api_schemas", "schema_id", false},
+}
+
+// mergeOne folds the ATTACHed `src` DB into the main DB, column-by-column on the
+// INTERSECTION of src/main columns so it tolerates schema drift (an older base
+// DB with fewer columns merges fine; new columns just take their default).
+// first=true copies the curated evolutions seed (identical in every shard).
 func mergeOne(ctx context.Context, sqldb *sql.DB, first bool) error {
-	maxID := func(table, col string) (int64, error) {
-		var n int64
-		err := sqldb.QueryRowContext(ctx, `SELECT COALESCE(MAX(`+col+`),0) FROM `+table).Scan(&n)
-		return n, err
-	}
-
-	// Synthetic-PK tables: offset ids so shards never collide.
-	cOff, err := maxID("clauses", "chunk_id")
-	if err != nil {
-		return err
-	}
-	opOff, err := maxID("api_operations", "op_id")
-	if err != nil {
-		return err
-	}
-	scOff, err := maxID("api_schemas", "schema_id")
-	if err != nil {
-		return err
-	}
-
-	stmts := []string{
-		// Natural-key dimension/overlay tables: dedup on conflict.
-		`INSERT INTO specs SELECT * FROM src.specs ON CONFLICT DO NOTHING`,
-		`INSERT INTO spec_versions SELECT * FROM src.spec_versions ON CONFLICT DO NOTHING`,
-		`INSERT INTO acronyms SELECT * FROM src.acronyms ON CONFLICT DO NOTHING`,
-		`INSERT INTO li_events SELECT * FROM src.li_events ON CONFLICT DO NOTHING`,
-		`INSERT INTO li_event_fields SELECT * FROM src.li_event_fields ON CONFLICT DO NOTHING`,
-		`INSERT INTO li_nf_clauses SELECT * FROM src.li_nf_clauses ON CONFLICT DO NOTHING`,
-		`INSERT INTO asn1_types SELECT * FROM src.asn1_types ON CONFLICT DO NOTHING`,
-		`INSERT INTO releases SELECT * FROM src.releases ON CONFLICT DO NOTHING`,
-		// No-PK fact table: disjoint across shards, plain append.
-		`INSERT INTO changes SELECT * FROM src.changes`,
-		// Synthetic-PK fact tables: append with an id offset.
-		fmt.Sprintf(`INSERT INTO clauses
-			SELECT chunk_id + %d, spec_id, release, version, clause_path, heading, text, is_normative, embedding
-			FROM src.clauses`, cOff),
-		fmt.Sprintf(`INSERT INTO api_operations
-			SELECT op_id + %d, spec_id, release, version, api_doc_version, service, service_family,
-			       api_root, path, method, operation_id, summary, tags, request_schema, response_codes,
-			       yaml_file, forge_sha, forge_url
-			FROM src.api_operations`, opOff),
-		fmt.Sprintf(`INSERT INTO api_schemas
-			SELECT schema_id + %d, spec_id, release, version, service, schema_name, kind, description,
-			       properties, enum_values, refs_out, yaml_file, forge_sha, forge_url
-			FROM src.api_schemas`, scOff),
+	for _, t := range mergeTables {
+		if err := foldTable(ctx, sqldb, t); err != nil {
+			return fmt.Errorf("fold %s: %w", t.name, err)
+		}
 	}
 	if first {
-		// evolutions is a curated seed, identical in every shard — keep one copy.
-		stmts = append(stmts, `INSERT INTO evolutions SELECT * FROM src.evolutions`)
-	}
-	for _, q := range stmts {
-		if _, err := sqldb.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("%s: %w", firstLine(q), err)
+		if err := foldTable(ctx, sqldb, tableSpec{"evolutions", "", false}); err != nil {
+			return fmt.Errorf("fold evolutions: %w", err)
 		}
 	}
 	return nil
 }
 
-func firstLine(s string) string {
-	for i, r := range s {
-		if r == '\n' {
-			return s[:i]
+func foldTable(ctx context.Context, sqldb *sql.DB, t tableSpec) error {
+	outCols, err := cols(ctx, sqldb, t.name)
+	if err != nil {
+		return err
+	}
+	srcCols, err := cols(ctx, sqldb, "src."+t.name)
+	if err != nil {
+		return nil // src lacks this table (older shard) — nothing to fold
+	}
+	srcSet := map[string]bool{}
+	for _, c := range srcCols {
+		srcSet[c] = true
+	}
+	var off int64
+	if t.idCol != "" {
+		if err := sqldb.QueryRowContext(ctx, `SELECT COALESCE(MAX(`+t.idCol+`),0) FROM `+t.name).Scan(&off); err != nil {
+			return err
 		}
 	}
-	return s
+	var ins, sel []string
+	for _, c := range outCols { // preserve main column order; keep only common cols
+		if !srcSet[c] {
+			continue
+		}
+		ins = append(ins, c)
+		if c == t.idCol {
+			sel = append(sel, fmt.Sprintf("%s + %d", c, off))
+		} else {
+			sel = append(sel, c)
+		}
+	}
+	if len(ins) == 0 {
+		return nil
+	}
+	q := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM src.%s",
+		t.name, strings.Join(ins, ","), strings.Join(sel, ","), t.name)
+	if t.conflict {
+		q += " ON CONFLICT DO NOTHING"
+	}
+	_, err = sqldb.ExecContext(ctx, q)
+	return err
+}
+
+// cols returns a table's column names (rel may be "clauses" or "src.clauses").
+func cols(ctx context.Context, sqldb *sql.DB, rel string) ([]string, error) {
+	rows, err := sqldb.QueryContext(ctx, "DESCRIBE "+rel)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	colNames, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for rows.Next() {
+		cells := make([]any, len(colNames))
+		ptrs := make([]any, len(colNames))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		if name, ok := cells[0].(string); ok { // first DESCRIBE column = column_name
+			out = append(out, name)
+		}
+	}
+	return out, rows.Err()
 }
