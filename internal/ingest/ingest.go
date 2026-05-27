@@ -252,10 +252,10 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		// Build-then-freeze (axis #6): CHECKPOINT-fenced build + verify + freeze
 		// markers, so serve can open read-only and trust the index. Best-effort:
 		// a failure leaves hnsw_state='building' and serve degrades to exact scan.
-		model := "bge-m3"
-		if !opt.Embedder.Enabled() {
-			model = "disabled"
-		}
+		// Stamp the embedder's canonical id (e.g. "bge-m3" | "hash-local") so the
+		// serve-time coherence guard can refuse a client embedding with a different
+		// model (silently-wrong cosine scores). st.Vectors ⇒ embedder enabled.
+		model := opt.Embedder.ModelID()
 		if err := db.BuildAndFreezeHNSW(ctx, model); err != nil {
 			logf("HNSW build-then-freeze failed (vector search degrades to exact scan): %v", err)
 		} else {
