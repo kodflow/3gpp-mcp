@@ -1,0 +1,1528 @@
+[
+ {
+  "nf": "AMF",
+  "event": "REGISTRATION",
+  "spec": "33.128",
+  "clause": "6.2.2.2.2",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "DEREGISTRATION",
+  "spec": "33.128",
+  "clause": "6.2.2.2.3",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "START_OF_INTERCEPTION",
+  "spec": "33.128",
+  "clause": "6.2.2.2.5",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "LOCATION_UPDATE",
+  "spec": "33.128",
+  "clause": "6.2.2.2.4",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "UNSUCCESSFUL_PROCEDURE",
+  "spec": "33.128",
+  "clause": "6.2.2.2.6",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "IDENTIFIER_ASSOCIATION",
+  "spec": "33.128",
+  "clause": "6.2.2.2.7",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "POSITIONING_TRANSFER",
+  "spec": "33.128",
+  "clause": "6.2.2.2.8",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "UE_CONFIG_UPDATE",
+  "spec": "33.128",
+  "clause": "6.2.2.2.9",
+  "alias": false
+ },
+ {
+  "nf": "AMF",
+  "event": "NAS_SERVICE_REQUEST",
+  "spec": "33.128",
+  "clause": "6.2.2.2.2",
+  "alias": true
+ },
+ {
+  "nf": "AMF",
+  "event": "NAS_AUTH_FAILURE",
+  "spec": "33.128",
+  "clause": "6.2.2.2.6",
+  "alias": true
+ },
+ {
+  "nf": "AMF",
+  "event": "UE_POLICY_CONTAINER_TRANSFER",
+  "spec": "33.128",
+  "clause": "6.2.2.2.9",
+  "alias": true
+ },
+ {
+  "nf": "AMF",
+  "event": "CONFIG_UPDATE_COMMAND",
+  "spec": "33.128",
+  "clause": "6.2.2.2.9",
+  "alias": true
+ },
+ {
+  "nf": "AMF",
+  "event": "CONFIG_UPDATE_REJECT",
+  "spec": "33.128",
+  "clause": "6.2.2.2.6",
+  "alias": true
+ },
+ {
+  "nf": "AUSF",
+  "event": "AUTHENTICATION_REQUEST",
+  "spec": "33.128",
+  "clause": "6.1",
+  "alias": false
+ },
+ {
+  "nf": "AUSF",
+  "event": "AUTHENTICATION_RESPONSE",
+  "spec": "33.128",
+  "clause": "6.1",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "REGISTER_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "CANCEL_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SERVING_SYSTEM",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SUBSCRIBER_CHANGE",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "LOCATION_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "UPDATE_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "PURGE_MS",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SEND_AUTHENTICATION_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SEND_ROUTING_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SEND_ROUTING_INFO_FOR_SM",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SEND_ROUTING_INFO_FOR_LCS",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "ANY_TIME_INTERROGATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "REG_TERMINATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "INSERT_SUBSCRIBER_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "DELETE_SUBSCRIBER_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "RESTORE_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "PROVIDE_SUBSCRIBER_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "NOTE_SUBSCRIBER_DATA_MODIFIED",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HLR",
+  "event": "SEND_IDENTIFICATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "REGISTER_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "CANCEL_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "SERVING_SYSTEM",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "SUBSCRIBER_CHANGE",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "LOCATION_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "UPDATE_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "PURGE_UE",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "HSS_SUBSCRIBER_RECORD_CHG",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "AUTHENTICATION_INFORMATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "CHECK_IMEI",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "INSERT_SUBSCRIBER_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "DELETE_SUBSCRIBER_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS",
+  "event": "NOTIFY_REQUEST",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "HSS",
+  "event": "UPDATE_SUBSCRIBER_DATA",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "REG_TERMINATION",
+  "spec": "33.108",
+  "clause": "7.9",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "SERVING_SYSTEM",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "SUBSCRIBER_CHANGE",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "LOCATION_INFO",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_CANCEL_LOCATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_PURGE_UE",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_AUTHENTICATION_INFORMATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": false
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_DEREGISTRATION",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "REGISTRATION_REFRESH",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_AUTH_REJECT",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "HSS-IMS",
+  "event": "IMS_AUTH_FAIL",
+  "spec": "33.108",
+  "clause": "Annex",
+  "alias": true
+ },
+ {
+  "nf": "LMF",
+  "event": "LALS_REPORT",
+  "spec": "33.128",
+  "clause": "7.3.1.4",
+  "alias": false
+ },
+ {
+  "nf": "LMF",
+  "event": "LOCATION_METHOD_FAILURE",
+  "spec": "33.128",
+  "clause": "7.3.1.4",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "EUTRAN_ATTACH",
+  "spec": "33.108",
+  "clause": "10.5.1.2.1",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "EUTRAN_DETACH",
+  "spec": "33.108",
+  "clause": "10.5.1.2.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "LOCATION_UPDATE",
+  "spec": "33.108",
+  "clause": "10.5.1.2.4",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "PDN_CONNECTIVITY",
+  "spec": "33.108",
+  "clause": "10.5.1.2.5",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "PDN_DISCONNECTION",
+  "spec": "33.108",
+  "clause": "10.5.1.2.6",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "SMS",
+  "spec": "33.108",
+  "clause": "10.5.1.2.9",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "BEARER_ACTIVATION",
+  "spec": "33.108",
+  "clause": "10.5.1.2.3",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "BEARER_MODIFICATION",
+  "spec": "33.108",
+  "clause": "10.5.1.2.3",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "BEARER_DEACTIVATION",
+  "spec": "33.108",
+  "clause": "10.5.1.2.3",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "UE_REQ_BEARER_RES_MOD",
+  "spec": "33.108",
+  "clause": "10.5.1.2.3",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_INTCPT_EUTRAN_ATT_UE",
+  "spec": "33.108",
+  "clause": "10.5.1.2.1",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_OF_INTCPT_MS_ATTACHED",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_INTCPT_ACTIVE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.2.3",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "SERVING_EVOLVED_PS",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "TRACKING_AREA_UPDATE",
+  "spec": "33.108",
+  "clause": "10.5.1.2.4",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "PROSE_REMOTE_UE_REPORT",
+  "spec": "33.108",
+  "clause": "10.5.1.2.15",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "PROSE_REMOTE_UE_START",
+  "spec": "33.108",
+  "clause": "10.5.1.2.15",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "PROSE_REMOTE_UE_END",
+  "spec": "33.108",
+  "clause": "10.5.1.2.15",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_LI_PROSE_REMOTE",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_LI_PROSE_UE_NW_RELAY",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "START_OF_INTCPT_IDLE",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "X2_HANDOVER",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "S1_HANDOVER",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "ATTACH_REJECT",
+  "spec": "33.108",
+  "clause": "10.5.1.2.1",
+  "alias": true
+ },
+ {
+  "nf": "MME",
+  "event": "DETACH_INITIATION",
+  "spec": "33.108",
+  "clause": "10.5.1.2.2",
+  "alias": true
+ },
+ {
+  "nf": "MME",
+  "event": "UE_CONTEXT_RELEASE",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": true
+ },
+ {
+  "nf": "MME",
+  "event": "SCEF_REQ_NON_IP_PDN_ESTABLISHMENT",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "SCEF_REQ_NON_IP_PDN_DISCONNECTION",
+  "spec": "33.108",
+  "clause": "10.5.1.2",
+  "alias": false
+ },
+ {
+  "nf": "MME",
+  "event": "CHECK_IMEI",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": true
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_SEND",
+  "spec": "33.128",
+  "clause": "7.4.3.1",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_SEND_BY_NON_LOCAL",
+  "spec": "33.128",
+  "clause": "7.4.3.2",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_NOTIFICATION",
+  "spec": "33.128",
+  "clause": "7.4.3.3",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_SEND_TO_NON_LOCAL",
+  "spec": "33.128",
+  "clause": "7.4.3.4",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_NOTIFICATION_RESPONSE",
+  "spec": "33.128",
+  "clause": "7.4.3.5",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_RETRIEVAL",
+  "spec": "33.128",
+  "clause": "7.4.3.6",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_DELIVERY_ACK",
+  "spec": "33.128",
+  "clause": "7.4.3.7",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_FORWARD",
+  "spec": "33.128",
+  "clause": "7.4.3.8",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_DELETE_FROM_RELAY",
+  "spec": "33.128",
+  "clause": "7.4.3.9",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_DELIVERY_REPORT",
+  "spec": "33.128",
+  "clause": "7.4.3.13",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_DELIVERY_REPORT_NON_LOCAL",
+  "spec": "33.128",
+  "clause": "7.4.3.14",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_READ_REPORT",
+  "spec": "33.128",
+  "clause": "7.4.3.15",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_READ_REPORT_NON_LOCAL",
+  "spec": "33.128",
+  "clause": "7.4.3.16",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_CANCEL",
+  "spec": "33.128",
+  "clause": "7.4.3.17",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_MBOX_STORE",
+  "spec": "33.128",
+  "clause": "7.4.3.10",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_MBOX_UPLOAD",
+  "spec": "33.128",
+  "clause": "7.4.3.11",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_MBOX_DELETE",
+  "spec": "33.128",
+  "clause": "7.4.3.12",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_MBOX_VIEW_REQUEST",
+  "spec": "33.128",
+  "clause": "7.4.3.18",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_MBOX_VIEW_RESPONSE",
+  "spec": "33.128",
+  "clause": "7.4.3.19",
+  "alias": false
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_SUBMIT_INDICATION",
+  "spec": "33.128",
+  "clause": "7.4.3.1",
+  "alias": true
+ },
+ {
+  "nf": "MMS",
+  "event": "MMS_BULK_MMS_SEND",
+  "spec": "33.128",
+  "clause": "7.4.3.1",
+  "alias": true
+ },
+ {
+  "nf": "PGW",
+  "event": "CREATE_SESSION",
+  "spec": "33.108",
+  "clause": "10.5.1.5.1",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DELETE_SESSION",
+  "spec": "33.108",
+  "clause": "10.5.1.5.2",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "CREATE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.5.3",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DELETE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.5.3",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "MODIFY_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.5.3",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "UE_REQ_BEARER_RES_MOD",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "UE_REQ_PDN_CONNECTIVITY",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "UE_REQ_PDN_DISCONNECTION",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "TRACKING_AREA_UPDATE",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "SERVING_EVOLVED_PS",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "START_INTCPT_ACTIVE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.5.3",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PACKET_DATA_HEADER_INFO",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "SCEF_REQ_NON_IP_PDN_DISCONNECTION",
+  "spec": "33.108",
+  "clause": "10.5.1.1.7A",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "SCEF_REQ_NON_IP_PDN_ESTABLISHMENT",
+  "spec": "33.108",
+  "clause": "10.5.1.1.7B",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PMIP_ATTACH_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PMIP_DETACH_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "START_INTCPT_ACTIVE_PMIP",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PMIP_PDN_GW_INIT_DISCONN",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "MIP_REG_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "MIP_DEREG_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "START_INTCPT_ACTIVE_MIP",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DSMIP_REG_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DSMIP_DEREG_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "START_INTCPT_ACTIVE_DSMIP",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DSMIP_HA_SWITCH",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PMIP_RES_ALLOC_DEACT",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "MIP_RES_ALLOC_DEACT",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PMIP_SESSION_MODIFICATION",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "DSMIP_SESSION_MODIFICATION",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "PACKET_DATA_SUMMARY_REPORT",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": false
+ },
+ {
+  "nf": "PGW",
+  "event": "IP_ALLOCATION",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": true
+ },
+ {
+  "nf": "PGW",
+  "event": "IP_RELEASE",
+  "spec": "33.108",
+  "clause": "10.5.1.5",
+  "alias": true
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_REGISTRATION",
+  "spec": "33.128",
+  "clause": "7.5.2.1",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_SESSION_INITIATION",
+  "spec": "33.128",
+  "clause": "7.5.2.2",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_SESSION_ABANDON",
+  "spec": "33.128",
+  "clause": "7.5.2.3",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_SESSION_START",
+  "spec": "33.128",
+  "clause": "7.5.2.4",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_SESSION_END",
+  "spec": "33.128",
+  "clause": "7.5.2.5",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_START_OF_INTERCEPTION",
+  "spec": "33.128",
+  "clause": "7.5.2.6",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_PRE_ESTABLISHED_SESSION",
+  "spec": "33.128",
+  "clause": "7.5.2.7",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_INSTANT_PERSONAL_ALERT",
+  "spec": "33.128",
+  "clause": "7.5.2.8",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_PARTY_JOIN",
+  "spec": "33.128",
+  "clause": "7.5.2.9",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_PARTY_DROP",
+  "spec": "33.128",
+  "clause": "7.5.2.10",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_PARTY_HOLD",
+  "spec": "33.128",
+  "clause": "7.5.2.11",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_MEDIA_MODIFICATION",
+  "spec": "33.128",
+  "clause": "7.5.2.12",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_GROUP_ADVERTISEMENT",
+  "spec": "33.128",
+  "clause": "7.5.2.13",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_FLOOR_CONTROL",
+  "spec": "33.128",
+  "clause": "7.5.2.14",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_TARGET_PRESENCE",
+  "spec": "33.128",
+  "clause": "7.5.2.15",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_PARTICIPANT_PRESENCE",
+  "spec": "33.128",
+  "clause": "7.5.2.16",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_LIST_MANAGEMENT",
+  "spec": "33.128",
+  "clause": "7.5.2.17",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_ACCESS_POLICY",
+  "spec": "33.128",
+  "clause": "7.5.2.18",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_EMERGENCY",
+  "spec": "33.128",
+  "clause": "7.5.2",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_AMBIENT_LISTENING",
+  "spec": "33.128",
+  "clause": "7.5.2",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_REMOTE_GROUP_CHANGE",
+  "spec": "33.128",
+  "clause": "7.5.2",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "PTC_E2E_KEYS",
+  "spec": "33.128",
+  "clause": "7.5.2",
+  "alias": false
+ },
+ {
+  "nf": "PTC",
+  "event": "EMERGENCY_ALERT_CANCEL",
+  "spec": "33.128",
+  "clause": "7.5.2",
+  "alias": true
+ },
+ {
+  "nf": "PTC",
+  "event": "PRE_ARRANGED_GROUP",
+  "spec": "33.128",
+  "clause": "7.5.2.7",
+  "alias": true
+ },
+ {
+  "nf": "PTC",
+  "event": "FLOOR_REQUEST_DENIED",
+  "spec": "33.128",
+  "clause": "7.5.2.14",
+  "alias": true
+ },
+ {
+  "nf": "PTC",
+  "event": "TALK_BURST_GRANT",
+  "spec": "33.128",
+  "clause": "7.5.2.14",
+  "alias": true
+ },
+ {
+  "nf": "SGW",
+  "event": "CREATE_SESSION",
+  "spec": "33.108",
+  "clause": "10.5.1.4.1",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "DELETE_SESSION",
+  "spec": "33.108",
+  "clause": "10.5.1.4.2",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "CREATE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.4.3",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "DELETE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.4.3",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "MODIFY_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.4.3",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "TRACKING_AREA_UPDATE",
+  "spec": "33.108",
+  "clause": "10.5.1.4.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "SERVING_EVOLVED_PS",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "UE_REQ_BEARER_RES_MOD",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "UE_REQ_PDN_CONNECTIVITY",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "UE_REQ_PDN_DISCONNECTION",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PMIP_ATTACH_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PMIP_DETACH_TUNNEL",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "START_INTCPT_ACTIVE_PMIP",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PMIP_PDN_GW_INIT_DISCONN",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PMIP_RES_ALLOC_DEACT",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PMIP_SESSION_MODIFICATION",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "X2_HANDOVER",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "S1_HANDOVER",
+  "spec": "33.108",
+  "clause": "10.5.1.1",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "PACKET_DATA_HEADER_INFO",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SGW",
+  "event": "START_INTCPT_ACTIVE_BEARER",
+  "spec": "33.108",
+  "clause": "10.5.1.4",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "PDU_SESSION_ESTABLISHMENT",
+  "spec": "33.128",
+  "clause": "6.2.3.2.2",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "PDU_SESSION_MODIFICATION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.3",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "PDU_SESSION_RELEASE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.4",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "START_OF_INTERCEPTION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.5",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "UNSUCCESSFUL_SM_PROCEDURE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.6",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "MA_PDU_SESSION_ESTABLISHMENT",
+  "spec": "33.128",
+  "clause": "6.2.3.2.7.2",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "MA_PDU_SESSION_MODIFICATION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.7.3",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "MA_PDU_SESSION_RELEASE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.7.4",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "START_OF_INTERCEPTION_MA_PDU",
+  "spec": "33.128",
+  "clause": "6.2.3.2.7.5",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "UNSUCCESSFUL_MA_SM_PROCEDURE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.7.6",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "PDU_TO_MA_PDU_SESSION_CONVERSION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.8",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "ATSSS_RULE_CHANGE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.8",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "ETHERNET_PDU_SESSION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.2",
+  "alias": true
+ },
+ {
+  "nf": "SMF",
+  "event": "UE_LOC_INFO_CHANGE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.3",
+  "alias": true
+ },
+ {
+  "nf": "SMF",
+  "event": "QOS_FLOW_ESTABLISHMENT",
+  "spec": "33.128",
+  "clause": "6.2.3.2.3",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "QOS_FLOW_MODIFICATION",
+  "spec": "33.128",
+  "clause": "6.2.3.2.3",
+  "alias": false
+ },
+ {
+  "nf": "SMF",
+  "event": "QOS_FLOW_RELEASE",
+  "spec": "33.128",
+  "clause": "6.2.3.2.4",
+  "alias": false
+ },
+ {
+  "nf": "SMSF",
+  "event": "SMS_MESSAGE",
+  "spec": "33.128",
+  "clause": "6.2.5.3",
+  "alias": false
+ },
+ {
+  "nf": "SMSF",
+  "event": "SMS_REPORT",
+  "spec": "33.128",
+  "clause": "6.2.5.4",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "SERVING_SYSTEM_MESSAGE",
+  "spec": "33.128",
+  "clause": "7.2.2.3.2",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "SUBSCRIBER_RECORD_CHANGE",
+  "spec": "33.128",
+  "clause": "7.2.2.3.3",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "CANCEL_LOCATION",
+  "spec": "33.128",
+  "clause": "7.2.2.3.4",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "LOCATION_INFO_REQUEST",
+  "spec": "33.128",
+  "clause": "7.2.2.3.5",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "REGISTRATION_STATUS_QUERY",
+  "spec": "33.128",
+  "clause": "7.2.2.3.7",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "AUTHENTICATION_CONFIRMATION",
+  "spec": "33.128",
+  "clause": "7.2.2.3.8",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "START_OF_INTERCEPTION",
+  "spec": "33.128",
+  "clause": "7.2.2.3",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "AUTHENTICATION_FAILURE",
+  "spec": "33.128",
+  "clause": "7.2.2.3.8",
+  "alias": false
+ },
+ {
+  "nf": "UDM",
+  "event": "UE_DEREGISTRATION_REQUEST",
+  "spec": "33.128",
+  "clause": "7.2.2.3.4",
+  "alias": true
+ },
+ {
+  "nf": "UDM",
+  "event": "SUCI_DECONCEALMENT",
+  "spec": "33.128",
+  "clause": "7.2.2",
+  "alias": true
+ }
+]
