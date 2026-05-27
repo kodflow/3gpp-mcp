@@ -54,6 +54,8 @@ func New(st *store.Store, version, baseline string) *server.MCPServer {
 		mcp.WithString("spec_id", mcp.Description("e.g. 33.128")),
 		mcp.WithNumber("top_k", mcp.Description("max results per page (default 10)")),
 		mcp.WithString("cursor", mcp.Description("opaque pagination cursor from a previous call's next_cursor")),
+		mcp.WithString("mode", mcp.Description("retrieval mode: hybrid (default) | lexical | semantic")),
+		mcp.WithBoolean("rerank", mcp.Description("re-score the top candidates with the cross-encoder (default false; needs the -tags onnx binary + reranker model)")),
 	), h.searchSpec)
 
 	s.AddTool(mcp.NewTool("get_spec",
@@ -187,7 +189,10 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	// Over-fetch the page window + 1 to detect "more exists" without a count.
-	hits, err := h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: offset + pageSize + 1})
+	hits, err := h.eng.Search(ctx, search.Request{
+		Text: q, Filter: filter, TopK: offset + pageSize + 1,
+		Mode: r.GetString("mode", ""), Rerank: r.GetBool("rerank", false),
+	})
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("search failed", err), nil
 	}
