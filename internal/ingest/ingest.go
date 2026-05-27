@@ -78,9 +78,9 @@ type Stats struct {
 }
 
 // Matches a spec file name: NNNNN-XXX, optionally followed by a "_<section>"
-// suffix for multi-part specs (e.g. 36213-j30_s10-s13). Junk inner docs from
-// embedded media (dog_captured_*, streetView_*) lack the NNNNN-XXX prefix and
-// are correctly excluded. Parts of the same (spec, version) merge naturally.
+// suffix for multi-part specs (e.g. 36213-j30_s10-s13). 5-digit = 3GPP specs.
+// (GSM Phase 1/2 = 4-digit series 00-12, different numbering — out of scope.)
+// Junk inner docs from embedded media lack the prefix and are excluded.
 var reFile = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
 
 // Run executes the pipeline into the DuckDB file at dbPath.

@@ -47,7 +47,9 @@ DONE="$ROOT/data/sources/.corpus.done"
 source "$SCRIPT_DIR/lib/convert.sh"
 CONV_TIMEOUT="${CONV_TIMEOUT:-900}"   # was a hard 240s — big specs (28552/33501) need ~700s
 
-SET="${SET:-Rel-17}"          # release floor (env-overridable)
+SET="${SET:-Rel-99}"          # release floor (env-overridable). Rel-99 = every real
+                              # 3GPP release (Rel-99 + Rel-4..latest); pre-Rel-99
+                              # drafts (major 0/1/2) skipped. Future releases auto.
 JOBS=4                        # per-spec workers (soffice is RAM-heavy)
 ENUM_JOBS=8                   # enumeration workers (network-bound)
 SERIES_FILTER=""
@@ -70,7 +72,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SET_MAJOR="$(printf '%s' "$SET" | grep -oE '[0-9]+' | head -1)"; SET_MAJOR="${SET_MAJOR:-17}"
+SET_MAJOR="$(printf '%s' "$SET" | grep -oE '[0-9]+' | head -1)"; SET_MAJOR="${SET_MAJOR:-3}"
+[[ "$SET" == "Rel-99" ]] && SET_MAJOR=3   # Rel-99 == version major 3 (not 99)
 
 mkdir -p "$ORIGIN" "$CONVERT"
 
@@ -101,7 +104,7 @@ export -f decode_char
 emit_spec() {
   local s="$1" spec="$2" num dir html files
   num="${spec/./}"
-  [[ ${#num} -le 4 ]] && return 0                  # 4-digit = legacy GSM -> excluded
+  [[ ${#num} -le 4 ]] && return 0                  # 4-digit = legacy GSM Phase 1/2 -> out of scope
   dir="$BASE/${s}_series/${spec}/"
   html="$(fetch "$dir" 2>/dev/null || true)"; [[ -z "$html" ]] && return 0
   files="$(printf '%s' "$html" | grep -oE '[0-9]{5}-[0-9a-z]{3}\.zip' | sort -u || true)"

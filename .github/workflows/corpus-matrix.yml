@@ -1,71 +1,94 @@
-# Corpus Matrix — FULL consolidation via a DYNAMIC matrix (POC).
+# Corpus Matrix — DYNAMIC, delta-sized 3GPP corpus consolidation.
 #
-# Beats the 14 GB / 6 h single-runner limit by sharding the corpus across
-# parallel runners, then fusing the partial DBs. The shard axis is the 3GPP
-# SERIES, because the archive is physically organised by series
-# (33_series/33.128/…) so series shards are DISJOINT with zero download overlap
-# (release shards would re-download, since release is a per-file attribute).
+# Not frozen in time: the matrix is sized to what actually changed on 3gpp.org.
+#   discover     → fetch the 3GPP status report, diff vs corpus-index.json (the
+#                  indexed state in `latest`), emit ONLY the changed series
+#                  (0, a few, or all) — or all series on a full build.
+#   build-shard  → one runner per series (parallel): download → convert → ingest
+#                  → partial DB. A shard is one COMPLETE series.
+#   merge        → delta: pull the existing DB from `latest` as --base, each
+#                  shard's series REPLACES the base's; full: fuse shards fresh.
+#                  Re-emits corpus-index.json and (opt-in) publishes to `latest`.
 #
-#   discover  → detects the series list from 3gpp.org → emits a JSON matrix
-#   build-shard (matrix) → one runner per series: download → convert → ingest → partial DB
-#   merge     → fuse all partial DBs (cmd/merge) → one consolidated DB
-#
-# POC: bounded scope + artifact output (does not publish to `latest`).
+# Series sharding is disjoint (archive is series-structured); release is captured
+# by the floor (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen) + future releases appear in
+# the listing automatically, so nothing is hard-frozen.
 
 name: Corpus Matrix
 
 on:
   workflow_dispatch:
     inputs:
+      full:
+        description: "Full rebuild: index ALL series (ignore the index / no base)."
+        type: boolean
+        default: false
       series_scope:
-        description: "Space-separated series to shard (empty = ALL series detected on 3gpp.org)."
+        description: "Explicit space-separated series (overrides auto-detect). Empty = delta from the index."
         type: string
-        default: "21 24"
+        default: ""
       release_floor:
-        description: "Lowest release to ingest."
+        description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen)."
         type: string
-        default: "Rel-17"
+        default: "Rel-99"
       publish_to_latest:
-        description: "Publish the consolidated DB to the rolling 'latest' release (else: artifact only)."
+        description: "Publish the consolidated DB + index to the rolling 'latest' release."
         type: boolean
         default: false
 
 permissions:
-  contents: read # discover/build-shard are read-only; merge elevates per-job
+  contents: read # discover/build-shard read-only; merge elevates per-job
 
 env:
   CGO_ENABLED: "1"
-  BASE: "https://www.3gpp.org/ftp/Specs/archive"
 
 jobs:
-  # ---- 1. dynamic discovery → matrix ---------------------------------------
+  # ---- 1. dynamic, delta-sized discovery → matrix --------------------------
   discover:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       floor: ${{ steps.set.outputs.floor }}
+      full: ${{ steps.set.outputs.full }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - id: set
         run: |
+          scope="${{ github.event.inputs.series_scope }}"
+          floor="${{ github.event.inputs.release_floor }}"
+          full="${{ github.event.inputs.full }}"
+          # PR validation: tiny fixed scope.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            scope="21 24"; floor="Rel-19"
+            scope="21 24"; floor="Rel-19"; full="false"
+          fi
+          if [ -n "$scope" ]; then
+            matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)   # explicit series
           else
-            scope="${{ github.event.inputs.series_scope }}"; floor="${{ github.event.inputs.release_floor }}"
+            # Auto: diff the live 3GPP status report vs the indexed state.
+            gh release download latest --repo "$GITHUB_REPOSITORY" -p corpus-index.json -D . 2>/dev/null || true
+            if [ "$full" = "true" ]; then
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor")
+            else
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --floor "$floor")
+            fi
           fi
-          # Empty scope → detect ALL series dynamically from the 3GPP archive.
-          if [ -z "$scope" ]; then
-            scope=$(curl -fsSL -A "mcp-3gpp-discover" "$BASE/" \
-              | grep -oE '[0-9]{2}_series' | sed 's/_series//' | sort -u | tr '\n' ' ')
-          fi
-          echo "Series scope: $scope"
-          matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "floor=$floor" >> "$GITHUB_OUTPUT"
-          echo "matrix=$matrix"
+          echo "floor=$floor"   >> "$GITHUB_OUTPUT"
+          echo "full=$full"     >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix  floor=$floor  full=$full"
 
-  # ---- 2. one shard per series (parallel) ----------------------------------
+  # ---- 2. one shard per changed series (parallel) --------------------------
   build-shard:
     needs: discover
+    if: needs.discover.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -95,12 +118,15 @@ jobs:
           path: dist/shard-${{ matrix.series }}.duckdb
           retention-days: 1
 
-  # ---- 3. fuse the partial DBs ---------------------------------------------
+  # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
   merge:
-    needs: build-shard
+    needs: [discover, build-shard]
+    if: needs.discover.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: write # only merge may clobber the DB asset on 'latest'
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -116,31 +142,38 @@ jobs:
           path: shards
           pattern: shard-*
           merge-multiple: true
-      - name: Merge shards → consolidated DB
+      - name: Merge → consolidated DB (+ index)
         run: |
-          ls -lh shards/
           go build -trimpath -o bin/merge ./cmd/merge
           mkdir -p data
-          ./bin/merge --out data/3gpp.duckdb shards/*.duckdb
-          echo "=== consolidated ===" && ls -lh data/3gpp.duckdb
+          base_arg=""
+          # Delta run: start from the existing DB and let each shard's series replace it.
+          if [ "${{ needs.discover.outputs.full }}" != "true" ]; then
+            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D . 2>/dev/null; then
+              zstd -d 3gpp.duckdb.zst -o base.duckdb
+              base_arg="--base base.duckdb"
+              echo "incremental: using existing latest DB as base"
+            fi
+          fi
+          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json $base_arg shards/*.duckdb
+          ls -lh data/3gpp.duckdb
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
-      # Default: artifact only (won't touch the canonical 'latest' DB).
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Upload artifact (when not publishing)
         if: github.event.inputs.publish_to_latest != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-duckdb-merged
           path: |
             data/3gpp.duckdb.zst
             data/3gpp.duckdb.sha256
+            data/corpus-index.json
           retention-days: 7
-      # Opt-in: publish the consolidated DB to the rolling 'latest' release.
-      - name: Publish DB to 'latest' (clobber)
+      - name: Publish DB + index to 'latest' (clobber)
         if: github.event.inputs.publish_to_latest == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view latest >/dev/null 2>&1 || \
-            gh release create latest --latest --title "latest" \
+          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
-          gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber
+          gh release upload latest --repo "$GITHUB_REPOSITORY" \
+            data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 data/corpus-index.json --clobber

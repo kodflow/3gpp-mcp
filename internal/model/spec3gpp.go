@@ -36,8 +36,11 @@ func encodeChar(n int) (byte, bool) {
 	}
 }
 
-// ReleaseFromMajor turns a major ordinal into a release label ("Rel-18",
-// and the special case major 3 -> "Rel-99").
+// ReleaseFromMajor turns a 3GPP version major into a release label. The real
+// release line is: Rel-99 (major 3) → Rel-4 (major 4) → … → Rel-20. There is no
+// "Rel-98": after Rel-99 the count jumps to Rel-4. Majors 0/1/2 are pre-Rel-99
+// DRAFTS (not releases) — callers floor them out. (GSM "Phase 1/2" specs are the
+// separate 4-digit series with their own numbering, not handled here.)
 func ReleaseFromMajor(major int) string {
 	if major == 3 {
 		return "Rel-99"
