@@ -31,7 +31,7 @@ on:
         default: false
 
 permissions:
-  contents: write # to clobber the DB asset on 'latest' when publishing
+  contents: read # discover/build-shard are read-only; merge elevates per-job
 
 env:
   CGO_ENABLED: "1"
@@ -72,8 +72,10 @@ jobs:
         series: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -87,7 +89,7 @@ jobs:
         run: |
           mkdir -p dist
           ./bin/ingest --series "${{ matrix.series }}" --out "dist/shard-${{ matrix.series }}.duckdb"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: shard-${{ matrix.series }}
           path: dist/shard-${{ matrix.series }}.duckdb
@@ -97,15 +99,19 @@ jobs:
   merge:
     needs: build-shard
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # only merge may clobber the DB asset on 'latest'
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Install deps
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: shards
           pattern: shard-*
@@ -120,7 +126,7 @@ jobs:
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
       # Default: artifact only (won't touch the canonical 'latest' DB).
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: github.event.inputs.publish_to_latest != 'true'
         with:
           name: 3gpp-duckdb-merged
