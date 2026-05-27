@@ -21,6 +21,20 @@ import (
 // the engine narrows to TopK (axis #7: retrieve broad → rerank → return narrow).
 const rerankWindow = 20
 
+// vecCandidateN bounds the BM25 candidate pool the no-HNSW vector fallback scores
+// exactly (so it stays O(N), never a full-corpus cosine scan).
+const vecCandidateN = 200
+
+// chunkIDsOf extracts the chunk ids of a ranked hit list (candidate set for the
+// no-HNSW exact-rerank fallback).
+func chunkIDsOf(hits []model.SearchHit) []uint64 {
+	ids := make([]uint64, len(hits))
+	for i, h := range hits {
+		ids[i] = h.Clause.ChunkID
+	}
+	return ids
+}
+
 // Intent is the routing decision for a query (CLAUDE.md §3).
 type Intent string
 
@@ -93,7 +107,19 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// no VSS) just fall back to the lexical list.
 	if e.emb.Enabled() {
 		if vecs, err := e.emb.Embed(ctx, []string{r.Text}); err == nil && len(vecs) == 1 {
-			if vhits, verr := e.st.SearchVectors(ctx, vecs[0], r.Filter, topK); verr == nil {
+			var vhits []model.SearchHit
+			var verr error
+			if e.st.VSSAvailable() {
+				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // HNSW fast path
+			} else {
+				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
+				// never a full-corpus scan. One extra wide lexical fetch.
+				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
+				if cerr == nil {
+					vhits, verr = e.st.SearchVectorsAmong(ctx, vecs[0], chunkIDsOf(cand), topK)
+				}
+			}
+			if verr == nil && len(vhits) > 0 {
 				lists = append(lists, vhits)
 			}
 		}
