@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -30,7 +31,7 @@ func main() {
 	out := flag.String("out", "data/3gpp.duckdb", "merged output DuckDB path")
 	fts := flag.Bool("fts", true, "rebuild the BM25 FTS index on the merged DB")
 	indexOut := flag.String("index-out", "", "also write a corpus-index.json (spec_id -> latest version) for incremental discover")
-	base := flag.String("base", "", "existing DB to start from (incremental): each shard's whole series REPLACES the base's")
+	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
 	flag.Parse()
 	inputs := flag.Args()
 	if len(inputs) == 0 {
@@ -75,11 +76,13 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		if _, err := sqldb.ExecContext(ctx, attach); err != nil {
 			return fmt.Errorf("attach %s: %w", in, err)
 		}
-		// Incremental: drop the base's copy of every series this shard carries
-		// before folding it (the base is fold 0 and is never self-purged).
+		// Incremental: drop the base's copy of the (series, release) buckets this
+		// shard carries before folding it (the base is fold 0 and is never
+		// self-purged). (series,release) — not whole series — so a per-release
+		// sub-shard can't clobber sibling buckets of the same series.
 		if incremental && i > 0 {
-			if err := purgeShardSeries(ctx, sqldb); err != nil {
-				return fmt.Errorf("purge series for %s: %w", in, err)
+			if err := purgeShardScope(ctx, sqldb); err != nil {
+				return fmt.Errorf("purge scope for %s: %w", in, err)
 			}
 		}
 		if err := mergeOne(ctx, sqldb, i == 0); err != nil {
@@ -162,36 +165,76 @@ func triple(s string) [3]int {
 	return t
 }
 
-// purgeShardSeries removes, from the main DB, every row of the series carried by
-// the ATTACHed `src` shard — so the shard's fresh, complete series replaces the
-// base's stale copy (no per-version supersede needed: a shard is a whole series).
-func purgeShardSeries(ctx context.Context, sqldb *sql.DB) error {
-	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) FROM src.specs`)
+// purgeShardScope removes, from the main DB, only the (series, release) buckets
+// the ATTACHed `src` shard actually carries — so a per-release sub-shard replaces
+// its own buckets without clobbering sibling sub-shards of the same series.
+//
+//   - the 8 release-bearing tables → scoped by (series, release);
+//   - `changes` (no release column) → scoped by (series, major-of-to_version),
+//     mapping each release to its version major via ReleaseOrdinal (drafts that
+//     don't map are skipped, so unrelated CRs are never deleted);
+//   - `specs` (no release; one row shared across releases) → NOT purged: a
+//     release sub-shard may not carry every spec of the series, so deleting by
+//     series would drop siblings. ON CONFLICT DO NOTHING on re-fold keeps it.
+func purgeShardScope(ctx context.Context, sqldb *sql.DB) error {
+	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) AS series, release FROM src.spec_versions`)
 	if err != nil {
 		return err
 	}
-	var series []string
+	type pair struct{ series, release string }
+	var pairs []pair
 	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
+		var p pair
+		if err := rows.Scan(&p.series, &p.release); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		series = append(series, "'"+strings.ReplaceAll(s, "'", "''")+"'")
+		pairs = append(pairs, p)
 	}
 	_ = rows.Close()
-	if len(series) == 0 {
+	if len(pairs) == 0 {
 		return nil
 	}
-	in := strings.Join(series, ",")
-	// Every spec-keyed table (acronyms/evolutions are global → left intact).
+
+	// (a) release-bearing tables: DELETE WHERE (series, release) matches a bucket.
+	relPred := make([]string, 0, len(pairs))
+	relArgs := make([]any, 0, len(pairs)*2)
+	for _, p := range pairs {
+		relPred = append(relPred, "(substr(spec_id,1,2) = ? AND release = ?)")
+		relArgs = append(relArgs, p.series, p.release)
+	}
+	relWhere := strings.Join(relPred, " OR ")
 	for _, t := range []string{
-		"specs", "spec_versions", "clauses", "changes",
+		"spec_versions", "clauses",
 		"li_events", "li_event_fields", "li_nf_clauses",
 		"api_operations", "api_schemas", "asn1_types",
 	} {
-		if _, err := sqldb.ExecContext(ctx, `DELETE FROM `+t+` WHERE substr(spec_id,1,2) IN (`+in+`)`); err != nil {
+		if _, err := sqldb.ExecContext(ctx, `DELETE FROM `+t+` WHERE `+relWhere, relArgs...); err != nil {
 			return fmt.Errorf("%s: %w", t, err)
+		}
+	}
+
+	// (b) changes: no release column → scope by (series, major-of-to_version).
+	seen := map[string]bool{}
+	chPred := make([]string, 0, len(pairs))
+	chArgs := make([]any, 0, len(pairs)*2)
+	for _, p := range pairs {
+		ord, ok := model.ReleaseOrdinal(p.release)
+		if !ok {
+			continue // draft / unmapped — don't risk deleting unrelated CRs
+		}
+		maj := strconv.Itoa(ord)
+		key := p.series + "/" + maj
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		chPred = append(chPred, "(substr(spec_id,1,2) = ? AND split_part(to_version,'.',1) = ?)")
+		chArgs = append(chArgs, p.series, maj)
+	}
+	if len(chPred) > 0 {
+		if _, err := sqldb.ExecContext(ctx, `DELETE FROM changes WHERE `+strings.Join(chPred, " OR "), chArgs...); err != nil {
+			return fmt.Errorf("changes: %w", err)
 		}
 	}
 	return nil
