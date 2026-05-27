@@ -65,6 +65,7 @@ type Options struct {
 	Series     []string // optional: keep only these series ("33"); empty = all
 	SpecIDs    []string // optional: keep only these spec ids ("33.128"); empty = all
 	EnableFTS  bool     // build the BM25 index after load
+	EmbedFloor string   // optional: embed ONLY clauses at/above this release ("Rel-15"); empty = embed all. Lexical coverage is unaffected — every clause is still ingested.
 	Embedder   embed.Embedder
 	Registry   *subject.Registry // domain subjects (nil = registry.Default())
 	Logf       func(string, ...any)
@@ -153,6 +154,17 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		return st, err
 	}
 
+	// Vector floor: embed only clauses at/above this release (lexical coverage is
+	// unaffected). 0 = embed everything ingested.
+	floorOrd := 0
+	if opt.EmbedFloor != "" {
+		if o, ok := model.ReleaseOrdinal(opt.EmbedFloor); ok {
+			floorOrd = o
+		} else {
+			logf("ignoring unparseable EmbedFloor %q (embedding all releases)", opt.EmbedFloor)
+		}
+	}
+
 	specsSeen := map[string]bool{}
 	var chunkID uint64
 	for _, j := range jobs {
@@ -186,7 +198,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 		st.Clauses += len(ps.Clauses)
 
-		if err := embedClauses(ctx, db, opt.Embedder, ps.Clauses, &st); err != nil {
+		if err := embedClauses(ctx, db, opt.Embedder, ps.Clauses, floorOrd, &st); err != nil {
 			return st, err
 		}
 
@@ -254,28 +266,44 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 }
 
 // embedClauses vectorises and persists embeddings when the embedder is enabled.
-func embedClauses(ctx context.Context, db *store.Store, e embed.Embedder, clauses []model.Clause, st *Stats) error {
+// When floorOrd > 0, only clauses whose release ordinal is >= floorOrd are
+// embedded (vectors for recent releases only); every clause stays ingested
+// lexically. st.Vectors is set only if something was actually embedded, so an
+// all-below-floor corpus doesn't trigger an empty HNSW build downstream.
+func embedClauses(ctx context.Context, db *store.Store, e embed.Embedder, clauses []model.Clause, floorOrd int, st *Stats) error {
 	if !e.Enabled() || len(clauses) == 0 {
 		return nil
 	}
 	const batch = 32
 	for i := 0; i < len(clauses); i += batch {
 		end := min(i+batch, len(clauses))
+		// Track chunk ids in parallel with texts: clauses skipped by the floor
+		// break positional alignment with the returned vectors.
 		texts := make([]string, 0, end-i)
+		ids := make([]uint64, 0, end-i)
 		for _, c := range clauses[i:end] {
+			if floorOrd > 0 {
+				if o, ok := model.ReleaseOrdinal(c.Release); !ok || o < floorOrd {
+					continue // below the vector floor: lexical-only
+				}
+			}
 			texts = append(texts, c.Heading+"\n"+c.Text)
+			ids = append(ids, c.ChunkID)
+		}
+		if len(texts) == 0 {
+			continue
 		}
 		vecs, err := e.Embed(ctx, texts)
 		if err != nil {
 			return err
 		}
 		for k, v := range vecs {
-			if err := db.SetEmbedding(ctx, clauses[i+k].ChunkID, v); err != nil {
+			if err := db.SetEmbedding(ctx, ids[k], v); err != nil {
 				return err
 			}
 		}
+		st.Vectors = true
 	}
-	st.Vectors = true
 	return nil
 }
 
