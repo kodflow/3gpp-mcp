@@ -1,4 +1,4 @@
-# CI — fmt, vet, lint, test. Translated from the original .gitlab-ci.yml.
+# CI — fmt, vet, test. Linting is handled by ktn-linter (hooks), not golangci-lint.
 # CGO is required (DuckDB; optional ONNX behind -tags onnx). No cross-compile:
 # tests run natively per-OS. Default build stays lexical (no -tags onnx).
 
@@ -35,9 +35,6 @@ jobs:
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then echo "not gofmt-clean:"; echo "$unformatted"; exit 1; fi
       - run: go vet ./...
-      - uses: golangci/golangci-lint-action@v7
-        with:
-          version: v2.12.2 # must be built with Go >= go.mod (1.25); v1 is rejected
 
   test:
     strategy:
