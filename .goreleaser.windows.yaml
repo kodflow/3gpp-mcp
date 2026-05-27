@@ -1,0 +1,38 @@
+# GoReleaser — WINDOWS target, built NATIVELY on a windows runner with its
+# MinGW gcc (the DuckDB windows lib links against the MinGW C++ runtime).
+# Cross-compiling this from Linux fails (libstdc++/MSVC ABI), so it runs on
+# windows-latest. windows/arm64 is absent: DuckDB ships no windows-arm64 lib.
+# Default (lexical) build — ONNX stays behind `-tags onnx`.
+#
+# Validate on windows:  goreleaser build --snapshot --clean --config .goreleaser.windows.yaml
+version: 2
+
+project_name: mcp-3gpp
+
+snapshot:
+  version_template: "latest"
+
+builds:
+  - id: mcp-3gpp-windows
+    main: ./cmd/server
+    binary: mcp-3gpp
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    goos: [windows]
+    goarch: [amd64]
+
+archives:
+  - id: default
+    ids: [mcp-3gpp-windows]
+    name_template: "mcp-3gpp_{{ .Os }}_{{ .Arch }}"
+    formats: [zip]
+
+checksum:
+  name_template: "checksums-windows.txt"
+
+release:
+  disable: true

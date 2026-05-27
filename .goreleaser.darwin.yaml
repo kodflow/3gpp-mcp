@@ -1,0 +1,37 @@
+# GoReleaser — Darwin (macOS) targets, built NATIVELY on a macOS runner.
+# No zig: Apple clang ships the macOS SDK (libresolv, CoreFoundation/Security
+# frameworks) the DuckDB darwin lib links against, and targets both archs
+# natively. Linux + Windows are cross-compiled separately via .goreleaser.yaml.
+#
+# Validate on macOS:  goreleaser build --snapshot --clean --config .goreleaser.darwin.yaml
+version: 2
+
+project_name: mcp-3gpp
+
+snapshot:
+  version_template: "latest"
+
+builds:
+  - id: mcp-3gpp-darwin
+    main: ./cmd/server
+    binary: mcp-3gpp
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    goos: [darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    ids: [mcp-3gpp-darwin]
+    name_template: "mcp-3gpp_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+
+checksum:
+  name_template: "checksums-darwin.txt"
+
+release:
+  disable: true
