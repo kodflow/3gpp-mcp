@@ -1,0 +1,60 @@
+# CI — fmt, vet, lint, test. Translated from the original .gitlab-ci.yml.
+# CGO is required (DuckDB; optional ONNX behind -tags onnx). No cross-compile:
+# tests run natively per-OS. Default build stays lexical (no -tags onnx).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "1"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "not gofmt-clean:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          args: --timeout 5m
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14] # linux/amd64 + darwin/arm64 (native CGO)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install build deps (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config
+      - name: Test (race + coverage)
+        run: |
+          go test -race -count=1 -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1

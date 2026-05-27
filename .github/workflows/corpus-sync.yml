@@ -1,0 +1,24 @@
+# Corpus sync — placeholder for the incremental index refresh (plan Part C4).
+#
+# Intentionally minimal: full corpus ingest (~20 GB) never runs on a hosted
+# runner (14 GB disk / 7 GB RAM). The real job will fetch only the delta of new
+# 3GPP versions, append to the last released DB, publish a dated zstd Release,
+# and open a PR on corpus.lock. Kept simple on purpose — wired up when the
+# `ingest` delta path lands.
+
+name: Corpus Sync
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "17 4 * * 1"  # weekly, off-peak, non-round minute
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::notice::corpus-sync is a stub — incremental ingest path pending (plan C4)."

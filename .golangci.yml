@@ -1,0 +1,16 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - misspell
+    - bodyclose
+  exclusions:
+    rules:
+      # Test files may keep terse defer x.Close() and unchecked helpers.
+      - path: _test\.go
+        linters:
+          - errcheck
