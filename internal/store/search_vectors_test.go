@@ -8,6 +8,36 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
+// TestEmbeddingModelMetaAndDisableVSS verifies the coherence-guard primitives:
+// BuildAndFreezeHNSW stamps embedding_model, and DisableVSS turns vector search
+// off (what the serve guard calls on a client/DB model mismatch).
+func TestEmbeddingModelMetaAndDisableVSS(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "meta.duckdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	seedEmbedded(t, st)
+	if err := st.BuildAndFreezeHNSW(ctx, "hash-local"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GetMeta(ctx, "embedding_model"); got != "hash-local" {
+		t.Fatalf("embedding_model meta = %q, want hash-local", got)
+	}
+	// VSSAvailable is set by LoadVSS (the serve-side load), not by the build.
+	if err := st.LoadVSS(ctx); err != nil {
+		t.Fatalf("LoadVSS after freeze: %v", err)
+	}
+	if !st.VSSAvailable() {
+		t.Fatal("VSS should be available after freeze + LoadVSS")
+	}
+	st.DisableVSS() // what the serve guard does on a model mismatch
+	if st.VSSAvailable() {
+		t.Fatal("DisableVSS did not turn vector search off")
+	}
+}
+
 // TestSearchVectorsKNNAndFilter checks the bare-k-NN path returns the nearest
 // clause and that the SpecFilter is applied (in Go) after the index lookup.
 func TestSearchVectorsKNNAndFilter(t *testing.T) {

@@ -30,6 +30,11 @@ func OpenReadOnly(path string) (*Store, error) {
 // false, vector search degrades to an exact full-scan (still correct, just O(N)).
 func (s *Store) VSSAvailable() bool { return s.vssAvailable }
 
+// DisableVSS turns vector search off at serve time (e.g. when the client embedder
+// disagrees with the DB's indexed model — see the coherence guard in cmd/server).
+// Lexical retrieval is unaffected.
+func (s *Store) DisableVSS() { s.vssAvailable = false }
+
 // GetMeta reads a schema_meta value ("" if absent).
 func (s *Store) GetMeta(ctx context.Context, key string) string {
 	var v string

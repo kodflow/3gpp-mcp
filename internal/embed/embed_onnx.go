@@ -65,8 +65,9 @@ func newEmbedder() Embedder {
 	return &onnxEmbedder{tok: tok, session: sess}
 }
 
-func (*onnxEmbedder) Enabled() bool { return true }
-func (*onnxEmbedder) Dim() int      { return Dim }
+func (*onnxEmbedder) Enabled() bool   { return true }
+func (*onnxEmbedder) Dim() int        { return Dim }
+func (*onnxEmbedder) ModelID() string { return "bge-m3" }
 
 // batchSize bounds how many clauses go into one ONNX call. 32 (CLAUDE.md §2)
 // amortises the per-call overhead while keeping the padded tensor small.
