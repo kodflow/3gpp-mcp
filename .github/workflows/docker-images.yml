@@ -83,7 +83,7 @@ jobs:
 
       - name: Build and push base by digest
         id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .devcontainer/images
           file: .devcontainer/images/Dockerfile.base
@@ -274,7 +274,7 @@ jobs:
       # PR: Build only (no push)
       - name: Build image (PR)
         if: github.event_name == 'pull_request' && steps.base-check.outputs.available == 'true'
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .devcontainer/images
           file: .devcontainer/images/Dockerfile
@@ -290,7 +290,7 @@ jobs:
       - name: Build and push by digest
         if: github.event_name != 'pull_request' && steps.base-check.outputs.available == 'true'
         id: build
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .devcontainer/images
           file: .devcontainer/images/Dockerfile
