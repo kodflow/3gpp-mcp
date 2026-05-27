@@ -15,6 +15,7 @@ import (
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/mcp"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
@@ -98,6 +99,19 @@ func serve(args []string) error {
 	// degrades to an exact full-scan — correct, just slower (axis #6 §6).
 	if err := st.LoadVSS(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] HNSW unavailable, vector search uses exact scan: %v\n", err)
+	}
+	// Coherence guard: if this binary's embedder produces a DIFFERENT model than
+	// the one the DB's vectors/HNSW were built with, cosine scores would be
+	// silently wrong. Disable vector search (lexical still serves) and say why.
+	// (A lexical/disabled client embedder can't emit a query vector, so there is
+	// nothing to guard — the engine never calls the vector path.)
+	if st.VSSAvailable() {
+		if emb := embed.New(); emb.Enabled() {
+			if dbModel := st.GetMeta(ctx, "embedding_model"); dbModel != emb.ModelID() {
+				st.DisableVSS()
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] semantic disabled: DB embedding_model=%q, client=%q (mismatch)\n", dbModel, emb.ModelID())
+			}
+		}
 	}
 
 	srv := mcp.New(st, Version, *release)
