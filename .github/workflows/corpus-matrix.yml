@@ -136,7 +136,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install deps
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd python3
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: shards
@@ -157,6 +157,23 @@ jobs:
           fi
           ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json $base_arg shards/*.duckdb
           ls -lh data/3gpp.duckdb
+      - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
+        run: |
+          # Authoritative DynaReport metadata (WG, title, TS/TR, freeze_date → fixes
+          # the non-monotonic version-ordering trap) + 5GC OpenAPI (populates
+          # search_api). Both are idempotent (UPSERT / clear-api_*-then-reingest)
+          # and degrade-don't-block: a forge/DynaReport outage must not fail the
+          # corpus build — the DB stays valid with filename-derived metadata.
+          go build -trimpath -o bin/ingest-catalog ./cmd/ingest-catalog
+          ./bin/ingest-catalog --out data/3gpp.duckdb --cache data/catalog \
+            || echo "[merge] catalog overlay degraded (kept filename-derived metadata)"
+          go build -trimpath -o bin/ingest-openapi ./cmd/ingest-openapi
+          ./scripts/fetch-5g-apis.sh REL-17 REL-18 REL-19 \
+            || echo "[merge] 5g-apis fetch degraded"
+          ./bin/ingest-openapi --out data/3gpp.duckdb \
+            || echo "[merge] openapi ingest degraded"
+      - name: Package (zstd + sha256 over the enriched DB)
+        run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
       - name: Upload artifact (when not publishing)
