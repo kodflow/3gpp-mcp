@@ -7,7 +7,7 @@ require (
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
 	github.com/mark3labs/mcp-go v0.54.1
 	github.com/sugarme/tokenizer v0.3.0
-	github.com/yalue/onnxruntime_go v1.14.0
+	github.com/yalue/onnxruntime_go v1.30.1
 	golang.org/x/net v0.55.0
 	gopkg.in/yaml.v3 v3.0.1
 )
