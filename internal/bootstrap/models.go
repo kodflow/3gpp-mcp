@@ -21,10 +21,12 @@ import (
 // fails CLOSED on a mismatch or a missing pin. Bump these together with
 // DefaultORTVersion (sha256 of the published .tgz).
 var ortSHA256 = map[string]string{
-	"onnxruntime-linux-x64-1.20.1":     "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105",
-	"onnxruntime-linux-aarch64-1.20.1": "ae4fedbdc8c18d688c01306b4b50c63de3445cdf2dbd720e01a2fa3810b8106a",
-	"onnxruntime-osx-arm64-1.20.1":     "b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a",
-	"onnxruntime-osx-x86_64-1.20.1":    "0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78",
+	"onnxruntime-linux-x64-1.26.0":     "1254da24fb389cf39dc0ff3451ab48301740ffbfcbaf646849df92f80ee92c57",
+	"onnxruntime-linux-aarch64-1.26.0": "34ff1c2d0f12e2cf3d33a0c5f82e39792e1d581fbd6968fd7c30d173654be01a",
+	"onnxruntime-osx-arm64-1.26.0":     "7a1280bbb1701ea514f71828765237e7896e0f2e1cd332f1f70dbd5c3e33aca3",
+	// osx-x86_64 (Intel Mac) intentionally absent: Microsoft stopped publishing
+	// onnxruntime-osx-x86_64 builds at 1.25.0 (404 on the release). Intel Mac
+	// stays lexical-only; verifyORT fails closed for that arch by design.
 }
 
 // verifyORT checks a downloaded ORT tarball against its pinned sha256. Unknown
@@ -41,8 +43,10 @@ func verifyORT(pkg string, data []byte) error {
 	return nil
 }
 
-// DefaultORTVersion matches onnxruntime_go v1.14.0 (ORT C API 20).
-const DefaultORTVersion = "1.20.1"
+// DefaultORTVersion provides ORT C API 26 — needed by onnxruntime_go v1.30.x
+// which requests API 25. Bump this AND ortSHA256 together (and the
+// scripts/fetch-model.sh pin); the dependabot ignore keeps these coupled.
+const DefaultORTVersion = "1.26.0"
 
 // HF model sources are pinned to immutable commit SHAs (not the mutable
 // `/resolve/main` ref): an upstream re-export can't silently swap the weights
@@ -91,10 +95,11 @@ func ortPackage(version string) (pkg, lib string, err error) {
 		return "onnxruntime-linux-aarch64-" + version, "libonnxruntime.so", nil
 	case "darwin/arm64":
 		return "onnxruntime-osx-arm64-" + version, "libonnxruntime.dylib", nil
-	case "darwin/amd64":
-		return "onnxruntime-osx-x86_64-" + version, "libonnxruntime.dylib", nil
+	// darwin/amd64 (Intel Mac): Microsoft stopped publishing onnxruntime-osx-x86_64
+	// at 1.25.0 — no upstream tarball exists. Intel Mac stays LEXICAL-ONLY (the
+	// onnx variant degrades to Disabled{} since FetchORT fails here).
 	default:
-		return "", "", fmt.Errorf("no ONNX Runtime build for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return "", "", fmt.Errorf("no ONNX Runtime build for %s/%s (Intel Mac unsupported since ORT 1.25)", runtime.GOOS, runtime.GOARCH)
 	}
 }
 
