@@ -36,9 +36,10 @@ import (
 const maxTokens = 512
 
 type onnxEmbedder struct {
-	tok     *tokenizer.Tokenizer
-	session *ort.DynamicAdvancedSession
-	mu      sync.Mutex // ORT session Run is not guaranteed concurrent-safe
+	tok       *tokenizer.Tokenizer
+	session   *ort.DynamicAdvancedSession
+	mu        sync.Mutex // ORT session Run is not guaranteed concurrent-safe
+	windowing string     // "" = truncate at maxTokens (default); "mean_pool" = window long clauses + mean-pool (EMBED_WINDOWING)
 }
 
 // newEmbedder (onnx build) returns the BGE-M3 embedder, or Disabled{} if the
@@ -62,7 +63,7 @@ func newEmbedder() Embedder {
 	if err != nil {
 		return Disabled{}
 	}
-	return &onnxEmbedder{tok: tok, session: sess}
+	return &onnxEmbedder{tok: tok, session: sess, windowing: envOr("EMBED_WINDOWING", "")}
 }
 
 func (*onnxEmbedder) Enabled() bool   { return true }
@@ -82,6 +83,9 @@ const padID int64 = 1
 // Embed tokenises and runs BGE-M3 in padded batches of batchSize, returning
 // L2-normalised 1024-dim dense vectors (cosine/HNSW expect unit norm).
 func (e *onnxEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	if e.windowing == "mean_pool" {
+		return e.embedWindowed(texts)
+	}
 	out := make([][]float32, len(texts))
 	for start := 0; start < len(texts); start += batchSize {
 		end := start + batchSize
@@ -91,6 +95,36 @@ func (e *onnxEmbedder) Embed(_ context.Context, texts []string) ([][]float32, er
 		if err := e.embedBatch(texts[start:end], out[start:end]); err != nil {
 			return nil, err
 		}
+	}
+	return out, nil
+}
+
+// embedWindowed splits each text into ≤defaultWindowWords word-windows, embeds
+// every window (batched), and mean-pools each text's windows into one vector —
+// so a long clause (tables, ASN.1) contributes all its content instead of being
+// silently truncated at maxTokens. Enabled by EMBED_WINDOWING=mean_pool.
+func (e *onnxEmbedder) embedWindowed(texts []string) ([][]float32, error) {
+	var flat []string
+	owner := make([][]int, len(texts))
+	for i, t := range texts {
+		for _, w := range windowText(t, defaultWindowWords) {
+			owner[i] = append(owner[i], len(flat))
+			flat = append(flat, w)
+		}
+	}
+	vecs := make([][]float32, len(flat))
+	for start := 0; start < len(flat); start += batchSize {
+		end := start + batchSize
+		if end > len(flat) {
+			end = len(flat)
+		}
+		if err := e.embedBatch(flat[start:end], vecs[start:end]); err != nil {
+			return nil, err
+		}
+	}
+	out := make([][]float32, len(texts))
+	for i := range texts {
+		out[i] = meanPoolL2(vecs, owner[i])
 	}
 	return out, nil
 }
