@@ -93,9 +93,46 @@ jobs:
           echo "full=$full"     >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix  floor=$floor  full=$full"
 
+  # ---- 1b. model bundle (embed only): fetch BGE-M3 + ORT from HuggingFace ONCE
+  # and publish to a 'models' release, so the N shards restore it intra-GitHub
+  # instead of each hammering HF (~70 GB → 2.3 GB). Always SUCCEEDS (no-op when
+  # embed=false) so build-shard can `needs:` it without the skipped-dependency trap.
+  model:
+    needs: discover
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Lexical run — no model needed
+        if: github.event.inputs.embed != 'true'
+        run: echo "embed=false → skipping the model bundle"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        if: github.event.inputs.embed == 'true'
+        with:
+          persist-credentials: false
+      - name: Build + publish the model bundle (idempotent)
+        if: github.event.inputs.embed == 'true'
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
+          # Skip only if the actual bundle asset exists (not just its sidecar — a
+          # prior run could have uploaded the .sha256 then failed before the bundle).
+          if gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '.assets[].name' 2>/dev/null | grep -qx 'models.tar.zst'; then
+            echo "model bundle already on the 'models' release — skipping HF fetch"; exit 0
+          fi
+          ./scripts/fetch-model.sh
+          tar -C data/models -cf - . | zstd -19 -T0 -o models.tar.zst
+          sha256sum models.tar.zst > models.tar.zst.sha256
+          gh release view models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create models --repo "$GITHUB_REPOSITORY" --title models \
+              --notes "Pinned BGE-M3 + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
+          gh release upload models --repo "$GITHUB_REPOSITORY" models.tar.zst models.tar.zst.sha256 --clobber
+
   # ---- 2. one shard per changed series (parallel) --------------------------
   build-shard:
-    needs: discover
+    needs: [discover, model]
     if: needs.discover.outputs.matrix != '[]'
     strategy:
       fail-fast: false
@@ -119,9 +156,19 @@ jobs:
           else
             go build -trimpath -o bin/ingest ./cmd/ingest
           fi
-      - name: Fetch BGE-M3 + ONNX Runtime (semantic only)
+      - name: Restore model bundle from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
-        run: ./scripts/fetch-model.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get install -y --no-install-recommends zstd
+          mkdir -p data/models
+          if gh release download models --repo "$GITHUB_REPOSITORY" -p 'models.tar.zst*' -D . 2>/dev/null; then
+            sha256sum -c models.tar.zst.sha256
+            zstd -d models.tar.zst -c | tar -C data/models -xf -
+          else
+            ./scripts/fetch-model.sh   # fallback: direct HF fetch (model job didn't publish)
+          fi
       - name: Download + convert series ${{ matrix.series }}
         env:
           # default-ON disk cleanup when embedding (the vectorized shard + model
