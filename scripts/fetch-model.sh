@@ -42,13 +42,21 @@ sha256_verify() {
 # ---------------------------------------------------------------------------
 ORT_VERSION="${ORT_VERSION:-1.26.0}"
 ORT_DIR="$MODELS/onnxruntime"
-case "$(uname -s)-$(uname -m)" in
+# Apple-Silicon-under-Rosetta returns Darwin-x86_64 from uname -m. Detect the
+# real ARM hardware via sysctl (hw.optional.arm64=1) so a developer in an x86_64
+# shell on an M-series Mac still gets the arm64 ORT instead of "Intel unsupported".
+arch_uname="$(uname -m)"
+if [[ "$(uname -s)" == "Darwin" && "$arch_uname" == "x86_64" ]] \
+   && [[ "$(sysctl -in hw.optional.arm64 2>/dev/null)" == "1" ]]; then
+  arch_uname="arm64"
+fi
+case "$(uname -s)-${arch_uname}" in
   Linux-x86_64)  ORT_PKG="onnxruntime-linux-x64-${ORT_VERSION}";     ORT_LIBNAME="libonnxruntime.so" ;;
   Linux-aarch64) ORT_PKG="onnxruntime-linux-aarch64-${ORT_VERSION}"; ORT_LIBNAME="libonnxruntime.so" ;;
   Darwin-arm64)  ORT_PKG="onnxruntime-osx-arm64-${ORT_VERSION}";     ORT_LIBNAME="libonnxruntime.dylib" ;;
-  # Darwin-x86_64 (Intel Mac): Microsoft stopped publishing onnxruntime-osx-x86_64
-  # at 1.25.0 (no upstream tarball). Intel Mac stays LEXICAL-ONLY.
-  *) echo "unsupported platform: $(uname -s)-$(uname -m) (Intel Mac unsupported since ORT 1.25)" >&2; exit 1 ;;
+  # Darwin-x86_64 (real Intel Mac): Microsoft stopped publishing
+  # onnxruntime-osx-x86_64 at 1.25.0 (no upstream tarball) — stays LEXICAL-ONLY.
+  *) echo "unsupported platform: $(uname -s)-${arch_uname} (Intel Mac unsupported since ORT 1.25)" >&2; exit 1 ;;
 esac
 if [[ ! -f "$ORT_DIR/lib/$ORT_LIBNAME" ]]; then
   echo "→ ONNX Runtime $ORT_VERSION ($ORT_PKG)"
