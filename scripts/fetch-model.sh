@@ -29,6 +29,14 @@ dl() { # dl <url> <dest>
   mv "$dest.part" "$dest"
 }
 
+# sha256_verify <expected-hex> <file> — portable across Linux (sha256sum) and
+# macOS (shasum -a 256). Exits non-zero on mismatch.
+sha256_verify() {
+  if command -v sha256sum >/dev/null 2>&1; then echo "$1  $2" | sha256sum -c -
+  elif command -v shasum >/dev/null 2>&1; then echo "$1  $2" | shasum -a 256 -c -
+  else echo "no sha256 tool (sha256sum/shasum) available" >&2; return 1; fi
+}
+
 # ---------------------------------------------------------------------------
 # 1. ONNX Runtime (CPU) — per-OS/arch shared library
 # ---------------------------------------------------------------------------
@@ -55,7 +63,7 @@ if [[ ! -f "$ORT_DIR/lib/$ORT_LIBNAME" ]]; then
   url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PKG}.tgz"
   tmp="$(mktemp -d)"
   dl "$url" "$tmp/ort.tgz"
-  echo "${ORT_SHA}  ${tmp}/ort.tgz" | sha256sum -c - || { echo "ORT checksum mismatch — refusing" >&2; rm -rf "$tmp"; exit 1; }
+  sha256_verify "$ORT_SHA" "$tmp/ort.tgz" || { echo "ORT checksum mismatch — refusing" >&2; rm -rf "$tmp"; exit 1; }
   tar -xzf "$tmp/ort.tgz" -C "$tmp"
   rm -rf "$ORT_DIR"; mv "$tmp/$ORT_PKG" "$ORT_DIR"
   rm -rf "$tmp"
