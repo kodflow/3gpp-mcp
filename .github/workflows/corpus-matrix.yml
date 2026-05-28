@@ -157,9 +157,12 @@ jobs:
           if-no-files-found: ignore
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
+  # Lexical path only: under embed=true the per-series sub-bases are the Option-B
+  # distribution units (published by publish-vec), NOT folded into a global DB —
+  # so a vectorized run never clobbers the lexical 'latest' DB.
   merge:
     needs: [discover, build-shard]
-    if: needs.discover.outputs.matrix != '[]'
+    if: needs.discover.outputs.matrix != '[]' && github.event.inputs.embed != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write # only merge may clobber the DB asset on 'latest'
@@ -232,3 +235,64 @@ jobs:
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
           gh release upload latest --repo "$GITHUB_REPOSITORY" \
             data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 data/corpus-index.json --clobber
+
+  # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
+  # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,
+  # emit vec-manifest.json, and ORAS-push them to a rolling 'latest' OCI tag (no
+  # 2 GB Release-asset cap). Gated on embed; the actual push is gated on publish.
+  # NEEDS A CI DRY-RUN to validate (ORAS auth + the sub-bases exist).
+  publish-vec:
+    needs: [discover, build-shard]
+    if: needs.discover.outputs.matrix != '[]' && github.event.inputs.embed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORAS_VERSION: "1.2.0"
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: shards
+          pattern: shard-*
+          merge-multiple: true
+      - name: Install zstd + jq + ORAS (pinned)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd jq
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin oras
+          oras version
+      - name: Package sub-bases + vec-manifest
+        run: |
+          mkdir -p vec
+          subs="[]"
+          for f in shards/shard-*.duckdb; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f" .duckdb)
+            zstd -19 -T0 -f "$f" -o "vec/$b.duckdb.zst"
+            subs=$(printf '%s' "$subs" | jq --arg n "$b.duckdb" '. + [$n]')
+          done
+          printf '%s' "$subs" | jq \
+            --arg floor "${{ github.event.inputs.embed_floor }}" \
+            '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
+          cat vec/vec-manifest.json
+          test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no vectorized sub-bases to publish"; exit 1; }
+      - name: Push sub-bases + manifest to GHCR (rolling 'latest')
+        if: github.event.inputs.publish_to_latest == 'true'
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cd vec
+          args="vec-manifest.json:application/json"
+          for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
+          oras push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest" \
+            --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            $args
+      - name: Upload artifact (when not publishing)
+        if: github.event.inputs.publish_to_latest != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: 3gpp-vec
+          path: vec/
+          retention-days: 7
