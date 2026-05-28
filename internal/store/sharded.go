@@ -33,6 +33,22 @@ func (s *Store) AttachShards(ctx context.Context, paths []string) ([]string, err
 	return aliases, nil
 }
 
+// ShardsCoherent checks that every attached sub-base was built with wantModel
+// (the client embedder's ModelID). A mismatch means cross-model cosine scores
+// would be silently wrong — the caller must NOT route queries to these shards.
+// Returns (false, detail) on the first mismatch. Aliases are internal (vs0,…),
+// not user input, so they're safe to interpolate.
+func (s *Store) ShardsCoherent(ctx context.Context, aliases []string, wantModel string) (bool, string) {
+	for _, a := range aliases {
+		var m string
+		_ = s.db.QueryRowContext(ctx, "SELECT value FROM "+a+".schema_meta WHERE key = 'embedding_model'").Scan(&m)
+		if m != wantModel {
+			return false, fmt.Sprintf("%s embedding_model=%q != client %q", a, m, wantModel)
+		}
+	}
+	return true, ""
+}
+
 // SearchVectorsSharded is the Option-B scatter-gather: it runs the k-NN against
 // each attached shard with the bare index-eligible shape
 // (`ORDER BY array_cosine_distance ASC LIMIT topK`, no WHERE, so each shard's HNSW
