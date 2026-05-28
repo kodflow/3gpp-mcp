@@ -29,11 +29,34 @@ builds:
       - goos: linux
         goarch: arm64 # GNU cross-toolchain — ABI-matches the prebuilt arm64 lib
         env: [CC=aarch64-linux-gnu-gcc, CXX=aarch64-linux-gnu-g++]
+  # Semantic-capable variant: -tags onnx compiles the BGE-M3/reranker backend.
+  # onnxruntime_go dlopens libonnxruntime at runtime (no extra link deps), so the
+  # DuckDB GNU toolchain is unchanged; `bootstrap --semantic` fetches ORT + model.
+  - id: mcp-3gpp-linux-onnx
+    main: ./cmd/server
+    binary: mcp-3gpp
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+      - -tags=onnx
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    goos: [linux]
+    goarch: [amd64, arm64]
+    overrides:
+      - goos: linux
+        goarch: arm64
+        env: [CC=aarch64-linux-gnu-gcc, CXX=aarch64-linux-gnu-g++]
 
 archives:
   - id: default
     ids: [mcp-3gpp-linux]
     name_template: "mcp-3gpp_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+  - id: onnx
+    ids: [mcp-3gpp-linux-onnx]
+    name_template: "mcp-3gpp-onnx_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
 
 checksum:
