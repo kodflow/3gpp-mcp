@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -31,6 +33,26 @@ func (s *Store) AttachShards(ctx context.Context, paths []string) ([]string, err
 		aliases = append(aliases, alias)
 	}
 	return aliases, nil
+}
+
+// ShardsCoherent checks that every attached sub-base was built with wantModel
+// (the client embedder's ModelID). A mismatch means cross-model cosine scores
+// would be silently wrong — the caller must NOT route queries to these shards.
+// Returns (false, detail) on the first mismatch. Aliases are internal (vs0,…),
+// not user input, so they're safe to interpolate.
+func (s *Store) ShardsCoherent(ctx context.Context, aliases []string, wantModel string) (bool, string) {
+	for _, a := range aliases {
+		var m string
+		err := s.db.QueryRowContext(ctx, "SELECT value FROM "+a+".schema_meta WHERE key = 'embedding_model'").Scan(&m)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			// Can't read the marker → fail closed (don't route to an unverifiable shard).
+			return false, fmt.Sprintf("%s: read embedding_model: %v", a, err)
+		}
+		if m != wantModel {
+			return false, fmt.Sprintf("%s embedding_model=%q != client %q", a, m, wantModel)
+		}
+	}
+	return true, ""
 }
 
 // SearchVectorsSharded is the Option-B scatter-gather: it runs the k-NN against

@@ -149,14 +149,25 @@ func serve(args []string) error {
 	// degrades to single-DB / lexical (degrade, never block).
 	var vecShards []string
 	if *vecManifest != "" {
-		paths, err := loadVecManifest(*vecManifest)
-		if err != nil {
+		emb := embed.New() // same selection as the engine
+		switch paths, err := loadVecManifest(*vecManifest); {
+		case err != nil:
 			fmt.Fprintf(os.Stderr, "[3gpp-mcp] vec-manifest ignored (%v) — single-DB vectors\n", err)
-		} else if aliases, err := st.AttachShards(ctx, paths); err != nil {
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] sub-bases not attached (%v) — single-DB vectors\n", err)
-		} else {
-			vecShards = aliases
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option B: %d vector sub-bases attached\n", len(aliases))
+		case !emb.Enabled():
+			// A lexical/disabled client can't embed a query, so sub-bases would
+			// never be queried; don't attach them.
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] vec-manifest ignored: client embedder disabled (lexical)\n")
+		default:
+			if aliases, err := st.AttachShards(ctx, paths); err != nil {
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] sub-bases not attached (%v) — single-DB vectors\n", err)
+			} else if ok, why := st.ShardsCoherent(ctx, aliases, emb.ModelID()); !ok {
+				// Coherence guard for Option B: a sub-base built with a different
+				// model than the client would yield silently-wrong cosine scores.
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option-B sub-bases ignored (single-DB/lexical vectors): model mismatch (%s)\n", why)
+			} else {
+				vecShards = aliases
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option B: %d vector sub-bases attached\n", len(aliases))
+			}
 		}
 	}
 
