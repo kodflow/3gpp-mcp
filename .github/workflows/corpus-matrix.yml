@@ -49,6 +49,10 @@ permissions:
 
 env:
   CGO_ENABLED: "1"
+  # Pinned ONNX Runtime version — MUST match DefaultORTVersion in
+  # internal/bootstrap/models.go (and scripts/fetch-model.sh). Embedded in the
+  # cached model bundle filename so a bump auto-invalidates a stale bundle.
+  ORT_VERSION: "1.26.0"
 
 jobs:
   # ---- 1. dynamic, delta-sized discovery → matrix --------------------------
@@ -112,23 +116,25 @@ jobs:
         if: github.event.inputs.embed == 'true'
         with:
           persist-credentials: false
-      - name: Build + publish the model bundle (idempotent)
+      - name: Build + publish the model bundle (idempotent, version-keyed)
         if: github.event.inputs.embed == 'true'
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
-          # Skip only if the actual bundle asset exists (not just its sidecar — a
-          # prior run could have uploaded the .sha256 then failed before the bundle).
+          BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
+          # Skip only if the EXACT versioned bundle exists (a bump to ORT_VERSION
+          # / fetch-model.sh auto-invalidates the prior bundle because its name
+          # encodes the version — no manual cleanup of stale bundles needed).
           if gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
-               --jq '.assets[].name' 2>/dev/null | grep -qx 'models.tar.zst'; then
-            echo "model bundle already on the 'models' release — skipping HF fetch"; exit 0
+               --jq '.assets[].name' 2>/dev/null | grep -qx "$BUNDLE"; then
+            echo "model bundle $BUNDLE already on the 'models' release — skipping HF fetch"; exit 0
           fi
           ./scripts/fetch-model.sh
-          tar -C data/models -cf - . | zstd -19 -T0 -o models.tar.zst
-          sha256sum models.tar.zst > models.tar.zst.sha256
+          tar -C data/models -cf - . | zstd -19 -T0 -o "$BUNDLE"
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
           gh release view models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create models --repo "$GITHUB_REPOSITORY" --title models \
               --notes "Pinned BGE-M3 + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
-          gh release upload models --repo "$GITHUB_REPOSITORY" models.tar.zst models.tar.zst.sha256 --clobber
+          gh release upload models --repo "$GITHUB_REPOSITORY" "$BUNDLE" "$BUNDLE.sha256" --clobber
 
   # ---- 2. one shard per changed series (parallel) --------------------------
   build-shard:
@@ -163,9 +169,13 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
-          if gh release download models --repo "$GITHUB_REPOSITORY" -p 'models.tar.zst*' -D . 2>/dev/null; then
-            sha256sum -c models.tar.zst.sha256
-            zstd -d models.tar.zst -c | tar -C data/models -xf -
+          BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
+          # Restore only the version-keyed bundle: a prior run with a different
+          # ORT_VERSION left an obsolete bundle whose API doesn't match the linked
+          # onnxruntime_go. The fallback re-fetches from HF for the current pin.
+          if gh release download models --repo "$GITHUB_REPOSITORY" -p "${BUNDLE}*" -D . 2>/dev/null; then
+            sha256sum -c "$BUNDLE.sha256"
+            zstd -d "$BUNDLE" -c | tar -C data/models -xf -
           else
             ./scripts/fetch-model.sh   # fallback: direct HF fetch (model job didn't publish)
           fi
