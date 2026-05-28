@@ -24,7 +24,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/pretrained"
@@ -131,53 +130,52 @@ func (e *onnxEmbedder) embedWindowed(texts []string) ([][]float32, error) {
 	return out, nil
 }
 
-// safePrefix returns up to n bytes of s on a valid UTF-8 boundary — used to
-// log a snippet of an input that crashed the tokenizer without injecting raw
-// invalid sequences into the log.
-func safePrefix(s string, n int) string {
-	if len(s) <= n {
-		return s
+// XLM-RoBERTa (BGE-M3) special tokens — used as a last-resort floor when even
+// the space fallback fails. [CLS]=0, [SEP]=2 produce a valid 2-token sequence
+// with a non-empty attention mask, so the ONNX session always sees a tensor it
+// can run instead of an all-padded row with an all-zero mask.
+const (
+	xlmrCLS = 0
+	xlmrSEP = 2
+)
+
+// encodeIDs is the recoverable tokenize step (extracted so safeEncode in
+// embed_safe.go can host the panic-recovery contract and test it without a
+// real tokenizer).
+func (e *onnxEmbedder) encodeIDs(text string) ([]int, error) {
+	enc, err := e.tok.EncodeSingle(text, true)
+	if err != nil {
+		return nil, err
 	}
-	cut := n
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + "…"
+	return enc.Ids, nil
 }
 
-// tokenizeSafe runs the BGE-M3 tokenizer with a recover net: sugarme/tokenizer
-// v0.3.0 panics with "slice bounds out of range" on some inputs in the
-// Metaspace pretokenizer (off-by-one in byte→char range translation). Rather
-// than blow up the whole shard for a single clause, we log the offender and
-// fall back to a single space — which always tokenizes to [CLS] [SEP] (or
-// equivalent) and produces a valid, near-zero vector. The downstream consumer
-// keeps the row (no NULL embedding); it simply won't rank meaningfully in
-// vector search but lexical (BM25) still indexes it.
+// tokenizeSafe runs the BGE-M3 tokenizer with a three-tier degradation:
+//  1. Normal call. On panic (sugarme/tokenizer v0.3.0 Metaspace off-by-one) or
+//     error, fall back to ► 2.
+//  2. EncodeSingle(" "). Single space tokenizes cleanly across XLM-RoBERTa
+//     vocab. On panic/error, fall back to ► 3.
+//  3. Hardcoded {CLS, SEP}. Guarantees a non-empty token sequence so embedBatch
+//     never builds an all-padding row with an all-zero attention_mask.
+//
+// On any fallback we log {len, sha256-prefix} of the input — never the input
+// itself, which can be a user search query (Qodo finding #3: privacy).
 func (e *onnxEmbedder) tokenizeSafe(text string) []int {
-	var ids []int
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("embed: tokenizer panic on input len=%d, prefix=%q: %v — falling back to single space",
-					len(text), safePrefix(text, 80), r)
-				enc, ferr := e.tok.EncodeSingle(" ", true)
-				if ferr == nil {
-					ids = enc.Ids
-				}
-			}
-		}()
-		enc, err := e.tok.EncodeSingle(text, true)
-		if err != nil {
-			log.Printf("embed: tokenize error on input len=%d: %v — falling back to single space", len(text), err)
-			enc2, ferr := e.tok.EncodeSingle(" ", true)
-			if ferr == nil {
-				ids = enc2.Ids
-			}
-			return
-		}
-		ids = enc.Ids
-	}()
-	return ids
+	ids, err := safeEncode(e.encodeIDs, text)
+	if err == nil && len(ids) > 0 {
+		return ids
+	}
+	if err != nil {
+		log.Printf("embed: tokenize failed (len=%d, hash=%s): %v — fallback to single space",
+			len(text), snippetHash(text), err)
+	}
+	ids, err = safeEncode(e.encodeIDs, " ")
+	if err == nil && len(ids) > 0 {
+		return ids
+	}
+	log.Printf("embed: space-fallback also failed (orig len=%d, hash=%s): %v — using hardcoded CLS+SEP",
+		len(text), snippetHash(text), err)
+	return []int{xlmrCLS, xlmrSEP}
 }
 
 // embedBatch embeds one batch (len <= batchSize) into dst (same length). It
