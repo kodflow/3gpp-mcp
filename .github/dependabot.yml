@@ -12,6 +12,12 @@ updates:
     groups:
       go-deps:
         patterns: ["*"]
+    ignore:
+      # onnxruntime_go's requested C API is coupled to the pinned ONNX Runtime
+      # release (DefaultORTVersion in internal/bootstrap/models.go + ortSHA256).
+      # An auto-bump breaks the embedder at runtime ("requested API version [N]
+      # is not available"). Bump them together by hand.
+      - dependency-name: "github.com/yalue/onnxruntime_go"
   # GitHub Actions used by ci.yml / release.yml / corpus-sync.yml.
   - package-ecosystem: "github-actions"
     directory: "/"
