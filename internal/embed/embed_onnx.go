@@ -18,6 +18,7 @@ package embed
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -129,6 +130,54 @@ func (e *onnxEmbedder) embedWindowed(texts []string) ([][]float32, error) {
 	return out, nil
 }
 
+// XLM-RoBERTa (BGE-M3) special tokens — used as a last-resort floor when even
+// the space fallback fails. [CLS]=0, [SEP]=2 produce a valid 2-token sequence
+// with a non-empty attention mask, so the ONNX session always sees a tensor it
+// can run instead of an all-padded row with an all-zero mask.
+const (
+	xlmrCLS = 0
+	xlmrSEP = 2
+)
+
+// encodeIDs is the recoverable tokenize step (extracted so safeEncode in
+// embed_safe.go can host the panic-recovery contract and test it without a
+// real tokenizer).
+func (e *onnxEmbedder) encodeIDs(text string) ([]int, error) {
+	enc, err := e.tok.EncodeSingle(text, true)
+	if err != nil {
+		return nil, err
+	}
+	return enc.Ids, nil
+}
+
+// tokenizeSafe runs the BGE-M3 tokenizer with a three-tier degradation:
+//  1. Normal call. On panic (sugarme/tokenizer v0.3.0 Metaspace off-by-one) or
+//     error, fall back to ► 2.
+//  2. EncodeSingle(" "). Single space tokenizes cleanly across XLM-RoBERTa
+//     vocab. On panic/error, fall back to ► 3.
+//  3. Hardcoded {CLS, SEP}. Guarantees a non-empty token sequence so embedBatch
+//     never builds an all-padding row with an all-zero attention_mask.
+//
+// On any fallback we log {len, sha256-prefix} of the input — never the input
+// itself, which can be a user search query (Qodo finding #3: privacy).
+func (e *onnxEmbedder) tokenizeSafe(text string) []int {
+	ids, err := safeEncode(e.encodeIDs, text)
+	if err == nil && len(ids) > 0 {
+		return ids
+	}
+	if err != nil {
+		log.Printf("embed: tokenize failed (len=%d, hash=%s): %v — fallback to single space",
+			len(text), snippetHash(text), err)
+	}
+	ids, err = safeEncode(e.encodeIDs, " ")
+	if err == nil && len(ids) > 0 {
+		return ids
+	}
+	log.Printf("embed: space-fallback also failed (orig len=%d, hash=%s): %v — using hardcoded CLS+SEP",
+		len(text), snippetHash(text), err)
+	return []int{xlmrCLS, xlmrSEP}
+}
+
 // embedBatch embeds one batch (len <= batchSize) into dst (same length). It
 // pads every row to the batch's longest sequence and lets attention_mask zero
 // the padding, so batching never changes a vector — only the throughput.
@@ -138,11 +187,7 @@ func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, t := range texts {
-		enc, err := e.tok.EncodeSingle(t, true)
-		if err != nil {
-			return fmt.Errorf("tokenize: %w", err)
-		}
-		ids := enc.Ids
+		ids := e.tokenizeSafe(t)
 		if len(ids) > maxTokens {
 			ids = ids[:maxTokens]
 		}
