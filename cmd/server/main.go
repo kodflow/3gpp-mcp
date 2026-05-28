@@ -17,6 +17,7 @@ import (
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/mcp"
 	"github.com/kodflow/3gpp-mcp/internal/store"
@@ -82,6 +83,7 @@ func serve(args []string) error {
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
 	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
 	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
+	vecGHCR := fs.String("vec-ghcr", "", "Option B: pull vector sub-bases from ghcr.io/<owner>/3gpp-vec:latest into the cache and serve them (empty = off)")
 	_ = fs.Parse(args)
 
 	// Let the (onnx) embedder/reranker transparently use cache-bootstrapped
@@ -147,6 +149,19 @@ func serve(args []string) error {
 	// Option B: if a vec-manifest lists per-series sub-bases, ATTACH them and route
 	// the vector arm through the scatter-gather. Best-effort: a bad manifest just
 	// degrades to single-DB / lexical (degrade, never block).
+	// Optionally pull the Option-B sub-bases from GHCR into the cache, then serve
+	// them via the manifest path below (best-effort: a failed pull degrades).
+	if *vecGHCR != "" {
+		if dir, err := bootstrap.CacheDir(); err == nil {
+			if mp, err := bootstrap.FetchVecBases(ctx, *vecGHCR, filepath.Join(dir, "vec")); err != nil {
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] vector sub-bases pull failed (%v) — single-DB/lexical\n", err)
+			} else {
+				*vecManifest = mp
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] pulled vector sub-bases from ghcr.io/%s/3gpp-vec\n", *vecGHCR)
+			}
+		}
+	}
+
 	var vecShards []string
 	if *vecManifest != "" {
 		emb := embed.New() // same selection as the engine
