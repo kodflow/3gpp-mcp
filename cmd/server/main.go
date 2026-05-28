@@ -9,9 +9,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -46,12 +48,40 @@ func main() {
 	}
 }
 
+// loadVecManifest reads a vec-manifest ({"sub_bases":["…duckdb",…]}) and returns
+// the sub-base DB paths, resolved relative to the manifest's directory.
+func loadVecManifest(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		SubBases []string `json:"sub_bases"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	if len(m.SubBases) == 0 {
+		return nil, fmt.Errorf("manifest lists no sub_bases")
+	}
+	dir := filepath.Dir(path)
+	out := make([]string, 0, len(m.SubBases))
+	for _, p := range m.SubBases {
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(dir, p)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dbPath := fs.String("db", "data/3gpp.duckdb", "DuckDB snapshot path")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
 	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
+	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
 	_ = fs.Parse(args)
 
 	// Let the (onnx) embedder/reranker transparently use cache-bootstrapped
@@ -114,7 +144,23 @@ func serve(args []string) error {
 		}
 	}
 
-	srv := mcp.New(st, Version, *release)
+	// Option B: if a vec-manifest lists per-series sub-bases, ATTACH them and route
+	// the vector arm through the scatter-gather. Best-effort: a bad manifest just
+	// degrades to single-DB / lexical (degrade, never block).
+	var vecShards []string
+	if *vecManifest != "" {
+		paths, err := loadVecManifest(*vecManifest)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] vec-manifest ignored (%v) — single-DB vectors\n", err)
+		} else if aliases, err := st.AttachShards(ctx, paths); err != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] sub-bases not attached (%v) — single-DB vectors\n", err)
+		} else {
+			vecShards = aliases
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option B: %d vector sub-bases attached\n", len(aliases))
+		}
+	}
+
+	srv := mcp.New(st, Version, *release, vecShards)
 	scope := *release
 	if scope == "" {
 		scope = "latest"
