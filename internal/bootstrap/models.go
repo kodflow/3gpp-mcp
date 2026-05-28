@@ -2,8 +2,11 @@ package bootstrap
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +15,31 @@ import (
 	"runtime"
 	"strings"
 )
+
+// ortSHA256 pins each ONNX Runtime release tarball for DefaultORTVersion. ORT is
+// native code loaded via dlopen, so a swapped tarball is an RCE vector: FetchORT
+// fails CLOSED on a mismatch or a missing pin. Bump these together with
+// DefaultORTVersion (sha256 of the published .tgz).
+var ortSHA256 = map[string]string{
+	"onnxruntime-linux-x64-1.20.1":     "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105",
+	"onnxruntime-linux-aarch64-1.20.1": "ae4fedbdc8c18d688c01306b4b50c63de3445cdf2dbd720e01a2fa3810b8106a",
+	"onnxruntime-osx-arm64-1.20.1":     "b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a",
+	"onnxruntime-osx-x86_64-1.20.1":    "0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78",
+}
+
+// verifyORT checks a downloaded ORT tarball against its pinned sha256. Unknown
+// package (no pin) is a hard error — we never load an unverified native lib.
+func verifyORT(pkg string, data []byte) error {
+	want, ok := ortSHA256[pkg]
+	if !ok {
+		return fmt.Errorf("no pinned ORT checksum for %q (refusing an unverified native runtime)", pkg)
+	}
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != want {
+		return fmt.Errorf("ORT checksum mismatch for %q: got %s, want %s", pkg, got, want)
+	}
+	return nil
+}
 
 // DefaultORTVersion matches onnxruntime_go v1.14.0 (ORT C API 20).
 const DefaultORTVersion = "1.20.1"
@@ -95,8 +123,20 @@ func FetchORT(ctx context.Context, modelsDir, version string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("get ORT: status %s", resp.Status)
 	}
+	// Buffer + verify the sha256 BEFORE extracting: ORT is dlopen'd native code,
+	// so an unverified/tampered tarball is an RCE vector (fail closed). Cap the
+	// read so a malicious/broken peer can't OOM us with an unbounded body (ORT
+	// tarballs are tens of MB; a real one over the cap just fails the checksum).
+	const maxORTBytes = 256 << 20 // 256 MiB
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxORTBytes))
+	if err != nil {
+		return fmt.Errorf("read ORT: %w", err)
+	}
+	if err := verifyORT(pkg, body); err != nil {
+		return err
+	}
 	// Extract, stripping the leading "<pkg>/" component into modelsDir/onnxruntime.
-	return extractTarGz(resp.Body, filepath.Join(modelsDir, "onnxruntime"), pkg+"/")
+	return extractTarGz(bytes.NewReader(body), filepath.Join(modelsDir, "onnxruntime"), pkg+"/")
 }
 
 func extractTarGz(r io.Reader, destDir, stripPrefix string) error {
