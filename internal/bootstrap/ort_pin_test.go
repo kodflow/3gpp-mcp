@@ -22,13 +22,14 @@ func TestVerifyORT(t *testing.T) {
 		t.Fatal("missing pin must fail closed (refuse unverified native lib)")
 	}
 
-	// The shipped pins are 64-hex sha256 strings.
+	// The shipped pins are real 32-byte (64 hex char) sha256 digests.
 	for pkg, h := range ortSHA256 {
 		if pkg == "pkg-under-test" {
 			continue
 		}
-		if len(h) != 64 {
-			t.Errorf("pin %q is not a sha256: %q", pkg, h)
+		raw, err := hex.DecodeString(h)
+		if err != nil || len(raw) != sha256.Size {
+			t.Errorf("pin %q is not a sha256 hex digest: %q (err=%v)", pkg, h, err)
 		}
 	}
 }

@@ -124,8 +124,11 @@ func FetchORT(ctx context.Context, modelsDir, version string) error {
 		return fmt.Errorf("get ORT: status %s", resp.Status)
 	}
 	// Buffer + verify the sha256 BEFORE extracting: ORT is dlopen'd native code,
-	// so an unverified/tampered tarball is an RCE vector (fail closed).
-	body, err := io.ReadAll(resp.Body)
+	// so an unverified/tampered tarball is an RCE vector (fail closed). Cap the
+	// read so a malicious/broken peer can't OOM us with an unbounded body (ORT
+	// tarballs are tens of MB; a real one over the cap just fails the checksum).
+	const maxORTBytes = 256 << 20 // 256 MiB
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxORTBytes))
 	if err != nil {
 		return fmt.Errorf("read ORT: %w", err)
 	}
