@@ -43,9 +43,19 @@ case "$(uname -s)-$(uname -m)" in
 esac
 if [[ ! -f "$ORT_DIR/lib/$ORT_LIBNAME" ]]; then
   echo "→ ONNX Runtime $ORT_VERSION ($ORT_PKG)"
+  # ORT is dlopen'd native code → an unverified tarball is an RCE vector. Pin the
+  # sha256 per package (must match internal/bootstrap/models.go) and fail closed.
+  case "$ORT_PKG" in
+    onnxruntime-linux-x64-1.20.1)     ORT_SHA=67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105 ;;
+    onnxruntime-linux-aarch64-1.20.1) ORT_SHA=ae4fedbdc8c18d688c01306b4b50c63de3445cdf2dbd720e01a2fa3810b8106a ;;
+    onnxruntime-osx-arm64-1.20.1)     ORT_SHA=b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a ;;
+    onnxruntime-osx-x86_64-1.20.1)    ORT_SHA=0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78 ;;
+    *) echo "no pinned ORT checksum for $ORT_PKG (refusing an unverified native runtime)" >&2; exit 1 ;;
+  esac
   url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PKG}.tgz"
   tmp="$(mktemp -d)"
   dl "$url" "$tmp/ort.tgz"
+  echo "${ORT_SHA}  ${tmp}/ort.tgz" | sha256sum -c - || { echo "ORT checksum mismatch — refusing" >&2; rm -rf "$tmp"; exit 1; }
   tar -xzf "$tmp/ort.tgz" -C "$tmp"
   rm -rf "$ORT_DIR"; mv "$tmp/$ORT_PKG" "$ORT_DIR"
   rm -rf "$tmp"
