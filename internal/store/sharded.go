@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -41,7 +43,11 @@ func (s *Store) AttachShards(ctx context.Context, paths []string) ([]string, err
 func (s *Store) ShardsCoherent(ctx context.Context, aliases []string, wantModel string) (bool, string) {
 	for _, a := range aliases {
 		var m string
-		_ = s.db.QueryRowContext(ctx, "SELECT value FROM "+a+".schema_meta WHERE key = 'embedding_model'").Scan(&m)
+		err := s.db.QueryRowContext(ctx, "SELECT value FROM "+a+".schema_meta WHERE key = 'embedding_model'").Scan(&m)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			// Can't read the marker → fail closed (don't route to an unverifiable shard).
+			return false, fmt.Sprintf("%s: read embedding_model: %v", a, err)
+		}
 		if m != wantModel {
 			return false, fmt.Sprintf("%s embedding_model=%q != client %q", a, m, wantModel)
 		}

@@ -163,7 +163,7 @@ func serve(args []string) error {
 			} else if ok, why := st.ShardsCoherent(ctx, aliases, emb.ModelID()); !ok {
 				// Coherence guard for Option B: a sub-base built with a different
 				// model than the client would yield silently-wrong cosine scores.
-				fmt.Fprintf(os.Stderr, "[3gpp-mcp] semantic disabled: sub-base/client model mismatch (%s)\n", why)
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option-B sub-bases ignored (single-DB/lexical vectors): model mismatch (%s)\n", why)
 			} else {
 				vecShards = aliases
 				fmt.Fprintf(os.Stderr, "[3gpp-mcp] Option B: %d vector sub-bases attached\n", len(aliases))
