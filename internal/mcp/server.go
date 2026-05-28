@@ -27,8 +27,12 @@ import (
 // the release every answer is scoped to ("Rel-17"); empty means "latest". When
 // set, get_spec returns the baseline content plus an annex of what later
 // releases add (so the user is always told newer releases extend the answer).
-func New(st *store.Store, version, baseline string) *server.MCPServer {
+// vecShards (optional) are attached sub-base aliases from store.AttachShards —
+// when present, the vector arm runs the Option-B scatter-gather over them
+// instead of the single-DB HNSW.
+func New(st *store.Store, version, baseline string, vecShards []string) *server.MCPServer {
 	eng := search.New(st)
+	eng.UseVectorShards(vecShards)
 	scope := "latest release"
 	if baseline != "" {
 		scope = baseline + " (baseline norm; later-release additions surfaced as an annex)"
