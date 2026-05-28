@@ -91,7 +91,7 @@ func TestLIEventsPerNF_E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = store0.Close() }()
-	srv := mcpsrv.New(store0, "e2e", "")
+	srv := mcpsrv.New(store0, "e2e", "", nil)
 
 	c, err := client.NewInProcessClient(srv)
 	if err != nil {
