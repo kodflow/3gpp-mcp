@@ -73,9 +73,10 @@ func Classify(q string) Intent {
 // Engine ties the router to the store, the (optional) embedder, and the
 // (optional) reranker.
 type Engine struct {
-	st  *store.Store
-	emb embed.Embedder
-	rr  rerank.Reranker
+	st        *store.Store
+	emb       embed.Embedder
+	rr        rerank.Reranker
+	vecShards []string // Option B: attached sub-base aliases; empty = single-DB vectors
 }
 
 // New builds an Engine over a store, picking the embedder + reranker from the
@@ -83,6 +84,11 @@ type Engine struct {
 func New(st *store.Store) *Engine {
 	return &Engine{st: st, emb: embed.New(), rr: rerank.New()}
 }
+
+// UseVectorShards routes the vector arm through the scatter-gather over these
+// attached sub-base aliases (Option B) instead of the single-DB HNSW. Pass the
+// aliases returned by store.AttachShards; empty restores single-DB behaviour.
+func (e *Engine) UseVectorShards(aliases []string) { e.vecShards = aliases }
 
 // EmbedderEnabled reports whether this engine can vectorise a query (so the
 // server can tell, and report, whether semantic search is actually reachable).
@@ -125,9 +131,13 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		if vecs, err := e.emb.Embed(ctx, []string{r.Text}); err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
-			if e.st.VSSAvailable() {
-				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // HNSW fast path
-			} else {
+			switch {
+			case len(e.vecShards) > 0:
+				// Option B: scatter-gather across the attached per-series sub-bases.
+				vhits, verr = e.st.SearchVectorsSharded(ctx, vecs[0], e.vecShards, r.Filter, topK)
+			case e.st.VSSAvailable():
+				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // single-DB HNSW
+			default:
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
 				// never a full-corpus scan.
 				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
