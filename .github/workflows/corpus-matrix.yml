@@ -116,7 +116,10 @@ jobs:
         if: github.event.inputs.embed == 'true'
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
-          if gh release download models --repo "$GITHUB_REPOSITORY" -p models.tar.zst.sha256 -D /tmp 2>/dev/null; then
+          # Skip only if the actual bundle asset exists (not just its sidecar — a
+          # prior run could have uploaded the .sha256 then failed before the bundle).
+          if gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '.assets[].name' 2>/dev/null | grep -qx 'models.tar.zst'; then
             echo "model bundle already on the 'models' release — skipping HF fetch"; exit 0
           fi
           ./scripts/fetch-model.sh
