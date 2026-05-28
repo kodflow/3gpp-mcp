@@ -63,6 +63,24 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	folds := inputs
 	incremental := base != ""
 	if incremental {
+		// Invariant #2 (plan §15): a delta is only valid if the base was built by
+		// the SAME indexing pipeline. If pipeline_version differs (parser/chunking/
+		// schema/embedding-model change), the base is incompatible → rebuild fresh.
+		if len(inputs) > 0 {
+			basePV := metaValue(ctx, sqldb, base, "pipeline_version")
+			// All shards in one run come from the same ingest build, so they share a
+			// pipeline_version; inputs[0] is representative of "the current pipeline".
+			shardPV := metaValue(ctx, sqldb, inputs[0], "pipeline_version")
+			// Strict compare: "" is a distinct value, so a base that predates
+			// pipeline_version (basePV=="") vs a versioned shard is a mismatch and is
+			// rebuilt. Only when BOTH are empty (all pre-feature) do we reuse the base.
+			if basePV != shardPV {
+				fmt.Fprintf(os.Stderr, "[merge] pipeline_version mismatch (base=%q shard=%q) — full rebuild, ignoring --base\n", basePV, shardPV)
+				incremental = false
+			}
+		}
+	}
+	if incremental {
 		folds = append([]string{base}, inputs...)
 	}
 
@@ -112,6 +130,20 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		fmt.Fprintf(os.Stderr, "[merge] index: %s — %d specs\n", indexOut, n)
 	}
 	return nil
+}
+
+// metaValue reads one schema_meta value from a DuckDB file (attach read-only →
+// select → detach). Returns "" on any error or missing key. Used to compare the
+// base's pipeline_version against an incoming shard's.
+func metaValue(ctx context.Context, sqldb *sql.DB, path, key string) string {
+	attach := "ATTACH '" + strings.ReplaceAll(path, "'", "''") + "' AS mv (READ_ONLY)"
+	if _, err := sqldb.ExecContext(ctx, attach); err != nil {
+		return ""
+	}
+	defer func() { _, _ = sqldb.ExecContext(ctx, "DETACH mv") }()
+	var v string
+	_ = sqldb.QueryRowContext(ctx, "SELECT value FROM mv.schema_meta WHERE key = ?", key).Scan(&v)
+	return v
 }
 
 // writeIndex emits corpus-index.json = {spec_id: latest version}, the small
