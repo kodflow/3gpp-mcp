@@ -18,11 +18,13 @@ package embed
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/pretrained"
@@ -129,6 +131,55 @@ func (e *onnxEmbedder) embedWindowed(texts []string) ([][]float32, error) {
 	return out, nil
 }
 
+// safePrefix returns up to n bytes of s on a valid UTF-8 boundary — used to
+// log a snippet of an input that crashed the tokenizer without injecting raw
+// invalid sequences into the log.
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// tokenizeSafe runs the BGE-M3 tokenizer with a recover net: sugarme/tokenizer
+// v0.3.0 panics with "slice bounds out of range" on some inputs in the
+// Metaspace pretokenizer (off-by-one in byte→char range translation). Rather
+// than blow up the whole shard for a single clause, we log the offender and
+// fall back to a single space — which always tokenizes to [CLS] [SEP] (or
+// equivalent) and produces a valid, near-zero vector. The downstream consumer
+// keeps the row (no NULL embedding); it simply won't rank meaningfully in
+// vector search but lexical (BM25) still indexes it.
+func (e *onnxEmbedder) tokenizeSafe(text string) []int {
+	var ids []int
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("embed: tokenizer panic on input len=%d, prefix=%q: %v — falling back to single space",
+					len(text), safePrefix(text, 80), r)
+				enc, ferr := e.tok.EncodeSingle(" ", true)
+				if ferr == nil {
+					ids = enc.Ids
+				}
+			}
+		}()
+		enc, err := e.tok.EncodeSingle(text, true)
+		if err != nil {
+			log.Printf("embed: tokenize error on input len=%d: %v — falling back to single space", len(text), err)
+			enc2, ferr := e.tok.EncodeSingle(" ", true)
+			if ferr == nil {
+				ids = enc2.Ids
+			}
+			return
+		}
+		ids = enc.Ids
+	}()
+	return ids
+}
+
 // embedBatch embeds one batch (len <= batchSize) into dst (same length). It
 // pads every row to the batch's longest sequence and lets attention_mask zero
 // the padding, so batching never changes a vector — only the throughput.
@@ -138,11 +189,7 @@ func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, t := range texts {
-		enc, err := e.tok.EncodeSingle(t, true)
-		if err != nil {
-			return fmt.Errorf("tokenize: %w", err)
-		}
-		ids := enc.Ids
+		ids := e.tokenizeSafe(t)
 		if len(ids) > maxTokens {
 			ids = ids[:maxTokens]
 		}
