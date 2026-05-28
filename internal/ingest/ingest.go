@@ -241,6 +241,12 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	if err := db.SetMeta("convert_dir", opt.ConvertDir); err != nil {
 		return st, err
 	}
+	// Stamp the indexing pipeline version so a delta merge can detect an
+	// incompatible base (different parser/chunking/schema/embedding model) and
+	// rebuild from scratch instead of mixing mechanics (plan §15 invariant #2).
+	if err := db.SetMeta("pipeline_version", model.PipelineVersion(opt.Embedder.ModelID())); err != nil {
+		return st, err
+	}
 	if opt.EnableFTS {
 		if err := db.EnableFTS(ctx); err != nil {
 			logf("FTS unavailable, lexical search degrades to LIKE: %v", err)
