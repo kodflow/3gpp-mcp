@@ -59,7 +59,9 @@ fi
 #    the previous version had: it fetched only model.onnx.
 # ---------------------------------------------------------------------------
 BGE_DIR="$MODELS/bge-m3"
-BGE_BASE="https://huggingface.co/BAAI/bge-m3/resolve/main"
+# Pinned to an immutable commit SHA (not /resolve/main) — must match the Go
+# bootstrap pins in internal/bootstrap/models.go (supply-chain reproducibility).
+BGE_BASE="https://huggingface.co/BAAI/bge-m3/resolve/5617a9f61b028005a4858fdac845db406aefb181"
 mkdir -p "$BGE_DIR"
 echo "→ BGE-M3 ONNX + external weights (~2.3 GB) from HuggingFace"
 dl "$BGE_BASE/onnx/model.onnx"             "$BGE_DIR/model.onnx"
@@ -76,14 +78,14 @@ dl "$BGE_BASE/tokenizer.json"              "$BGE_DIR/tokenizer.json"
 # ---------------------------------------------------------------------------
 if [[ "${WITH_RERANKER:-0}" == "1" ]]; then
   RR_DIR="$MODELS/bge-reranker-v2-m3"
-  RR_BASE="https://huggingface.co/celinehoang/bge-reranker-v2-m3-onnx/resolve/main"
+  RR_BASE="https://huggingface.co/celinehoang/bge-reranker-v2-m3-onnx/resolve/87449985a27bbd817f13ee2338df130bdb532bad"
   RERANKER_ONNX_URL="${RERANKER_ONNX_URL:-$RR_BASE/model.onnx}"
   RERANKER_DATA_URL="${RERANKER_DATA_URL:-$RR_BASE/model.onnx_data}"
   mkdir -p "$RR_DIR"
   echo "→ bge-reranker-v2-m3 ONNX + weights (~2.3 GB)"
   dl "$RERANKER_ONNX_URL" "$RR_DIR/model.onnx"
   dl "$RERANKER_DATA_URL" "$RR_DIR/model.onnx_data"
-  dl "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/tokenizer.json" "$RR_DIR/tokenizer.json"
+  dl "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e/tokenizer.json" "$RR_DIR/tokenizer.json"
 fi
 
 echo "✓ models ready in $MODELS"
