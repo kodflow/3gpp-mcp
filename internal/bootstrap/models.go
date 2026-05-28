@@ -44,10 +44,18 @@ func verifyORT(pkg string, data []byte) error {
 // DefaultORTVersion matches onnxruntime_go v1.14.0 (ORT C API 20).
 const DefaultORTVersion = "1.20.1"
 
+// HF model sources are pinned to immutable commit SHAs (not the mutable
+// `/resolve/main` ref): an upstream re-export can't silently swap the weights
+// under us, and the downloaded vectors stay reproducible. Bump the SHA
+// deliberately (and re-verify) when intentionally updating a model.
 const (
-	bgeBase      = "https://huggingface.co/BAAI/bge-m3/resolve/main"
-	rerankBase   = "https://huggingface.co/celinehoang/bge-reranker-v2-m3-onnx/resolve/main"
-	rerankTokURL = "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/tokenizer.json"
+	bgeCommit       = "5617a9f61b028005a4858fdac845db406aefb181" // BAAI/bge-m3
+	rerankCommit    = "87449985a27bbd817f13ee2338df130bdb532bad" // celinehoang/bge-reranker-v2-m3-onnx
+	rerankTokCommit = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e" // BAAI/bge-reranker-v2-m3 (tokenizer)
+
+	bgeBase      = "https://huggingface.co/BAAI/bge-m3/resolve/" + bgeCommit
+	rerankBase   = "https://huggingface.co/celinehoang/bge-reranker-v2-m3-onnx/resolve/" + rerankCommit
+	rerankTokURL = "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/" + rerankTokCommit + "/tokenizer.json"
 )
 
 // EmbedderArtifacts are the BGE-M3 files (graph + external weights + tokenizer)
