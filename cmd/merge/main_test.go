@@ -86,7 +86,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	})
 
 	// Incremental merge: base + shardA + shardB. FTS off (no extension under test).
-	if err := run(ctx, out, []string{shardA, shardB}, false, "", base); err != nil {
+	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -142,5 +142,59 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	_ = db.QueryRowContext(ctx, `SELECT count(DISTINCT split_part(to_version,'.',1)) FROM changes WHERE spec_id='32.298'`).Scan(&crMajors)
 	if crMajors != 4 {
 		t.Errorf("want 4 distinct to_version majors for 32.298, got %d", crMajors)
+	}
+}
+
+// TestStripEmbeddings verifies that the --strip-embeddings flag DROPs the
+// embedding column from the merged DB (so the lexical 'latest' release asset
+// stays under the 2 GB GitHub cap when embed=true is in flight and shards
+// carry FLOAT[1024] vectors). The vectorised channel is publish-vec on GHCR.
+func TestStripEmbeddings(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	shard := filepath.Join(dir, "shard.duckdb")
+	out := filepath.Join(dir, "merged.duckdb")
+
+	// Build a shard carrying a populated embedding (the realistic case).
+	buildShard(t, shard, func(st *store.Store) {
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.0.0", "5.1.1")})
+		// SetEmbedding writes a non-NULL vector — strip must then DROP the whole column.
+		v := make([]float32, 1024)
+		v[0] = 0.42
+		_ = st.SetEmbedding(ctx, 1, v)
+		_ = st.SetMeta("embedding_model", "bge-m3")
+		_ = st.SetMeta("embedding_dim", "1024")
+		_ = st.SetMeta("embedding_count", "1")
+	})
+
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.OpenReadOnly(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	db := st.DB()
+
+	// Embedding column gone — query must fail.
+	if _, err := db.QueryContext(ctx, `SELECT embedding FROM clauses LIMIT 1`); err == nil {
+		t.Fatal("embedding column survived --strip-embeddings (lexical artifact would carry vectors)")
+	}
+	// Lexical surface intact: clauses still selectable; spec still present.
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("clauses lost after strip: n=%d err=%v", n, err)
+	}
+	// Vector-specific meta keys gone (the slim DB must not claim semantic capability).
+	for _, k := range []string{"embedding_model", "embedding_dim", "embedding_count", "hnsw_state"} {
+		var v string
+		_ = db.QueryRowContext(ctx, `SELECT value FROM schema_meta WHERE key = ?`, k).Scan(&v)
+		if v != "" {
+			t.Errorf("meta %q = %q survived --strip-embeddings", k, v)
+		}
 	}
 }

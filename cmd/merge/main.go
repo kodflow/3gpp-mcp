@@ -32,19 +32,21 @@ func main() {
 	fts := flag.Bool("fts", true, "rebuild the BM25 FTS index on the merged DB")
 	indexOut := flag.String("index-out", "", "also write a corpus-index.json (spec_id -> latest version) for incremental discover")
 	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
+	stripEmbeddings := flag.Bool("strip-embeddings", false,
+		"after merge, DROP COLUMN embedding so the GitHub Release asset stays slim (vectors live in the GHCR per-series sub-bases)")
 	flag.Parse()
 	inputs := flag.Args()
 	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "merge: no input DBs given")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base); err != nil {
+	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings); err != nil {
 		fmt.Fprintln(os.Stderr, "merge:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string) error {
+func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool) error {
 	_ = os.Remove(out)
 	db, err := store.Open(out)
 	if err != nil {
@@ -112,6 +114,22 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		fmt.Fprintf(os.Stderr, "[merge] folded %s\n", in)
 	}
 
+	// Strip vectors BEFORE the FTS rebuild + before counting/index-out, so the
+	// downstream artifact (e.g. the `latest` GitHub Release asset, capped at 2 GB)
+	// only carries the lexical surface. The per-series vectorised sub-bases
+	// (with their HNSW) are distributed separately on GHCR by `publish-vec` —
+	// this strip keeps the lexical channel slim while embed=true is in flight.
+	if stripEmbeddings {
+		if err := stripEmbeddingColumn(ctx, sqldb); err != nil {
+			return fmt.Errorf("strip embeddings: %w", err)
+		}
+		// Drop any leftover meta that's vector-specific so the slim DB doesn't
+		// claim semantic capability the consumer can't realise.
+		_, _ = sqldb.ExecContext(ctx, `DELETE FROM schema_meta WHERE key IN ('embedding_model','embedding_dim','embedding_count','hnsw_state')`)
+		// Reclaim space so the .duckdb file shrinks before zstd.
+		_, _ = sqldb.ExecContext(ctx, `CHECKPOINT`)
+		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
+	}
 	if fts {
 		if err := db.EnableFTS(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "[merge] FTS unavailable (lexical degrades to LIKE): %v\n", err)
@@ -382,4 +400,46 @@ func cols(ctx context.Context, sqldb *sql.DB, rel string) ([]string, error) {
 		}
 	}
 	return out, rows.Err()
+}
+
+// stripEmbeddingColumn removes the FLOAT[1024] `embedding` column from `clauses`.
+//
+// DuckDB refuses ALTER TABLE … DROP COLUMN as soon as ANY index references the
+// table (it errors with "Dependency Error" even when the indexed columns are
+// unrelated — conservative engine policy). The portable way out is the classic
+// CREATE-AS-SELECT + RENAME swap: build the slim copy, drop the old table, then
+// rename the slim into place. SELECT … EXCLUDE (embedding) is supported on
+// DuckDB ≥ 0.8 and avoids enumerating every other column by hand.
+func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
+	// 1. Drop any indices that mention `embedding` (only the HNSW one), and the
+	//    secondary indices we re-create afterwards. The HNSW index would otherwise
+	//    re-build over the column we're about to drop.
+	for _, idx := range []string{"clauses_hnsw", "clauses_spec", "clauses_rel", "clauses_path"} {
+		_, _ = sqldb.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx)
+	}
+	// 2. Slim copy: same rows, every column EXCEPT embedding.
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding) FROM clauses`); err != nil {
+		return fmt.Errorf("create clauses_slim: %w", err)
+	}
+	// 3. Swap.
+	if _, err := sqldb.ExecContext(ctx, `DROP TABLE clauses`); err != nil {
+		return fmt.Errorf("drop old clauses: %w", err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `ALTER TABLE clauses_slim RENAME TO clauses`); err != nil {
+		return fmt.Errorf("rename clauses_slim: %w", err)
+	}
+	// 4. Re-create the lexical indices the schema.sql guarantees. (PK on chunk_id
+	//    is dropped by the CREATE-AS-SELECT path; queries don't rely on the PK
+	//    being declared at the DDL level — chunk_id is already unique by ingest
+	//    construction — so we skip re-asserting it here to keep DuckDB happy.)
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS clauses_spec ON clauses (spec_id)`,
+		`CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release)`,
+		`CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path)`,
+	} {
+		if _, err := sqldb.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("recreate index: %w", err)
+		}
+	}
+	return nil
 }
