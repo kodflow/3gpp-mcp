@@ -55,6 +55,35 @@ env:
   ORT_VERSION: "1.26.0"
 
 jobs:
+  # ---- 0. preflight: ORT_VERSION must be IDENTICAL across YAML / Go / shell.
+  # The manual 3-way coupling is exactly the failure mode #41 tries to prevent
+  # at the bundle-cache layer — so we fail-closed at the source. Cheap (<5 s).
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: ORT_VERSION sync (YAML env vs Go const vs shell default)
+        run: |
+          set -eu
+          wf="${ORT_VERSION}"
+          # const DefaultORTVersion = "1.26.0"
+          go_=$(grep -oE 'DefaultORTVersion = "[^"]+"' internal/bootstrap/models.go \
+                | head -1 | grep -oE '"[^"]+"' | tr -d '"')
+          # ORT_VERSION="${ORT_VERSION:-1.26.0}"
+          sh_=$(grep -oE 'ORT_VERSION:-[0-9][^}]+' scripts/fetch-model.sh \
+                | head -1 | sed 's/^ORT_VERSION:-//')
+          if [ -z "$wf" ] || [ -z "$go_" ] || [ -z "$sh_" ]; then
+            echo "::error::could not extract ORT_VERSION (workflow=$wf go=$go_ shell=$sh_)"; exit 1
+          fi
+          if [ "$wf" != "$go_" ] || [ "$wf" != "$sh_" ]; then
+            echo "::error::ORT_VERSION desync — workflow=$wf, internal/bootstrap/models.go=$go_, scripts/fetch-model.sh=$sh_"
+            echo "::error::bump all three TOGETHER (see comment near env: ORT_VERSION)"
+            exit 1
+          fi
+          echo "OK: ORT_VERSION=$wf (uniform across YAML/Go/shell)"
+
   # ---- 1. dynamic, delta-sized discovery → matrix --------------------------
   discover:
     runs-on: ubuntu-latest
@@ -102,7 +131,7 @@ jobs:
   # instead of each hammering HF (~70 GB → 2.3 GB). Always SUCCEEDS (no-op when
   # embed=false) so build-shard can `needs:` it without the skipped-dependency trap.
   model:
-    needs: discover
+    needs: [preflight, discover]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -121,12 +150,16 @@ jobs:
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
           BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
-          # Skip only if the EXACT versioned bundle exists (a bump to ORT_VERSION
-          # / fetch-model.sh auto-invalidates the prior bundle because its name
-          # encodes the version — no manual cleanup of stale bundles needed).
-          if gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
-               --jq '.assets[].name' 2>/dev/null | grep -qx "$BUNDLE"; then
-            echo "model bundle $BUNDLE already on the 'models' release — skipping HF fetch"; exit 0
+          # Skip only if BOTH the bundle AND its sha256 sidecar are present
+          # (restore enforces the checksum — a release with the bundle but
+          # without .sha256 would reliably break every shard). grep -Fqx for a
+          # literal match: $BUNDLE contains regex-metacharacter dots that would
+          # otherwise wildcard-match `models-ortX1X26X0Xtar.zst` etc.
+          ASSETS=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
+                     --jq '.assets[].name' 2>/dev/null || true)
+          if printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE" \
+             && printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE.sha256"; then
+            echo "model bundle $BUNDLE + sha256 already on the 'models' release — skipping HF fetch"; exit 0
           fi
           ./scripts/fetch-model.sh
           tar -C data/models -cf - . | zstd -19 -T0 -o "$BUNDLE"
@@ -170,14 +203,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
           BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
-          # Restore only the version-keyed bundle: a prior run with a different
-          # ORT_VERSION left an obsolete bundle whose API doesn't match the linked
-          # onnxruntime_go. The fallback re-fetches from HF for the current pin.
-          if gh release download models --repo "$GITHUB_REPOSITORY" -p "${BUNDLE}*" -D . 2>/dev/null; then
-            sha256sum -c "$BUNDLE.sha256"
-            zstd -d "$BUNDLE" -c | tar -C data/models -xf -
-          else
-            ./scripts/fetch-model.sh   # fallback: direct HF fetch (model job didn't publish)
+          # Restore only the version-keyed bundle. ANY failure along the
+          # download/verify/extract path falls back to a direct HF fetch — a
+          # partial upload (only .sha256), a truncated bundle, or a checksum
+          # mismatch was previously turning a recoverable cache miss into a
+          # hard CI failure (the verify/extract sat inside the `then` branch).
+          # Note: we ask for both assets EXPLICITLY (not a glob): if only
+          # .sha256 is present the download still succeeds, but the subsequent
+          # `-f "$BUNDLE"` guard sends us to the fallback.
+          restore_ok=0
+          if gh release download models --repo "$GITHUB_REPOSITORY" \
+                -p "$BUNDLE" -p "$BUNDLE.sha256" -D . 2>/dev/null \
+             && [ -f "$BUNDLE" ] && [ -f "$BUNDLE.sha256" ] \
+             && sha256sum -c "$BUNDLE.sha256" \
+             && zstd -d "$BUNDLE" -c | tar -C data/models -xf -; then
+            restore_ok=1
+          fi
+          if [ "$restore_ok" -eq 0 ]; then
+            echo "::notice::bundle restore failed (missing/corrupt asset) → falling back to direct HF fetch"
+            rm -f "$BUNDLE" "$BUNDLE.sha256"
+            ./scripts/fetch-model.sh
           fi
       - name: Download + convert series ${{ matrix.series }}
         env:
