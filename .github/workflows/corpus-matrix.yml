@@ -53,6 +53,14 @@ env:
   # internal/bootstrap/models.go (and scripts/fetch-model.sh). Embedded in the
   # cached model bundle filename so a bump auto-invalidates a stale bundle.
   ORT_VERSION: "1.26.0"
+  # Pinned HuggingFace commit SHAs — MUST match the bgeCommit / rerankCommit
+  # constants in internal/bootstrap/models.go and the URLs in
+  # scripts/fetch-model.sh. The first 8 hex chars are embedded in the per-
+  # component asset filenames, so bumping a SHA auto-invalidates the cached
+  # asset on the 'models' release. preflight (job below) verifies all three
+  # places stay in lockstep.
+  BGE_COMMIT: "5617a9f61b028005a4858fdac845db406aefb181"
+  RERANK_COMMIT: "87449985a27bbd817f13ee2338df130bdb532bad"
 
 jobs:
   # ---- 0. preflight: ORT_VERSION must be IDENTICAL across YAML / Go / shell.
@@ -64,25 +72,41 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
-      - name: ORT_VERSION sync (YAML env vs Go const vs shell default)
+      - name: Pin sync — ORT_VERSION + HF commit SHAs (YAML env vs Go vs shell)
         run: |
           set -eu
-          wf="${ORT_VERSION}"
-          # const DefaultORTVersion = "1.26.0"
-          go_=$(grep -oE 'DefaultORTVersion = "[^"]+"' internal/bootstrap/models.go \
-                | head -1 | grep -oE '"[^"]+"' | tr -d '"')
-          # ORT_VERSION="${ORT_VERSION:-1.26.0}"
-          sh_=$(grep -oE 'ORT_VERSION:-[0-9][^}]+' scripts/fetch-model.sh \
-                | head -1 | sed 's/^ORT_VERSION:-//')
-          if [ -z "$wf" ] || [ -z "$go_" ] || [ -z "$sh_" ]; then
-            echo "::error::could not extract ORT_VERSION (workflow=$wf go=$go_ shell=$sh_)"; exit 1
+          # check_pin <name> <yaml-value> <go-regex> <shell-regex>
+          #   Extracts the same value from internal/bootstrap/models.go and
+          #   scripts/fetch-model.sh, compares the trio. Fails CLOSED so a
+          #   silent drift never reaches the model-bundle build (a drifted
+          #   commit SHA would otherwise reuse a stale cached asset under the
+          #   same fixed name and never re-fetch — exactly the bug PR #45
+          #   addresses at the cache-key level).
+          check_pin() {
+            local name="$1" wf="$2" go_re="$3" sh_re="$4"
+            local go_ sh_
+            go_=$(grep -oE "$go_re" internal/bootstrap/models.go | head -1 | grep -oE '"[^"]+"' | tr -d '"')
+            sh_=$(grep -oE "$sh_re" scripts/fetch-model.sh | head -1 | grep -oE '[A-Za-z0-9._-]{8,}' | tail -1)
+            if [ -z "$wf" ] || [ -z "$go_" ] || [ -z "$sh_" ]; then
+              echo "::error::could not extract $name (workflow=$wf go=$go_ shell=$sh_)"; return 1
+            fi
+            if [ "$wf" != "$go_" ] || [ "$wf" != "$sh_" ]; then
+              echo "::error::$name desync — workflow=$wf, models.go=$go_, fetch-model.sh=$sh_"
+              echo "::error::bump all three TOGETHER (see comment near env: $name)"
+              return 1
+            fi
+            echo "OK: $name=$wf (uniform across YAML/Go/shell)"
+          }
+          # ORT_VERSION: numeric default in fetch-model.sh, const in Go.
+          ort_sh=$(grep -oE 'ORT_VERSION:-[0-9][^}]+' scripts/fetch-model.sh | head -1 | sed 's/^ORT_VERSION:-//')
+          if [ "$ORT_VERSION" != "$(grep -oE 'DefaultORTVersion = "[^"]+"' internal/bootstrap/models.go | head -1 | grep -oE '"[^"]+"' | tr -d '"')" ] \
+             || [ "$ORT_VERSION" != "$ort_sh" ]; then
+            echo "::error::ORT_VERSION desync"; exit 1
           fi
-          if [ "$wf" != "$go_" ] || [ "$wf" != "$sh_" ]; then
-            echo "::error::ORT_VERSION desync — workflow=$wf, internal/bootstrap/models.go=$go_, scripts/fetch-model.sh=$sh_"
-            echo "::error::bump all three TOGETHER (see comment near env: ORT_VERSION)"
-            exit 1
-          fi
-          echo "OK: ORT_VERSION=$wf (uniform across YAML/Go/shell)"
+          echo "OK: ORT_VERSION=$ORT_VERSION"
+          # HF commits: 40-hex sha pinned in 3 places (Go const, shell URL, YAML env).
+          check_pin "BGE_COMMIT"    "$BGE_COMMIT"    'bgeCommit\s*=\s*"[0-9a-f]+"'    'BAAI/bge-m3/resolve/[0-9a-f]+'
+          check_pin "RERANK_COMMIT" "$RERANK_COMMIT" 'rerankCommit\s*=\s*"[0-9a-f]+"' 'celinehoang/bge-reranker-v2-m3-onnx/resolve/[0-9a-f]+'
 
   # ---- 1. dynamic, delta-sized discovery → matrix --------------------------
   discover:
@@ -145,48 +169,96 @@ jobs:
         if: github.event.inputs.embed == 'true'
         with:
           persist-credentials: false
-      - name: Build + publish the model bundle (idempotent, version-keyed, reranker-aware)
+      - name: Build + publish the model bundle (idempotent, version-keyed, per-component)
         if: github.event.inputs.embed == 'true'
         env:
           # Bundle the cross-encoder reranker alongside the embedder so the
           # build-shard ingest can fully populate the rerank path. Toggle off
-          # only if disk-pressure on the runner becomes a real problem (the
-          # reranker adds ~2.3 GB to the bundle).
+          # only if disk-pressure on the runner becomes a real problem.
           WITH_RERANKER: "1"
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
-          # Bundle name encodes BOTH the ORT version AND the reranker presence:
-          # bumping either invalidates the cache, no manual cleanup needed.
-          suffix=""
-          [ "${WITH_RERANKER:-0}" = "1" ] && suffix="-rerank"
-          BUNDLE="models-ort-${ORT_VERSION}${suffix}.tar.zst"
-          # Skip only if BOTH the bundle AND its sha256 sidecar are present
-          # (restore enforces the checksum — a release with the bundle but
-          # without .sha256 would reliably break every shard). grep -Fqx for a
-          # literal match: $BUNDLE contains regex-metacharacter dots that would
-          # otherwise wildcard-match `models-ortX1X26X0Xtar.zst` etc.
-          # Emit the resolved bundle name UNCONDITIONALLY (both cache-hit and
-          # cache-miss paths exit through here) — the build-shard restore reads
-          # it via needs.model.outputs.bundle_name. Doing this BEFORE either
-          # `exit 0` (cache hit) or the upload means the downstream job never
-          # gets an empty string and never has to guess the suffix.
-          echo "BUNDLE=$BUNDLE" >> "$GITHUB_OUTPUT"
-          ASSETS=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
+          # GitHub Release assets are CAPPED at 2 GiB (HTTP 422 "size must be less
+          # than 2147483648"). A single tarball of BGE-M3 + reranker + ORT is
+          # 3.16 GiB compressed (6.4 GiB raw). The fix is to split along the
+          # natural component boundaries — each .tar.zst stays well under the cap
+          # and the consumer can skip pieces (e.g. when WITH_RERANKER toggles off
+          # in the future, the build-shard restore just doesn't pull rerank.tar.zst).
+          #
+          # Component-keyed names embed BOTH ORT_VERSION (binding API) AND the
+          # commit-SHA-pinned model version (deterministic upstream content), so a
+          # bump on either side auto-invalidates the cache — no manual cleanup.
+          # Cache key encodes the upstream commit SHA (8-hex prefix) so a bump
+          # of bgeCommit / rerankCommit (verified in preflight to match Go +
+          # shell) auto-invalidates the cached asset — no risk of restoring
+          # stale model contents under the same filename (Qodo Bug #45).
+          ORT_ASSET="ort-${ORT_VERSION}.tar.zst"
+          BGE_ASSET="bge-m3-${BGE_COMMIT:0:8}.tar.zst"
+          RERANK_ASSET="bge-reranker-v2-m3-${RERANK_COMMIT:0:8}.tar.zst"
+          ASSETS_NEEDED=("$ORT_ASSET" "$BGE_ASSET")
+          [ "${WITH_RERANKER:-0}" = "1" ] && ASSETS_NEEDED+=("$RERANK_ASSET")
+          # Export the asset names BEFORE any exit path so build-shard's restore
+          # step has a stable contract regardless of cache hit vs miss.
+          {
+            echo "ORT_ASSET=$ORT_ASSET"
+            echo "BGE_ASSET=$BGE_ASSET"
+            echo "RERANK_ASSET=$RERANK_ASSET"
+            echo "WITH_RERANKER=${WITH_RERANKER:-0}"
+          } >> "$GITHUB_OUTPUT"
+          # Cache-hit: every asset + its .sha256 sidecar present (restore enforces
+          # the checksum). grep -Fqx for literal matching — asset names contain
+          # regex-meta dots that would otherwise wildcard-match.
+          PRESENT=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
                      --jq '.assets[].name' 2>/dev/null || true)
-          if printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE" \
-             && printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE.sha256"; then
-            echo "model bundle $BUNDLE + sha256 already on the 'models' release — skipping HF fetch"; exit 0
+          all_present=1
+          for a in "${ASSETS_NEEDED[@]}"; do
+            if ! printf '%s\n' "$PRESENT" | grep -Fqx "$a" \
+                || ! printf '%s\n' "$PRESENT" | grep -Fqx "$a.sha256"; then
+              all_present=0
+              break
+            fi
+          done
+          if [ "$all_present" = 1 ]; then
+            echo "all model components + sha256 already on the 'models' release — skipping HF fetch"
+            exit 0
           fi
           ./scripts/fetch-model.sh  # honours WITH_RERANKER above
-          tar -C data/models -cf - . | zstd -19 -T0 -o "$BUNDLE"
-          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+          # One .tar.zst per component. -19 high compression + -T0 multi-threaded.
+          # Each archive's payload (BGE ~2.3 GiB raw, reranker ~3.3 GiB raw, ORT
+          # ~70 MiB raw) compresses well under the 2 GiB GitHub cap.
+          tar -C data/models -cf - onnxruntime | zstd -19 -T0 -o "$ORT_ASSET"
+          tar -C data/models -cf - bge-m3      | zstd -19 -T0 -o "$BGE_ASSET"
+          sha256sum "$ORT_ASSET" > "$ORT_ASSET.sha256"
+          sha256sum "$BGE_ASSET" > "$BGE_ASSET.sha256"
+          UPLOAD=("$ORT_ASSET" "$ORT_ASSET.sha256" "$BGE_ASSET" "$BGE_ASSET.sha256")
+          if [ "${WITH_RERANKER:-0}" = "1" ]; then
+            tar -C data/models -cf - bge-reranker-v2-m3 | zstd -19 -T0 -o "$RERANK_ASSET"
+            sha256sum "$RERANK_ASSET" > "$RERANK_ASSET.sha256"
+            UPLOAD+=("$RERANK_ASSET" "$RERANK_ASSET.sha256")
+          fi
+          # Fail-loud BEFORE upload if any single component blows past the GitHub
+          # 2 GiB cap (e.g. a future model bump pushes one piece over the limit).
+          # Catching it here points at the offending component instead of an HTTP
+          # 422 deep in `gh release upload` after a long retry storm.
+          for a in "$ORT_ASSET" "$BGE_ASSET" "$RERANK_ASSET"; do
+            [ -e "$a" ] || continue
+            sz=$(stat -c %s "$a")
+            if [ "$sz" -ge 2147483648 ]; then
+              echo "::error::$a is $sz bytes (>= 2 GiB GitHub Release cap) — split this component"
+              exit 1
+            fi
+            printf '  %-40s %s bytes\n' "$a" "$sz"
+          done
           gh release view models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create models --repo "$GITHUB_REPOSITORY" --title models \
-              --notes "Pinned BGE-M3 + reranker + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
-          gh release upload models --repo "$GITHUB_REPOSITORY" "$BUNDLE" "$BUNDLE.sha256" --clobber
+              --notes "Per-component model bundle: ORT (binding-version keyed) + BGE-M3 + (optional) bge-reranker-v2-m3. Each component < 2 GiB GitHub Release cap. Commit-SHA pinned upstream."
+          gh release upload models --repo "$GITHUB_REPOSITORY" "${UPLOAD[@]}" --clobber
         id: bundle
     outputs:
-      bundle_name: ${{ steps.bundle.outputs.BUNDLE }}
+      ort_asset: ${{ steps.bundle.outputs.ORT_ASSET }}
+      bge_asset: ${{ steps.bundle.outputs.BGE_ASSET }}
+      rerank_asset: ${{ steps.bundle.outputs.RERANK_ASSET }}
+      with_reranker: ${{ steps.bundle.outputs.WITH_RERANKER }}
 
   # ---- 2. one shard per changed series (parallel) --------------------------
   build-shard:
@@ -220,47 +292,52 @@ jobs:
           else
             go build -trimpath -o bin/ingest ./cmd/ingest
           fi
-      - name: Restore model bundle from the 'models' release (semantic only)
+      - name: Restore model components from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          # The model job exports the exact bundle name (with `-rerank` suffix when
-          # the reranker is included). Falling back to the lexical-only name keeps
-          # this step working if a future toggle drops the reranker.
-          BUNDLE_NAME: ${{ needs.model.outputs.bundle_name }}
-          # Mirror the model job's reranker decision so the fallback HF fetch
-          # produces the SAME on-disk layout the bundle would have.
-          WITH_RERANKER: "1"
+          # Component names come from the model job (single source of truth). The
+          # fallbacks below MUST match the model job's naming rule exactly — they
+          # only kick in on a `needs.model.outputs.*` glitch (extremely unlikely
+          # given preflight gating); the real names always win.
+          ORT_ASSET: ${{ needs.model.outputs.ort_asset }}
+          BGE_ASSET: ${{ needs.model.outputs.bge_asset }}
+          RERANK_ASSET: ${{ needs.model.outputs.rerank_asset }}
+          # Whether the model job actually published the reranker — controls
+          # whether the restore here pulls it (and whether HF fallback fetches it).
+          WITH_RERANKER: ${{ needs.model.outputs.with_reranker || '1' }}
         run: |
           sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
-          # Fallback bundle name MUST mirror the model job's naming rule (suffix
-          # derived from WITH_RERANKER) — a hardcoded `-rerank` here would skew
-          # the restore if a future config drops the reranker. Real name from
-          # the upstream output stays the source of truth when present.
-          suffix=""
-          [ "${WITH_RERANKER:-0}" = "1" ] && suffix="-rerank"
-          BUNDLE="${BUNDLE_NAME:-models-ort-${ORT_VERSION}${suffix}.tar.zst}"
-          echo "restoring bundle: $BUNDLE"
-          # Restore only the version-keyed bundle. ANY failure along the
-          # download/verify/extract path falls back to a direct HF fetch — a
-          # partial upload (only .sha256), a truncated bundle, or a checksum
-          # mismatch was previously turning a recoverable cache miss into a
-          # hard CI failure (the verify/extract sat inside the `then` branch).
-          # Note: we ask for both assets EXPLICITLY (not a glob): if only
-          # .sha256 is present the download still succeeds, but the subsequent
-          # `-f "$BUNDLE"` guard sends us to the fallback.
-          restore_ok=0
-          if gh release download models --repo "$GITHUB_REPOSITORY" \
-                -p "$BUNDLE" -p "$BUNDLE.sha256" -D . 2>/dev/null \
-             && [ -f "$BUNDLE" ] && [ -f "$BUNDLE.sha256" ] \
-             && sha256sum -c "$BUNDLE.sha256" \
-             && zstd -d "$BUNDLE" -c | tar -C data/models -xf -; then
-            restore_ok=1
-          fi
+          ort="${ORT_ASSET:-ort-${ORT_VERSION}.tar.zst}"
+          bge="${BGE_ASSET:-bge-m3.tar.zst}"
+          rerank="${RERANK_ASSET:-bge-reranker-v2-m3.tar.zst}"
+          assets=("$ort" "$bge")
+          [ "${WITH_RERANKER:-0}" = "1" ] && assets+=("$rerank")
+          echo "restoring components: ${assets[*]}"
+          # restore_one <asset>: download + sha256 verify + extract. Returns 0
+          # on success, 1 on any failure (caller decides whether to fallback).
+          # We ask for the asset + its .sha256 EXPLICITLY (not a glob): if only
+          # .sha256 is present, gh exits 0 but the `-f "$asset"` guard catches it.
+          restore_one() {
+            local a="$1"
+            gh release download models --repo "$GITHUB_REPOSITORY" \
+                  -p "$a" -p "$a.sha256" -D . 2>/dev/null \
+              && [ -f "$a" ] && [ -f "$a.sha256" ] \
+              && sha256sum -c "$a.sha256" \
+              && zstd -d "$a" -c | tar -C data/models -xf -
+          }
+          restore_ok=1
+          for a in "${assets[@]}"; do
+            if ! restore_one "$a"; then
+              echo "::warning::failed to restore component $a"
+              restore_ok=0
+            fi
+          done
           if [ "$restore_ok" -eq 0 ]; then
-            echo "::notice::bundle restore failed (missing/corrupt asset) → falling back to direct HF fetch (WITH_RERANKER=$WITH_RERANKER)"
-            rm -f "$BUNDLE" "$BUNDLE.sha256"
+            echo "::notice::partial/missing component restore → falling back to direct HF fetch (WITH_RERANKER=$WITH_RERANKER)"
+            # Clean any partial extractions so fetch-model.sh starts fresh.
+            rm -rf data/models/onnxruntime data/models/bge-m3 data/models/bge-reranker-v2-m3
             ./scripts/fetch-model.sh
           fi
       - name: Download + convert series ${{ matrix.series }}
