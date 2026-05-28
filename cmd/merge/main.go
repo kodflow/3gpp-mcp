@@ -124,10 +124,18 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 			return fmt.Errorf("strip embeddings: %w", err)
 		}
 		// Drop any leftover meta that's vector-specific so the slim DB doesn't
-		// claim semantic capability the consumer can't realise.
-		_, _ = sqldb.ExecContext(ctx, `DELETE FROM schema_meta WHERE key IN ('embedding_model','embedding_dim','embedding_count','hnsw_state')`)
-		// Reclaim space so the .duckdb file shrinks before zstd.
-		_, _ = sqldb.ExecContext(ctx, `CHECKPOINT`)
+		// claim semantic capability the consumer can't realise. Errors are
+		// SURFACED (a silent drop would let the slim DB advertise stale
+		// embedding_model/dim/count that no longer match its schema).
+		if _, err := sqldb.ExecContext(ctx, `DELETE FROM schema_meta WHERE key IN ('embedding_model','embedding_dim','embedding_count','hnsw_state')`); err != nil {
+			return fmt.Errorf("clear vector meta: %w", err)
+		}
+		// Reclaim space so the .duckdb file shrinks before zstd. Same reasoning
+		// for error surfacing: a failed CHECKPOINT means the file still carries
+		// the dropped column's pages and the Release-asset size gate stops working.
+		if _, err := sqldb.ExecContext(ctx, `CHECKPOINT`); err != nil {
+			return fmt.Errorf("checkpoint after strip: %w", err)
+		}
 		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
 	}
 	if fts {
@@ -410,22 +418,42 @@ func cols(ctx context.Context, sqldb *sql.DB, rel string) ([]string, error) {
 // CREATE-AS-SELECT + RENAME swap: build the slim copy, drop the old table, then
 // rename the slim into place. SELECT … EXCLUDE (embedding) is supported on
 // DuckDB ≥ 0.8 and avoids enumerating every other column by hand.
+//
+// The whole sequence runs inside a transaction so a failure mid-way leaves the
+// DB exactly as it was (rollback drops the partial clauses_slim, restores the
+// original clauses + indices). Without the BEGIN/COMMIT a crash between DROP
+// TABLE and RENAME would brick the artifact and require a manual rebuild.
 func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
-	// 1. Drop any indices that mention `embedding` (only the HNSW one), and the
-	//    secondary indices we re-create afterwards. The HNSW index would otherwise
-	//    re-build over the column we're about to drop.
+	tx, err := sqldb.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin strip tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback() // best-effort cleanup; the real error is already returned to caller
+		}
+	}()
+
+	// 1. Drop the indices that reference the table (the HNSW one mentions
+	//    `embedding` explicitly; the lexical ones don't but DuckDB refuses
+	//    ALTER on ANY indexed table — see func doc). DROP INDEX errors are
+	//    SURFACED: an unexpected schema (e.g. an extra index from a future
+	//    schema change) is signal we want to diagnose, not silently ignore.
 	for _, idx := range []string{"clauses_hnsw", "clauses_spec", "clauses_rel", "clauses_path"} {
-		_, _ = sqldb.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx)
+		if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
+			return fmt.Errorf("drop index %s: %w", idx, err)
+		}
 	}
 	// 2. Slim copy: same rows, every column EXCEPT embedding.
-	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding) FROM clauses`); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding) FROM clauses`); err != nil {
 		return fmt.Errorf("create clauses_slim: %w", err)
 	}
 	// 3. Swap.
-	if _, err := sqldb.ExecContext(ctx, `DROP TABLE clauses`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE clauses`); err != nil {
 		return fmt.Errorf("drop old clauses: %w", err)
 	}
-	if _, err := sqldb.ExecContext(ctx, `ALTER TABLE clauses_slim RENAME TO clauses`); err != nil {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE clauses_slim RENAME TO clauses`); err != nil {
 		return fmt.Errorf("rename clauses_slim: %w", err)
 	}
 	// 4. Re-create the lexical indices the schema.sql guarantees. (PK on chunk_id
@@ -437,9 +465,13 @@ func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release)`,
 		`CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path)`,
 	} {
-		if _, err := sqldb.ExecContext(ctx, ddl); err != nil {
+		if _, err := tx.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("recreate index: %w", err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit strip tx: %w", err)
+	}
+	committed = true
 	return nil
 }

@@ -165,6 +165,12 @@ jobs:
           # without .sha256 would reliably break every shard). grep -Fqx for a
           # literal match: $BUNDLE contains regex-metacharacter dots that would
           # otherwise wildcard-match `models-ortX1X26X0Xtar.zst` etc.
+          # Emit the resolved bundle name UNCONDITIONALLY (both cache-hit and
+          # cache-miss paths exit through here) — the build-shard restore reads
+          # it via needs.model.outputs.bundle_name. Doing this BEFORE either
+          # `exit 0` (cache hit) or the upload means the downstream job never
+          # gets an empty string and never has to guess the suffix.
+          echo "BUNDLE=$BUNDLE" >> "$GITHUB_OUTPUT"
           ASSETS=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
                      --jq '.assets[].name' 2>/dev/null || true)
           if printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE" \
@@ -178,8 +184,6 @@ jobs:
             gh release create models --repo "$GITHUB_REPOSITORY" --title models \
               --notes "Pinned BGE-M3 + reranker + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
           gh release upload models --repo "$GITHUB_REPOSITORY" "$BUNDLE" "$BUNDLE.sha256" --clobber
-          # Emit the resolved bundle name so build-shard pulls the matching cache key.
-          echo "BUNDLE=$BUNDLE" >> "$GITHUB_OUTPUT"
         id: bundle
     outputs:
       bundle_name: ${{ steps.bundle.outputs.BUNDLE }}
@@ -230,7 +234,13 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
-          BUNDLE="${BUNDLE_NAME:-models-ort-${ORT_VERSION}-rerank.tar.zst}"
+          # Fallback bundle name MUST mirror the model job's naming rule (suffix
+          # derived from WITH_RERANKER) — a hardcoded `-rerank` here would skew
+          # the restore if a future config drops the reranker. Real name from
+          # the upstream output stays the source of truth when present.
+          suffix=""
+          [ "${WITH_RERANKER:-0}" = "1" ] && suffix="-rerank"
+          BUNDLE="${BUNDLE_NAME:-models-ort-${ORT_VERSION}${suffix}.tar.zst}"
           echo "restoring bundle: $BUNDLE"
           # Restore only the version-keyed bundle. ANY failure along the
           # download/verify/extract path falls back to a direct HF fetch — a

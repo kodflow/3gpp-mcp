@@ -167,6 +167,10 @@ func TestStripEmbeddings(t *testing.T) {
 		_ = st.SetMeta("embedding_model", "bge-m3")
 		_ = st.SetMeta("embedding_dim", "1024")
 		_ = st.SetMeta("embedding_count", "1")
+		// Seed hnsw_state so the cleanup assertion is non-trivial: without this
+		// the DELETE would be a no-op and the test would pass even if the strip
+		// path forgot the key.
+		_ = st.SetMeta("hnsw_state", "frozen")
 	})
 
 	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */); err != nil {
