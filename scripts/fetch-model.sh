@@ -12,7 +12,7 @@
 #          make ingest-onnx ARGS="--spec 33.128"
 #
 # Env overrides:
-#   ORT_VERSION   ONNX Runtime version  (default 1.20.1 — matches onnxruntime_go v1.14.0 / API 20)
+#   ORT_VERSION   ONNX Runtime version  (default 1.26.0 — matches onnxruntime_go v1.30.x / API 25)
 #   MODELS        target dir            (default <repo>/data/models)
 #   WITH_RERANKER fetch the reranker    (default 0; source resolved in A3)
 set -euo pipefail
