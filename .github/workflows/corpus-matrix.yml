@@ -145,29 +145,48 @@ jobs:
         if: github.event.inputs.embed == 'true'
         with:
           persist-credentials: false
-      - name: Build + publish the model bundle (idempotent, version-keyed)
+      - name: Build + publish the model bundle (idempotent, version-keyed, reranker-aware)
         if: github.event.inputs.embed == 'true'
+        env:
+          # Bundle the cross-encoder reranker alongside the embedder so the
+          # build-shard ingest can fully populate the rerank path. Toggle off
+          # only if disk-pressure on the runner becomes a real problem (the
+          # reranker adds ~2.3 GB to the bundle).
+          WITH_RERANKER: "1"
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
-          BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
+          # Bundle name encodes BOTH the ORT version AND the reranker presence:
+          # bumping either invalidates the cache, no manual cleanup needed.
+          suffix=""
+          [ "${WITH_RERANKER:-0}" = "1" ] && suffix="-rerank"
+          BUNDLE="models-ort-${ORT_VERSION}${suffix}.tar.zst"
           # Skip only if BOTH the bundle AND its sha256 sidecar are present
           # (restore enforces the checksum — a release with the bundle but
           # without .sha256 would reliably break every shard). grep -Fqx for a
           # literal match: $BUNDLE contains regex-metacharacter dots that would
           # otherwise wildcard-match `models-ortX1X26X0Xtar.zst` etc.
+          # Emit the resolved bundle name UNCONDITIONALLY (both cache-hit and
+          # cache-miss paths exit through here) — the build-shard restore reads
+          # it via needs.model.outputs.bundle_name. Doing this BEFORE either
+          # `exit 0` (cache hit) or the upload means the downstream job never
+          # gets an empty string and never has to guess the suffix.
+          echo "BUNDLE=$BUNDLE" >> "$GITHUB_OUTPUT"
           ASSETS=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
                      --jq '.assets[].name' 2>/dev/null || true)
           if printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE" \
              && printf '%s\n' "$ASSETS" | grep -Fqx "$BUNDLE.sha256"; then
             echo "model bundle $BUNDLE + sha256 already on the 'models' release — skipping HF fetch"; exit 0
           fi
-          ./scripts/fetch-model.sh
+          ./scripts/fetch-model.sh  # honours WITH_RERANKER above
           tar -C data/models -cf - . | zstd -19 -T0 -o "$BUNDLE"
           sha256sum "$BUNDLE" > "$BUNDLE.sha256"
           gh release view models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create models --repo "$GITHUB_REPOSITORY" --title models \
-              --notes "Pinned BGE-M3 + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
+              --notes "Pinned BGE-M3 + reranker + ONNX Runtime bundle (commit-pinned; see scripts/fetch-model.sh)."
           gh release upload models --repo "$GITHUB_REPOSITORY" "$BUNDLE" "$BUNDLE.sha256" --clobber
+        id: bundle
+    outputs:
+      bundle_name: ${{ steps.bundle.outputs.BUNDLE }}
 
   # ---- 2. one shard per changed series (parallel) --------------------------
   build-shard:
@@ -205,10 +224,24 @@ jobs:
         if: github.event.inputs.embed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          # The model job exports the exact bundle name (with `-rerank` suffix when
+          # the reranker is included). Falling back to the lexical-only name keeps
+          # this step working if a future toggle drops the reranker.
+          BUNDLE_NAME: ${{ needs.model.outputs.bundle_name }}
+          # Mirror the model job's reranker decision so the fallback HF fetch
+          # produces the SAME on-disk layout the bundle would have.
+          WITH_RERANKER: "1"
         run: |
           sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
-          BUNDLE="models-ort-${ORT_VERSION}.tar.zst"
+          # Fallback bundle name MUST mirror the model job's naming rule (suffix
+          # derived from WITH_RERANKER) — a hardcoded `-rerank` here would skew
+          # the restore if a future config drops the reranker. Real name from
+          # the upstream output stays the source of truth when present.
+          suffix=""
+          [ "${WITH_RERANKER:-0}" = "1" ] && suffix="-rerank"
+          BUNDLE="${BUNDLE_NAME:-models-ort-${ORT_VERSION}${suffix}.tar.zst}"
+          echo "restoring bundle: $BUNDLE"
           # Restore only the version-keyed bundle. ANY failure along the
           # download/verify/extract path falls back to a direct HF fetch — a
           # partial upload (only .sha256), a truncated bundle, or a checksum
@@ -226,7 +259,7 @@ jobs:
             restore_ok=1
           fi
           if [ "$restore_ok" -eq 0 ]; then
-            echo "::notice::bundle restore failed (missing/corrupt asset) → falling back to direct HF fetch"
+            echo "::notice::bundle restore failed (missing/corrupt asset) → falling back to direct HF fetch (WITH_RERANKER=$WITH_RERANKER)"
             rm -f "$BUNDLE" "$BUNDLE.sha256"
             ./scripts/fetch-model.sh
           fi
@@ -241,6 +274,17 @@ jobs:
           EMBEDDER: ${{ github.event.inputs.embed == 'true' && 'bge-m3' || '' }}
           BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
           ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
+          # Long clauses (ASN.1 tables, full procedures) routinely exceed BGE-M3's
+          # 512-token cap; without windowing their tail is silently truncated.
+          # mean_pool windows the input + averages window vectors so every byte
+          # contributes. Default-ON in CI; opt-out only if perf-probing.
+          EMBED_WINDOWING: mean_pool
+          # Cross-encoder reranker (bundled by the model job when WITH_RERANKER=1
+          # — see above). The ingest itself doesn't rerank, but pre-populating
+          # the directory keeps the path predictable when the serve binary uses
+          # the same data/models layout (and lets `make rerank-eval` work
+          # locally on the same artifacts).
+          RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
           mkdir -p dist
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
@@ -265,12 +309,19 @@ jobs:
           if-no-files-found: ignore
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
-  # Lexical path only: under embed=true the per-series sub-bases are the Option-B
-  # distribution units (published by publish-vec), NOT folded into a global DB —
-  # so a vectorized run never clobbers the lexical 'latest' DB.
+  # Runs in BOTH modes:
+  #   embed=false → merge produces the lexical DB as before (full vectors absent).
+  #   embed=true  → merge ALSO runs, with `--strip-embeddings` so the lexical
+  #                 'latest' Release asset stays under the 2 GB GitHub cap. The
+  #                 per-series vectorized sub-bases (with their HNSW) are
+  #                 distributed in PARALLEL by publish-vec on GHCR. The two
+  #                 channels are independent: lexical-only client pulls the
+  #                 Release, semantic client pulls GHCR + sub-bases.
+  #   ⇒ this fixes the long-standing 'latest stays stale during embed runs' gap
+  #     and lets the OpenAPI ingest (wired here) ride along on every embed run.
   merge:
     needs: [discover, build-shard]
-    if: needs.discover.outputs.matrix != '[]' && github.event.inputs.embed != 'true'
+    if: needs.discover.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: write # only merge may clobber the DB asset on 'latest'
@@ -304,7 +355,16 @@ jobs:
               echo "incremental: using existing latest DB as base"
             fi
           fi
-          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json $base_arg shards/*.duckdb
+          # When embed=true the shards carry FLOAT[1024] embeddings + a per-shard
+          # HNSW. Stripping them in the merged output keeps the lexical Release
+          # asset slim (vectors live in the GHCR per-series sub-bases — see
+          # publish-vec). The strip step also clears vector-specific schema_meta
+          # so the slim DB doesn't claim semantic capability it can't deliver.
+          strip_arg=""
+          if [ "${{ github.event.inputs.embed }}" = "true" ]; then
+            strip_arg="--strip-embeddings"
+          fi
+          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json $base_arg $strip_arg shards/*.duckdb
           ls -lh data/3gpp.duckdb
       - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
         run: |
