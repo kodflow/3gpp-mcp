@@ -178,6 +178,12 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
+    # Measured 1.95 min/spec on series 21 (22 specs → 43 min ingest). Series 24
+    # has 196 specs → ~6.4h projected, which would TIMEOUT at the default 360 min
+    # and skip publish-vec for an inconsistent run. Floor at 720 min (12h):
+    # comfortably above the worst current series, well under the GitHub hosted
+    # hard ceiling (35 days), and free since runners are billed per started job.
+    timeout-minutes: 720
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
