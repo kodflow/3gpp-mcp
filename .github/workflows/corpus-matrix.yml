@@ -205,49 +205,74 @@ jobs:
             echo "RERANK_ASSET=$RERANK_ASSET"
             echo "WITH_RERANKER=${WITH_RERANKER:-0}"
           } >> "$GITHUB_OUTPUT"
-          # Cache-hit: every asset + its .sha256 sidecar present (restore enforces
-          # the checksum). grep -Fqx for literal matching — asset names contain
-          # regex-meta dots that would otherwise wildcard-match.
+          # Cache-hit: AT LEAST .part00 + .sha256 for every required asset.
+          # (A real multi-part asset has .part00..N; we don't know N here, but
+          # if any part is missing the consumer's cat-reassemble step fails the
+          # sha256 check and falls back to direct HF fetch — graceful degrade.)
           PRESENT=$(gh release view models --repo "$GITHUB_REPOSITORY" --json assets \
                      --jq '.assets[].name' 2>/dev/null || true)
           all_present=1
           for a in "${ASSETS_NEEDED[@]}"; do
-            if ! printf '%s\n' "$PRESENT" | grep -Fqx "$a" \
+            if ! printf '%s\n' "$PRESENT" | grep -Fqx "$a.part00" \
                 || ! printf '%s\n' "$PRESENT" | grep -Fqx "$a.sha256"; then
               all_present=0
               break
             fi
           done
           if [ "$all_present" = 1 ]; then
-            echo "all model components + sha256 already on the 'models' release — skipping HF fetch"
+            echo "all model components (part00 + sha256) already on the 'models' release — skipping HF fetch"
             exit 0
           fi
           ./scripts/fetch-model.sh  # honours WITH_RERANKER above
           # One .tar.zst per component. -19 high compression + -T0 multi-threaded.
-          # Each archive's payload (BGE ~2.3 GiB raw, reranker ~3.3 GiB raw, ORT
-          # ~70 MiB raw) compresses well under the 2 GiB GitHub cap.
-          tar -C data/models -cf - onnxruntime | zstd -19 -T0 -o "$ORT_ASSET"
-          tar -C data/models -cf - bge-m3      | zstd -19 -T0 -o "$BGE_ASSET"
-          sha256sum "$ORT_ASSET" > "$ORT_ASSET.sha256"
-          sha256sum "$BGE_ASSET" > "$BGE_ASSET.sha256"
-          UPLOAD=("$ORT_ASSET" "$ORT_ASSET.sha256" "$BGE_ASSET" "$BGE_ASSET.sha256")
-          if [ "${WITH_RERANKER:-0}" = "1" ]; then
+          tar -C data/models -cf - onnxruntime        | zstd -19 -T0 -o "$ORT_ASSET"
+          tar -C data/models -cf - bge-m3             | zstd -19 -T0 -o "$BGE_ASSET"
+          [ "${WITH_RERANKER:-0}" = "1" ] && \
             tar -C data/models -cf - bge-reranker-v2-m3 | zstd -19 -T0 -o "$RERANK_ASSET"
-            sha256sum "$RERANK_ASSET" > "$RERANK_ASSET.sha256"
-            UPLOAD+=("$RERANK_ASSET" "$RERANK_ASSET.sha256")
-          fi
-          # Fail-loud BEFORE upload if any single component blows past the GitHub
-          # 2 GiB cap (e.g. a future model bump pushes one piece over the limit).
-          # Catching it here points at the offending component instead of an HTTP
-          # 422 deep in `gh release upload` after a long retry storm.
-          for a in "$ORT_ASSET" "$BGE_ASSET" "$RERANK_ASSET"; do
-            [ -e "$a" ] || continue
+          # Even per-component a single archive can blow past the 2 GiB Release
+          # cap — the reranker ONNX compresses to ~2.1 GiB (49.5% ratio on ~4.25
+          # GiB raw weights). pack_and_split() always produces N >= 1 numbered
+          # parts (.part00, .part01, …) so the consumer's restore loop is
+          # uniform regardless of original size. Sha256 covers the WHOLE
+          # pre-split archive (verified after cat-reassemble on the consumer).
+          SPLIT_BYTES=1932735283   # 1.8 GiB — leaves headroom under the 2 GiB cap for HTTP overhead
+          pack_and_split() {
+            local a="$1"
+            [ -e "$a" ] || return 0
+            sha256sum "$a" > "$a.sha256"
+            local sz
             sz=$(stat -c %s "$a")
+            if [ "$sz" -lt "$SPLIT_BYTES" ]; then
+              mv "$a" "$a.part00"
+            else
+              split -d -b "$SPLIT_BYTES" "$a" "$a.part"
+              rm "$a"
+            fi
+            printf '  %-44s %s bytes → %s parts\n' "$a" "$sz" "$(ls "$a".part* | wc -l)"
+          }
+          for a in "$ORT_ASSET" "$BGE_ASSET" "$RERANK_ASSET"; do
+            pack_and_split "$a"
+          done
+          # Assemble upload list: every .part* + every .sha256 we just produced.
+          UPLOAD=()
+          for a in "$ORT_ASSET" "$BGE_ASSET" "$RERANK_ASSET"; do
+            [ -e "$a.sha256" ] || continue
+            UPLOAD+=("$a.sha256")
+            # Glob expands lexically (.part00, .part01, …) — guaranteed order
+            # for cat-based reassembly on the consumer.
+            for p in "$a".part*; do
+              UPLOAD+=("$p")
+            done
+          done
+          # Final sanity check: NO single part may still be >= 2 GiB (a future
+          # change to SPLIT_BYTES that breaks the invariant should fail loud
+          # here rather than in `gh release upload`).
+          for p in "${UPLOAD[@]}"; do
+            sz=$(stat -c %s "$p")
             if [ "$sz" -ge 2147483648 ]; then
-              echo "::error::$a is $sz bytes (>= 2 GiB GitHub Release cap) — split this component"
+              echo "::error::$p is $sz bytes — split logic is broken"
               exit 1
             fi
-            printf '  %-40s %s bytes\n' "$a" "$sz"
           done
           gh release view models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create models --repo "$GITHUB_REPOSITORY" --title models \
@@ -315,17 +340,32 @@ jobs:
           assets=("$ort" "$bge")
           [ "${WITH_RERANKER:-0}" = "1" ] && assets+=("$rerank")
           echo "restoring components: ${assets[*]}"
-          # restore_one <asset>: download + sha256 verify + extract. Returns 0
-          # on success, 1 on any failure (caller decides whether to fallback).
-          # We ask for the asset + its .sha256 EXPLICITLY (not a glob): if only
-          # .sha256 is present, gh exits 0 but the `-f "$asset"` guard catches it.
+          # restore_one <asset>: download every .partNN + .sha256 → cat them in
+          # lexical order to reassemble the original archive → verify sha256
+          # over the WHOLE archive → extract. Returns 0 on success, 1 on any
+          # failure (caller falls back to direct HF fetch). The glob pattern
+          # `${asset}.part*` matches every numbered part (split -d makes them
+          # .part00, .part01, … in lexical = upload = cat order).
           restore_one() {
             local a="$1"
+            # Wipe any leftover parts/archive from a previous failed call so a
+            # partial-state retry doesn't cat orphan bytes.
+            rm -f "$a" "$a".part* "$a.sha256"
             gh release download models --repo "$GITHUB_REPOSITORY" \
-                  -p "$a" -p "$a.sha256" -D . 2>/dev/null \
-              && [ -f "$a" ] && [ -f "$a.sha256" ] \
-              && sha256sum -c "$a.sha256" \
-              && zstd -d "$a" -c | tar -C data/models -xf -
+                  -p "$a.part*" -p "$a.sha256" -D . 2>/dev/null || return 1
+            [ -f "$a.sha256" ] || return 1
+            # Bash globs expand in lexical (= sorted) order by default → cat
+            # gets parts in the exact same order they were split (part00,
+            # part01, …, partNN). The array indirection keeps each part as a
+            # SEPARATE arg even if a filename ever held whitespace — `cat $glob`
+            # would word-split on $IFS and break the reassembly.
+            local parts=( "$a".part* )
+            [ -e "${parts[0]}" ] || return 1
+            cat "${parts[@]}" > "$a" || return 1
+            sha256sum -c "$a.sha256" || return 1
+            zstd -d "$a" -c | tar -C data/models -xf - || return 1
+            # Free disk: the parts + reassembled archive aren't needed past extract.
+            rm -f "$a" "$a".part*
           }
           restore_ok=1
           for a in "${assets[@]}"; do
