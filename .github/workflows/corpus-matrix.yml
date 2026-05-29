@@ -386,7 +386,35 @@ jobs:
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ matrix.series }}" --jobs 2
-      - name: Ingest shard ${{ matrix.series }}
+      # Resume: if a prior attempt of THIS workflow run uploaded a partial DB
+      # for this series, pull it down so --resume can skip 'done' specs and
+      # purge+redo only the 'started' (half-ingested) one. continue-on-error
+      # keeps the first attempt clean (no artifact yet → just start fresh).
+      - name: Restore prior shard artifact (resume from previous attempt)
+        if: github.event.inputs.embed == 'true'
+        id: restore_shard
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: shard-${{ matrix.series }}
+          path: dist
+      - name: Note resume state
+        if: github.event.inputs.embed == 'true'
+        run: |
+          mkdir -p dist
+          if [ -f "dist/shard-${{ matrix.series }}.duckdb" ]; then
+            echo "resume: prior shard restored — --resume will skip its 'done' specs"
+            ls -lh "dist/shard-${{ matrix.series }}.duckdb"
+          else
+            echo "resume: no prior shard — fresh ingest"
+          fi
+      # The ingest itself runs in a retry loop: a runner OOM, network blip, or
+      # user-side cancel of a single attempt leaves the artifact upload step
+      # (always: success or failure) keeping the partial DB available for the
+      # next attempt. --resume makes the next attempt skip 'done' specs +
+      # purge half-ingested ones (PR #47, see internal/ingest/ingest.go).
+      - name: Ingest shard ${{ matrix.series }} (with --resume + retry)
+        id: ingest
         env:
           EMBEDDER: ${{ github.event.inputs.embed == 'true' && 'bge-m3' || '' }}
           BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
@@ -404,19 +432,52 @@ jobs:
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
           mkdir -p dist
-          if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            # Option B: each per-series shard builds its OWN HNSW (ingest does this
-            # when vectors exist) → a self-contained vectorized sub-base. Hard gate
-            # on the JSON report so a NULL-vector shard never passes silently.
-            ./bin/ingest --series "${{ matrix.series }}" --out "dist/shard-${{ matrix.series }}.duckdb" \
-              --embed-floor "${{ github.event.inputs.embed_floor }}" --require-semantic --report json \
-              | tee "dist/shard-${{ matrix.series }}.report.json"
-            jq -e '.model=="bge-m3" and .embedded_clauses>0' "dist/shard-${{ matrix.series }}.report.json"
-            rm -rf data/sources/convert || true   # free HTML before upload
-          else
-            ./bin/ingest --series "${{ matrix.series }}" --out "dist/shard-${{ matrix.series }}.duckdb"
+          OUT="dist/shard-${{ matrix.series }}.duckdb"
+          RPT="dist/shard-${{ matrix.series }}.report.json"
+          # Bash retry loop (defense-in-depth): if the binary returns non-zero
+          # mid-ingest (e.g. a transient ONNX session error a recover() missed),
+          # --resume on the next attempt picks up from the last 'done' spec.
+          # The Restore-prior-artifact step plus this loop give us two layers:
+          # - intra-step transient failure → bash retry (this loop)
+          # - runner-kill / user-cancel    → GitHub re-run + artifact restore
+          # Both paths converge on the same --resume contract.
+          attempt=0
+          max_attempts=3
+          ingest_ok=0
+          while [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt+1))
+            echo "::group::ingest attempt $attempt/$max_attempts (series ${{ matrix.series }})"
+            if [ "${{ github.event.inputs.embed }}" = "true" ]; then
+              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume \
+                   --embed-floor "${{ github.event.inputs.embed_floor }}" --require-semantic --report json \
+                   | tee "$RPT" \
+                 && jq -e '.model=="bge-m3" and .embedded_clauses>0' "$RPT"; then
+                ingest_ok=1
+              fi
+            else
+              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
+                ingest_ok=1
+              fi
+            fi
+            echo "::endgroup::"
+            if [ "$ingest_ok" -eq 1 ]; then
+              echo "ingest attempt $attempt succeeded"
+              break
+            fi
+            echo "::warning::ingest attempt $attempt failed — sleeping 30s before retry"
+            sleep 30
+          done
+          if [ "$ingest_ok" -eq 0 ]; then
+            echo "::error::ingest exhausted $max_attempts attempts; the always-upload step preserves the partial DB so a manual re-run can --resume"
+            exit 1
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          rm -rf data/sources/convert || true   # free HTML before artifact upload
+      # Upload artifact ALWAYS (success or failure) so the next attempt of
+      # this same job can --resume from the partial DB on disk. retention-days
+      # is short (1d) — these are temp shards, not the published corpus.
+      - name: Upload shard artifact (always — feeds --resume on retry)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: shard-${{ matrix.series }}
           path: |
@@ -424,6 +485,7 @@ jobs:
             dist/shard-${{ matrix.series }}.report.json
           retention-days: 1
           if-no-files-found: ignore
+          overwrite: true   # each attempt of this matrix slice replaces the prior partial
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
   # Runs in BOTH modes:

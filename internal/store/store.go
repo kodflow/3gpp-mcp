@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
 
@@ -83,6 +84,114 @@ func (s *Store) SetMeta(key, value string) error {
 		`INSERT INTO schema_meta (key, value) VALUES (?, ?)
 		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
+}
+
+// ---- ingest_log (axis #15: --resume checkpoint) -------------------------
+//
+// MarkIngestStarted is called BEFORE InsertClauses + SetEmbedding for a spec.
+// A row with status='started' survives a runner kill; on resume that spec is
+// PURGED + re-ingested (a half-written spec would otherwise poison vectors).
+// pipeline_version stamps the row so a later algorithm change invalidates
+// every row (the caller checks model.PipelineVersion at resume time).
+func (s *Store) MarkIngestStarted(ctx context.Context, specID, version, pipelineVersion string) error {
+	// Timestamps are passed as bound parameters (time.Now()) rather than the
+	// SQL keyword CURRENT_TIMESTAMP because go-duckdb v1.x mis-parses the
+	// keyword in INSERT … ON CONFLICT clauses (treats it as a column ref;
+	// "Table ingest_log does not have a column named CURRENT_TIMESTAMP").
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ingest_log (spec_id, version, status, pipeline_version, started_at)
+		VALUES (?, ?, 'started', ?, ?)
+		ON CONFLICT (spec_id, version) DO UPDATE SET
+		  status='started', pipeline_version=excluded.pipeline_version,
+		  started_at=excluded.started_at, completed_at=NULL`,
+		specID, version, pipelineVersion, now)
+	return err
+}
+
+// MarkIngestDone flips the spec to status='done' once every step (parse,
+// upsert, clauses, embed, changes, subjects) succeeded. Only 'done' rows are
+// skipped on resume.
+func (s *Store) MarkIngestDone(ctx context.Context, specID, version string) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE ingest_log SET status='done', completed_at=?
+		WHERE spec_id=? AND version=?`, now, specID, version)
+	return err
+}
+
+// IngestProgress returns the per-status counts of the ingest_log table for the
+// given pipeline_version (rows from a stale pipeline are ignored — the caller
+// is expected to have wiped them via ResetIngestLog when the version drifts).
+// Used by --resume + the progress display to show {planned, done, in-flight}.
+func (s *Store) IngestProgress(ctx context.Context, pipelineVersion string) (done, started int, err error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(SUM(CASE WHEN status='done'    THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN status='started' THEN 1 ELSE 0 END), 0)
+		FROM ingest_log
+		WHERE pipeline_version = ?`, pipelineVersion)
+	err = row.Scan(&done, &started)
+	return done, started, err
+}
+
+// IsIngestDone reports whether (spec, version) finished cleanly under the
+// SAME pipeline_version — the gate the resume loop uses to skip work.
+func (s *Store) IsIngestDone(ctx context.Context, specID, version, pipelineVersion string) (bool, error) {
+	var status, pv string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status, pipeline_version FROM ingest_log WHERE spec_id=? AND version=?`,
+		specID, version).Scan(&status, &pv)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// A row from a stale pipeline counts as not-done (caller will wipe + re-ingest).
+	return status == "done" && pv == pipelineVersion, nil
+}
+
+// PurgeSpecScope removes EVERY row carrying a given (spec_id, version) tuple
+// from the writable tables — used on resume to clear a half-ingested spec
+// (status='started' but no 'done') before re-running it. Scoped strictly by
+// (spec_id, version): the `specs` row is keyed by spec_id alone and may be
+// shared across versions, so we don't touch it (the re-ingest UPSERTs it).
+func (s *Store) PurgeSpecScope(ctx context.Context, specID, version string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM clauses WHERE spec_id=? AND version=?`, specID, version); err != nil {
+		return fmt.Errorf("purge clauses: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM changes WHERE spec_id=? AND to_version=?`, specID, version); err != nil {
+		return fmt.Errorf("purge changes: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM spec_versions WHERE spec_id=? AND version=?`, specID, version); err != nil {
+		return fmt.Errorf("purge spec_versions: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM ingest_log WHERE spec_id=? AND version=?`, specID, version); err != nil {
+		return fmt.Errorf("purge ingest_log row: %w", err)
+	}
+	return nil
+}
+
+// ResetIngestLog drops every checkpoint row that doesn't match the current
+// pipeline_version — invariant #2: when the chunker / embedder / schema
+// changes, the on-disk log is no longer comparable so the resume contract
+// must restart from scratch.
+func (s *Store) ResetIngestLog(ctx context.Context, currentPipelineVersion string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM ingest_log WHERE pipeline_version IS NULL OR pipeline_version <> ?`,
+		currentPipelineVersion)
+	return err
+}
+
+// MaxChunkID returns the largest chunk_id present in `clauses`, used on resume
+// to continue the synthetic-key sequence without colliding with rows already
+// inserted by an earlier attempt. Returns 0 on an empty table or any error
+// (the caller treats that as "start at 1" which matches the fresh-run default).
+func (s *Store) MaxChunkID(ctx context.Context) (uint64, error) {
+	var n uint64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(chunk_id), 0) FROM clauses`).Scan(&n)
+	return n, err
 }
 
 // ---- writes -------------------------------------------------------------
