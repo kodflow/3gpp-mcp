@@ -25,8 +25,19 @@ on:
     workflows: ["Corpus Matrix"]
     types: [completed]
 
-# The default GITHUB_TOKEN has no actions:write; we need it to call `gh run rerun`.
+# Serialize per source run so two completion events in quick succession can't
+# race to dispatch overlapping reruns of the same shards (each rerun bumps
+# run_attempt; a double-fire would skip the safety cap or worse trigger
+# duplicate work).
+concurrency:
+  group: corpus-matrix-autorerun-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
 permissions:
+  # actions:write is REQUIRED by `gh run rerun` (called below) — the default
+  # GITHUB_TOKEN is actions:read, which lets us READ the failed jobs list via
+  # `gh api .../jobs` but NOT trigger a rerun. contents:read keeps everything
+  # else (e.g. the implicit checkout-action footprint) at the minimum scope.
   actions: write
   contents: read
 
@@ -58,12 +69,18 @@ jobs:
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Count build-shard jobs that ended cancelled or failure on THIS attempt.
-          # If zero (e.g. the run was cancelled at the discover/model stage),
-          # rerunning is pointless because there's no shard work to resume.
-          to_rerun=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs" \
-            --jq '[.jobs[] | select(.name | startswith("build-shard"))
-                            | select(.conclusion=="cancelled" or .conclusion=="failure")] | length')
+          # Count build-shard jobs that ended cancelled or failure on THIS
+          # attempt. The GH API endpoint defaults to `filter=latest` (only
+          # the most-recent attempt's jobs), but we pin it explicitly: a
+          # default change would silently start summing across all prior
+          # attempts and inflate the count. We ALSO sanity-check
+          # run_attempt in the jq pipe — if the API ever returns mixed
+          # attempts, we still only count those matching SOURCE_ATTEMPT.
+          to_rerun=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq --argjson att "$SOURCE_ATTEMPT" \
+              '[.jobs[] | select(.name | startswith("build-shard"))
+                       | select(.run_attempt == $att)
+                       | select(.conclusion=="cancelled" or .conclusion=="failure")] | length')
           echo "build-shards needing rerun: $to_rerun"
           if [ "$to_rerun" -eq 0 ]; then
             echo "::notice::no cancelled/failed build-shards on attempt $SOURCE_ATTEMPT — nothing to rerun"
