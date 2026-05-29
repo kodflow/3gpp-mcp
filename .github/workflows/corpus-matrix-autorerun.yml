@@ -73,14 +73,20 @@ jobs:
           # attempt. The GH API endpoint defaults to `filter=latest` (only
           # the most-recent attempt's jobs), but we pin it explicitly: a
           # default change would silently start summing across all prior
-          # attempts and inflate the count. We ALSO sanity-check
-          # run_attempt in the jq pipe — if the API ever returns mixed
-          # attempts, we still only count those matching SOURCE_ATTEMPT.
+          # attempts and inflate the count.
+          #
+          # Note: `gh api --jq` accepts ONE argument (the jq expression). We
+          # can't use jq's --argjson here (that's a flag of the standalone
+          # jq binary, not of gh's --jq wrapper — the previous attempt PR #48
+          # tried that and got "accepts 1 arg(s), received 4"). So we inline
+          # $SOURCE_ATTEMPT into the jq expression via shell expansion (double
+          # quotes), which is safe because the variable comes from a trusted
+          # GitHub-controlled context (workflow_run.run_attempt is always a
+          # small integer set by the platform itself).
           to_rerun=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq --argjson att "$SOURCE_ATTEMPT" \
-              '[.jobs[] | select(.name | startswith("build-shard"))
-                       | select(.run_attempt == $att)
-                       | select(.conclusion=="cancelled" or .conclusion=="failure")] | length')
+            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
+                          | select(.run_attempt == $SOURCE_ATTEMPT)
+                          | select(.conclusion==\"cancelled\" or .conclusion==\"failure\")] | length")
           echo "build-shards needing rerun: $to_rerun"
           if [ "$to_rerun" -eq 0 ]; then
             echo "::notice::no cancelled/failed build-shards on attempt $SOURCE_ATTEMPT — nothing to rerun"
