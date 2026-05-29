@@ -37,6 +37,7 @@ func main() {
 		embFlr  = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-15); empty = embed all. Lexical coverage is unaffected.")
 		reqSem  = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1) — guards against publishing a NULL-vector DB")
 		report  = flag.String("report", "text", "end-of-run summary format: text | json")
+		resume  = flag.Bool("resume", false, "resume into the existing --out DB: skip (spec,version) tuples whose ingest_log row is 'done' under the current pipeline_version; purge + redo 'started' rows; wipe stale-pipeline rows first")
 	)
 	flag.Parse()
 
@@ -64,6 +65,7 @@ func main() {
 		EmbedFloor: *embFlr,
 		Embedder:   embed.New(),
 		Logf:       logf,
+		Resume:     *resume,
 	}
 
 	// Hard contract: when semantic is required, refuse to silently produce a

@@ -191,3 +191,20 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   VARCHAR PRIMARY KEY,
     value VARCHAR
 );
+
+-- Resume checkpoint (axis #15: --resume). One row per (spec, version) tuple
+-- the ingest has touched. status='started' means a row was inserted but the
+-- spec wasn't fully ingested (the runner died mid-spec); status='done' means
+-- every step for that spec finished. On resume, the ingest skips 'done' rows
+-- and PURGES + re-ingests 'started' ones so a half-written spec can't poison
+-- the merged corpus. pipeline_version stamps every row so an algorithm change
+-- (new chunker / new embedder) invalidates the whole log and forces a rebuild.
+CREATE TABLE IF NOT EXISTS ingest_log (
+    spec_id          VARCHAR,
+    version          VARCHAR,
+    status           VARCHAR,   -- 'started' | 'done'
+    pipeline_version VARCHAR,
+    started_at       TIMESTAMP,
+    completed_at     TIMESTAMP,
+    PRIMARY KEY (spec_id, version)
+);
