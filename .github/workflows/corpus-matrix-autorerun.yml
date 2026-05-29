@@ -61,6 +61,12 @@ jobs:
       # restarts. With timeout=360 it caps the cumulative wall-clock at 72h
       # which is still a real cap; a job genuinely broken won't loop forever.
       MAX_ATTEMPTS: "12"
+      # Source run's shard_timeout_minutes — read directly from the workflow_run
+      # event payload (`github.event.workflow_run.inputs.*` is the documented
+      # path for workflow_dispatch inputs). Falls back to '360' (the YAML
+      # default) when the source run wasn't a workflow_dispatch (e.g. a
+      # scheduled trigger, or a rerun of a run pre-dating the input).
+      TIMEOUT_MIN: ${{ github.event.workflow_run.inputs.shard_timeout_minutes || '360' }}
     steps:
       - name: Decide whether to rerun
         id: decide
@@ -72,20 +78,19 @@ jobs:
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Pull the source run's input shard_timeout_minutes so we can
-          # distinguish a platform-cap kill from a user-cancel. The platform
-          # always kills runners EXACTLY at the configured timeout-minutes;
-          # a user cancel happens at an arbitrary elapsed time (usually
-          # much less). Defaults to 360 if not present (older dispatches
-          # without the input).
-          TIMEOUT_MIN=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID" \
-            --jq '.referenced_workflows | length' 2>/dev/null >/dev/null; \
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/corpus-matrix.yml/runs/$SOURCE_RUN_ID" 2>/dev/null \
-              | jq -r '.inputs.shard_timeout_minutes // "360"' 2>/dev/null || echo "360")
-          # Fallback if the above didn't work (the workflow_run object's
-          # inputs field shape varies across API versions): just use 360.
-          [ -z "$TIMEOUT_MIN" ] && TIMEOUT_MIN=360
+          # TIMEOUT_MIN comes from the workflow_run event payload (the source
+          # run's shard_timeout_minutes input). It's wired via the job-level
+          # env var below — the `${{ ... }}` is expanded at YAML evaluation
+          # time so the bash sees a literal string. Defaults to 360 (the
+          # YAML's own default for that input) if the source dispatch didn't
+          # provide it (older workflow versions, scheduled triggers, etc.).
           echo "source timeout=${TIMEOUT_MIN} min"
+          # Sanity: TIMEOUT_MIN must be a positive integer (paranoia: workflow_run
+          # inputs are repo-collaborator-controlled but we still validate before
+          # using it in arithmetic).
+          if ! printf '%s' "$TIMEOUT_MIN" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::TIMEOUT_MIN='$TIMEOUT_MIN' is not a positive integer"; exit 1
+          fi
           # Pull all cancelled/failed build-shards with their elapsed time.
           # A platform-cap kill has elapsed_min == TIMEOUT_MIN (within 1 min
           # of slack for runner teardown). A user cancel has elapsed_min
