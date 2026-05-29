@@ -72,6 +72,45 @@ jobs:
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Pull the source run's input shard_timeout_minutes so we can
+          # distinguish a platform-cap kill from a user-cancel. The platform
+          # always kills runners EXACTLY at the configured timeout-minutes;
+          # a user cancel happens at an arbitrary elapsed time (usually
+          # much less). Defaults to 360 if not present (older dispatches
+          # without the input).
+          TIMEOUT_MIN=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID" \
+            --jq '.referenced_workflows | length' 2>/dev/null >/dev/null; \
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/corpus-matrix.yml/runs/$SOURCE_RUN_ID" 2>/dev/null \
+              | jq -r '.inputs.shard_timeout_minutes // "360"' 2>/dev/null || echo "360")
+          # Fallback if the above didn't work (the workflow_run object's
+          # inputs field shape varies across API versions): just use 360.
+          [ -z "$TIMEOUT_MIN" ] && TIMEOUT_MIN=360
+          echo "source timeout=${TIMEOUT_MIN} min"
+          # Pull all cancelled/failed build-shards with their elapsed time.
+          # A platform-cap kill has elapsed_min == TIMEOUT_MIN (within 1 min
+          # of slack for runner teardown). A user cancel has elapsed_min
+          # strictly less. We refuse to rerun if MAJORITY of cancellations
+          # look like user-cancels (this protects against an operator who
+          # `gh run cancel`'d a run from being auto-resurrected — exactly
+          # the bug the prod v1 26661646421 hit after I cancelled it).
+          CANCELLED_AT_CAP=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
+                          | select(.run_attempt == $SOURCE_ATTEMPT)
+                          | select(.conclusion==\"cancelled\")
+                          | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)
+                          | select(. >= $TIMEOUT_MIN - 1)] | length")
+          USER_CANCELLED=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
+                          | select(.run_attempt == $SOURCE_ATTEMPT)
+                          | select(.conclusion==\"cancelled\")
+                          | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)
+                          | select(. < $TIMEOUT_MIN - 1)] | length")
+          echo "cancelled @ cap: $CANCELLED_AT_CAP   user-cancelled: $USER_CANCELLED"
+          if [ "$USER_CANCELLED" -gt "$CANCELLED_AT_CAP" ]; then
+            echo "::warning::source run looks USER-cancelled (most shards elapsed < timeout=$TIMEOUT_MIN) — refusing to rerun"
+            echo "rerun=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Count build-shard jobs that ended cancelled or failure on THIS
           # attempt. The GH API endpoint defaults to `filter=latest` (only
           # the most-recent attempt's jobs), but we pin it explicitly: a
