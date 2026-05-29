@@ -103,5 +103,11 @@ jobs:
           # those jobs in-place; the Restore-prior-artifact step in the
           # rerun then pulls the partial shard DB the previous attempt
           # uploaded via its `if: always()` upload step.
-          gh run rerun "$SOURCE_RUN_ID" --failed
+          #
+          # --repo is REQUIRED here: this workflow has no actions/checkout
+          # step (it doesn't need the repo code, only the API), so gh CLI
+          # has no .git in cwd to infer the remote from — without --repo it
+          # crashes with "failed to determine base repo". The same context-
+          # variable is used for the upstream gh api calls.
+          gh run rerun "$SOURCE_RUN_ID" --failed --repo "$GITHUB_REPOSITORY"
           echo "::notice::rerun dispatched for run $SOURCE_RUN_ID (was attempt $SOURCE_ATTEMPT)"
