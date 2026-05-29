@@ -43,6 +43,10 @@ on:
         description: "Embed only clauses at/above this release (vectors are recent-only; lexical stays full)."
         type: string
         default: "Rel-15"
+      shard_timeout_minutes:
+        description: "Per-shard timeout (max 360 on free hosted runners; lower to force the auto-rerun chain quickly during testing — e.g. 10 to validate resume in ~30min)."
+        type: string
+        default: "360"
 
 permissions:
   contents: read # discover/build-shard read-only; merge elevates per-job
@@ -107,6 +111,35 @@ jobs:
           # HF commits: 40-hex sha pinned in 3 places (Go const, shell URL, YAML env).
           check_pin "BGE_COMMIT"    "$BGE_COMMIT"    'bgeCommit\s*=\s*"[0-9a-f]+"'    'BAAI/bge-m3/resolve/[0-9a-f]+'
           check_pin "RERANK_COMMIT" "$RERANK_COMMIT" 'rerankCommit\s*=\s*"[0-9a-f]+"' 'celinehoang/bge-reranker-v2-m3-onnx/resolve/[0-9a-f]+'
+      # Workflow-dispatch input validation (Qodo PR #49). Fails CLOSED before
+      # any expensive job spends a runner-minute on a bad input.
+      - name: Validate workflow inputs
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          IN_TIMEOUT: ${{ github.event.inputs.shard_timeout_minutes }}
+          IN_EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
+          IN_RELEASE_FLOOR: ${{ github.event.inputs.release_floor }}
+        run: |
+          set -eu
+          # shard_timeout_minutes: positive integer, 1..360. Any value > 360
+          # is a no-op (platform hard-caps anyway), so reject loud rather than
+          # let the user think 720 means 12h. fromJSON() downstream would also
+          # fail on non-numeric, but here we fail with a CLEAR message early.
+          if ! printf '%s' "${IN_TIMEOUT:-360}" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::shard_timeout_minutes must be a positive integer (got: '${IN_TIMEOUT}')"; exit 1
+          fi
+          if [ "${IN_TIMEOUT:-360}" -gt 360 ]; then
+            echo "::error::shard_timeout_minutes=${IN_TIMEOUT} exceeds the GitHub free-runner hard cap of 360 — the platform will kill the job at 360 regardless. Lower it or accept default 360."; exit 1
+          fi
+          # release_floor + embed_floor: must look like Rel-<number> so the
+          # cache key + downstream filters can rely on the shape.
+          for var in IN_EMBED_FLOOR IN_RELEASE_FLOOR; do
+            val=$(eval echo \$$var)
+            if [ -n "$val" ] && ! printf '%s' "$val" | grep -qE '^Rel-(99|[0-9]{1,2})$'; then
+              echo "::error::$var must match ^Rel-(99|[0-9]{1,2})\$ (got: '$val')"; exit 1
+            fi
+          done
+          echo "OK: shard_timeout=${IN_TIMEOUT:-360}m, embed_floor=${IN_EMBED_FLOOR}, release_floor=${IN_RELEASE_FLOOR}"
 
   # ---- 1. dynamic, delta-sized discovery → matrix --------------------------
   discover:
@@ -294,12 +327,14 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
-    # Measured 1.95 min/spec on series 21 (22 specs → 43 min ingest). Series 24
-    # has 196 specs → ~6.4h projected, which would TIMEOUT at the default 360 min
-    # and skip publish-vec for an inconsistent run. Floor at 720 min (12h):
-    # comfortably above the worst current series, well under the GitHub hosted
-    # hard ceiling (35 days), and free since runners are billed per started job.
-    timeout-minutes: 720
+    # Per-shard timeout, driven by the workflow input shard_timeout_minutes
+    # (default 360, max enforceable on free hosted runners — the platform itself
+    # kills the job at exactly that, which is why ANY value > 360 is a no-op).
+    # Lowering this is the easiest way to TEST the auto-rerun + --resume chain
+    # quickly: set 10 → cap fires within minutes → autorerun engages → full
+    # cycle observable in ~30-45 min instead of ~30h.
+    # fromJSON() converts the string input to the int the API expects.
+    timeout-minutes: ${{ fromJSON(github.event.inputs.shard_timeout_minutes || '360') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -386,10 +421,42 @@ jobs:
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ matrix.series }}" --jobs 2
-      # Resume: if a prior attempt of THIS workflow run uploaded a partial DB
-      # for this series, pull it down so --resume can skip 'done' specs and
-      # purge+redo only the 'started' (half-ingested) one. continue-on-error
-      # keeps the first attempt clean (no artifact yet → just start fresh).
+      # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
+      # Persists partial + completed shard DBs across DIFFERENT workflow runs
+      # so a fresh dispatch on unchanged code finds yesterday's 13-success
+      # shards in the cache → restore + --resume sees all 'done' → ingest
+      # exits in ~seconds instead of redoing 3-260 min of work per shard.
+      #
+      # Key invariants:
+      #   - pipeline_version (model.PipelineVersion in Go) MUST be in the key,
+      #     so a chunker/embedder bump auto-invalidates the cache (rebuild
+      #     from scratch on the algorithm shift — invariant #2).
+      #   - hashFiles() of the SOURCE files that decide what a shard contains
+      #     guarantees a code change to ingest/parse/store rebuilds; comment-
+      #     only changes don't bust the cache.
+      #   - restore-keys cascade lets a partial code change still pick up a
+      #     compatible-enough prior shard (--resume's purge then handles the
+      #     drift safely).
+      #
+      # GH Actions cache: 10 GiB total per repo, 7-day inactivity TTL. The
+      # per-series shards are ~50-200 MiB each, so 28 series ~= 5 GiB — fits.
+      - name: Cross-run shard cache (resume baseline from prior runs)
+        if: github.event.inputs.embed == 'true'
+        id: shard_cache
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
+        with:
+          path: |
+            dist/shard-${{ matrix.series }}.duckdb
+            dist/shard-${{ matrix.series }}.report.json
+          key: shard-v1-${{ matrix.series }}-emb${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'cmd/ingest/main.go') }}
+          restore-keys: |
+            shard-v1-${{ matrix.series }}-emb${{ github.event.inputs.embed_floor }}-
+            shard-v1-${{ matrix.series }}-
+      # Intra-run fallback: a partial DB uploaded by an EARLIER attempt of the
+      # SAME run (e.g. the auto-rerun cycle after a 6h-cap kill) takes priority
+      # over the cross-run cache hit (it's strictly more recent). Best-effort:
+      # no artifact in the current run yet → no-op, the cache value (if any)
+      # stays on disk.
       - name: Restore prior shard artifact (resume from previous attempt)
         if: github.event.inputs.embed == 'true'
         id: restore_shard
@@ -403,8 +470,11 @@ jobs:
         run: |
           mkdir -p dist
           if [ -f "dist/shard-${{ matrix.series }}.duckdb" ]; then
-            echo "resume: prior shard restored — --resume will skip its 'done' specs"
-            ls -lh "dist/shard-${{ matrix.series }}.duckdb"
+            sz=$(stat -c %s "dist/shard-${{ matrix.series }}.duckdb")
+            echo "resume: prior shard restored (${sz} bytes) — --resume will skip its 'done' specs"
+            # Cache-hit telemetry: helps spot a cold cache vs a warm one in logs.
+            echo "  cache hit:          ${{ steps.shard_cache.outputs.cache-hit }}"
+            echo "  cache matched key:  ${{ steps.shard_cache.outputs.cache-matched-key }}"
           else
             echo "resume: no prior shard — fresh ingest"
           fi
