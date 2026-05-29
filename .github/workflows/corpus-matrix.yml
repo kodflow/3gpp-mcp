@@ -431,6 +431,11 @@ jobs:
           # locally on the same artifacts).
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
+          # pipefail propagates ANY non-zero in a pipeline (the embed branch
+          # below pipes ingest into tee; without pipefail an ingest crash whose
+          # stdout is consumed by tee silently returns 0 — the retry loop would
+          # treat it as success and upload a partial DB).
+          set -o pipefail
           mkdir -p dist
           OUT="dist/shard-${{ matrix.series }}.duckdb"
           RPT="dist/shard-${{ matrix.series }}.report.json"

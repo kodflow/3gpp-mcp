@@ -122,3 +122,81 @@ func TestPurgeSpecScope(t *testing.T) {
 		t.Errorf("MaxChunkID after purge = %d (want 2)", maxID)
 	}
 }
+
+// TestReplaceChangesIdempotent verifies the resume-safety contract of
+// ReplaceChanges: a second call with the same batch must NOT duplicate rows
+// (the bug Qodo flagged on PR #47 — the changes table has no unique key, a
+// naked re-INSERT under --resume would double the cumulative change history).
+func TestReplaceChangesIdempotent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "shard.duckdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS"})
+
+	batch := []model.Change{
+		{CRNumber: "C001", CRRevision: 1, SpecID: "23.501", ToVersion: "18.0.0"},
+		{CRNumber: "C002", CRRevision: 0, SpecID: "23.501", ToVersion: "18.1.0"},
+	}
+
+	if err := st.ReplaceChanges(ctx, "23.501", batch); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	// Second call with the SAME batch must not double the row count — that's
+	// the whole point of Replace vs Insert.
+	if err := st.ReplaceChanges(ctx, "23.501", batch); err != nil {
+		t.Fatalf("second insert (resume retry): %v", err)
+	}
+	var n int
+	_ = st.db.QueryRowContext(ctx, `SELECT count(*) FROM changes WHERE spec_id='23.501'`).Scan(&n)
+	if n != 2 {
+		t.Errorf("after two ReplaceChanges calls, count=%d (want 2 — duplicates would mean 4)", n)
+	}
+	// Scoped by spec_id: changes from a SIBLING spec must survive a replace.
+	_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+	_ = st.ReplaceChanges(ctx, "24.501", []model.Change{{CRNumber: "C100", SpecID: "24.501", ToVersion: "18.0.0"}})
+	_ = st.ReplaceChanges(ctx, "23.501", batch) // re-replace 23.501 — sibling untouched
+	var n24 int
+	_ = st.db.QueryRowContext(ctx, `SELECT count(*) FROM changes WHERE spec_id='24.501'`).Scan(&n24)
+	if n24 != 1 {
+		t.Errorf("sibling spec changes count=%d, want 1 (ReplaceChanges leaked scope)", n24)
+	}
+}
+
+// TestReplaceEvolutionsIdempotent — same shape as above for the curated NE↔NF
+// edge seed. A --resume run re-calls ReplaceEvolutions; a plain re-INSERT
+// would append a second copy of every edge.
+func TestReplaceEvolutionsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "shard.duckdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	seed := []model.Evolution{
+		{FromTerm: "MME", ToTerm: "AMF", EvolutionType: "SPLIT", Confidence: 0.9},
+		{FromTerm: "MME", ToTerm: "SMF", EvolutionType: "SPLIT", Confidence: 0.9},
+	}
+	if err := st.ReplaceEvolutions(ctx, seed); err != nil {
+		t.Fatalf("first replace: %v", err)
+	}
+	if err := st.ReplaceEvolutions(ctx, seed); err != nil {
+		t.Fatalf("second replace (resume retry): %v", err)
+	}
+	var n int
+	_ = st.db.QueryRowContext(ctx, `SELECT count(*) FROM evolutions`).Scan(&n)
+	if n != 2 {
+		t.Errorf("evolutions count after two replaces = %d (want 2 — duplicates would mean 4)", n)
+	}
+}

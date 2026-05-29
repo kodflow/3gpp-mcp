@@ -157,12 +157,16 @@ func (s *Store) IsIngestDone(ctx context.Context, specID, version, pipelineVersi
 // (status='started' but no 'done') before re-running it. Scoped strictly by
 // (spec_id, version): the `specs` row is keyed by spec_id alone and may be
 // shared across versions, so we don't touch it (the re-ingest UPSERTs it).
+//
+// `changes` is INTENTIONALLY NOT purged here: rows carry `to_version` that
+// spans many historical versions (the whole change-history annex is folded
+// into the table at the LATEST version's ingest), so a (spec, to_version)
+// delete would drop unrelated historical rows. Idempotency on changes is
+// handled at insert time by ReplaceChanges (delete-then-insert scoped to
+// spec_id) in the latest-version branch of the ingest loop.
 func (s *Store) PurgeSpecScope(ctx context.Context, specID, version string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM clauses WHERE spec_id=? AND version=?`, specID, version); err != nil {
 		return fmt.Errorf("purge clauses: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM changes WHERE spec_id=? AND to_version=?`, specID, version); err != nil {
-		return fmt.Errorf("purge changes: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM spec_versions WHERE spec_id=? AND version=?`, specID, version); err != nil {
 		return fmt.Errorf("purge spec_versions: %w", err)
@@ -171,6 +175,33 @@ func (s *Store) PurgeSpecScope(ctx context.Context, specID, version string) erro
 		return fmt.Errorf("purge ingest_log row: %w", err)
 	}
 	return nil
+}
+
+// ReplaceChanges wipes every existing `changes` row for spec_id and re-inserts
+// the given batch. Used by the ingest loop at the LATEST-version branch (the
+// only branch that writes changes) so a --resume retry of that same spec
+// doesn't append duplicates of the cumulative change history. Idempotent on
+// re-runs that produce the same set.
+func (s *Store) ReplaceChanges(ctx context.Context, specID string, changes []model.Change) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM changes WHERE spec_id=?`, specID); err != nil {
+		return fmt.Errorf("clear changes for %s: %w", specID, err)
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	return s.InsertChanges(changes)
+}
+
+// ReplaceEvolutions wipes the evolutions table then re-inserts the given seed.
+// Used by the ingest in BOTH fresh and resume modes — InsertEvolutions has no
+// uniqueness constraint, so a --resume run would otherwise APPEND a duplicate
+// curated edge set. The seed is small + deterministic; the truncate-then-load
+// keeps the table in a known canonical state.
+func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
+		return fmt.Errorf("clear evolutions: %w", err)
+	}
+	return s.InsertEvolutions(evos)
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current

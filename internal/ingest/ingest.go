@@ -252,7 +252,11 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 
 		if latest[j.specID] == j.version && len(ps.Changes) > 0 {
-			if err := db.InsertChanges(ps.Changes); err != nil {
+			// ReplaceChanges = DELETE WHERE spec_id=? + INSERT — keeps the
+			// cumulative change history idempotent on --resume (prior attempt
+			// may have inserted these rows; the changes table has no unique
+			// constraint, so a plain INSERT would duplicate them).
+			if err := db.ReplaceChanges(ctx, ps.Spec.SpecID, ps.Changes); err != nil {
 				return st, err
 			}
 			st.Changes += len(ps.Changes)
@@ -298,9 +302,11 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	}
 
 	// Seed the curated NE<->NF evolution edges (relational stand-in for the V2
-	// graph). Idempotent because Reset() cleared the table at the start.
+	// graph). ReplaceEvolutions = truncate + insert, so a --resume run that
+	// kept the existing DB doesn't APPEND a duplicate edge set on the table
+	// (which has no uniqueness constraint).
 	evos := seedEvolutions()
-	if err := db.InsertEvolutions(evos); err != nil {
+	if err := db.ReplaceEvolutions(ctx, evos); err != nil {
 		return st, err
 	}
 	st.Evolutions = len(evos)
