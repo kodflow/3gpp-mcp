@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/htmlparse"
@@ -69,6 +70,12 @@ type Options struct {
 	Embedder   embed.Embedder
 	Registry   *subject.Registry // domain subjects (nil = registry.Default())
 	Logf       func(string, ...any)
+	// Resume keeps the existing DB at dbPath instead of Reset()-ing it, skips
+	// (spec, version) tuples whose ingest_log row is 'done' under the current
+	// pipeline_version, and PURGES + re-runs rows that are 'started' (a runner
+	// that died mid-spec left a half-state — re-do that spec only). Stale-
+	// pipeline rows are wiped first (invariant #2: algorithm bump rebuilds).
+	Resume bool
 }
 
 // Stats summarises a run.
@@ -83,6 +90,11 @@ type Stats struct {
 // (GSM Phase 1/2 = 4-digit series 00-12, different numbering — out of scope.)
 // Junk inner docs from embedded media lack the prefix and are excluded.
 var reFile = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
+
+// ingestJob is one (spec, version) tuple to process. Promoted to a named type
+// (was anonymous inside Run) so filterResumeJobs can take it as a parameter
+// without anonymous-struct identity issues.
+type ingestJob struct{ path, specID, release, version string }
 
 // Run executes the pipeline into the DuckDB file at dbPath.
 func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
@@ -107,8 +119,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	if err != nil {
 		return st, err
 	}
-	type job struct{ path, specID, release, version string }
-	var jobs []job
+	var jobs []ingestJob
 	relSet, serSet, specSet := set(opt.Releases), set(opt.Series), set(opt.SpecIDs)
 	for _, p := range files {
 		base := strings.TrimSuffix(filepath.Base(p), ext)
@@ -131,7 +142,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		if len(specSet) > 0 && !specSet[specID] && !specSet[num] {
 			continue
 		}
-		jobs = append(jobs, job{p, specID, release, version})
+		jobs = append(jobs, ingestJob{p, specID, release, version})
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].path < jobs[j].path })
 
@@ -144,14 +155,22 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 	}
 
-	_ = os.Remove(dbPath) // deterministic rebuild: start from a fresh file
+	// Resume mode: keep the existing DB (if any) and skip already-done specs.
+	// Fresh mode (default): drop the file so the run is deterministic.
+	resuming := opt.Resume && fileExists(dbPath)
+	if !resuming {
+		_ = os.Remove(dbPath)
+	}
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return st, err
 	}
 	defer func() { _ = db.Close() }()
-	if err := db.Reset(ctx); err != nil {
-		return st, err
+	// Only Reset() on a fresh run — resuming wipes the work we want to keep.
+	if !resuming {
+		if err := db.Reset(ctx); err != nil {
+			return st, err
+		}
 	}
 
 	// Vector floor: embed only clauses at/above this release (lexical coverage is
@@ -165,9 +184,32 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 	}
 
-	specsSeen := map[string]bool{}
+	// Resume orchestration (axis #15, plan §15 invariant #2):
+	//   1. wipe ingest_log rows from a stale pipeline_version (algorithm bump
+	//      ⇒ the partial DB is no longer comparable, redo everything),
+	//   2. for each (spec, version) that's 'started' but not 'done', purge
+	//      its tables and the log row so the re-run is clean,
+	//   3. filter out (spec, version) tuples already 'done'.
+	pipelineVersion := model.PipelineVersion(opt.Embedder.ModelID())
+	jobs, skippedDone, err := filterResumeJobs(ctx, db, jobs, opt.Resume, pipelineVersion, logf)
+	if err != nil {
+		return st, fmt.Errorf("resume filter: %w", err)
+	}
+	// chunkID picks up from MAX(chunk_id) when resuming so re-runs don't
+	// collide with rows already in `clauses` from earlier attempts.
 	var chunkID uint64
-	for _, j := range jobs {
+	if resuming {
+		if maxID, err := db.MaxChunkID(ctx); err == nil {
+			chunkID = maxID
+		}
+	}
+	specsSeen := map[string]bool{}
+	// total = planned (after skip), N = jobs to process this run. The progress
+	// counter shows "done in this run" / planned + the cumulative "already done"
+	// from previous attempts so the operator can see real corpus coverage.
+	total := len(jobs)
+	startedAt := time.Now()
+	for i, j := range jobs {
 		ps, err := parse(j.path)
 		if err != nil {
 			logf("skip %s: %v", j.path, err)
@@ -180,6 +222,13 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		if !specsSeen[ps.Spec.SpecID] {
 			specsSeen[ps.Spec.SpecID] = true
 			st.Specs++
+		}
+		// Checkpoint START: a runner kill from this point on leaves a
+		// status='started' row; on resume we'll PurgeSpecScope + redo this
+		// (spec, version). Stamped with the current pipeline_version so an
+		// algorithm bump invalidates the log (see ResetIngestLog above).
+		if err := db.MarkIngestStarted(ctx, ps.Spec.SpecID, ps.Version.Version, pipelineVersion); err != nil {
+			return st, fmt.Errorf("mark ingest start %s %s: %w", ps.Spec.SpecID, ps.Version.Version, err)
 		}
 		if err := db.UpsertSpec(ps.Spec); err != nil {
 			return st, fmt.Errorf("upsert spec %s: %w", ps.Spec.SpecID, err)
@@ -203,7 +252,11 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 
 		if latest[j.specID] == j.version && len(ps.Changes) > 0 {
-			if err := db.InsertChanges(ps.Changes); err != nil {
+			// ReplaceChanges = DELETE WHERE spec_id=? + INSERT — keeps the
+			// cumulative change history idempotent on --resume (prior attempt
+			// may have inserted these rows; the changes table has no unique
+			// constraint, so a plain INSERT would duplicate them).
+			if err := db.ReplaceChanges(ctx, ps.Spec.SpecID, ps.Changes); err != nil {
 				return st, err
 			}
 			st.Changes += len(ps.Changes)
@@ -226,14 +279,34 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 				logf("subject %s: +%d on %s %s", s.Name(), n, ps.Spec.SpecID, ps.Version.Release)
 			}
 		}
-		logf("ingested %s %s (%s) — %d clauses%s", ps.Spec.SpecID, ps.Version.Version,
+		// Checkpoint DONE: flips status='done' so the next resume run skips
+		// this (spec, version) entirely.
+		if err := db.MarkIngestDone(ctx, ps.Spec.SpecID, ps.Version.Version); err != nil {
+			return st, fmt.Errorf("mark ingest done %s %s: %w", ps.Spec.SpecID, ps.Version.Version, err)
+		}
+		// Progress + ETA. With Resume, `skippedDone` rows are real corpus
+		// coverage from a previous attempt — we show both numbers so the
+		// operator sees both this-run progress AND total accomplished work.
+		pct := (i + 1) * 100 / max1(total)
+		elapsed := time.Since(startedAt)
+		var etaStr string
+		if i+1 < total && i+1 > 0 {
+			perJob := elapsed / time.Duration(i+1)
+			eta := perJob * time.Duration(total-i-1)
+			etaStr = fmt.Sprintf(" ETA %s", eta.Round(time.Second))
+		}
+		logf("[%3d/%d %3d%% +%d resumed]%s ingested %s %s (%s) — %d clauses%s",
+			i+1, total, pct, skippedDone, etaStr,
+			ps.Spec.SpecID, ps.Version.Version,
 			ps.Version.Release, len(ps.Clauses), degradedTag(ps.Degraded))
 	}
 
 	// Seed the curated NE<->NF evolution edges (relational stand-in for the V2
-	// graph). Idempotent because Reset() cleared the table at the start.
+	// graph). ReplaceEvolutions = truncate + insert, so a --resume run that
+	// kept the existing DB doesn't APPEND a duplicate edge set on the table
+	// (which has no uniqueness constraint).
 	evos := seedEvolutions()
-	if err := db.InsertEvolutions(evos); err != nil {
+	if err := db.ReplaceEvolutions(ctx, evos); err != nil {
 		return st, err
 	}
 	st.Evolutions = len(evos)
@@ -351,4 +424,61 @@ func splitVer(v string) [3]int {
 		out[i], _ = strconv.Atoi(p)
 	}
 	return out
+}
+
+// fileExists is the local truthiness for "the DB on disk is real" — used by
+// the Resume gate. Kept separate from internal/embed's `fileExists` to avoid a
+// cross-package import for one trivial stat.
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
+
+// max1 guarantees the divisor of a percentage stays >= 1 so a zero-job run
+// doesn't divide-by-zero the progress display.
+func max1(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// filterResumeJobs implements the three-step resume orchestration:
+//  1. ResetIngestLog drops rows that don't belong to the CURRENT pipeline
+//     version (invariant #2: algorithm bump rebuilds from scratch).
+//  2. Every (spec, version) still 'started' (a killed runner left a half-
+//     ingested spec) is PurgeSpecScope'd so the redo is clean.
+//  3. (spec, version) tuples that are 'done' under the current pipeline are
+//     filtered out of the job list (the actual skip).
+//
+// Returns the filtered job list + the count of skipped-because-done so the
+// progress line can report "+N resumed" alongside this-run progress.
+func filterResumeJobs(ctx context.Context, db *store.Store, jobs []ingestJob, resume bool, pipelineVersion string, logf func(string, ...any)) ([]ingestJob, int, error) {
+	if !resume {
+		return jobs, 0, nil
+	}
+	if err := db.ResetIngestLog(ctx, pipelineVersion); err != nil {
+		return jobs, 0, fmt.Errorf("reset stale ingest_log: %w", err)
+	}
+	out := jobs[:0]
+	skipped := 0
+	for _, j := range jobs {
+		done, err := db.IsIngestDone(ctx, j.specID, j.version, pipelineVersion)
+		if err != nil {
+			return jobs, 0, fmt.Errorf("check ingest_log %s %s: %w", j.specID, j.version, err)
+		}
+		if done {
+			skipped++
+			continue
+		}
+		// status='started' but not 'done' — half-ingested, purge then redo.
+		if err := db.PurgeSpecScope(ctx, j.specID, j.version); err != nil {
+			return jobs, 0, fmt.Errorf("purge half-ingested %s %s: %w", j.specID, j.version, err)
+		}
+		out = append(out, j)
+	}
+	if skipped > 0 {
+		logf("resume: %d (spec, version) tuples already done, %d to process this run", skipped, len(out))
+	}
+	return out, skipped, nil
 }
