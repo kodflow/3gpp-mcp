@@ -55,9 +55,12 @@ jobs:
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
       SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
       # Hard cap to avoid an infinite rerun loop on a genuinely-broken state.
-      # 5 attempts × ~6h each = up to 30h wall-clock for the worst series,
-      # which is well past the projected ~10h needed for series 24.
-      MAX_ATTEMPTS: "5"
+      # 12 attempts × {shard_timeout_minutes} each. With timeout=60 that's 12h
+      # of cumulative runner time per shard — comfortably above series 24's
+      # ~5h ingest projection AND leaves headroom for partial-progress
+      # restarts. With timeout=360 it caps the cumulative wall-clock at 72h
+      # which is still a real cap; a job genuinely broken won't loop forever.
+      MAX_ATTEMPTS: "12"
     steps:
       - name: Decide whether to rerun
         id: decide
