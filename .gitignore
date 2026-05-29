@@ -174,5 +174,5 @@ out/
 .claude/logs/
 core.*
 .taskmaster/
-merge
+/merge
 docs/architecture-pipeline.md
