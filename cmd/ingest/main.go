@@ -84,19 +84,33 @@ func main() {
 	}
 	if *report == "json" {
 		// Machine summary for CI gates (e.g. jq '.model=="bge-m3" and .embedded_clauses>0').
-		// null_embeddings is the TOTAL null count — with --embed-floor it legitimately
-		// includes below-floor clauses, so gate on embedded_clauses>0 + model, not null==0.
-		nullEmb := 0
+		// IMPORTANT: report CUMULATIVE DB state, not this-run delta. With
+		// --resume + cross-run cache, a re-ingest may legitimately do ZERO
+		// work this attempt (everything already 'done' from a prior attempt
+		// or yesterday's cached shard) and st.Clauses is then 0. The OLD
+		// formula `st.Clauses - nullEmb` mixed delta with cumulative and
+		// reported embedded_clauses=0 on every cache-hit — which tripped the
+		// CI gate on shards that had ALREADY successfully embedded.
+		//
+		// Fix: open the output DB read-only and pull the real counts.
+		// "clauses" + "embedded_clauses" + "null_embeddings" now describe
+		// the FINAL DB state the artifact represents, regardless of how
+		// much work this particular attempt did. _this_run_clauses is
+		// retained for observability (operator can see whether the attempt
+		// actually did anything vs. relied on a cache hit).
+		totalClauses, nullEmb := 0, 0
 		if rdb, e := store.OpenReadOnly(*out); e == nil {
+			totalClauses, _ = rdb.CountClauses(context.Background())
 			nullEmb, _ = rdb.CountNullEmbeddings(context.Background())
 			_ = rdb.Close()
 		}
 		rep := map[string]any{
 			"embedder_enabled": opt.Embedder.Enabled(),
 			"model":            opt.Embedder.ModelID(),
-			"clauses":          st.Clauses,
-			"embedded_clauses": st.Clauses - nullEmb,
+			"clauses":          totalClauses,
+			"embedded_clauses": totalClauses - nullEmb,
 			"null_embeddings":  nullEmb,
+			"this_run_clauses": st.Clauses, // delta this attempt (0 on full cache-hit)
 			"fts":              st.FTS,
 			"hnsw":             st.HNSW,
 			"version":          Version,
