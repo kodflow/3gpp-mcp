@@ -1,0 +1,84 @@
+# Auto-rerun corpus-matrix when build-shards hit the GitHub-hosted-runner 6h
+# job cap. Pairs with the --resume infrastructure shipped in PR #47:
+#
+#   1. corpus-matrix dispatches → build-shards run
+#   2. big series (e.g. 24, 196 specs) ~8-10h ingest → killed at 360 min
+#      with conclusion="cancelled" (NOT failure — the platform terminates the
+#      runner, doesn't error the step), whole run becomes "cancelled"
+#   3. THIS workflow fires on the workflow_run completion event, detects
+#      cancelled build-shards, calls `gh run rerun --failed` (which reruns
+#      cancelled AND failed jobs)
+#   4. the rerun's `Restore prior shard artifact` pulls back the partial DB
+#      uploaded by the previous attempt's `if: always()` step; --resume skips
+#      'done' specs and purges+redoes 'started' ones — so the rerun makes
+#      ADDITIONAL progress in its next 6h slot
+#   5. repeat until either all shards green (publish-vec fires) or the
+#      max_attempts safety cap kicks in
+#
+# Why this beats per-(series,release) matrix splitting: it's a single ~50-line
+# YAML, requires zero code change, and ANY future 6h-bound shard auto-recovers
+# regardless of which spec made it big.
+name: Corpus Matrix — auto-rerun on 6h cap
+
+on:
+  workflow_run:
+    workflows: ["Corpus Matrix"]
+    types: [completed]
+
+# The default GITHUB_TOKEN has no actions:write; we need it to call `gh run rerun`.
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun:
+    # Fire only when the source run ended non-success AND it was a dispatch
+    # (manual triggers are the only ones that hit this path — PR validations
+    # use a tiny scope that fits in 6h, so they never end cancelled).
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      # Hard cap to avoid an infinite rerun loop on a genuinely-broken state.
+      # 5 attempts × ~6h each = up to 30h wall-clock for the worst series,
+      # which is well past the projected ~10h needed for series 24.
+      MAX_ATTEMPTS: "5"
+    steps:
+      - name: Decide whether to rerun
+        id: decide
+        run: |
+          set -eu
+          echo "source run=$SOURCE_RUN_ID attempt=$SOURCE_ATTEMPT conclusion=${{ github.event.workflow_run.conclusion }}"
+          if [ "$SOURCE_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::warning::source run already at attempt $SOURCE_ATTEMPT/$MAX_ATTEMPTS — refusing further reruns"
+            echo "rerun=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Count build-shard jobs that ended cancelled or failure on THIS attempt.
+          # If zero (e.g. the run was cancelled at the discover/model stage),
+          # rerunning is pointless because there's no shard work to resume.
+          to_rerun=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs" \
+            --jq '[.jobs[] | select(.name | startswith("build-shard"))
+                            | select(.conclusion=="cancelled" or .conclusion=="failure")] | length')
+          echo "build-shards needing rerun: $to_rerun"
+          if [ "$to_rerun" -eq 0 ]; then
+            echo "::notice::no cancelled/failed build-shards on attempt $SOURCE_ATTEMPT — nothing to rerun"
+            echo "rerun=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "rerun=true" >> "$GITHUB_OUTPUT"
+      - name: Re-run failed/cancelled jobs (resumes via --resume)
+        if: steps.decide.outputs.rerun == 'true'
+        run: |
+          set -eu
+          # `gh run rerun --failed` is the documented "rerun only failed AND
+          # cancelled jobs" call. It bumps run_attempt by 1 and re-executes
+          # those jobs in-place; the Restore-prior-artifact step in the
+          # rerun then pulls the partial shard DB the previous attempt
+          # uploaded via its `if: always()` upload step.
+          gh run rerun "$SOURCE_RUN_ID" --failed
+          echo "::notice::rerun dispatched for run $SOURCE_RUN_ID (was attempt $SOURCE_ATTEMPT)"
