@@ -33,7 +33,7 @@ func TestMergePipelineVersionGate(t *testing.T) {
 		_ = st.SetMeta("pipeline_version", "NEW-PIPELINE")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -73,7 +73,7 @@ func TestMergePipelineVersionGateEmptyBase(t *testing.T) {
 		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.0.0", "1")})
 		_ = st.SetMeta("pipeline_version", "NEW-PIPELINE")
 	})
-	if err := run(ctx, out, []string{shard}, false, "", base, false); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)

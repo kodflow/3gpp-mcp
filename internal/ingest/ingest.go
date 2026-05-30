@@ -23,6 +23,7 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/registry"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subject"
+	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
 // parsedSpec is the parser-agnostic result; both htmlparse and ooxml produce the
@@ -319,6 +320,16 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	// rebuild from scratch instead of mixing mechanics (plan §15 invariant #2).
 	if err := db.SetMeta("pipeline_version", model.PipelineVersion(opt.Embedder.ModelID())); err != nil {
 		return st, err
+	}
+	// Stamp each subject's footprint so the shard self-describes which subject
+	// versions produced it; merge re-stamps authoritatively and publishes the
+	// subject-index.json that discover diffs to detect a changed subject (plan
+	// TROU #1). subjectmeta is the CGO-free source of truth, kept in lockstep
+	// with the registry by TestSubjectMetaMatchesRegistry.
+	for _, m := range subjectmeta.All {
+		if err := db.SetMeta("subject_fp_"+m.Name, subjectmeta.Footprint(m)); err != nil {
+			return st, err
+		}
 	}
 	if opt.EnableFTS {
 		if err := db.EnableFTS(ctx); err != nil {
