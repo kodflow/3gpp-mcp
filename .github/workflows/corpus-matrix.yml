@@ -148,6 +148,7 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
       floor: ${{ steps.set.outputs.floor }}
       full: ${{ steps.set.outputs.full }}
+      publish: ${{ steps.set.outputs.publish }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -185,7 +186,25 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "floor=$floor"   >> "$GITHUB_OUTPUT"
           echo "full=$full"     >> "$GITHUB_OUTPUT"
-          echo "matrix=$matrix  floor=$floor  full=$full"
+
+          # PUBLISH GUARD (single source of truth): only a WHOLE-corpus run may
+          # ever clobber the rolling `latest` release. A scoped run — an explicit
+          # series_scope (the operator's small test like "21 33"), or a PR's tiny
+          # fixed scope — produces ARTIFACTS ONLY, even if publish_to_latest=true
+          # was passed. This is the guard that stops a "small test scenario" from
+          # shrinking latest (e.g. the 3031→149 clobber that motivated it): latest
+          # is written exclusively by the job that builds the entire corpus.
+          publish=false
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+             && [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] \
+             && [ -z "$scope" ]; then
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix  floor=$floor  full=$full  publish=$publish (scope='$scope')"
+          if [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] && [ "$publish" != "true" ]; then
+            echo "::notice::publish_to_latest=true was IGNORED — this is a scoped/PR run (scope='$scope'); latest is only written by a whole-corpus run. Outputs go to artifacts."
+          fi
 
   # ---- 1b. model bundle (embed only): fetch BGE-M3 + ORT from HuggingFace ONCE
   # and publish to a 'models' release, so the N shards restore it intra-GitHub
@@ -655,8 +674,10 @@ jobs:
         run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
-      - name: Upload artifact (when not publishing)
-        if: github.event.inputs.publish_to_latest != 'true'
+      # Always upload the merged DB + indexes as an artifact (even on a publish
+      # run) — cheap, and gives an inspectable copy of every run including the
+      # scoped tests that intentionally never touch `latest`.
+      - name: Upload artifact (merged DB + indexes)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-duckdb-merged
@@ -666,8 +687,11 @@ jobs:
             data/corpus-index.json
             data/subject-index.json
           retention-days: 7
+      # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
+      # publish_to_latest=true. A scoped/test run never reaches this step, so it
+      # can't clobber latest no matter what inputs it was given.
       - name: Publish DB + index to 'latest' (clobber)
-        if: github.event.inputs.publish_to_latest == 'true'
+        if: needs.discover.outputs.publish == 'true'
         run: |
           gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
@@ -684,6 +708,7 @@ jobs:
   publish-vec:
     needs: [discover, build-shard]
     if: needs.discover.outputs.matrix != '[]' && github.event.inputs.embed == 'true'
+    # discover.outputs.publish gates the actual GHCR push (whole-corpus run only).
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -718,8 +743,11 @@ jobs:
             '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
           cat vec/vec-manifest.json
           test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no vectorized sub-bases to publish"; exit 1; }
+      # Push to the rolling GHCR tag ONLY on an authorised whole-corpus run (same
+      # guard as the Release publish — a scoped/test embed run never overwrites
+      # the published vectorized channel).
       - name: Push sub-bases + manifest to GHCR (rolling 'latest')
-        if: github.event.inputs.publish_to_latest == 'true'
+        if: needs.discover.outputs.publish == 'true'
         run: |
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           cd vec
@@ -729,8 +757,8 @@ jobs:
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
-      - name: Upload artifact (when not publishing)
-        if: github.event.inputs.publish_to_latest != 'true'
+      # Always keep an artifact copy (even on a publish run, for inspection).
+      - name: Upload artifact (vectorized sub-bases)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-vec
