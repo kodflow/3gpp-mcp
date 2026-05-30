@@ -61,12 +61,14 @@ jobs:
       # restarts. With timeout=360 it caps the cumulative wall-clock at 72h
       # which is still a real cap; a job genuinely broken won't loop forever.
       MAX_ATTEMPTS: "12"
-      # Source run's shard_timeout_minutes — read directly from the workflow_run
-      # event payload (`github.event.workflow_run.inputs.*` is the documented
-      # path for workflow_dispatch inputs). Falls back to '360' (the YAML
-      # default) when the source run wasn't a workflow_dispatch (e.g. a
-      # scheduled trigger, or a rerun of a run pre-dating the input).
-      TIMEOUT_MIN: ${{ github.event.workflow_run.inputs.shard_timeout_minutes || '360' }}
+      # Source run's shard_timeout_minutes. workflow_run events DO NOT propagate
+      # workflow_dispatch inputs from the source run — `github.event.workflow_run.inputs`
+      # is not a valid expression on this trigger (parser rejects the whole YAML).
+      # Hardcoded to match the value used by current production dispatches; bump
+      # in lockstep with corpus-matrix.yml's shard_timeout_minutes input default
+      # if production switches away from 60 (e.g. back to 360). Worth a small
+      # maintenance tax for the readable user-cancel-vs-cap heuristic below.
+      TIMEOUT_MIN: "60"
     steps:
       - name: Decide whether to rerun
         id: decide
