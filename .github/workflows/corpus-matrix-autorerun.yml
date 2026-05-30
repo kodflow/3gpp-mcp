@@ -80,12 +80,9 @@ jobs:
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # TIMEOUT_MIN comes from the workflow_run event payload (the source
-          # run's shard_timeout_minutes input). It's wired via the job-level
-          # env var below — the `${{ ... }}` is expanded at YAML evaluation
-          # time so the bash sees a literal string. Defaults to 360 (the
-          # YAML's own default for that input) if the source dispatch didn't
-          # provide it (older workflow versions, scheduled triggers, etc.).
+          # TIMEOUT_MIN is wired via the job-level env var above (hardcoded for
+          # now — workflow_run events do not propagate source workflow_dispatch
+          # inputs, see comment on the env declaration).
           echo "source timeout=${TIMEOUT_MIN} min"
           # Sanity: TIMEOUT_MIN must be a positive integer (paranoia: workflow_run
           # inputs are repo-collaborator-controlled but we still validate before
