@@ -28,6 +28,7 @@ internal/
 ├── bootstrap/    # self-provisioning: fetch DB snapshot + models into user cache
 ├── mcp/          # MCP tool surface (8 tools, CLAUDE.md §5) + resources + pagination
 ├── registry/     # wires the set of enabled subjects (the only core↔subject seam)
+├── subjectmeta/  # CGO-free subject footprints (Version/Series) for incremental rebuild
 └── subject/      # domain-vertical plugin contract
     ├── glossary/ # seeds acronyms from TS 21.905 (no tool of its own)
     └── li/        # Lawful Interception (TS 33.128): ASN.1 registry + li_events tool

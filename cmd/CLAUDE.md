@@ -30,7 +30,7 @@ cmd/
 | `server` | MCP server (stdio); `serve` / `bootstrap` / `version` subcommands | ✅ user-facing |
 | `ingest` | Scrape-converted HTML → clauses + embeddings → DuckDB (CLAUDE.md §6) | offline |
 | `merge` | Concatenate disjoint shard DBs; offsets synthetic PKs, rebuilds FTS | CI |
-| `discover` | Diff site versions vs `corpus-index.json` → JSON series array | CI matrix |
+| `discover` | Diff site versions vs `corpus-index.json` + changed subjects vs `subject-index.json` → JSON series array | CI matrix |
 | `ingest-catalog` | Additive metadata overlay from DynaReport HTML (axis #3) | offline |
 | `ingest-openapi` | Additive 5GC OpenAPI load; clears only `api_*` tables (axis #2) | offline |
 | `li-audit` | Verify/relocate LI events against normative text → markdown report | tooling |
