@@ -360,38 +360,30 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 // embedded (vectors for recent releases only); every clause stays ingested
 // lexically. st.Vectors is set only if something was actually embedded, so an
 // all-below-floor corpus doesn't trigger an empty HNSW build downstream.
+//
+// Delegates the batching + per-clause hashing + skip-if-unchanged to embed.Apply,
+// the single shared embed path also used by cmd/embed. Each embedded clause gets
+// its embedding_hash stored so a later run (inline or decoupled) re-embeds only
+// the clauses whose text or model changed.
 func embedClauses(ctx context.Context, db *store.Store, e embed.Embedder, clauses []model.Clause, floorOrd int, st *Stats) error {
 	if !e.Enabled() || len(clauses) == 0 {
 		return nil
 	}
-	const batch = 32
-	for i := 0; i < len(clauses); i += batch {
-		end := min(i+batch, len(clauses))
-		// Track chunk ids in parallel with texts: clauses skipped by the floor
-		// break positional alignment with the returned vectors.
-		texts := make([]string, 0, end-i)
-		ids := make([]uint64, 0, end-i)
-		for _, c := range clauses[i:end] {
-			if floorOrd > 0 {
-				if o, ok := model.ReleaseOrdinal(c.Release); !ok || o < floorOrd {
-					continue // below the vector floor: lexical-only
-				}
-			}
-			texts = append(texts, c.Heading+"\n"+c.Text)
-			ids = append(ids, c.ChunkID)
-		}
-		if len(texts) == 0 {
-			continue
-		}
-		vecs, err := e.Embed(ctx, texts)
-		if err != nil {
-			return err
-		}
-		for k, v := range vecs {
-			if err := db.SetEmbedding(ctx, ids[k], v); err != nil {
-				return err
+	items := make([]embed.Item, 0, len(clauses))
+	for _, c := range clauses {
+		if floorOrd > 0 {
+			if o, ok := model.ReleaseOrdinal(c.Release); !ok || o < floorOrd {
+				continue // below the vector floor: lexical-only
 			}
 		}
+		// Freshly-parsed clauses carry no stored hash; embed.Apply embeds them all.
+		items = append(items, embed.Item{ChunkID: c.ChunkID, Heading: c.Heading, Text: c.Text})
+	}
+	n, err := embed.Apply(ctx, e, items, db.SetEmbeddingWithHash)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
 		st.Vectors = true
 	}
 	return nil

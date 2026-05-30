@@ -100,6 +100,27 @@ func (s *Store) RebuildHNSW(ctx context.Context) error {
 	return s.BuildAndFreezeHNSW(ctx, s.GetMeta(ctx, "embedding_model"))
 }
 
+// PrepareForEmbedUpdate makes the clauses table writable for embedding updates.
+// DuckDB forbids modifying a table while an HNSW index references it ("Cannot
+// bind index 'clauses', unknown index type 'HNSW'" / dependency error), so the
+// decoupled embed step must drop the index before UPDATE-ing the embedding
+// column and let BuildAndFreezeHNSW recreate it afterwards. Loading VSS first is
+// required for DROP INDEX on the custom index type to be recognised. Safe to call
+// on a DB that was never embedded (DROP IF EXISTS is a no-op); best-effort on VSS
+// so a build without the extension still allows plain UPDATEs.
+func (s *Store) PrepareForEmbedUpdate(ctx context.Context) error {
+	// VSS may be unavailable (extension not installed); that's fine for a DB with
+	// no HNSW index — the DROP becomes a no-op and UPDATEs work normally.
+	_ = s.EnableVSS(ctx)
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS clauses_hnsw`); err != nil {
+		return fmt.Errorf("drop hnsw before embed update: %w", err)
+	}
+	// Clear the frozen markers so a crash mid-embed doesn't leave serve trusting a
+	// now-dropped index. BuildAndFreezeHNSW re-stamps them on success.
+	_ = s.SetMeta("hnsw_state", "building")
+	return nil
+}
+
 // LoadVSS is the serve-side counterpart of LoadFTS: it loads the extension and
 // marks vssAvailable=true ONLY when a frozen, present, count-consistent index is
 // found (the corruption gate, axis #6 §6). It never creates an index.

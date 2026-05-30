@@ -562,8 +562,12 @@ func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
 			return fmt.Errorf("drop index %s: %w", idx, err)
 		}
 	}
-	// 2. Slim copy: same rows, every column EXCEPT embedding.
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding) FROM clauses`); err != nil {
+	// 2. Slim copy: same rows, every column EXCEPT the vector ones (the dense
+	//    vector AND its per-clause fingerprint). Dropping embedding_hash too keeps
+	//    the lexical asset free of any vector metadata, and means a future embed
+	//    run over this slim DB sees every clause as "never embedded" (correct: it
+	//    has no vectors).
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding, embedding_hash) FROM clauses`); err != nil {
 		return fmt.Errorf("create clauses_slim: %w", err)
 	}
 	// 3. Swap.
