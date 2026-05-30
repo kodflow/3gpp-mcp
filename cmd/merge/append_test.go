@@ -146,11 +146,20 @@ func TestMergeEmitsSubjectIndex(t *testing.T) {
 	out := filepath.Join(dir, "out.duckdb")
 	subjIdx := filepath.Join(dir, "subject-index.json")
 
+	// Cover BOTH subject series (33 = li, 21 = glossary) so a full build advances
+	// every subject's footprint to the current code (a real --all includes all
+	// series; a narrow build would only advance the built subjects — see the
+	// not-rebuilt test).
 	buildShard(t, shard, func(st *store.Store) {
 		_ = st.SetMeta("pipeline_version", model.PipelineVersion(""))
 		_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
+		_ = st.UpsertSpec(model.Spec{SpecID: "21.905", Series: "21", DocType: "TS"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-18", Version: "18.0.0"})
-		_ = st.InsertClauses([]model.Clause{cl(1, "33.128", "Rel-18", "18.0.0", "6")})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "21.905", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.InsertClauses([]model.Clause{
+			cl(1, "33.128", "Rel-18", "18.0.0", "6"),
+			cl(2, "21.905", "Rel-18", "18.0.0", "3"),
+		})
 	})
 
 	if err := run(ctx, out, []string{shard}, false, "", "", false, subjIdx); err != nil {
@@ -186,5 +195,63 @@ func TestMergeEmitsSubjectIndex(t *testing.T) {
 		if got := st.GetMeta(ctx, "subject_fp_"+m.Name); got != subjectmeta.Footprint(m) {
 			t.Errorf("meta subject_fp_%s = %q, want %q", m.Name, got, subjectmeta.Footprint(m))
 		}
+	}
+}
+
+// TestSubjectFootprintNotAdvancedWhenSeriesNotRebuilt is the "footprint must not
+// lie" guard. An incremental merge whose shards DON'T include a subject's series
+// must NOT advance that subject's published footprint to the current code — it
+// must carry the base's value forward, so the next discover still rebuilds the
+// not-yet-updated subject. (Reproduces the explicit-series_scope hazard.)
+func TestSubjectFootprintNotAdvancedWhenSeriesNotRebuilt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.duckdb")
+	shard := filepath.Join(dir, "shard-24.duckdb")
+	out := filepath.Join(dir, "out.duckdb")
+	subjIdx := filepath.Join(dir, "subject-index.json")
+	lexPV := model.PipelineVersion("")
+
+	// Base carries a STALE li footprint (pretend li was last built at an old
+	// version) plus series 33 (li's series) and series 24.
+	const staleLIFP = "oldli0000000"
+	buildShard(t, base, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
+		_ = st.SetMeta("subject_fp_li", staleLIFP)
+		_ = st.SetMeta("subject_fp_glossary", "oldgloss0000")
+		_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.InsertClauses([]model.Clause{
+			cl(1, "33.128", "Rel-18", "18.0.0", "6"),
+			cl(2, "24.501", "Rel-18", "18.0.0", "5"),
+		})
+	})
+	// Delta rebuilds ONLY series 24 — li's series (33) is untouched this run.
+	buildShard(t, shard, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.1.0"})
+		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.1.0", "5")})
+	})
+
+	if err := run(ctx, out, []string{shard}, false, "", base, false, subjIdx); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(subjIdx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	// li's series (33) was NOT rebuilt → its footprint must stay the base's stale
+	// value, NOT advance to current code. Otherwise the index would claim li is
+	// up to date while series 33 still holds the old extraction.
+	if got["li"] != staleLIFP {
+		t.Errorf("li footprint = %q, want carried-forward base %q (33 not rebuilt → must not advance)", got["li"], staleLIFP)
 	}
 }

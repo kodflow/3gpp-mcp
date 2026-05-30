@@ -157,15 +157,25 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	if err := db.SetMeta("pipeline_version", outPV); err != nil {
 		return fmt.Errorf("stamp pipeline_version: %w", err)
 	}
-	// Stamp each subject's current footprint into the output meta so the DB
-	// self-describes which subject versions produced it. merge is built from the
-	// same commit as the shards in this run, so subjectmeta (current code) is the
-	// authoritative footprint for the merged content. discover diffs the published
-	// subject-index.json (below) against this same code on the NEXT run; a changed
-	// subject then forces its series back into the matrix (plan TROU #1).
-	for _, m := range subjectmeta.All {
-		if err := db.SetMeta("subject_fp_"+m.Name, subjectmeta.Footprint(m)); err != nil {
-			return fmt.Errorf("stamp subject_fp_%s: %w", m.Name, err)
+	// Stamp each subject's EFFECTIVE footprint into the output meta so the DB
+	// self-describes which subject versions actually produced its content. A
+	// subject's footprint may advance to the current code's value ONLY if every
+	// series it owns was rebuilt in this run (or this is a full rebuild) — because
+	// the subject re-extracts during the per-series ingest, so a series that
+	// wasn't rebuilt still holds the OLD subject's rows. If we blindly stamped the
+	// current footprint, an operator dispatch with an explicit series_scope that
+	// excludes a changed subject's series would publish a subject-index claiming
+	// the new version while the DB still holds the old extraction — and the next
+	// auto-delta would see "unchanged" and never rebuild it (a footprint that
+	// lies). When not advancing, we carry the base's stored footprint forward, so
+	// the next auto-delta still detects the pending change and rebuilds it.
+	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, base)
+	if err != nil {
+		return fmt.Errorf("compute subject footprints: %w", err)
+	}
+	for name, fp := range effFP {
+		if err := db.SetMeta("subject_fp_"+name, fp); err != nil {
+			return fmt.Errorf("stamp subject_fp_%s: %w", name, err)
 		}
 	}
 	if fts {
@@ -186,18 +196,83 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		fmt.Fprintf(os.Stderr, "[merge] index: %s — %d specs\n", indexOut, n)
 	}
 	// Publish the subject footprints alongside corpus-index.json so the next
-	// discover can detect a changed subject and re-index only its series.
+	// discover can detect a changed subject and re-index only its series. This is
+	// the SAME effective-footprint map stamped into the DB meta above, so the
+	// published index never disagrees with the DB it describes.
 	if subjectIndexOut != "" {
-		b, err := json.MarshalIndent(subjectmeta.Index(), "", " ")
+		b, err := json.MarshalIndent(effFP, "", " ")
 		if err != nil {
 			return fmt.Errorf("marshal subject index: %w", err)
 		}
 		if err := os.WriteFile(subjectIndexOut, b, 0o644); err != nil {
 			return fmt.Errorf("write subject index %s: %w", subjectIndexOut, err)
 		}
-		fmt.Fprintf(os.Stderr, "[merge] subject-index: %s — %d subjects\n", subjectIndexOut, len(subjectmeta.All))
+		fmt.Fprintf(os.Stderr, "[merge] subject-index: %s — %d subjects\n", subjectIndexOut, len(effFP))
 	}
 	return nil
+}
+
+// effectiveSubjectFootprints returns name->footprint for every subject, where a
+// subject advances to the current code's footprint ONLY if every series it owns
+// was present in this run's shards (i.e. its rows were actually re-extracted).
+// Otherwise it carries the base's stored footprint forward — which is "" when
+// there is no base or the base predates the stamp, and that's safe: discover
+// then treats the subject as changed and rebuilds it. This uniform rule covers
+// both the explicit-narrow-scope delta AND the first-build-with-narrow-scope
+// case; a real full build (--all) includes every series, so every subject
+// advances. See the call site for why a blind current-footprint stamp lies.
+func effectiveSubjectFootprints(ctx context.Context, sqldb *sql.DB, inputs []string, base string) (map[string]string, error) {
+	rebuilt, err := shardSeries(ctx, sqldb, inputs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(subjectmeta.All))
+	for _, m := range subjectmeta.All {
+		advance := true
+		for _, s := range m.Series {
+			if !rebuilt[s] {
+				advance = false
+				break
+			}
+		}
+		if advance {
+			out[m.Name] = subjectmeta.Footprint(m)
+		} else {
+			out[m.Name] = metaValue(ctx, sqldb, base, "subject_fp_"+m.Name)
+		}
+	}
+	return out, nil
+}
+
+// shardSeries returns the set of 2-digit series (substr(spec_id,1,2)) present in
+// the given shard DBs — i.e. the series actually rebuilt this run.
+func shardSeries(ctx context.Context, sqldb *sql.DB, paths []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, p := range paths {
+		esc := strings.ReplaceAll(p, "'", "''")
+		if _, err := sqldb.ExecContext(ctx, "ATTACH '"+esc+"' AS ss (READ_ONLY)"); err != nil {
+			return nil, fmt.Errorf("attach %s: %w", p, err)
+		}
+		rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) FROM ss.spec_versions`)
+		if err != nil {
+			_, _ = sqldb.ExecContext(ctx, "DETACH ss")
+			return nil, err
+		}
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				_ = rows.Close()
+				_, _ = sqldb.ExecContext(ctx, "DETACH ss")
+				return nil, err
+			}
+			out[s] = true
+		}
+		_ = rows.Close()
+		if _, err := sqldb.ExecContext(ctx, "DETACH ss"); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // metaValue reads one schema_meta value from a DuckDB file (attach read-only →
