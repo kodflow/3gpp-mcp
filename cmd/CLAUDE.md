@@ -14,7 +14,8 @@ cmd/
 ├── server/          # MCP server over stdio + `bootstrap` provisioning subcommand
 │   ├── main.go
 │   └── bootstrap.go
-├── ingest/          # build the deterministic DuckDB snapshot from converted HTML
+├── ingest/          # build the deterministic DuckDB snapshot from converted HTML (lexical)
+├── embed/           # decoupled vectorisation of an EXISTING DB; re-embeds only changed clauses
 ├── merge/           # fuse per-shard DuckDB snapshots into one consolidated DB
 ├── discover/        # decide which series need (re)indexing → sizes the CI matrix
 ├── ingest-catalog/  # overlay DynaReport metadata (WG, title, freeze_date) onto a DB
@@ -28,7 +29,8 @@ cmd/
 | Binary | Role | Ships? |
 |--------|------|--------|
 | `server` | MCP server (stdio); `serve` / `bootstrap` / `version` subcommands | ✅ user-facing |
-| `ingest` | Scrape-converted HTML → clauses + embeddings → DuckDB (CLAUDE.md §6) | offline |
+| `ingest` | Scrape-converted HTML → clauses + FTS → DuckDB (lexical; embed is now separate) | offline |
+| `embed` | Vectorise an existing DB in place; re-embeds ONLY clauses whose `embedding_hash` drifted (micro-granular). Runs after ingest, never on a lexical-only build | offline/CI |
 | `merge` | Concatenate disjoint shard DBs; offsets synthetic PKs, rebuilds FTS | CI |
 | `discover` | Diff site versions vs `corpus-index.json` + changed subjects vs `subject-index.json` → JSON series array | CI matrix |
 | `ingest-catalog` | Additive metadata overlay from DynaReport HTML (axis #3) | offline |

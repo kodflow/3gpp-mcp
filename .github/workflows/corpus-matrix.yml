@@ -368,12 +368,15 @@ jobs:
           cache: true
       - name: Install deps (LibreOffice + build)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
-      - name: Build ingest (-tags onnx when embedding)
+      - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
+          # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
+          # separate step (cmd/embed), so ingest just produces the clause text +
+          # FTS. When embed=true we ALSO build the onnx-tagged cmd/embed, which
+          # vectorises the shard in place, re-embedding ONLY changed clauses.
+          go build -trimpath -o bin/ingest ./cmd/ingest
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/ingest ./cmd/ingest
-          else
-            go build -trimpath -o bin/ingest ./cmd/ingest
+            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/embed ./cmd/embed
           fi
       - name: Restore model components from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
@@ -484,7 +487,7 @@ jobs:
           # would see every spec 'done' and skip embedding, producing a
           # vector-less shard that fails the embedded_clauses gate. v2 bump
           # invalidates the old (mode-less, subject-less) cache namespace.
-          key: shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'cmd/ingest/main.go', 'internal/subject/**/*.go', 'internal/subjectmeta/**/*.go', 'internal/registry/**/*.go') }}
+          key: shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'internal/store/hnsw.go', 'cmd/ingest/main.go', 'cmd/embed/main.go', 'internal/subject/**/*.go', 'internal/subjectmeta/**/*.go', 'internal/registry/**/*.go') }}
           restore-keys: |
             shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-
             shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-
@@ -517,56 +520,23 @@ jobs:
       # (always: success or failure) keeping the partial DB available for the
       # next attempt. --resume makes the next attempt skip 'done' specs +
       # purge half-ingested ones (PR #47, see internal/ingest/ingest.go).
-      - name: Ingest shard ${{ matrix.series }} (with --resume + retry)
+      - name: Ingest shard ${{ matrix.series }} (lexical, --resume + retry)
         id: ingest
-        env:
-          EMBEDDER: ${{ github.event.inputs.embed == 'true' && 'bge-m3' || '' }}
-          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
-          ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
-          # Long clauses (ASN.1 tables, full procedures) routinely exceed BGE-M3's
-          # 512-token cap; without windowing their tail is silently truncated.
-          # mean_pool windows the input + averages window vectors so every byte
-          # contributes. Default-ON in CI; opt-out only if perf-probing.
-          EMBED_WINDOWING: mean_pool
-          # Cross-encoder reranker (bundled by the model job when WITH_RERANKER=1
-          # — see above). The ingest itself doesn't rerank, but pre-populating
-          # the directory keeps the path predictable when the serve binary uses
-          # the same data/models layout (and lets `make rerank-eval` work
-          # locally on the same artifacts).
-          RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
-          # pipefail propagates ANY non-zero in a pipeline (the embed branch
-          # below pipes ingest into tee; without pipefail an ingest crash whose
-          # stdout is consumed by tee silently returns 0 — the retry loop would
-          # treat it as success and upload a partial DB).
+          # Ingest is now ALWAYS lexical (clause text + FTS); embedding is the
+          # separate step below. --resume skips 'done' specs from a restored
+          # partial shard; the retry loop covers transient mid-ingest failures.
           set -o pipefail
           mkdir -p dist
           OUT="dist/shard-${{ matrix.series }}.duckdb"
-          RPT="dist/shard-${{ matrix.series }}.report.json"
-          # Bash retry loop (defense-in-depth): if the binary returns non-zero
-          # mid-ingest (e.g. a transient ONNX session error a recover() missed),
-          # --resume on the next attempt picks up from the last 'done' spec.
-          # The Restore-prior-artifact step plus this loop give us two layers:
-          # - intra-step transient failure → bash retry (this loop)
-          # - runner-kill / user-cancel    → GitHub re-run + artifact restore
-          # Both paths converge on the same --resume contract.
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
             echo "::group::ingest attempt $attempt/$max_attempts (series ${{ matrix.series }})"
-            if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume \
-                   --embed-floor "${{ github.event.inputs.embed_floor }}" --require-semantic --report json \
-                   | tee "$RPT" \
-                 && jq -e '.model=="bge-m3" and .embedded_clauses>0' "$RPT"; then
-                ingest_ok=1
-              fi
-            else
-              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
-                ingest_ok=1
-              fi
+            if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
+              ingest_ok=1
             fi
             echo "::endgroup::"
             if [ "$ingest_ok" -eq 1 ]; then
@@ -580,7 +550,52 @@ jobs:
             echo "::error::ingest exhausted $max_attempts attempts; the always-upload step preserves the partial DB so a manual re-run can --resume"
             exit 1
           fi
-          rm -rf data/sources/convert || true   # free HTML before artifact upload
+      # ── DECOUPLED EMBED (embed=true only) ───────────────────────────────────
+      # Runs cmd/embed ON the just-built lexical shard: re-embeds ONLY the clauses
+      # whose text or model changed (per-clause embedding_hash), so a resumed /
+      # cached shard re-embeds the delta, not the whole series. The embedding_hash
+      # persists in the shard artifact + cross-run cache, so a re-run over an
+      # unchanged series embeds ~0 clauses. Retry loop: a 6h-cap kill mid-embed
+      # leaves the partial vectors + hashes in the uploaded shard; the rerun's
+      # restore + this step re-embed only what's still missing.
+      - name: Embed shard ${{ matrix.series }} (decoupled, micro-granular, --resume)
+        if: github.event.inputs.embed == 'true'
+        env:
+          EMBEDDER: bge-m3
+          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
+          ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
+          EMBED_WINDOWING: mean_pool
+          RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
+        run: |
+          set -o pipefail
+          OUT="dist/shard-${{ matrix.series }}.duckdb"
+          RPT="dist/shard-${{ matrix.series }}.report.json"
+          attempt=0
+          max_attempts=3
+          embed_ok=0
+          while [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt+1))
+            echo "::group::embed attempt $attempt/$max_attempts (series ${{ matrix.series }})"
+            # --require-semantic refuses to no-op if the embedder isn't enabled.
+            # The gate checks the model + that NO at/above-floor clause is left
+            # without a vector (null_embeddings==0 means the shard is fully
+            # vectorised; a 6h-cap partial leaves >0 and fails → rerun resumes).
+            if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
+                 --require-semantic --report json | tee "$RPT" \
+               && jq -e '.model=="bge-m3" and .null_embeddings==0' "$RPT"; then
+              embed_ok=1
+            fi
+            echo "::endgroup::"
+            if [ "$embed_ok" -eq 1 ]; then echo "embed attempt $attempt succeeded"; break; fi
+            echo "::warning::embed attempt $attempt incomplete — sleeping 30s before retry (resumes via embedding_hash)"
+            sleep 30
+          done
+          if [ "$embed_ok" -eq 0 ]; then
+            echo "::error::embed exhausted $max_attempts attempts; partial vectors+hashes preserved in the shard for a --resume rerun"
+            exit 1
+          fi
+      - name: Free HTML before artifact upload
+        run: rm -rf data/sources/convert || true
       # Upload artifact ALWAYS (success or failure) so the next attempt of
       # this same job can --resume from the partial DB on disk. retention-days
       # is short (1d) — these are temp shards, not the published corpus.
