@@ -646,6 +646,27 @@ jobs:
           fi
       - name: Free HTML before artifact upload
         run: rm -rf data/sources/convert || true
+      # Stamp the EFFECTIVE per-shard timeout into a run artifact so the
+      # workflow_run-triggered autorerun can read the real value instead of
+      # hardcoding it (PR-1, timeout-min-drift-resurrects-operator-cancel).
+      # workflow_run events do NOT propagate the source dispatch inputs, but
+      # they CAN list/download the source run's artifacts — so this is the
+      # drift-proof channel. Every matrix slice writes the SAME value; a single
+      # overwrite-able artifact (last write wins, all identical) is enough.
+      - name: Stamp effective shard timeout (for autorerun)
+        if: always()
+        run: |
+          mkdir -p dist
+          printf '%s\n' "${{ fromJSON(github.event.inputs.shard_timeout_minutes || '360') }}" > dist/shard-timeout.txt
+      - name: Upload shard-timeout stamp (autorerun reads this)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: shard-timeout
+          path: dist/shard-timeout.txt
+          retention-days: 1
+          if-no-files-found: ignore
+          overwrite: true
       # Upload artifact ALWAYS (success or failure) so the next attempt of
       # this same job can --resume from the partial DB on disk. retention-days
       # is short (1d) — these are temp shards, not the published corpus.
@@ -701,11 +722,26 @@ jobs:
           mkdir -p data
           base_arg=""
           # Delta run: start from the existing DB and let each shard's series replace it.
+          #
+          # FAIL-CLOSED on a PUBLISHING delta run (PR-1,
+          # delta-publish-clobbers-latest-on-base-download-failure): if this run is
+          # authorised to clobber `latest` (publish=true) and is a delta (full=false),
+          # a missing/failed base download MUST abort — merging delta-only shards with
+          # no --base produces a fresh DB of just the changed series, and clobbering
+          # `latest` with it would shrink the published corpus to a handful of specs.
+          # The `2>/dev/null` that used to swallow the error is GONE so the failure is
+          # visible in the log. A NON-publishing delta run may still degrade to a fresh
+          # artifacts-only build (it never touches `latest`).
           if [ "${{ needs.discover.outputs.full }}" != "true" ]; then
-            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D . 2>/dev/null; then
+            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D .; then
               zstd -d 3gpp.duckdb.zst -o base.duckdb
               base_arg="--base base.duckdb"
               echo "incremental: using existing latest DB as base"
+            elif [ "${{ needs.discover.outputs.publish }}" = "true" ]; then
+              echo "::error::delta publish run could not fetch the 'latest' base DB — refusing to clobber latest with a delta-only rebuild"
+              exit 1
+            else
+              echo "::notice::no base available; non-publishing run proceeds as a fresh rebuild (artifacts only)"
             fi
           fi
           # When embed=true the shards carry FLOAT[1024] embeddings + a per-shard
@@ -752,6 +788,61 @@ jobs:
             data/corpus-index.json
             data/subject-index.json
           retention-days: 7
+      # PRE-PUBLISH COUNT GUARD (PR-1, deterministic / fail-closed). Before
+      # clobbering `latest`, assert the about-to-publish DB does NOT have FEWER
+      # spec_versions or api_operations than the base it is replacing. A delta
+      # publish must only ADD or REPLACE rows; a DROP means the merge silently
+      # lost normative/API coverage (e.g. a base-download or enrich regression
+      # slipping past the fail-closed branch above). No vague "significantly
+      # smaller" threshold — ANY decrease blocks, unless this is a full rebuild
+      # (full=true, where shrink is intentional) or the operator explicitly
+      # acknowledges it via ALLOW_CORPUS_SHRINK / ALLOW_API_SHRINK. The counts are
+      # printed either way so a block is self-explanatory.
+      - name: Pre-publish count guard (no silent corpus/API shrink)
+        if: needs.discover.outputs.publish == 'true'
+        env:
+          ALLOW_CORPUS_SHRINK: ${{ vars.ALLOW_CORPUS_SHRINK }}
+          ALLOW_API_SHRINK: ${{ vars.ALLOW_API_SHRINK }}
+          FULL: ${{ needs.discover.outputs.full }}
+        run: |
+          set -eu
+          go build -trimpath -o bin/dbcount ./cmd/dbcount
+          # Parse "key=value" lines into shell vars (new_spec_versions, etc.).
+          eval "$(./bin/dbcount --db data/3gpp.duckdb | sed 's/^/new_/')"
+          echo "new: spec_versions=$new_spec_versions api_operations=$new_api_operations"
+          if [ "$FULL" = "true" ]; then
+            echo "::notice::full rebuild — count guard skipped (a full run may legitimately reshape the corpus)"
+            exit 0
+          fi
+          if [ ! -f base.duckdb ]; then
+            # A delta publish with no base would already have failed the fail-closed
+            # branch in the merge step; this is pure defence-in-depth.
+            echo "::error::delta publish run has no base.duckdb to compare against — refusing to publish"
+            exit 1
+          fi
+          eval "$(./bin/dbcount --db base.duckdb | sed 's/^/base_/')"
+          echo "base: spec_versions=$base_spec_versions api_operations=$base_api_operations"
+          block=0
+          if [ "$new_spec_versions" -lt "$base_spec_versions" ]; then
+            if [ "${ALLOW_CORPUS_SHRINK:-}" = "true" ]; then
+              echo "::warning::spec_versions shrank $base_spec_versions → $new_spec_versions but ALLOW_CORPUS_SHRINK=true — allowed"
+            else
+              echo "::error::spec_versions would SHRINK $base_spec_versions → $new_spec_versions on a delta publish — blocking (set repo variable ALLOW_CORPUS_SHRINK=true to override)"
+              block=1
+            fi
+          fi
+          if [ "$new_api_operations" -lt "$base_api_operations" ]; then
+            if [ "${ALLOW_API_SHRINK:-}" = "true" ]; then
+              echo "::warning::api_operations shrank $base_api_operations → $new_api_operations but ALLOW_API_SHRINK=true — allowed"
+            else
+              echo "::error::api_operations would SHRINK $base_api_operations → $new_api_operations on a delta publish — blocking (set repo variable ALLOW_API_SHRINK=true to override)"
+              block=1
+            fi
+          fi
+          if [ "$block" -ne 0 ]; then
+            exit 1
+          fi
+          echo "count guard PASSED: corpus/API coverage did not shrink"
       # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
       # publish_to_latest=true. A scoped/test run never reaches this step, so it
       # can't clobber latest no matter what inputs it was given.
