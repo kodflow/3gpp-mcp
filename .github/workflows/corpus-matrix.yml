@@ -686,12 +686,20 @@ jobs:
             # without a vector. We key on null_embeddings_at_floor, NOT the global
             # null_embeddings: with --embed-floor set, below-floor clauses are
             # LEFT NULL on purpose (lexical-only), so global null is never 0 and
-            # would fail every shard with older releases. _at_floor==0 means the
+            # would fail every shard with older releases. The gate ALSO requires
+            # .hnsw==true: a transient BuildAndFreezeHNSW failure leaves vectors
+            # present but the index unfrozen (rep.HNSW=false) and is otherwise
+            # non-fatal, so a shard could ship fully vectorised but UNINDEXED
+            # (serve degrades to O(N) exact scan, no alert). Failing the attempt
+            # makes the retry re-run the cheap build (0 re-embeds via
+            # embedding_hash) instead of publishing an unindexed sub-base
+            # (embed-gate-ignores-hnsw-false / hnsw-freeze-failure-not-gated).
+            # _at_floor==0 means the
             # shard is fully vectorised at/above the floor; a 6h-cap partial
             # leaves >0 and fails → the rerun resumes via embedding_hash.
             if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
                  --require-semantic --report json | tee "$RPT" \
-               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0' "$RPT"; then
+               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
               embed_ok=1
             fi
             echo "::endgroup::"
