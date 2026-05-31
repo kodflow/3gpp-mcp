@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/catalog"
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
@@ -45,7 +46,7 @@ func main() {
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
 	subjectIndexPath := flag.String("subject-index", "", "subject-index.json (subject -> footprint); a changed subject forces its series into the delta")
 	buildIndexPath := flag.String("build-index", "", "build-index.json (the three canonical identities); a drift vs current code forces a full rebuild")
-	expectModel := flag.String("embed-model", "", "the embedder ModelID the current build will use; compared against the published EmbedIdentity")
+	expectModel := flag.String("embed-model", "", "the embedder FAMILY the current build will use (e.g. bge-m3); resolved to the canonical EmbedIdentity and compared against the published one")
 	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
 	flag.Parse()
@@ -84,8 +85,14 @@ func main() {
 	var identityDrift []string
 	if !full && *buildIndexPath != "" {
 		published := loadBuildIndex(*buildIndexPath)
+		// Resolve the embedder FAMILY (e.g. "bge-m3") to the canonical ModelID the
+		// real backend would report (the full EmbedIdentity digest), so the drift
+		// compare keys on the SAME identity merge stamps and serve checks — a weight/
+		// tokenizer/dim/precision bump then forces a re-embed even though no spec
+		// version moved (finding model-change-needs-full-flag-not-auto-detected).
 		current := model.CurrentBuildIndex(
-			subjectmeta.IngestFootprints(), subjectmeta.ASN1ScannerVersion, *expectModel,
+			subjectmeta.IngestFootprints(), subjectmeta.ASN1ScannerVersion,
+			embed.ResolveModelID(*expectModel),
 			model.GlobalEnrichmentParts{},
 		)
 		identityDrift = published.Differs(current)
