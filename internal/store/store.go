@@ -75,6 +75,16 @@ func (s *Store) migrate() error {
 		 ON CONFLICT (key) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
 	}
+	// Additive upgrade: a DB built before embedding_hash existed (a lexical
+	// snapshot from an earlier binary) gets the column added in place — no
+	// rebuild, no data loss. DuckDB ADD COLUMN IF NOT EXISTS is a no-op when the
+	// column is already present (fresh DBs created from schema.sql above). This
+	// is metadata ABOUT embeddings, so it deliberately does NOT bump
+	// schema_version / SchemaVersion (lexical content is unchanged).
+	if _, err := s.db.Exec(
+		`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
+		return fmt.Errorf("add embedding_hash column: %w", err)
+	}
 	return nil
 }
 
@@ -482,6 +492,48 @@ func (s *Store) SetEmbedding(ctx context.Context, chunkID uint64, vec []float32)
 		`UPDATE clauses SET embedding = CAST(? AS FLOAT[1024]) WHERE chunk_id = ?`,
 		vecLiteral(vec), chunkID)
 	return err
+}
+
+// SetEmbeddingWithHash stores the vector AND the per-clause embedding hash in one
+// UPDATE, so the (vector, hash) pair stays consistent. The hash is the fingerprint
+// of (embedded text + model id): the decoupled embed step re-embeds a clause only
+// when its current hash differs from the stored one, making repeat embed runs
+// proportional to the clause delta rather than the whole spec/corpus.
+func (s *Store) SetEmbeddingWithHash(ctx context.Context, chunkID uint64, vec []float32, hash string) error {
+	if len(vec) == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE clauses SET embedding = CAST(? AS FLOAT[1024]), embedding_hash = ? WHERE chunk_id = ?`,
+		vecLiteral(vec), hash, chunkID)
+	return err
+}
+
+// EmbedCandidate is a clause the embed step may need to (re)embed: the text to
+// embed plus the hash currently stored against its vector ("" when never
+// embedded). The caller recomputes the expected hash and skips rows where it
+// already matches StoredHash, so only genuinely-changed clauses are embedded.
+type EmbedCandidate struct {
+	ChunkID    uint64
+	Heading    string
+	Text       string
+	Release    string
+	StoredHash string
+}
+
+// ClausesNeedingEmbedding streams the clauses that might need a vector: those with
+// no embedding yet, OR a stale/absent hash. A clause whose StoredHash already
+// equals the freshly-computed hash is returned but skipped by the caller — we
+// surface it rather than filtering in SQL so the hash function lives in one place
+// (Go), and so a model change (which the SQL can't know about) still re-embeds.
+// floorOrd > 0 restricts to clauses at/above that release ordinal (vectors are
+// recent-only; lexical coverage is unaffected). The rows() are streamed; the
+// caller must drain them.
+func (s *Store) ClausesNeedingEmbedding(ctx context.Context) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, `
+		SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '')
+		FROM clauses
+		ORDER BY chunk_id`)
 }
 
 // Reset truncates all data tables (full deterministic rebuild).

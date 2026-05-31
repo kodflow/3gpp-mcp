@@ -43,7 +43,10 @@ CREATE TABLE IF NOT EXISTS clauses (
     heading      VARCHAR,
     text         VARCHAR,
     is_normative BOOLEAN,
-    embedding    FLOAT[1024]             -- NULL until embeddings (Phase 4)
+    embedding    FLOAT[1024],            -- NULL until embeddings (Phase 4)
+    embedding_hash VARCHAR               -- sha(heading+text+model); NULL until embedded.
+                                         -- Lets the decoupled embed step re-embed ONLY
+                                         -- clauses whose text or model changed (micro-granular).
 );
 CREATE INDEX IF NOT EXISTS clauses_spec   ON clauses (spec_id);
 CREATE INDEX IF NOT EXISTS clauses_rel    ON clauses (release);

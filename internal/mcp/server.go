@@ -54,7 +54,7 @@ func New(st *store.Store, version, baseline string, vecShards []string) *server.
 		mcp.WithString("query", mcp.Required(), mcp.Description("free-text query")),
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
-		mcp.WithString("spec_type", mcp.Description("TS or TR")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
 		mcp.WithString("spec_id", mcp.Description("e.g. 33.128")),
 		mcp.WithNumber("top_k", mcp.Description("max results per page (default 10)")),
 		mcp.WithString("cursor", mcp.Description("opaque pagination cursor from a previous call's next_cursor")),
@@ -108,7 +108,7 @@ func New(st *store.Store, version, baseline string, vecShards []string) *server.
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
 		mcp.WithString("working_group", mcp.Description("e.g. SA3")),
-		mcp.WithString("spec_type", mcp.Description("TS or TR")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
 	), h.listSpecs)
 
 	s.AddTool(mcp.NewTool("search_api",
@@ -231,7 +231,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	}
 	filter := store.SpecFilter{
 		Release: r.GetString("release", h.baseline), Series: r.GetString("series", ""),
-		DocType: r.GetString("spec_type", ""), SpecID: r.GetString("spec_id", ""),
+		DocType: docTypeDefault(r.GetString("spec_type", "")), SpecID: r.GetString("spec_id", ""),
 	}
 	pageSize := r.GetInt("top_k", 10)
 	if pageSize <= 0 {
@@ -426,9 +426,24 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	}
 	cites := make([]model.Citation, 0, len(evos))
 	for _, e := range evos {
+		// Fill release+version from the justification spec's latest indexed version
+		// so the citation carries {spec_id, release, version, clause, url} whenever
+		// the spec is in the corpus (issue #7). An evolution is inherently
+		// cross-release, so the citation points at the spec's current state — the
+		// clause is the curated justification anchor. If the spec isn't indexed,
+		// release/version stay empty (cite-or-silent: we still give spec+clause+url).
+		rel, ver, _, _ := h.st.LatestVersion(ctx, e.JustificationSpec)
+		// Prefer the exact versioned archive URL; fall back to the spec directory
+		// when the justification spec isn't indexed (no version to encode) so the
+		// citation always carries a resolvable URL.
+		url := model.ArchiveURL(e.JustificationSpec, ver)
+		if url == "" {
+			url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(e.JustificationSpec) + "_series/" + e.JustificationSpec + "/"
+		}
 		cites = append(cites, model.Citation{
-			SpecID: e.JustificationSpec, Clause: e.JustificationClause,
-			URL: "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(e.JustificationSpec) + "_series/" + e.JustificationSpec + "/",
+			SpecID: e.JustificationSpec, Release: rel, Version: ver,
+			Clause: e.JustificationClause,
+			URL:    url,
 		})
 	}
 	return jsonResult(map[string]any{
@@ -440,6 +455,26 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	})
 }
 
+// docTypeDefault applies the TS-first doctrine (CLAUDE.md §7: "TS ≠ TR — toujours
+// filtrer par défaut sur TS"). When the caller omits spec_type we default to "TS"
+// so TR (informative study reports) don't pollute normative results. Explicit
+// "TR" filters to TR; "any"/"all"/"*" (case-insensitive) opt into the mixed set
+// by returning "" (no doc_type filter). Issue #6.
+func docTypeDefault(specType string) string {
+	switch strings.ToLower(strings.TrimSpace(specType)) {
+	case "":
+		return "TS" // TS-first default
+	case "any", "all", "*":
+		return "" // explicit opt-in to TS+TR
+	case "tr":
+		return "TR"
+	case "ts":
+		return "TS"
+	default:
+		return specType // pass through (store filters exact-match; unknown ⇒ empty result, which is honest)
+	}
+}
+
 var reSpecRef = regexp.MustCompile(`\bT[SR]\s?(\d\d\.\d{3})\b`)
 
 func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -447,9 +482,9 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	version := ""
-	if _, v, ok, _ := h.st.LatestVersion(ctx, specID); ok {
-		version = v
+	release, version := "", ""
+	if rel, v, ok, _ := h.st.LatestVersion(ctx, specID); ok {
+		release, version = rel, v
 	}
 	clauses, err := h.st.GetClauses(ctx, specID, version, r.GetString("clause", ""))
 	if err != nil {
@@ -457,25 +492,40 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	}
 	seen := map[string]bool{}
 	var refs []string
+	// One citation per resolved reference: the regex only yields a spec_id, so we
+	// resolve each referenced spec's latest indexed release/version to complete the
+	// citation (issue #7). A reference not in the corpus still gets spec_id + a
+	// spec-directory URL (cite-or-silent never drops the pointer).
+	refCites := make([]model.Citation, 0)
 	for _, c := range clauses {
 		for _, m := range reSpecRef.FindAllStringSubmatch(c.Heading+" "+c.Text, -1) {
 			id := m[1]
 			if id != specID && !seen[id] {
 				seen[id] = true
 				refs = append(refs, id)
+				rel, ver, _, _ := h.st.LatestVersion(ctx, id)
+				url := model.ArchiveURL(id, ver)
+				if url == "" {
+					url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(id) + "_series/" + id + "/"
+				}
+				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url})
 			}
 		}
 	}
 	return jsonResult(map[string]any{
-		"spec_id": specID, "version": version, "count": len(refs), "references": refs,
-		"citation": model.Citation{SpecID: specID, Version: version, URL: model.ArchiveURL(specID, version)},
+		"spec_id": specID, "release": release, "version": version,
+		"count": len(refs), "references": refs,
+		// Source-spec citation (where the references were found) + one citation per
+		// referenced spec, each with whatever provenance is resolvable.
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version)},
+		"ref_citations": refCites,
 	})
 }
 
 func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	specs, err := h.st.ListSpecs(ctx, store.SpecFilter{
 		Release: r.GetString("release", h.baseline), Series: r.GetString("series", ""),
-		WorkingGroup: r.GetString("working_group", ""), DocType: r.GetString("spec_type", ""),
+		WorkingGroup: r.GetString("working_group", ""), DocType: docTypeDefault(r.GetString("spec_type", "")),
 	})
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("list_specs failed", err), nil

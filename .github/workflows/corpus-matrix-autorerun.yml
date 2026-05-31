@@ -54,13 +54,17 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
       SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-      # Hard cap to avoid an infinite rerun loop on a genuinely-broken state.
-      # 12 attempts × {shard_timeout_minutes} each. With timeout=60 that's 12h
-      # of cumulative runner time per shard — comfortably above series 24's
-      # ~5h ingest projection AND leaves headroom for partial-progress
-      # restarts. With timeout=360 it caps the cumulative wall-clock at 72h
-      # which is still a real cap; a job genuinely broken won't loop forever.
-      MAX_ATTEMPTS: "12"
+      # Rerun cap. Set high (999) on purpose: the corpus build must keep
+      # resuming until every shard is green — a big series (or an embed=true
+      # run at ~1 clause/s on CPU) legitimately needs many 6h slots, and
+      # --resume makes real forward progress on each one (skips 'done' specs).
+      # The genuine-breakage guard is NOT this counter but the user-cancel
+      # heuristic below (a run cancelled well under the timeout is treated as
+      # an operator stop and NOT resurrected). So a truly-broken job that dies
+      # fast looks like a user-cancel pattern and stops; only jobs that burn
+      # their full slot (= real progress or a hard cap) get rerun. 999 ≈ "until
+      # it's done".
+      MAX_ATTEMPTS: "999"
       # Source run's shard_timeout_minutes. workflow_run events DO NOT propagate
       # workflow_dispatch inputs from the source run — `github.event.workflow_run.inputs`
       # is not a valid expression on this trigger (parser rejects the whole YAML).
