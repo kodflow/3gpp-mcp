@@ -15,10 +15,15 @@ import (
 // delta, not the spec or corpus. Keep this the single definition of "what text we
 // embed" so ingest and cmd/embed never disagree.
 //
-// The model component is the canonical model.EmbedIdentity (plan PR-3), so the
-// re-embed gate keys on the SAME identity as DB meta and serve-time compatibility
-// checks. PR-3 populates only the model id; PR-6 widens it (revision, tokenizer,
-// dim, precision) — a change in any of those then re-embeds without re-ingesting.
+// The model component is the canonical model.EmbedIdentity (plan PR-3/PR-6), so
+// the re-embed gate keys on the SAME identity as DB meta and serve-time
+// compatibility checks. modelID is the embedder's ModelID(): for the production
+// BGE-M3 backend that is ALREADY the full EmbedIdentity digest (model family +
+// weight revision + tokenizer revision + dim + normalisation + precision — see
+// embed.bgeModelID), so a change in any of those components re-embeds every clause
+// WITHOUT re-ingesting. Wrapping it in EmbedParts.ModelID keeps a single
+// definition of the embed component and stays deterministic for the lexical
+// ("hash-local") and disabled ("") embedders too.
 func ClauseHash(heading, text, modelID string) string {
 	embedID := model.EmbedIdentity(model.EmbedParts{ModelID: modelID})
 	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + embedID))

@@ -67,9 +67,16 @@ func newEmbedder() Embedder {
 	return &onnxEmbedder{tok: tok, session: sess, windowing: envOr("EMBED_WINDOWING", "")}
 }
 
-func (*onnxEmbedder) Enabled() bool   { return true }
-func (*onnxEmbedder) Dim() int        { return Dim }
-func (*onnxEmbedder) ModelID() string { return "bge-m3" }
+func (*onnxEmbedder) Enabled() bool { return true }
+func (*onnxEmbedder) Dim() int      { return Dim }
+
+// ModelID returns the canonical BGE-M3 EmbedIdentity (digest of model family +
+// pinned weight revision + tokenizer revision + dim + normalisation + precision),
+// NOT the bare family name. This is what is stamped into DB meta (embedding_model),
+// folded into ClauseHash, and compared at serve time — so a weight/tokenizer/dim/
+// precision change flips it and the re-embed + serve-compat gates fire instead of
+// silently scoring a fresh query vector against corpus vectors from another model.
+func (*onnxEmbedder) ModelID() string { return bgeModelID() }
 
 // batchSize bounds how many clauses go into one ONNX call. 32 (CLAUDE.md §2)
 // amortises the per-call overhead while keeping the padded tensor small.

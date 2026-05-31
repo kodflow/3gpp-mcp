@@ -194,10 +194,21 @@ jobs:
             # the delta even when no norm moved (plan TROU #1).
             gh release download latest --repo "$GITHUB_REPOSITORY" -p corpus-index.json -D . 2>/dev/null || true
             gh release download latest --repo "$GITHUB_REPOSITORY" -p subject-index.json -D . 2>/dev/null || true
+            # build-index.json carries the three canonical identities; a drift in
+            # the embed identity (model weight/tokenizer/dim/precision bump) or the
+            # spec-ingest identity forces a full rebuild even when no spec version
+            # moved (plan PR-3/PR-6). --embed-model is the FAMILY discover resolves
+            # to the canonical EmbedIdentity; keep it in lockstep with EMBEDDER on
+            # the build-shard job (default lexical when embed=false).
+            gh release download latest --repo "$GITHUB_REPOSITORY" -p build-index.json -D . 2>/dev/null || true
+            embed_model=""
+            if [ "${{ github.event.inputs.embed }}" = "true" ]; then
+              embed_model="bge-m3"
+            fi
             if [ "$full" = "true" ]; then
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor")
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --floor "$floor")
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor")
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -754,7 +765,8 @@ jobs:
             strip_arg="--strip-embeddings"
           fi
           ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json \
-            --subject-index-out data/subject-index.json $base_arg $strip_arg shards/*.duckdb
+            --subject-index-out data/subject-index.json \
+            --build-index-out data/build-index.json $base_arg $strip_arg shards/*.duckdb
           ls -lh data/3gpp.duckdb
       - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
         run: |
@@ -787,6 +799,7 @@ jobs:
             data/3gpp.duckdb.sha256
             data/corpus-index.json
             data/subject-index.json
+            data/build-index.json
           retention-days: 7
       # PRE-PUBLISH COUNT GUARD (PR-1, deterministic / fail-closed). Before
       # clobbering `latest`, assert the about-to-publish DB does NOT have FEWER
@@ -854,7 +867,7 @@ jobs:
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
           gh release upload latest --repo "$GITHUB_REPOSITORY" \
             data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 \
-            data/corpus-index.json data/subject-index.json --clobber
+            data/corpus-index.json data/subject-index.json data/build-index.json --clobber
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
   # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,
