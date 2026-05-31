@@ -23,6 +23,7 @@ import (
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
+	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
 var Version = "dev"
@@ -31,6 +32,7 @@ func main() {
 	out := flag.String("out", "data/3gpp.duckdb", "merged output DuckDB path")
 	fts := flag.Bool("fts", true, "rebuild the BM25 FTS index on the merged DB")
 	indexOut := flag.String("index-out", "", "also write a corpus-index.json (spec_id -> latest version) for incremental discover")
+	subjectIndexOut := flag.String("subject-index-out", "", "also write a subject-index.json (subject -> footprint) so discover can detect a changed subject")
 	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
 	stripEmbeddings := flag.Bool("strip-embeddings", false,
 		"after merge, DROP COLUMN embedding so the GitHub Release asset stays slim (vectors live in the GHCR per-series sub-bases)")
@@ -40,13 +42,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "merge: no input DBs given")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings); err != nil {
+	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut); err != nil {
 		fmt.Fprintln(os.Stderr, "merge:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool) error {
+func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut string) error {
 	_ = os.Remove(out)
 	db, err := store.Open(out)
 	if err != nil {
@@ -58,6 +60,20 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	}
 	sqldb := db.DB()
 
+	// The merged output's identity is its OWN pipeline_version — the digest of the
+	// indexing mechanics that produced its CONTENT (parser, chunking, schema,
+	// embedding model). It is lexical (empty model id) when we strip vectors,
+	// otherwise it mirrors the model the shards carry. This is the value the NEXT
+	// delta run compares its --base against, so it must describe the output, not
+	// the raw shard: a bge-m3 shard whose vectors we strip yields a LEXICAL DB and
+	// must be tagged as such, or the following lexical delta would see a spurious
+	// mismatch and full-rebuild (clobbering the corpus).
+	outModelID := ""
+	if !stripEmbeddings && len(inputs) > 0 {
+		outModelID = metaValue(ctx, sqldb, inputs[0], "embedding_model")
+	}
+	outPV := model.PipelineVersion(outModelID)
+
 	// Build the fold list. With --base (incremental), the existing DB is folded
 	// first as the accumulator; each subsequent shard's whole series REPLACES the
 	// base's copy of that series (a shard is one complete series). Without --base
@@ -66,20 +82,14 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	incremental := base != ""
 	if incremental {
 		// Invariant #2 (plan §15): a delta is only valid if the base was built by
-		// the SAME indexing pipeline. If pipeline_version differs (parser/chunking/
-		// schema/embedding-model change), the base is incompatible → rebuild fresh.
-		if len(inputs) > 0 {
-			basePV := metaValue(ctx, sqldb, base, "pipeline_version")
-			// All shards in one run come from the same ingest build, so they share a
-			// pipeline_version; inputs[0] is representative of "the current pipeline".
-			shardPV := metaValue(ctx, sqldb, inputs[0], "pipeline_version")
-			// Strict compare: "" is a distinct value, so a base that predates
-			// pipeline_version (basePV=="") vs a versioned shard is a mismatch and is
-			// rebuilt. Only when BOTH are empty (all pre-feature) do we reuse the base.
-			if basePV != shardPV {
-				fmt.Fprintf(os.Stderr, "[merge] pipeline_version mismatch (base=%q shard=%q) — full rebuild, ignoring --base\n", basePV, shardPV)
-				incremental = false
-			}
+		// the SAME indexing pipeline as the output we're about to stamp. If the
+		// base's pipeline_version differs (parser/chunking/schema/embedding-model
+		// change, or a legacy base that predates the stamp → ""), it is
+		// incompatible → rebuild fresh from the shards.
+		basePV := metaValue(ctx, sqldb, base, "pipeline_version")
+		if basePV != outPV {
+			fmt.Fprintf(os.Stderr, "[merge] pipeline_version mismatch (base=%q output=%q) — full rebuild, ignoring --base\n", basePV, outPV)
+			incremental = false
 		}
 	}
 	if incremental {
@@ -138,6 +148,36 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		}
 		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
 	}
+	// Stamp the output's pipeline_version (lost otherwise — schema_meta is NOT in
+	// the fold list, by design, so each provenance key is set deliberately here).
+	// WITHOUT this, the published DB carries an empty pipeline_version; the next
+	// delta run's --base gate then sees a mismatch, abandons the incremental fold,
+	// and republishes ONLY the changed series — destroying the rest of the corpus.
+	// This is the single line that makes cross-run append actually engage.
+	if err := db.SetMeta("pipeline_version", outPV); err != nil {
+		return fmt.Errorf("stamp pipeline_version: %w", err)
+	}
+	// Stamp each subject's EFFECTIVE footprint into the output meta so the DB
+	// self-describes which subject versions actually produced its content. A
+	// subject's footprint may advance to the current code's value ONLY if every
+	// series it owns was rebuilt in this run (or this is a full rebuild) — because
+	// the subject re-extracts during the per-series ingest, so a series that
+	// wasn't rebuilt still holds the OLD subject's rows. If we blindly stamped the
+	// current footprint, an operator dispatch with an explicit series_scope that
+	// excludes a changed subject's series would publish a subject-index claiming
+	// the new version while the DB still holds the old extraction — and the next
+	// auto-delta would see "unchanged" and never rebuild it (a footprint that
+	// lies). When not advancing, we carry the base's stored footprint forward, so
+	// the next auto-delta still detects the pending change and rebuilds it.
+	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, base)
+	if err != nil {
+		return fmt.Errorf("compute subject footprints: %w", err)
+	}
+	for name, fp := range effFP {
+		if err := db.SetMeta("subject_fp_"+name, fp); err != nil {
+			return fmt.Errorf("stamp subject_fp_%s: %w", name, err)
+		}
+	}
 	if fts {
 		if err := db.EnableFTS(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "[merge] FTS unavailable (lexical degrades to LIKE): %v\n", err)
@@ -155,7 +195,84 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		}
 		fmt.Fprintf(os.Stderr, "[merge] index: %s — %d specs\n", indexOut, n)
 	}
+	// Publish the subject footprints alongside corpus-index.json so the next
+	// discover can detect a changed subject and re-index only its series. This is
+	// the SAME effective-footprint map stamped into the DB meta above, so the
+	// published index never disagrees with the DB it describes.
+	if subjectIndexOut != "" {
+		b, err := json.MarshalIndent(effFP, "", " ")
+		if err != nil {
+			return fmt.Errorf("marshal subject index: %w", err)
+		}
+		if err := os.WriteFile(subjectIndexOut, b, 0o644); err != nil {
+			return fmt.Errorf("write subject index %s: %w", subjectIndexOut, err)
+		}
+		fmt.Fprintf(os.Stderr, "[merge] subject-index: %s — %d subjects\n", subjectIndexOut, len(effFP))
+	}
 	return nil
+}
+
+// effectiveSubjectFootprints returns name->footprint for every subject, where a
+// subject advances to the current code's footprint ONLY if every series it owns
+// was present in this run's shards (i.e. its rows were actually re-extracted).
+// Otherwise it carries the base's stored footprint forward — which is "" when
+// there is no base or the base predates the stamp, and that's safe: discover
+// then treats the subject as changed and rebuilds it. This uniform rule covers
+// both the explicit-narrow-scope delta AND the first-build-with-narrow-scope
+// case; a real full build (--all) includes every series, so every subject
+// advances. See the call site for why a blind current-footprint stamp lies.
+func effectiveSubjectFootprints(ctx context.Context, sqldb *sql.DB, inputs []string, base string) (map[string]string, error) {
+	rebuilt, err := shardSeries(ctx, sqldb, inputs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(subjectmeta.All))
+	for _, m := range subjectmeta.All {
+		advance := true
+		for _, s := range m.Series {
+			if !rebuilt[s] {
+				advance = false
+				break
+			}
+		}
+		if advance {
+			out[m.Name] = subjectmeta.Footprint(m)
+		} else {
+			out[m.Name] = metaValue(ctx, sqldb, base, "subject_fp_"+m.Name)
+		}
+	}
+	return out, nil
+}
+
+// shardSeries returns the set of 2-digit series (substr(spec_id,1,2)) present in
+// the given shard DBs — i.e. the series actually rebuilt this run.
+func shardSeries(ctx context.Context, sqldb *sql.DB, paths []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, p := range paths {
+		esc := strings.ReplaceAll(p, "'", "''")
+		if _, err := sqldb.ExecContext(ctx, "ATTACH '"+esc+"' AS ss (READ_ONLY)"); err != nil {
+			return nil, fmt.Errorf("attach %s: %w", p, err)
+		}
+		rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) FROM ss.spec_versions`)
+		if err != nil {
+			_, _ = sqldb.ExecContext(ctx, "DETACH ss")
+			return nil, err
+		}
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				_ = rows.Close()
+				_, _ = sqldb.ExecContext(ctx, "DETACH ss")
+				return nil, err
+			}
+			out[s] = true
+		}
+		_ = rows.Close()
+		if _, err := sqldb.ExecContext(ctx, "DETACH ss"); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // metaValue reads one schema_meta value from a DuckDB file (attach read-only →
@@ -445,8 +562,12 @@ func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
 			return fmt.Errorf("drop index %s: %w", idx, err)
 		}
 	}
-	// 2. Slim copy: same rows, every column EXCEPT embedding.
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding) FROM clauses`); err != nil {
+	// 2. Slim copy: same rows, every column EXCEPT the vector ones (the dense
+	//    vector AND its per-clause fingerprint). Dropping embedding_hash too keeps
+	//    the lexical asset free of any vector metadata, and means a future embed
+	//    run over this slim DB sees every clause as "never embedded" (correct: it
+	//    has no vectors).
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE clauses_slim AS SELECT * EXCLUDE (embedding, embedding_hash) FROM clauses`); err != nil {
 		return fmt.Errorf("create clauses_slim: %w", err)
 	}
 	// 3. Swap.

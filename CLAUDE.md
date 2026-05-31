@@ -261,18 +261,32 @@ Objectif V1 : **~2-3 semaines solo dev**, livrable utilisable depuis Claude Code
 ```
 3gpp-mcp/
 ├── cmd/
-│   ├── ingest/        # CLI one-shot : scrape FTP, parse DOCX, write DuckDB
-│   │   └── main.go
-│   └── server/        # MCP server (stdio + SSE)
-│       └── main.go
+│   ├── ingest/          # build the DuckDB snapshot from the converted corpus
+│   ├── server/          # MCP server (stdio + SSE) + bootstrap subcommand
+│   ├── merge/           # fuse per-shard DuckDB snapshots into one DB
+│   ├── discover/        # decide which series need (re)indexing (CI matrix)
+│   ├── ingest-catalog/  # overlay DynaReport metadata onto a DB (additive)
+│   ├── ingest-openapi/  # load the 5GC OpenAPI corpus into a DB (additive)
+│   ├── li-audit/        # cross-check an LI event catalogue vs indexed text
+│   └── bench/           # offline retrieval benchmark (IR metrics)
 ├── internal/
-│   ├── docx/          # DOCX parser (zip+xml, heading hierarchy, tables, annexes)
-│   ├── model/         # Spec, Clause, Change, Acronym, Evolution
-│   ├── store/         # DuckDB (FTS + HNSW) + KuzuDB (V2) wrappers
-│   ├── ingest/        # Pipeline d'ingestion
-│   ├── search/        # Router de requêtes (BM25 / vector / graph / changelog)
-│   ├── embed/         # ONNX Runtime + BGE-M3 wrapper
-│   └── mcp/           # Tools MCP (search_spec, get_changelog, ...)
+│   ├── model/           # Spec, Clause, Change, Acronym, Evolution
+│   ├── store/           # DuckDB (FTS + HNSW) wrappers, sharded reads
+│   ├── ingest/          # ingestion pipeline orchestration + evolutions seed
+│   ├── htmlparse/       # LibreOffice-HTML → ParsedSpec (primary parser)
+│   ├── ooxml/           # native .docx → ParsedSpec (zip+xml, merged tables)
+│   ├── catalog/         # DynaReport metadata overlay (WG, title, freeze_date)
+│   ├── openapi/         # 5GC OpenAPI (YAML) ingest → api_* tables
+│   ├── embed/           # BGE-M3 ONNX embedder seam (build tag onnx)
+│   ├── rerank/          # optional BGE-reranker-v2-m3 seam (build tag onnx)
+│   ├── onnxrt/          # shared ONNX Runtime init (process-global)
+│   ├── search/          # intent router + BM25/vector backends + RRF
+│   ├── releaseview/     # release-scoped clause views
+│   ├── eval/            # IR eval harness (graded queries + metrics)
+│   ├── bootstrap/       # self-provisioning: fetch DB snapshot + models
+│   ├── mcp/             # Tools MCP (search_spec, get_changelog, ...)
+│   ├── registry/        # wires the set of enabled subjects
+│   └── subject/         # domain-vertical plugins (glossary, li/asn1)
 ├── data/              # gitignored
 │   ├── 3gpp.duckdb
 │   ├── 3gpp.kuzu/
@@ -303,7 +317,7 @@ Le projet est conçu pour être développé **avec** Claude Code, pas malgré lu
 | Nouvelle fonctionnalité | `/plan "..."` → review → `/do` |
 | Doc / recherche normative | `/search "..."` (local-first sur `~/.claude/docs/`, fallback web) |
 | Commits conventionnels | `/git --commit` |
-| MR GitLab | `/git --pr` (auto-détection GitLab) |
+| PR GitHub | `/git --pr` (auto-détection GitHub) |
 | Code review en local | `/review` (5 agents specialists en parallèle) |
 | Linting Go | `/lint` (golangci-lint piloté par hooks) |
 | Sync template | `/update` (tarball + merge `devcontainer.local.json`) |
@@ -355,7 +369,7 @@ Les décisions ci-dessous sont **figées**. Une PR/MR proposant l'inverse doit �
 
 ## 14. Liens utiles
 
-- Repo GitLab : https://github.com/kodflow/3gpp-mcp
+- Repo GitHub : https://github.com/kodflow/3gpp-mcp
 - Template parent : https://github.com/kodflow/devcontainer-template
 - DuckDB Go : https://github.com/marcboeker/go-duckdb
 - KuzuDB Go : https://github.com/kuzudb/go-kuzu
