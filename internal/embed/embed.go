@@ -44,6 +44,31 @@ func (Disabled) Embed(context.Context, []string) ([][]float32, error) {
 	return nil, nil
 }
 
+// Execution-provider identifiers for the ONNX Runtime session.
+const (
+	// EPCPU is the default CPU execution provider (no GPU lib needed).
+	EPCPU = "cpu"
+	// EPCUDA requests the CUDA execution provider. Selecting it COMPILES on any
+	// host (the SessionOptions wiring is platform-independent); it only needs a
+	// real GPU + the CUDA-enabled ONNX Runtime shared library at RUNTIME. On a
+	// host without that, AppendExecutionProviderCUDA fails and the embedder
+	// degrades to Disabled{} (degrade, never block — see embed_onnx.go).
+	EPCUDA = "cuda"
+)
+
+// ExecutionProvider resolves the ONNX Runtime execution provider from the
+// ORT_EP env var, normalising to a known value. Anything other than a
+// case-insensitive "cuda" (incl. unset, empty, or garbage) maps to CPU, so the
+// default stays CPU and a typo can never silently request an unavailable GPU.
+// This selection is intentionally tag-free (no `onnx` build tag) so it can be
+// unit-tested without the ONNX Runtime / a real GPU.
+func ExecutionProvider() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ORT_EP")), EPCUDA) {
+		return EPCUDA
+	}
+	return EPCPU
+}
+
 // New returns the embedder selected by the EMBEDDER env var:
 //
 //	EMBEDDER=local|hash  -> Local{}     (deterministic vectors; proves the path)
