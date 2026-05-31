@@ -192,7 +192,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	//      its tables and the log row so the re-run is clean,
 	//   3. filter out (spec, version) tuples already 'done'.
 	pipelineVersion := model.PipelineVersion(opt.Embedder.ModelID())
-	jobs, skippedDone, err := filterResumeJobs(ctx, db, jobs, opt.Resume, pipelineVersion, logf)
+	jobs, skippedDone, err := filterResumeJobs(ctx, db, reg, jobs, opt.Resume, pipelineVersion, logf)
 	if err != nil {
 		return st, fmt.Errorf("resume filter: %w", err)
 	}
@@ -264,7 +264,14 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 		// Domain subjects extend indexing on the specs they own (LI on 33.128,
 		// glossary on 21.905, …). The core stays generic: no hardcoded spec ids.
-		// Degrade-don't-block: a subject error is logged, never fatal.
+		// A subject WRITE error FAILS the (spec, version) scope: we return before
+		// MarkIngestDone so the ingest_log row stays 'started' and the next
+		// --resume run purges + redoes it cleanly. Otherwise a half-written
+		// subject (li_events without li_event_fields) would be marked done and
+		// skipped forever (invariant #3/#4 degenerates to never-recompute). The
+		// genuine degrade-don't-block case — a MISSING attachment — is handled
+		// INSIDE the subject (li.Ingest returns (0, nil)), so absent ASN.1 still
+		// never blocks; only a real write error becomes fatal here.
 		for _, s := range reg.Active(ps.Spec.SpecID) {
 			n, serr := s.Ingest(ctx, db, subject.IngestContext{
 				SpecID: ps.Spec.SpecID, Release: ps.Version.Release, Version: ps.Version.Version,
@@ -272,8 +279,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 				Clauses: ps.Clauses, IsLatest: latest[j.specID] == j.version,
 			})
 			if serr != nil {
-				logf("subject %s on %s: %v", s.Name(), ps.Spec.SpecID, serr)
-				continue
+				return st, fmt.Errorf("subject %s on %s %s: %w", s.Name(), ps.Spec.SpecID, ps.Version.Version, serr)
 			}
 			if n > 0 {
 				st.SubjectAdded[s.Name()] += n
@@ -456,7 +462,7 @@ func max1(n int) int {
 //
 // Returns the filtered job list + the count of skipped-because-done so the
 // progress line can report "+N resumed" alongside this-run progress.
-func filterResumeJobs(ctx context.Context, db *store.Store, jobs []ingestJob, resume bool, pipelineVersion string, logf func(string, ...any)) ([]ingestJob, int, error) {
+func filterResumeJobs(ctx context.Context, db *store.Store, reg *subject.Registry, jobs []ingestJob, resume bool, pipelineVersion string, logf func(string, ...any)) ([]ingestJob, int, error) {
 	if !resume {
 		return jobs, 0, nil
 	}
@@ -477,6 +483,14 @@ func filterResumeJobs(ctx context.Context, db *store.Store, jobs []ingestJob, re
 		// status='started' but not 'done' — half-ingested, purge then redo.
 		if err := db.PurgeSpecScope(ctx, j.specID, j.version); err != nil {
 			return jobs, 0, fmt.Errorf("purge half-ingested %s %s: %w", j.specID, j.version, err)
+		}
+		// PurgeSpecScope only knows the core tables; fan out to subject-owned
+		// tables so the redo is clean for derived rows too (li_events, asn1_types,
+		// …). Without this a corrected/removed subject row survives the redo.
+		for _, p := range reg.Purgers(j.specID) {
+			if err := p.Purge(ctx, db, j.specID, j.release, j.version); err != nil {
+				return jobs, 0, fmt.Errorf("purge subject rows for %s %s: %w", j.specID, j.version, err)
+			}
 		}
 		out = append(out, j)
 	}
