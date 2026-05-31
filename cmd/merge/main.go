@@ -125,6 +125,17 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		fmt.Fprintf(os.Stderr, "[merge] folded %s\n", in)
 	}
 
+	// DEFENSIVE one-shot dedup of `changes` (plan PR-4). The delete-before-fold
+	// purge above is the real idempotency contract; this is a SAFETY NET that
+	// heals a base ALREADY corrupted by the prior (series, major) purge — those
+	// duplicate sub-floor CRs predate this build and can't be undone by a clean
+	// fold. We collapse to one row per (spec_id, cr_number, cr_revision,
+	// to_version). It is a no-op on a base built under the fixed contract, so it
+	// never masks a regression of the delete-before-fold guarantee.
+	if err := dedupChanges(ctx, sqldb); err != nil {
+		return fmt.Errorf("dedup changes: %w", err)
+	}
+
 	// Strip vectors BEFORE the FTS rebuild + before counting/index-out, so the
 	// downstream artifact (e.g. the `latest` GitHub Release asset, capped at 2 GB)
 	// only carries the lexical surface. The per-series vectorised sub-bases
@@ -170,7 +181,23 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	// auto-delta would see "unchanged" and never rebuild it (a footprint that
 	// lies). When not advancing, we carry the base's stored footprint forward, so
 	// the next auto-delta still detects the pending change and rebuilds it.
-	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, base)
+	//
+	// subject-fp honesty (plan PR-4): the carry-forward reads the BASE's footprint
+	// only when the base actually contributed its rows to the merged DB. When the
+	// pipeline_version gate above dropped the base (incremental=false over a narrow
+	// discover-sized matrix — a FORCED full rebuild, not a real --all), the merged
+	// DB holds ONLY the shards: an unrebuilt subject's rows (li_events, acronyms)
+	// are GONE. Carrying the dropped base's footprint forward would publish a
+	// subject-index claiming the subject is up-to-date while its data is absent,
+	// and the next discover would see "unchanged" and never heal it. Passing
+	// fpBase="" makes an unrebuilt subject's effective footprint "" → discover
+	// treats it as changed → its series is rebuilt next run (self-healing), exactly
+	// as the corpus-index path already self-heals from a shrunken post-fold DB.
+	fpBase := base
+	if !incremental {
+		fpBase = ""
+	}
+	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, fpBase)
 	if err != nil {
 		return fmt.Errorf("compute subject footprints: %w", err)
 	}
@@ -386,43 +413,64 @@ func triple(s string) [3]int {
 	return t
 }
 
-// purgeShardScope removes, from the main DB, only the (series, release) buckets
-// the ATTACHed `src` shard actually carries — so a per-release sub-shard replaces
-// its own buckets without clobbering sibling sub-shards of the same series.
+// purgeShardScope removes, from the main DB, exactly the rows the ATTACHed `src`
+// shard is about to re-fold — so a delta replaces its own buckets without
+// clobbering siblings AND without leaving duplicates. The purge SET must equal
+// (or contain) the fold's WRITE set, per table:
 //
-//   - the 8 release-bearing tables → scoped by (series, release);
-//   - `changes` (no release column) → scoped by (series, major-of-to_version),
-//     mapping each release to its version major via ReleaseOrdinal (drafts that
-//     don't map are skipped, so unrelated CRs are never deleted);
+//   - the 8 release-bearing tables → scoped by (spec_id, release) read from the
+//     shard's actual spec_versions. NOT (series, release): a sub-shard may carry
+//     a SUBSET of a series' specs (operator series_scope, a partial corpus on
+//     disk, or future per-spec sharding), and a series-wide delete would wipe
+//     sibling specs the shard never re-inserts (sibling-spec-loss).
+//   - `changes` → scoped by spec_id. The Change-History annex is CUMULATIVE per
+//     spec (every CR since inception, to_version spanning many majors) and is
+//     re-folded WHOLE for each spec the shard carries. Purging by major-of-
+//     to_version (the prior behaviour) deleted only the shard's release-major
+//     while the fold re-inserted ALL majors → sub-floor CRs duplicated on every
+//     delta. Deleting the whole spec_id bucket guarantees delete ⊇ insert.
+//   - `acronyms` → scoped by source_series (the owning subject's series). It is a
+//     global subject-owned table with no spec_id/release, so a changed/regressed
+//     glossary subject's stale rows would otherwise survive the ON-CONFLICT-DO-
+//     NOTHING fold forever. Rows without provenance (pre-PR-4 base) are left
+//     alone — they are healed once the owning series is re-ingested with the
+//     provenance column populated.
 //   - `specs` (no release; one row shared across releases) → NOT purged: a
-//     release sub-shard may not carry every spec of the series, so deleting by
-//     series would drop siblings. ON CONFLICT DO NOTHING on re-fold keeps it.
+//     sub-shard may not carry every spec, so deleting by series would drop
+//     siblings. ON CONFLICT DO NOTHING on re-fold keeps it.
 func purgeShardScope(ctx context.Context, sqldb *sql.DB) error {
-	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) AS series, release FROM src.spec_versions`)
+	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT spec_id, release FROM src.spec_versions`)
 	if err != nil {
 		return err
 	}
-	type pair struct{ series, release string }
+	type pair struct{ specID, release string }
 	var pairs []pair
+	specIDSet := map[string]bool{}
+	seriesSet := map[string]bool{}
 	for rows.Next() {
 		var p pair
-		if err := rows.Scan(&p.series, &p.release); err != nil {
+		if err := rows.Scan(&p.specID, &p.release); err != nil {
 			_ = rows.Close()
 			return err
 		}
 		pairs = append(pairs, p)
+		specIDSet[p.specID] = true
+		if len(p.specID) >= 2 {
+			seriesSet[p.specID[:2]] = true
+		}
 	}
 	_ = rows.Close()
 	if len(pairs) == 0 {
 		return nil
 	}
 
-	// (a) release-bearing tables: DELETE WHERE (series, release) matches a bucket.
+	// (a) release-bearing tables: DELETE WHERE (spec_id, release) matches a bucket
+	// the shard carries — never a broad series sweep (sibling-spec-loss).
 	relPred := make([]string, 0, len(pairs))
 	relArgs := make([]any, 0, len(pairs)*2)
 	for _, p := range pairs {
-		relPred = append(relPred, "(substr(spec_id,1,2) = ? AND release = ?)")
-		relArgs = append(relArgs, p.series, p.release)
+		relPred = append(relPred, "(spec_id = ? AND release = ?)")
+		relArgs = append(relArgs, p.specID, p.release)
 	}
 	relWhere := strings.Join(relPred, " OR ")
 	for _, t := range []string{
@@ -435,29 +483,94 @@ func purgeShardScope(ctx context.Context, sqldb *sql.DB) error {
 		}
 	}
 
-	// (b) changes: no release column → scope by (series, major-of-to_version).
-	seen := map[string]bool{}
-	chPred := make([]string, 0, len(pairs))
-	chArgs := make([]any, 0, len(pairs)*2)
-	for _, p := range pairs {
-		ord, ok := model.ReleaseOrdinal(p.release)
-		if !ok {
-			continue // draft / unmapped — don't risk deleting unrelated CRs
-		}
-		maj := strconv.Itoa(ord)
-		key := p.series + "/" + maj
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		chPred = append(chPred, "(substr(spec_id,1,2) = ? AND split_part(to_version,'.',1) = ?)")
-		chArgs = append(chArgs, p.series, maj)
+	// (b) changes: delete-before-fold by spec_id (the cumulative annex is
+	// re-folded whole per spec). This is the PRIMARY idempotency contract.
+	specArgs := make([]any, 0, len(specIDSet))
+	specPlace := make([]string, 0, len(specIDSet))
+	for id := range specIDSet {
+		specArgs = append(specArgs, id)
+		specPlace = append(specPlace, "?")
 	}
-	if len(chPred) > 0 {
-		if _, err := sqldb.ExecContext(ctx, `DELETE FROM changes WHERE `+strings.Join(chPred, " OR "), chArgs...); err != nil {
-			return fmt.Errorf("changes: %w", err)
+	if _, err := sqldb.ExecContext(ctx,
+		`DELETE FROM changes WHERE spec_id IN (`+strings.Join(specPlace, ",")+`)`, specArgs...); err != nil {
+		return fmt.Errorf("changes: %w", err)
+	}
+
+	// (c) acronyms: scope-purge the subject-owned global table by the series this
+	// shard rebuilds, so a corrected/removed glossary term replaces the stale base
+	// row instead of coexisting with it (ON CONFLICT DO NOTHING can't overwrite).
+	serArgs := make([]any, 0, len(seriesSet))
+	serPlace := make([]string, 0, len(seriesSet))
+	for s := range seriesSet {
+		serArgs = append(serArgs, s)
+		serPlace = append(serPlace, "?")
+	}
+	if len(serArgs) > 0 {
+		if _, err := sqldb.ExecContext(ctx,
+			`DELETE FROM acronyms WHERE source_series IN (`+strings.Join(serPlace, ",")+`)`, serArgs...); err != nil {
+			return fmt.Errorf("acronyms: %w", err)
 		}
 	}
+	return nil
+}
+
+// dedupChanges collapses `changes` to one row per natural key
+// (spec_id, cr_number, cr_revision, to_version), keeping the first occurrence.
+// It is the defensive heal for bases corrupted by the pre-PR-4 (series, major)
+// purge, which duplicated sub-floor CRs on every delta. The `changes` table has
+// no unique constraint (a CR can legitimately touch several specs, but the same
+// CR row for the SAME spec at the SAME to_version is a duplicate), so DuckDB
+// can't dedup it via ON CONFLICT; we rebuild the table keeping ROW_NUMBER()=1.
+// rowid (DuckDB's implicit row identifier) gives a stable tie-break so the pass
+// is deterministic. On a base built under the fixed delete-before-fold contract
+// every group already has exactly one row, so this is a no-op.
+func dedupChanges(ctx context.Context, sqldb *sql.DB) error {
+	tx, err := sqldb.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dedup tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	// COALESCE on the nullable key parts so NULLs group together (a NULL
+	// cr_revision must not split an otherwise-identical duplicate into two rows).
+	const ddl = `CREATE TABLE changes_dedup AS
+		SELECT * EXCLUDE (rn) FROM (
+			SELECT *, ROW_NUMBER() OVER (
+				PARTITION BY spec_id,
+				             COALESCE(cr_number, ''),
+				             COALESCE(CAST(cr_revision AS VARCHAR), ''),
+				             COALESCE(to_version, '')
+				ORDER BY rowid
+			) AS rn
+			FROM changes
+		) WHERE rn = 1`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("build changes_dedup: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE changes`); err != nil {
+		return fmt.Errorf("drop changes: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE changes_dedup RENAME TO changes`); err != nil {
+		return fmt.Errorf("rename changes_dedup: %w", err)
+	}
+	// Re-create the non-unique secondary indexes schema.sql guarantees (the
+	// CREATE-AS-SELECT path does not carry them over).
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS changes_spec ON changes (spec_id)`,
+		`CREATE INDEX IF NOT EXISTS changes_cr   ON changes (cr_number)`,
+	} {
+		if _, err := tx.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("recreate changes index: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dedup tx: %w", err)
+	}
+	committed = true
 	return nil
 }
 
