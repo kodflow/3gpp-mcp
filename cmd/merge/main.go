@@ -362,23 +362,28 @@ func metaValue(ctx context.Context, sqldb *sql.DB, path, key string) string {
 	return v
 }
 
-// writeIndex emits corpus-index.json = {spec_id: latest version}, the small
-// manifest `discover` diffs against the live 3GPP status report to size the
-// next matrix. "Latest" = the highest numeric X.Y.Z across the spec's versions.
+// writeIndex emits corpus-index.json = {"spec_id|release": latest version}, the
+// small manifest `discover` diffs against the live 3GPP status report to size the
+// next matrix. The key is per-(spec_id, release) — NOT a single scalar per spec
+// (plan PR-5, finding delta-blind-to-nonmonotonic-lower-release-update): a frozen
+// release keeps getting maintenance versions (CLAUDE.md §8 #8), so collapsing a
+// spec to its single highest X.Y.Z hid a Rel-16 bump whenever Rel-19 was higher.
+// "Latest" = the highest numeric X.Y.Z within each (spec, release) bucket.
 func writeIndex(ctx context.Context, sqldb *sql.DB, path string) (int, error) {
-	rows, err := sqldb.QueryContext(ctx, `SELECT spec_id, version FROM spec_versions`)
+	rows, err := sqldb.QueryContext(ctx, `SELECT spec_id, release, version FROM spec_versions`)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = rows.Close() }()
 	idx := map[string]string{}
 	for rows.Next() {
-		var spec, ver string
-		if err := rows.Scan(&spec, &ver); err != nil {
+		var spec, rel, ver string
+		if err := rows.Scan(&spec, &rel, &ver); err != nil {
 			return 0, err
 		}
-		if cmpVer(ver, idx[spec]) > 0 {
-			idx[spec] = ver
+		key := spec + "|" + rel
+		if cmpVer(ver, idx[key]) > 0 {
+			idx[key] = ver
 		}
 	}
 	b, err := json.MarshalIndent(idx, "", " ")
