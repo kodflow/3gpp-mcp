@@ -148,6 +148,7 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
       floor: ${{ steps.set.outputs.floor }}
       full: ${{ steps.set.outputs.full }}
+      publish: ${{ steps.set.outputs.publish }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -170,18 +171,40 @@ jobs:
           if [ -n "$scope" ]; then
             matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)   # explicit series
           else
-            # Auto: diff the live 3GPP status report vs the indexed state.
+            # Auto: diff the live 3GPP status report vs the indexed state. Pull
+            # BOTH the spec index (changed norms) and the subject index (changed
+            # subjects) from `latest`; a changed subject forces its series into
+            # the delta even when no norm moved (plan TROU #1).
             gh release download latest --repo "$GITHUB_REPOSITORY" -p corpus-index.json -D . 2>/dev/null || true
+            gh release download latest --repo "$GITHUB_REPOSITORY" -p subject-index.json -D . 2>/dev/null || true
             if [ "$full" = "true" ]; then
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor")
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --floor "$floor")
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --floor "$floor")
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "floor=$floor"   >> "$GITHUB_OUTPUT"
           echo "full=$full"     >> "$GITHUB_OUTPUT"
-          echo "matrix=$matrix  floor=$floor  full=$full"
+
+          # PUBLISH GUARD (single source of truth): only a WHOLE-corpus run may
+          # ever clobber the rolling `latest` release. A scoped run — an explicit
+          # series_scope (the operator's small test like "21 33"), or a PR's tiny
+          # fixed scope — produces ARTIFACTS ONLY, even if publish_to_latest=true
+          # was passed. This is the guard that stops a "small test scenario" from
+          # shrinking latest (e.g. the 3031→149 clobber that motivated it): latest
+          # is written exclusively by the job that builds the entire corpus.
+          publish=false
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+             && [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] \
+             && [ -z "$scope" ]; then
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix  floor=$floor  full=$full  publish=$publish (scope='$scope')"
+          if [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] && [ "$publish" != "true" ]; then
+            echo "::notice::publish_to_latest=true was IGNORED — this is a scoped/PR run (scope='$scope'); latest is only written by a whole-corpus run. Outputs go to artifacts."
+          fi
 
   # ---- 1b. model bundle (embed only): fetch BGE-M3 + ORT from HuggingFace ONCE
   # and publish to a 'models' release, so the N shards restore it intra-GitHub
@@ -345,12 +368,15 @@ jobs:
           cache: true
       - name: Install deps (LibreOffice + build)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
-      - name: Build ingest (-tags onnx when embedding)
+      - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
+          # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
+          # separate step (cmd/embed), so ingest just produces the clause text +
+          # FTS. When embed=true we ALSO build the onnx-tagged cmd/embed, which
+          # vectorises the shard in place, re-embedding ONLY changed clauses.
+          go build -trimpath -o bin/ingest ./cmd/ingest
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/ingest ./cmd/ingest
-          else
-            go build -trimpath -o bin/ingest ./cmd/ingest
+            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/embed ./cmd/embed
           fi
       - name: Restore model components from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
@@ -440,25 +466,37 @@ jobs:
       #
       # GH Actions cache: 10 GiB total per repo, 7-day inactivity TTL. The
       # per-series shards are ~50-200 MiB each, so 28 series ~= 5 GiB — fits.
+      # Cross-run shard cache — now active for LEXICAL runs too (plan TROU #2),
+      # not just embed=true. A lexical delta on a big series (e.g. 24) otherwise
+      # re-converts + re-ingests from scratch on every dispatch and every
+      # auto-rerun attempt; with the cache + --resume it picks up yesterday's
+      # 'done' specs and finishes in seconds. The embed_floor stays in the key so
+      # lexical and vectorised shards never cross-restore (different artifacts).
+      # Subject sources are in the hash so a subject bump (li-v1→li-v2) busts the
+      # owning series' cached shard — otherwise a restore + --resume would see
+      # every spec 'done' and the subject change would never be re-extracted.
       - name: Cross-run shard cache (resume baseline from prior runs)
-        if: github.event.inputs.embed == 'true'
         id: shard_cache
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
         with:
           path: |
             dist/shard-${{ matrix.series }}.duckdb
             dist/shard-${{ matrix.series }}.report.json
-          key: shard-v1-${{ matrix.series }}-emb${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'cmd/ingest/main.go') }}
+          # mode (embed true/false) is part of the namespace so a lexical shard
+          # (no vectors) is NEVER restored into an embed run — otherwise --resume
+          # would see every spec 'done' and skip embedding, producing a
+          # vector-less shard that fails the embedded_clauses gate. v2 bump
+          # invalidates the old (mode-less, subject-less) cache namespace.
+          key: shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'internal/store/hnsw.go', 'cmd/ingest/main.go', 'cmd/embed/main.go', 'internal/subject/**/*.go', 'internal/subjectmeta/**/*.go', 'internal/registry/**/*.go') }}
           restore-keys: |
-            shard-v1-${{ matrix.series }}-emb${{ github.event.inputs.embed_floor }}-
-            shard-v1-${{ matrix.series }}-
+            shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-
+            shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-
       # Intra-run fallback: a partial DB uploaded by an EARLIER attempt of the
       # SAME run (e.g. the auto-rerun cycle after a 6h-cap kill) takes priority
       # over the cross-run cache hit (it's strictly more recent). Best-effort:
       # no artifact in the current run yet → no-op, the cache value (if any)
       # stays on disk.
       - name: Restore prior shard artifact (resume from previous attempt)
-        if: github.event.inputs.embed == 'true'
         id: restore_shard
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -466,7 +504,6 @@ jobs:
           name: shard-${{ matrix.series }}
           path: dist
       - name: Note resume state
-        if: github.event.inputs.embed == 'true'
         run: |
           mkdir -p dist
           if [ -f "dist/shard-${{ matrix.series }}.duckdb" ]; then
@@ -483,56 +520,23 @@ jobs:
       # (always: success or failure) keeping the partial DB available for the
       # next attempt. --resume makes the next attempt skip 'done' specs +
       # purge half-ingested ones (PR #47, see internal/ingest/ingest.go).
-      - name: Ingest shard ${{ matrix.series }} (with --resume + retry)
+      - name: Ingest shard ${{ matrix.series }} (lexical, --resume + retry)
         id: ingest
-        env:
-          EMBEDDER: ${{ github.event.inputs.embed == 'true' && 'bge-m3' || '' }}
-          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
-          ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
-          # Long clauses (ASN.1 tables, full procedures) routinely exceed BGE-M3's
-          # 512-token cap; without windowing their tail is silently truncated.
-          # mean_pool windows the input + averages window vectors so every byte
-          # contributes. Default-ON in CI; opt-out only if perf-probing.
-          EMBED_WINDOWING: mean_pool
-          # Cross-encoder reranker (bundled by the model job when WITH_RERANKER=1
-          # — see above). The ingest itself doesn't rerank, but pre-populating
-          # the directory keeps the path predictable when the serve binary uses
-          # the same data/models layout (and lets `make rerank-eval` work
-          # locally on the same artifacts).
-          RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
-          # pipefail propagates ANY non-zero in a pipeline (the embed branch
-          # below pipes ingest into tee; without pipefail an ingest crash whose
-          # stdout is consumed by tee silently returns 0 — the retry loop would
-          # treat it as success and upload a partial DB).
+          # Ingest is now ALWAYS lexical (clause text + FTS); embedding is the
+          # separate step below. --resume skips 'done' specs from a restored
+          # partial shard; the retry loop covers transient mid-ingest failures.
           set -o pipefail
           mkdir -p dist
           OUT="dist/shard-${{ matrix.series }}.duckdb"
-          RPT="dist/shard-${{ matrix.series }}.report.json"
-          # Bash retry loop (defense-in-depth): if the binary returns non-zero
-          # mid-ingest (e.g. a transient ONNX session error a recover() missed),
-          # --resume on the next attempt picks up from the last 'done' spec.
-          # The Restore-prior-artifact step plus this loop give us two layers:
-          # - intra-step transient failure → bash retry (this loop)
-          # - runner-kill / user-cancel    → GitHub re-run + artifact restore
-          # Both paths converge on the same --resume contract.
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
             echo "::group::ingest attempt $attempt/$max_attempts (series ${{ matrix.series }})"
-            if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume \
-                   --embed-floor "${{ github.event.inputs.embed_floor }}" --require-semantic --report json \
-                   | tee "$RPT" \
-                 && jq -e '.model=="bge-m3" and .embedded_clauses>0' "$RPT"; then
-                ingest_ok=1
-              fi
-            else
-              if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
-                ingest_ok=1
-              fi
+            if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
+              ingest_ok=1
             fi
             echo "::endgroup::"
             if [ "$ingest_ok" -eq 1 ]; then
@@ -546,7 +550,52 @@ jobs:
             echo "::error::ingest exhausted $max_attempts attempts; the always-upload step preserves the partial DB so a manual re-run can --resume"
             exit 1
           fi
-          rm -rf data/sources/convert || true   # free HTML before artifact upload
+      # ── DECOUPLED EMBED (embed=true only) ───────────────────────────────────
+      # Runs cmd/embed ON the just-built lexical shard: re-embeds ONLY the clauses
+      # whose text or model changed (per-clause embedding_hash), so a resumed /
+      # cached shard re-embeds the delta, not the whole series. The embedding_hash
+      # persists in the shard artifact + cross-run cache, so a re-run over an
+      # unchanged series embeds ~0 clauses. Retry loop: a 6h-cap kill mid-embed
+      # leaves the partial vectors + hashes in the uploaded shard; the rerun's
+      # restore + this step re-embed only what's still missing.
+      - name: Embed shard ${{ matrix.series }} (decoupled, micro-granular, --resume)
+        if: github.event.inputs.embed == 'true'
+        env:
+          EMBEDDER: bge-m3
+          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
+          ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
+          EMBED_WINDOWING: mean_pool
+          RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
+        run: |
+          set -o pipefail
+          OUT="dist/shard-${{ matrix.series }}.duckdb"
+          RPT="dist/shard-${{ matrix.series }}.report.json"
+          attempt=0
+          max_attempts=3
+          embed_ok=0
+          while [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt+1))
+            echo "::group::embed attempt $attempt/$max_attempts (series ${{ matrix.series }})"
+            # --require-semantic refuses to no-op if the embedder isn't enabled.
+            # The gate checks the model + that NO at/above-floor clause is left
+            # without a vector (null_embeddings==0 means the shard is fully
+            # vectorised; a 6h-cap partial leaves >0 and fails → rerun resumes).
+            if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
+                 --require-semantic --report json | tee "$RPT" \
+               && jq -e '.model=="bge-m3" and .null_embeddings==0' "$RPT"; then
+              embed_ok=1
+            fi
+            echo "::endgroup::"
+            if [ "$embed_ok" -eq 1 ]; then echo "embed attempt $attempt succeeded"; break; fi
+            echo "::warning::embed attempt $attempt incomplete — sleeping 30s before retry (resumes via embedding_hash)"
+            sleep 30
+          done
+          if [ "$embed_ok" -eq 0 ]; then
+            echo "::error::embed exhausted $max_attempts attempts; partial vectors+hashes preserved in the shard for a --resume rerun"
+            exit 1
+          fi
+      - name: Free HTML before artifact upload
+        run: rm -rf data/sources/convert || true
       # Upload artifact ALWAYS (success or failure) so the next attempt of
       # this same job can --resume from the partial DB on disk. retention-days
       # is short (1d) — these are temp shards, not the published corpus.
@@ -618,7 +667,8 @@ jobs:
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
             strip_arg="--strip-embeddings"
           fi
-          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json $base_arg $strip_arg shards/*.duckdb
+          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json \
+            --subject-index-out data/subject-index.json $base_arg $strip_arg shards/*.duckdb
           ls -lh data/3gpp.duckdb
       - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
         run: |
@@ -639,8 +689,10 @@ jobs:
         run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
-      - name: Upload artifact (when not publishing)
-        if: github.event.inputs.publish_to_latest != 'true'
+      # Always upload the merged DB + indexes as an artifact (even on a publish
+      # run) — cheap, and gives an inspectable copy of every run including the
+      # scoped tests that intentionally never touch `latest`.
+      - name: Upload artifact (merged DB + indexes)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-duckdb-merged
@@ -648,15 +700,20 @@ jobs:
             data/3gpp.duckdb.zst
             data/3gpp.duckdb.sha256
             data/corpus-index.json
+            data/subject-index.json
           retention-days: 7
+      # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
+      # publish_to_latest=true. A scoped/test run never reaches this step, so it
+      # can't clobber latest no matter what inputs it was given.
       - name: Publish DB + index to 'latest' (clobber)
-        if: github.event.inputs.publish_to_latest == 'true'
+        if: needs.discover.outputs.publish == 'true'
         run: |
           gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
           gh release upload latest --repo "$GITHUB_REPOSITORY" \
-            data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 data/corpus-index.json --clobber
+            data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 \
+            data/corpus-index.json data/subject-index.json --clobber
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
   # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,
@@ -666,6 +723,7 @@ jobs:
   publish-vec:
     needs: [discover, build-shard]
     if: needs.discover.outputs.matrix != '[]' && github.event.inputs.embed == 'true'
+    # discover.outputs.publish gates the actual GHCR push (whole-corpus run only).
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -700,8 +758,11 @@ jobs:
             '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
           cat vec/vec-manifest.json
           test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no vectorized sub-bases to publish"; exit 1; }
+      # Push to the rolling GHCR tag ONLY on an authorised whole-corpus run (same
+      # guard as the Release publish — a scoped/test embed run never overwrites
+      # the published vectorized channel).
       - name: Push sub-bases + manifest to GHCR (rolling 'latest')
-        if: github.event.inputs.publish_to_latest == 'true'
+        if: needs.discover.outputs.publish == 'true'
         run: |
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           cd vec
@@ -711,8 +772,8 @@ jobs:
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
-      - name: Upload artifact (when not publishing)
-        if: github.event.inputs.publish_to_latest != 'true'
+      # Always keep an artifact copy (even on a publish run, for inspection).
+      - name: Upload artifact (vectorized sub-bases)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-vec

@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
 // One status-report row: <td>TS|TR</td><td><a..>NN.NNN[-p]</a></td><td>title</td><td>X.Y.Z</td>...
@@ -34,6 +36,7 @@ var rowRE = regexp.MustCompile(`(?s)<td>(?:TS|TR)</td>\s*<td><a[^>]*>(\d{2}\.\d{
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
+	subjectIndexPath := flag.String("subject-index", "", "subject-index.json (subject -> footprint); a changed subject forces its series into the delta")
 	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
 	flag.Parse()
@@ -57,6 +60,18 @@ func main() {
 		}
 	}
 
+	// Subject delta (plan TROU #1): a subject whose code changed (footprint shifts
+	// vs the published subject-index.json) forces its owning series back into the
+	// matrix, so its shard rebuilds and the normal ingest pass re-runs the subject.
+	// Only meaningful on a delta — a full build already rebuilds everything.
+	var subjChanged []string
+	if !full {
+		subjChanged = subjectmeta.ChangedSeries(loadIndex(*subjectIndexPath))
+		for _, s := range subjChanged {
+			series[s] = true
+		}
+	}
+
 	out := make([]string, 0, len(series))
 	for s := range series {
 		out = append(out, s)
@@ -66,8 +81,8 @@ func main() {
 	if full {
 		mode = "full"
 	}
-	fmt.Fprintf(os.Stderr, "discover: mode=%s site_specs=%d indexed=%d -> %d series: %v\n",
-		mode, len(site), len(idx), len(out), out)
+	fmt.Fprintf(os.Stderr, "discover: mode=%s site_specs=%d indexed=%d subject-changed=%v -> %d series: %v\n",
+		mode, len(site), len(idx), subjChanged, len(out), out)
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b)) // stdout = the JSON matrix
 }

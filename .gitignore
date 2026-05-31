@@ -174,5 +174,16 @@ out/
 .claude/logs/
 core.*
 .taskmaster/
-/merge
 docs/architecture-pipeline.md
+
+# Root-level Go build artifacts: `go build ./cmd/<name>` with no -o drops the
+# binary at the repo root. Ignore every cmd binary name so a stray build never
+# gets committed (the real outputs go to bin/ or dist/ via the Makefile).
+/bench
+/discover
+/ingest
+/ingest-catalog
+/ingest-openapi
+/li-audit
+/merge
+/server
