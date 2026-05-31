@@ -33,6 +33,7 @@ func main() {
 	fts := flag.Bool("fts", true, "rebuild the BM25 FTS index on the merged DB")
 	indexOut := flag.String("index-out", "", "also write a corpus-index.json (spec_id -> latest version) for incremental discover")
 	subjectIndexOut := flag.String("subject-index-out", "", "also write a subject-index.json (subject -> footprint) so discover can detect a changed subject")
+	buildIndexOut := flag.String("build-index-out", "", "also write a build-index.json (the three canonical identities) so discover can force ingest/enricher/embed refresh on an identity drift")
 	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
 	stripEmbeddings := flag.Bool("strip-embeddings", false,
 		"after merge, DROP COLUMN embedding so the GitHub Release asset stays slim (vectors live in the GHCR per-series sub-bases)")
@@ -42,13 +43,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "merge: no input DBs given")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut); err != nil {
+	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut, *buildIndexOut); err != nil {
 		fmt.Fprintln(os.Stderr, "merge:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut string) error {
+func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut, buildIndexOut string) error {
 	_ = os.Remove(out)
 	db, err := store.Open(out)
 	if err != nil {
@@ -209,7 +210,52 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		}
 		fmt.Fprintf(os.Stderr, "[merge] subject-index: %s — %d subjects\n", subjectIndexOut, len(effFP))
 	}
+	// Stamp + publish the three canonical build identities (plan PR-3). The
+	// SpecIngestIdentity describes the spec content the merged DB carries (its
+	// subject footprints are the EFFECTIVE ones, so an unrebuilt subject keeps the
+	// base's footprint and the published identity never claims a version whose rows
+	// are absent); EmbedIdentity reflects the output's actual model (lexical "" when
+	// vectors were stripped, mirroring pipeline_version above). discover reads this
+	// manifest and forces the matching refresh (re-ingest / re-embed / enricher) on
+	// a drift, so an identity change is detected even when no spec version moved.
+	bi := buildIndexFor(effFP, outModelID)
+	if err := db.SetMeta("spec_ingest_identity", bi.SpecIngestIdentity); err != nil {
+		return fmt.Errorf("stamp spec_ingest_identity: %w", err)
+	}
+	if err := db.SetMeta("global_enrichment_identity", bi.GlobalEnrichmentIdentity); err != nil {
+		return fmt.Errorf("stamp global_enrichment_identity: %w", err)
+	}
+	if err := db.SetMeta("embed_identity", bi.EmbedIdentity); err != nil {
+		return fmt.Errorf("stamp embed_identity: %w", err)
+	}
+	if buildIndexOut != "" {
+		b, err := json.MarshalIndent(bi, "", " ")
+		if err != nil {
+			return fmt.Errorf("marshal build index: %w", err)
+		}
+		if err := os.WriteFile(buildIndexOut, b, 0o644); err != nil {
+			return fmt.Errorf("write build index %s: %w", buildIndexOut, err)
+		}
+		fmt.Fprintf(os.Stderr, "[merge] build-index: %s\n", buildIndexOut)
+	}
 	return nil
+}
+
+// buildIndexFor composes the merged DB's three canonical identities (plan PR-3).
+// The SpecIngestIdentity uses the EFFECTIVE subject footprints (effFP) — the ones
+// actually backing the merged DB's rows — so a subject that wasn't rebuilt this
+// run keeps its base footprint and the published identity never overstates what
+// the DB contains. The ASN.1 scanner tag comes from the current code: it is folded
+// into the LI footprint already (subjectmeta.Footprint), so effFP carries it for a
+// rebuilt LI and the base value for an unrebuilt one — passing the current tag
+// here is consistent because the LI footprint is the authoritative carrier.
+// outModelID is "" for a lexical (stripped) output, mirroring pipeline_version.
+func buildIndexFor(effFP map[string]string, outModelID string) model.BuildIndex {
+	fps := make([]string, 0, len(effFP))
+	for _, fp := range effFP {
+		fps = append(fps, fp)
+	}
+	return model.CurrentBuildIndex(fps, subjectmeta.ASN1ScannerVersion, outModelID, model.GlobalEnrichmentParts{})
 }
 
 // effectiveSubjectFootprints returns name->footprint for every subject, where a

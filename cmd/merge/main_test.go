@@ -93,7 +93,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	})
 
 	// Incremental merge: base + shardA + shardB. FTS off (no extension under test).
-	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false, ""); err != nil {
+	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -180,7 +180,7 @@ func TestStripEmbeddings(t *testing.T) {
 		_ = st.SetMeta("hnsw_state", "frozen")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
