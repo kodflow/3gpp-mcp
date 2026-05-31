@@ -161,6 +161,8 @@ out/
 *.zst
 # Keep the manifest tracked even though it ends in .lock
 !corpus.lock
+# Kaggle GPU embed POC staging (lexical DB + model + ORT lib + src.tar + outputs)
+/.kaggle-poc/
 
 # ktn-linter cache (generated at runtime)
 *.ktn-linter.cache.db

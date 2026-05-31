@@ -59,8 +59,21 @@ func newEmbedder() Embedder {
 	if err := onnxrt.Init(); err != nil {
 		return Disabled{}
 	}
+	// Execution provider: CPU (default) needs no SessionOptions (nil). CUDA
+	// builds a SessionOptions and appends the CUDA EP; this compiles on any host
+	// but only succeeds at runtime on a GPU box with the CUDA-enabled ORT lib.
+	// On any failure (no GPU, CPU-only lib, EP error) we degrade to Disabled{} —
+	// the embedder seam never hard-fails (embed.go doctrine).
+	opts, err := sessionOptionsFor(ExecutionProvider())
+	if err != nil {
+		log.Printf("embed: execution-provider %q unavailable (%v) — disabling vectors", ExecutionProvider(), err)
+		return Disabled{}
+	}
+	if opts != nil {
+		defer func() { _ = opts.Destroy() }()
+	}
 	sess, err := ort.NewDynamicAdvancedSession(modelPath,
-		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, nil)
+		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, opts)
 	if err != nil {
 		return Disabled{}
 	}
@@ -286,4 +299,32 @@ func envInt(key string, def int) int {
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
+}
+
+// sessionOptionsFor builds the ORT SessionOptions for the requested execution
+// provider. CPU returns (nil, nil) — the ORT default needs no options. CUDA
+// allocates a SessionOptions, appends the CUDA EP (device 0), and returns it;
+// the caller owns Destroy(). NewCUDAProviderOptions/AppendExecutionProviderCUDA
+// return an error on a host whose ORT lib lacks CUDA, so the GPU path degrades
+// cleanly instead of crashing. Any unknown ep falls back to CPU.
+func sessionOptionsFor(ep string) (*ort.SessionOptions, error) {
+	if ep != EPCUDA {
+		return nil, nil
+	}
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, err
+	}
+	cuda, err := ort.NewCUDAProviderOptions()
+	if err != nil {
+		_ = opts.Destroy()
+		return nil, err
+	}
+	defer func() { _ = cuda.Destroy() }()
+	if err := opts.AppendExecutionProviderCUDA(cuda); err != nil {
+		_ = opts.Destroy()
+		return nil, err
+	}
+	log.Printf("embed: ONNX execution provider = cuda (device 0)")
+	return opts, nil
 }
