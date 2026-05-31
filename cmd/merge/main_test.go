@@ -40,8 +40,13 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	shardB := filepath.Join(dir, "shardB.duckdb") // 32 | Rel-19,20
 	out := filepath.Join(dir, "out.duckdb")
 
+	// All fixtures share the lexical pipeline_version, like real ingest output —
+	// the incremental gate now requires base and output pipelines to match.
+	lexPV := model.PipelineVersion("")
+
 	// base: series 32 (Rel-17, Rel-18) + a series-29 Rel-19 clause (isolation).
 	buildShard(t, base, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
 		_ = st.UpsertSpec(model.Spec{SpecID: "32.298", Series: "32", DocType: "TS"})
 		_ = st.UpsertSpec(model.Spec{SpecID: "29.518", Series: "29", DocType: "TS"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "32.298", Release: "Rel-17", Version: "17.4.0"})
@@ -59,6 +64,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 		})
 	})
 	buildShard(t, shardA, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
 		_ = st.UpsertSpec(model.Spec{SpecID: "32.298", Series: "32", DocType: "TS"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "32.298", Release: "Rel-17", Version: "17.4.0"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "32.298", Release: "Rel-18", Version: "18.3.0"})
@@ -72,6 +78,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 		})
 	})
 	buildShard(t, shardB, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
 		_ = st.UpsertSpec(model.Spec{SpecID: "32.298", Series: "32", DocType: "TS"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "32.298", Release: "Rel-19", Version: "19.2.0"})
 		_ = st.UpsertVersion(model.SpecVersion{SpecID: "32.298", Release: "Rel-20", Version: "20.0.0"})
@@ -86,7 +93,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	})
 
 	// Incremental merge: base + shardA + shardB. FTS off (no extension under test).
-	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false); err != nil {
+	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,7 +180,7 @@ func TestStripEmbeddings(t *testing.T) {
 		_ = st.SetMeta("hnsw_state", "frozen")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, ""); err != nil {
 		t.Fatal(err)
 	}
 
