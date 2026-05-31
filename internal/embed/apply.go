@@ -4,16 +4,24 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+
+	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // ClauseHash is the per-clause embedding fingerprint: it changes iff the embedded
-// text (heading + body, exactly what EmbedText feeds the model) OR the model
+// text (heading + body, exactly what EmbedText feeds the model) OR the EmbedIdentity
 // changes. Stored next to the vector so the decoupled embed step can re-embed
 // ONLY clauses whose hash drifted — making repeat runs proportional to the clause
 // delta, not the spec or corpus. Keep this the single definition of "what text we
 // embed" so ingest and cmd/embed never disagree.
+//
+// The model component is the canonical model.EmbedIdentity (plan PR-3), so the
+// re-embed gate keys on the SAME identity as DB meta and serve-time compatibility
+// checks. PR-3 populates only the model id; PR-6 widens it (revision, tokenizer,
+// dim, precision) — a change in any of those then re-embeds without re-ingesting.
 func ClauseHash(heading, text, modelID string) string {
-	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + modelID))
+	embedID := model.EmbedIdentity(model.EmbedParts{ModelID: modelID})
+	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + embedID))
 	return hex.EncodeToString(h[:])[:16]
 }
 

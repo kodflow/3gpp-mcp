@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
@@ -37,6 +38,8 @@ func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
 	subjectIndexPath := flag.String("subject-index", "", "subject-index.json (subject -> footprint); a changed subject forces its series into the delta")
+	buildIndexPath := flag.String("build-index", "", "build-index.json (the three canonical identities); a drift vs current code forces a full rebuild")
+	expectModel := flag.String("embed-model", "", "the embedder ModelID the current build will use; compared against the published EmbedIdentity")
 	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
 	flag.Parse()
@@ -72,6 +75,37 @@ func main() {
 		}
 	}
 
+	// Build-identity delta (plan PR-3): a parser/chunking/schema change
+	// (SpecIngestIdentity) or a model change (EmbedIdentity) moves NO spec version
+	// and NO subject footprint, so the checks above are blind to it. Compare the
+	// published build-index against the current code's identities; a drift in the
+	// spec-ingest or embed identity is corpus-global (it affects every series'
+	// content or vectors), so force EVERY site series above the floor into the
+	// matrix. The global-enrichment identity is published for completeness but is
+	// owned by PR-7's enricher refresh, so it does not size the per-spec matrix here.
+	var identityDrift []string
+	if !full && *buildIndexPath != "" {
+		published := loadBuildIndex(*buildIndexPath)
+		current := model.CurrentBuildIndex(
+			subjectmeta.IngestFootprints(), subjectmeta.ASN1ScannerVersion, *expectModel,
+			model.GlobalEnrichmentParts{},
+		)
+		identityDrift = published.Differs(current)
+		forceAll := false
+		for _, d := range identityDrift {
+			if d == "spec_ingest_identity" || d == "embed_identity" {
+				forceAll = true
+			}
+		}
+		if forceAll {
+			for spec, ver := range site {
+				if major(ver) >= floorMajor {
+					series[spec[:2]] = true
+				}
+			}
+		}
+	}
+
 	out := make([]string, 0, len(series))
 	for s := range series {
 		out = append(out, s)
@@ -81,8 +115,8 @@ func main() {
 	if full {
 		mode = "full"
 	}
-	fmt.Fprintf(os.Stderr, "discover: mode=%s site_specs=%d indexed=%d subject-changed=%v -> %d series: %v\n",
-		mode, len(site), len(idx), subjChanged, len(out), out)
+	fmt.Fprintf(os.Stderr, "discover: mode=%s site_specs=%d indexed=%d subject-changed=%v identity-drift=%v -> %d series: %v\n",
+		mode, len(site), len(idx), subjChanged, identityDrift, len(out), out)
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b)) // stdout = the JSON matrix
 }
@@ -127,6 +161,23 @@ func loadIndex(path string) map[string]string {
 	}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+// loadBuildIndex reads the published build-index.json (the three canonical
+// identities). A missing/unreadable file returns the zero BuildIndex, whose ""
+// fields make model.BuildIndex.Differs report a drift on every identity — so a
+// legacy publish with no build index self-heals by forcing a rebuild.
+func loadBuildIndex(path string) model.BuildIndex {
+	var bi model.BuildIndex
+	if path == "" {
+		return bi
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return bi
+	}
+	_ = json.Unmarshal(b, &bi)
+	return bi
 }
 
 // major returns the leading integer of "Rel-19" or "19.6.0" (0 on parse error).

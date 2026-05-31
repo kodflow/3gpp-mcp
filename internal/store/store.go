@@ -101,8 +101,11 @@ func (s *Store) SetMeta(key, value string) error {
 // MarkIngestStarted is called BEFORE InsertClauses + SetEmbedding for a spec.
 // A row with status='started' survives a runner kill; on resume that spec is
 // PURGED + re-ingested (a half-written spec would otherwise poison vectors).
-// pipeline_version stamps the row so a later algorithm change invalidates
-// every row (the caller checks model.PipelineVersion at resume time).
+// The pipeline_version column stamps the row with the caller's resume gate —
+// since plan PR-3 that gate is model.SpecIngestIdentity (parser/chunking/schema +
+// subject footprints), so a subject/parser change invalidates the row while a
+// model bump does not. The column name is retained for read-compat; it carries
+// whatever identity the caller passes.
 func (s *Store) MarkIngestStarted(ctx context.Context, specID, version, pipelineVersion string) error {
 	// Timestamps are passed as bound parameters (time.Now()) rather than the
 	// SQL keyword CURRENT_TIMESTAMP because go-duckdb v1.x mis-parses the
@@ -145,8 +148,9 @@ func (s *Store) IngestProgress(ctx context.Context, pipelineVersion string) (don
 	return done, started, err
 }
 
-// IsIngestDone reports whether (spec, version) finished cleanly under the
-// SAME pipeline_version — the gate the resume loop uses to skip work.
+// IsIngestDone reports whether (spec, version) finished cleanly under the SAME
+// resume gate (SpecIngestIdentity since plan PR-3) — the gate the resume loop
+// uses to skip work. A row stamped under a different identity counts as not-done.
 func (s *Store) IsIngestDone(ctx context.Context, specID, version, pipelineVersion string) (bool, error) {
 	var status, pv string
 	err := s.db.QueryRowContext(ctx,
@@ -215,9 +219,11 @@ func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) e
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current
-// pipeline_version — invariant #2: when the chunker / embedder / schema
-// changes, the on-disk log is no longer comparable so the resume contract
-// must restart from scratch.
+// resume gate — invariant #2: when the parser / chunking / schema / subject
+// footprint changes (the SpecIngestIdentity since plan PR-3), the on-disk log is
+// no longer comparable so the resume contract must restart for those rows. A
+// legacy DB stamped only with the old pipeline_version necessarily mismatches the
+// SpecIngestIdentity and is wiped here — the "incompatible / migrate once" path.
 func (s *Store) ResetIngestLog(ctx context.Context, currentPipelineVersion string) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM ingest_log WHERE pipeline_version IS NULL OR pipeline_version <> ?`,
