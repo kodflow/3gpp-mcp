@@ -893,6 +893,18 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 func (s *Store) CountSpecs(ctx context.Context) (int, error)   { return s.count(ctx, "specs") }
 func (s *Store) CountClauses(ctx context.Context) (int, error) { return s.count(ctx, "clauses") }
 
+// CountSpecVersions / CountAPIOperations expose the two corpus-coverage counters
+// the CI pre-publish guard reads (PR-1): a delta publish must never SHRINK either
+// vs the base it is replacing. They are the most direct "did we lose normative
+// rows" / "did we lose API rows" signals — spec_versions tracks every indexed
+// (spec, release, version); api_operations tracks every 5GC OpenAPI operation.
+func (s *Store) CountSpecVersions(ctx context.Context) (int, error) {
+	return s.count(ctx, "spec_versions")
+}
+func (s *Store) CountAPIOperations(ctx context.Context) (int, error) {
+	return s.count(ctx, "api_operations")
+}
+
 func (s *Store) count(ctx context.Context, table string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM `+table).Scan(&n)
