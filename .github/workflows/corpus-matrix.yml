@@ -496,12 +496,60 @@ jobs:
             rm -rf data/models/onnxruntime data/models/bge-m3 data/models/bge-reranker-v2-m3
             ./scripts/fetch-model.sh
           fi
+      # ── CONVERT/ORIGIN cache (PR-9 — perf only, NEVER correctness state) ──────
+      # The LibreOffice .doc→HTML conversion (data/sources/convert) is the single
+      # most expensive phase and the dominant reason a 6h-capped big series (e.g.
+      # 24) makes no forward progress on --resume: the shard cache + always-upload
+      # artifact persist ONLY dist/shard-*.duckdb, so a resumed run on a FRESH
+      # runner re-downloads + re-converts the WHOLE series from zero (corpus.sh
+      # skips a file only when its HTML/zip already sits on disk — wiped with the
+      # runner) before ingest can skip its 'done' specs. Restoring the converted
+      # HTML (and the origin zips) lets corpus.sh convert/download only the delta.
+      #
+      # This is a PURE optimisation, decoupled from the shard DB on purpose:
+      #   - separate cache namespace (`convert-v1-…`), separate from `shard-v2-…`,
+      #     so a convert-cache miss/eviction NEVER affects shard correctness and a
+      #     stale convert restore is harmless — corpus.sh re-converts anything
+      #     missing and ingest re-reads HTML from disk regardless.
+      #   - keyed on the per-shard tag (series OR series-release), so each entry is
+      #     bounded to ONE series/release slice → fits the 10 GiB repo cache budget
+      #     (a single series' convert+origin is well under it; the shard cache's
+      #     ~5 GiB and this share the same TTL-evicted pool).
+      #   - hash of the convert scripts only: a converter change (corpus.sh /
+      #     lib/convert.sh) busts the HTML cache so the new conversion is produced;
+      #     ingest/embed/model bumps do NOT bust it (they don't change the HTML).
+      #   - NO pipeline_version / embed_floor in the key: the converted HTML is
+      #     identical for lexical and embed runs, so both modes share it.
+      - name: Convert/origin cache (resume convert baseline — perf only)
+        id: convert_cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
+        with:
+          path: |
+            data/sources/convert
+            data/sources/origin
+          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
+          restore-keys: |
+            convert-v1-${{ steps.shard.outputs.tag }}-
       - name: Download + convert series ${{ steps.shard.outputs.tag }}
         env:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
+      # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
+      # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE
+      # the "Free HTML before artifact upload" rm -rf below — capturing the HTML
+      # while it still exists on disk. Best-effort: skipped on an exact-key hit
+      # (nothing new to store) and never fails the job (perf-only state).
+      - name: Save convert/origin cache (perf only — feeds next --resume)
+        if: always() && steps.convert_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
+        with:
+          path: |
+            data/sources/convert
+            data/sources/origin
+          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success
