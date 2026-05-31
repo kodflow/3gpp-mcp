@@ -164,8 +164,11 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		// Drop any leftover meta that's vector-specific so the slim DB doesn't
 		// claim semantic capability the consumer can't realise. Errors are
 		// SURFACED (a silent drop would let the slim DB advertise stale
-		// embedding_model/dim/count that no longer match its schema).
-		if _, err := sqldb.ExecContext(ctx, `DELETE FROM schema_meta WHERE key IN ('embedding_model','embedding_dim','embedding_count','hnsw_state')`); err != nil {
+		// embedding_model/dim/count that no longer match its schema). The IN-list
+		// is built from store.VectorMetaKeys — the SAME slice BuildAndFreezeHNSW
+		// stamps — so the purge can never omit a key the freeze writes (the
+		// hnsw_metric omission that hnsw-metric-omitted-from-strip-cleanup found).
+		if err := clearVectorMeta(ctx, sqldb); err != nil {
 			return fmt.Errorf("clear vector meta: %w", err)
 		}
 		// Reclaim space so the .duckdb file shrinks before zstd. Same reasoning
@@ -175,6 +178,17 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 			return fmt.Errorf("checkpoint after strip: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
+	} else if err := rebuildHNSWIfVectorized(ctx, db, sqldb); err != nil {
+		// NOT stripping: if any folded clause carries a vector, the merged DB must
+		// ship with a usable, frozen HNSW. foldTable concatenates only ROWS, never
+		// the per-shard indexes, and schema_meta is not folded — so without this a
+		// non-stripped merge of vectorized shards yields a vectorized-but-UNINDEXED
+		// DB (hnsw_state='' → serve's LoadVSS fails → silent O(N) exact-scan recall
+		// regression). merge-never-builds-hnsw-default-ships-unindexed-vectors. We
+		// rebuild here (HNSW build needs only the vss extension, no embedder, so it
+		// works on the default non-onnx build); a build failure is FATAL rather than
+		// shipping an unindexed-but-vectorized DB.
+		return fmt.Errorf("rebuild hnsw on vectorized merge: %w", err)
 	}
 	// Stamp the output's pipeline_version (lost otherwise — schema_meta is NOT in
 	// the fold list, by design, so each provenance key is set deliberately here).
@@ -775,5 +789,50 @@ func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
 		return fmt.Errorf("commit strip tx: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+// clearVectorMeta deletes every vector-capability key from schema_meta. The
+// IN-list is derived from store.VectorMetaKeys so it cannot drift from the keys
+// BuildAndFreezeHNSW stamps (hnsw-metric-omitted-from-strip-cleanup). A
+// non-vector key (e.g. pipeline_version) is never in the slice, so the slim DB
+// keeps its provenance meta — the delete is selective, not a blanket wipe.
+func clearVectorMeta(ctx context.Context, sqldb *sql.DB) error {
+	place := make([]string, 0, len(store.VectorMetaKeys))
+	args := make([]any, 0, len(store.VectorMetaKeys))
+	for _, k := range store.VectorMetaKeys {
+		place = append(place, "?")
+		args = append(args, k)
+	}
+	_, err := sqldb.ExecContext(ctx,
+		`DELETE FROM schema_meta WHERE key IN (`+strings.Join(place, ",")+`)`, args...)
+	return err
+}
+
+// rebuildHNSWIfVectorized rebuilds + freezes the HNSW index on the merged DB
+// when (and only when) at least one folded clause carries a non-NULL embedding.
+// A lexical merge (no vectors) is a no-op — the slim/lexical channel must NOT
+// gain a vector index. The index is a disposable cache over the embedding column
+// (axis #6), so building it from the concatenated vectors is correct regardless
+// of which shards contributed them. BuildAndFreezeHNSW handles CHECKPOINT
+// fencing, verification, and the frozen markers; it needs only the vss extension
+// (no embedder), so this path works on the default non-onnx build too.
+func rebuildHNSWIfVectorized(ctx context.Context, db *store.Store, sqldb *sql.DB) error {
+	var n int
+	if err := sqldb.QueryRowContext(ctx,
+		`SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&n); err != nil {
+		return fmt.Errorf("count embeddings: %w", err)
+	}
+	if n == 0 {
+		return nil // lexical merge — no vectors, no index to build
+	}
+	// Read the model off the OPEN output connection (schema_meta is not folded, so
+	// it may be ""); BuildAndFreezeHNSW still freezes a usable index — the model
+	// label is descriptive, the index is over the embedding column either way.
+	model := db.GetMeta(ctx, "embedding_model")
+	if err := db.BuildAndFreezeHNSW(ctx, model); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[merge] built+froze HNSW over %d merged vectors\n", n)
 	return nil
 }

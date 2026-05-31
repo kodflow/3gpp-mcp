@@ -183,12 +183,14 @@ func TestStripEmbeddings(t *testing.T) {
 		v := make([]float32, 1024)
 		v[0] = 0.42
 		_ = st.SetEmbedding(ctx, 1, v)
+		// Seed the vector-capability meta on the SHARD. These do NOT reach the
+		// merged output (schema_meta is not folded), so the integration assertion
+		// below is intentionally weak; the real cleanup contract is locked by
+		// TestClearVectorMetaPurgesAllKeys, which seeds the OUTPUT directly.
 		_ = st.SetMeta("embedding_model", "bge-m3")
 		_ = st.SetMeta("embedding_dim", "1024")
 		_ = st.SetMeta("embedding_count", "1")
-		// Seed hnsw_state so the cleanup assertion is non-trivial: without this
-		// the DELETE would be a no-op and the test would pass even if the strip
-		// path forgot the key.
+		_ = st.SetMeta("hnsw_metric", "cosine")
 		_ = st.SetMeta("hnsw_state", "frozen")
 	})
 
@@ -213,12 +215,175 @@ func TestStripEmbeddings(t *testing.T) {
 		t.Fatalf("clauses lost after strip: n=%d err=%v", n, err)
 	}
 	// Vector-specific meta keys gone (the slim DB must not claim semantic capability).
-	for _, k := range []string{"embedding_model", "embedding_dim", "embedding_count", "hnsw_state"} {
+	// NOTE: this integration assertion is necessarily WEAK — schema_meta is not in
+	// the fold list, so the shard's seeded keys never reach the merged output and
+	// the DELETE acts on absent rows. The REAL contract is locked by
+	// TestClearVectorMetaPurgesAllKeys below, which exercises clearVectorMeta on a
+	// DB where every key is actually present (strip-meta-test-tautological).
+	for _, k := range store.VectorMetaKeys {
 		var v string
 		_ = db.QueryRowContext(ctx, `SELECT value FROM schema_meta WHERE key = ?`, k).Scan(&v)
 		if v != "" {
 			t.Errorf("meta %q = %q survived --strip-embeddings", k, v)
 		}
+	}
+}
+
+// TestClearVectorMetaPurgesAllKeys is the NON-tautological replacement for the
+// old TestStripEmbeddings meta assertions (strip-meta-test-tautological): it seeds
+// EVERY store.VectorMetaKeys key — including hnsw_metric, the one the previous
+// hardcoded DELETE list omitted (hnsw-metric-omitted-from-strip-cleanup) — plus a
+// non-vector control key directly into a DB's schema_meta, runs the real
+// clearVectorMeta the strip path uses, then asserts every vector key is gone AND
+// the control key SURVIVES (proving the delete is selective, not a blanket wipe).
+// Because the keys actually exist before the delete, this test would FAIL if any
+// key were missing from store.VectorMetaKeys / the DELETE.
+func TestClearVectorMetaPurgesAllKeys(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meta.duckdb")
+
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Seed every vector-capability key with a real value so the DELETE has
+	// something to act on, plus a non-vector provenance key as a negative control.
+	for _, k := range store.VectorMetaKeys {
+		if err := st.SetMeta(k, "seeded"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const control = "pipeline_version"
+	if err := st.SetMeta(control, "pv-keep"); err != nil {
+		t.Fatal(err)
+	}
+	// Guard: hnsw_metric MUST be one of the keys (the historical omission).
+	var hasMetric bool
+	for _, k := range store.VectorMetaKeys {
+		if k == "hnsw_metric" {
+			hasMetric = true
+		}
+	}
+	if !hasMetric {
+		t.Fatal("store.VectorMetaKeys omits hnsw_metric — the strip cleanup would leak it")
+	}
+
+	if err := clearVectorMeta(ctx, st.DB()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range store.VectorMetaKeys {
+		var v string
+		_ = st.DB().QueryRowContext(ctx, `SELECT value FROM schema_meta WHERE key=?`, k).Scan(&v)
+		if v != "" {
+			t.Errorf("vector meta %q=%q survived clearVectorMeta", k, v)
+		}
+	}
+	// Negative control: a non-vector key must NOT be wiped.
+	var cv string
+	_ = st.DB().QueryRowContext(ctx, `SELECT value FROM schema_meta WHERE key=?`, control).Scan(&cv)
+	if cv != "pv-keep" {
+		t.Errorf("non-vector meta %q was wiped (=%q); clearVectorMeta must be selective", control, cv)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMergeVectorizedNoStripBuildsHNSW locks the PR-10 fix for
+// merge-never-builds-hnsw-default-ships-unindexed-vectors: a NON-stripped merge
+// of shards that carry FLOAT[1024] vectors must ship a usable, FROZEN HNSW. Before
+// the fix, merge rebuilt only FTS and never the index, and schema_meta wasn't
+// folded, so the merged DB had real vectors but hnsw_state=” → serve's LoadVSS
+// fails → silent O(N) exact-scan recall regression. We merge a vectorized shard
+// without --strip-embeddings, then assert the merged DB opens read-only with a
+// frozen, VSS-usable index that answers a vector self-match.
+func TestMergeVectorizedNoStripBuildsHNSW(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	shard := filepath.Join(dir, "shard.duckdb")
+	out := filepath.Join(dir, "merged.duckdb")
+
+	buildShard(t, shard, func(st *store.Store) {
+		_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-19", Version: "19.6.0"})
+		_ = st.InsertClauses([]model.Clause{
+			cl(1, "33.128", "Rel-19", "19.6.0", "6.1"),
+			cl(2, "33.128", "Rel-19", "19.6.0", "6.2"),
+		})
+		// Distinct one-hot vectors so a k-NN self-match is unambiguous.
+		v1 := make([]float32, 1024)
+		v1[10] = 1
+		v2 := make([]float32, 1024)
+		v2[20] = 1
+		_ = st.SetEmbedding(ctx, 1, v1)
+		_ = st.SetEmbedding(ctx, 2, v2)
+		_ = st.SetMeta("embedding_model", "bge-m3")
+	})
+
+	// Full (no --base), NON-stripping merge of a vectorized shard.
+	if err := run(ctx, out, []string{shard}, false, "", "", false /* stripEmbeddings */, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.OpenReadOnly(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// The merged DB must self-describe a frozen index and load VSS in the serve
+	// posture — proving merge built+froze the HNSW over the concatenated vectors.
+	if got := st.GetMeta(ctx, "hnsw_state"); got != "frozen" {
+		t.Errorf("hnsw_state=%q after non-strip vectorized merge, want frozen", got)
+	}
+	if err := st.LoadVSS(ctx); err != nil {
+		t.Fatalf("LoadVSS on merged vectorized DB: %v (HNSW was not built)", err)
+	}
+	if !st.VSSAvailable() {
+		t.Error("VSSAvailable false after merging vectorized shards without --strip-embeddings")
+	}
+	// A vector query resolves against the frozen index (clause 6.2's own direction).
+	q := make([]float32, 1024)
+	q[20] = 1
+	hits, err := st.SearchVectors(ctx, q, store.SpecFilter{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Clause.ClausePath != "6.2" {
+		t.Errorf("vector self-match on merged DB = %+v, want clause 6.2", hits)
+	}
+}
+
+// TestMergeLexicalNoStripSkipsHNSW is the negative control for the above: a merge
+// with NO vectors must NOT gain an HNSW (the lexical channel stays lexical) — the
+// rebuild is gated strictly on the presence of a non-NULL embedding.
+func TestMergeLexicalNoStripSkipsHNSW(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	shard := filepath.Join(dir, "shard.duckdb")
+	out := filepath.Join(dir, "merged.duckdb")
+
+	buildShard(t, shard, func(st *store.Store) {
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.0.0", "5.1")})
+	})
+
+	if err := run(ctx, out, []string{shard}, false, "", "", false, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.OpenReadOnly(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if got := st.GetMeta(ctx, "hnsw_state"); got != "" {
+		t.Errorf("lexical merge stamped hnsw_state=%q, want empty (no index over zero vectors)", got)
 	}
 }
 
