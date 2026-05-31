@@ -1,20 +1,37 @@
-# Corpus Matrix — DYNAMIC, delta-sized 3GPP corpus consolidation.
+# =============================================================================
+#  Corpus · Build      (3gpp.org → DuckDB → published `latest` release)
+# =============================================================================
 #
-# Not frozen in time: the matrix is sized to what actually changed on 3gpp.org.
-#   discover     → fetch the 3GPP status report, diff vs corpus-index.json (the
-#                  indexed state in `latest`), emit ONLY the changed series
-#                  (0, a few, or all) — or all series on a full build.
-#   build-shard  → one runner per series (parallel): download → convert → ingest
-#                  → partial DB. A shard is one COMPLETE series.
-#   merge        → delta: pull the existing DB from `latest` as --base, each
-#                  shard's series REPLACES the base's; full: fuse shards fresh.
-#                  Re-emits corpus-index.json and (opt-in) publishes to `latest`.
+#  WHEN it runs      MANUAL ONLY (workflow_dispatch). Never on push/PR/schedule.
+#                    You start it from the Actions tab and choose the inputs.
+#                    (A killed shard is auto-resumed by "Corpus · Auto-resume".)
 #
-# Series sharding is disjoint (archive is series-structured); release is captured
-# by the floor (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen) + future releases appear in
-# the listing automatically, so nothing is hard-frozen.
+#  WHAT it does      Builds the 3GPP corpus into a DuckDB snapshot, in parallel:
+#                      discover      → which series to (re)build (delta vs the
+#                                      published index, or all on full=true;
+#                                      a changed subject also pulls its series in)
+#                      build-shard   → 1 runner per series: download → convert
+#                                      (LibreOffice) → LEXICAL ingest → shard DB
+#                      embed (opt-in)→ embed=true only: cmd/embed vectorises each
+#                                      shard, re-embedding ONLY changed clauses
+#                      merge         → fuse shards (delta: replace only changed
+#                                      (series,release) buckets over the `latest`
+#                                      base; full: fresh). Enrich (catalog+API),
+#                                      write corpus-index.json + subject-index.json
+#                      publish-vec   → embed=true only: push vector sub-bases→GHCR
+#
+#  WHAT it PUBLISHES Only when publish_to_latest=true AND it's a whole-corpus run
+#                    (no series_scope, not a PR): the `latest` Release gets the
+#                    lexical DB + indexes; embed=true also pushes GHCR 3gpp-vec.
+#                    A scoped/test run = ARTIFACTS ONLY (never clobbers `latest`).
+#
+#  WHAT it does NOT  No semantic by default (embed=false → lexical only). Does not
+#                    build the user binaries (that's "Release"). Does not run on
+#                    code changes. Free runners cap each shard at 6h → big series
+#                    are auto-resumed, not lost.
+# =============================================================================
 
-name: Corpus Matrix
+name: Corpus · Build
 
 on:
   workflow_dispatch:
@@ -24,7 +41,7 @@ on:
         type: boolean
         default: false
       series_scope:
-        description: "Explicit space-separated series (overrides auto-detect). Empty = delta from the index."
+        description: "Explicit scope, space-separated. Either a bare series (e.g. '21 33') or a series|release sub-shard to keep big series under the 6h cap (e.g. '24|Rel-19 33|Rel-19'). Empty = auto delta from the index."
         type: string
         default: ""
       release_floor:
@@ -32,11 +49,11 @@ on:
         type: string
         default: "Rel-99"
       publish_to_latest:
-        description: "Publish the consolidated DB + index to the rolling 'latest' release."
+        description: "Publish the consolidated DB + index to the rolling 'latest' release (ONLY honoured on a whole-corpus run: no series_scope, not a PR)."
         type: boolean
         default: false
       embed:
-        description: "SEMANTIC: build per-series vectorized sub-bases (BGE-M3, -tags onnx, each with its own HNSW = Option B). Slow; off by default. NEEDS A CI DRY-RUN to validate the ONNX path."
+        description: "SEMANTIC (off by default): after the lexical ingest, run cmd/embed to vectorise each shard (BGE-M3, -tags onnx) re-embedding only changed clauses; publish the per-series vector sub-bases to GHCR (Option B). Slow on CPU (~1 clause/s)."
         type: boolean
         default: false
       embed_floor:
@@ -44,7 +61,7 @@ on:
         type: string
         default: "Rel-15"
       shard_timeout_minutes:
-        description: "Per-shard timeout (max 360 on free hosted runners; lower to force the auto-rerun chain quickly during testing — e.g. 10 to validate resume in ~30min)."
+        description: "Per-shard timeout (max 360 on free hosted runners; lower to force the auto-resume chain quickly during testing — e.g. 10 to validate resume in ~30min)."
         type: string
         default: "360"
 
@@ -366,6 +383,33 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # A matrix entry is either a bare series ("24") or a series|release sub-shard
+      # ("24|Rel-19"). Sub-sharding a big series by release keeps each job under the
+      # 6h cap so it finishes in one slot instead of relying on the auto-resume
+      # chain. Here we split the entry into:
+      #   series   → the --series filter (always set)
+      #   relflag  → "--release Rel-19" when a release is pinned, else empty
+      #   tag      → filesystem/cache-safe id ("24" or "24-Rel-19"); '|' is not safe
+      #              in an artifact name, so we map it to '-'.
+      - name: Parse shard key
+        id: shard
+        env:
+          KEY: ${{ matrix.series }}
+        run: |
+          series="${KEY%%|*}"          # before the '|' (or whole string if none)
+          rel=""
+          relflag=""
+          tag="$series"
+          if [ "$KEY" != "$series" ]; then
+            rel="${KEY#*|}"            # after the '|'
+            relflag="--release $rel"
+            tag="${series}-${rel}"
+          fi
+          echo "series=$series"   >> "$GITHUB_OUTPUT"
+          echo "release=$rel"     >> "$GITHUB_OUTPUT"
+          echo "relflag=$relflag" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "parsed shard key '$KEY' → series=$series release='${rel:-<all>}' tag=$tag"
       - name: Install deps (LibreOffice + build)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
       - name: Build ingest (+ decoupled embed binary when embedding)
@@ -441,12 +485,12 @@ jobs:
             rm -rf data/models/onnxruntime data/models/bge-m3 data/models/bge-reranker-v2-m3
             ./scripts/fetch-model.sh
           fi
-      - name: Download + convert series ${{ matrix.series }}
+      - name: Download + convert series ${{ steps.shard.outputs.tag }}
         env:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
-        run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ matrix.series }}" --jobs 2
+        run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success
@@ -480,17 +524,18 @@ jobs:
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
         with:
           path: |
-            dist/shard-${{ matrix.series }}.duckdb
-            dist/shard-${{ matrix.series }}.report.json
+            dist/shard-${{ steps.shard.outputs.tag }}.duckdb
+            dist/shard-${{ steps.shard.outputs.tag }}.report.json
           # mode (embed true/false) is part of the namespace so a lexical shard
           # (no vectors) is NEVER restored into an embed run — otherwise --resume
           # would see every spec 'done' and skip embedding, producing a
           # vector-less shard that fails the embedded_clauses gate. v2 bump
-          # invalidates the old (mode-less, subject-less) cache namespace.
-          key: shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'internal/store/hnsw.go', 'cmd/ingest/main.go', 'cmd/embed/main.go', 'internal/subject/**/*.go', 'internal/subjectmeta/**/*.go', 'internal/registry/**/*.go') }}
+          # invalidates the old (mode-less, subject-less) cache namespace. The tag
+          # is series or series-release so sub-shards have independent cache slots.
+          key: shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ hashFiles('internal/ingest/**/*.go', 'internal/embed/**/*.go', 'internal/htmlparse/**/*.go', 'internal/ooxml/**/*.go', 'internal/model/**/*.go', 'internal/store/schema.sql', 'internal/store/hnsw.go', 'cmd/ingest/main.go', 'cmd/embed/main.go', 'internal/subject/**/*.go', 'internal/subjectmeta/**/*.go', 'internal/registry/**/*.go') }}
           restore-keys: |
-            shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-
-            shard-v2-${{ matrix.series }}-emb${{ github.event.inputs.embed }}-
+            shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-
+            shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-
       # Intra-run fallback: a partial DB uploaded by an EARLIER attempt of the
       # SAME run (e.g. the auto-rerun cycle after a 6h-cap kill) takes priority
       # over the cross-run cache hit (it's strictly more recent). Best-effort:
@@ -501,13 +546,13 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: shard-${{ matrix.series }}
+          name: shard-${{ steps.shard.outputs.tag }}
           path: dist
       - name: Note resume state
         run: |
           mkdir -p dist
-          if [ -f "dist/shard-${{ matrix.series }}.duckdb" ]; then
-            sz=$(stat -c %s "dist/shard-${{ matrix.series }}.duckdb")
+          if [ -f "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" ]; then
+            sz=$(stat -c %s "dist/shard-${{ steps.shard.outputs.tag }}.duckdb")
             echo "resume: prior shard restored (${sz} bytes) — --resume will skip its 'done' specs"
             # Cache-hit telemetry: helps spot a cold cache vs a warm one in logs.
             echo "  cache hit:          ${{ steps.shard_cache.outputs.cache-hit }}"
@@ -520,22 +565,23 @@ jobs:
       # (always: success or failure) keeping the partial DB available for the
       # next attempt. --resume makes the next attempt skip 'done' specs +
       # purge half-ingested ones (PR #47, see internal/ingest/ingest.go).
-      - name: Ingest shard ${{ matrix.series }} (lexical, --resume + retry)
+      - name: Ingest shard ${{ steps.shard.outputs.tag }} (lexical, --resume + retry)
         id: ingest
         run: |
           # Ingest is now ALWAYS lexical (clause text + FTS); embedding is the
           # separate step below. --resume skips 'done' specs from a restored
           # partial shard; the retry loop covers transient mid-ingest failures.
+          # relflag pins a release when this is a (series|release) sub-shard.
           set -o pipefail
           mkdir -p dist
-          OUT="dist/shard-${{ matrix.series }}.duckdb"
+          OUT="dist/shard-${{ steps.shard.outputs.tag }}.duckdb"
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
-            echo "::group::ingest attempt $attempt/$max_attempts (series ${{ matrix.series }})"
-            if ./bin/ingest --series "${{ matrix.series }}" --out "$OUT" --resume; then
+            echo "::group::ingest attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
+            if ./bin/ingest --series "${{ steps.shard.outputs.series }}" ${{ steps.shard.outputs.relflag }} --out "$OUT" --resume; then
               ingest_ok=1
             fi
             echo "::endgroup::"
@@ -558,7 +604,7 @@ jobs:
       # unchanged series embeds ~0 clauses. Retry loop: a 6h-cap kill mid-embed
       # leaves the partial vectors + hashes in the uploaded shard; the rerun's
       # restore + this step re-embed only what's still missing.
-      - name: Embed shard ${{ matrix.series }} (decoupled, micro-granular, --resume)
+      - name: Embed shard ${{ steps.shard.outputs.tag }} (decoupled, micro-granular, --resume)
         if: github.event.inputs.embed == 'true'
         env:
           EMBEDDER: bge-m3
@@ -568,14 +614,14 @@ jobs:
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
           set -o pipefail
-          OUT="dist/shard-${{ matrix.series }}.duckdb"
-          RPT="dist/shard-${{ matrix.series }}.report.json"
+          OUT="dist/shard-${{ steps.shard.outputs.tag }}.duckdb"
+          RPT="dist/shard-${{ steps.shard.outputs.tag }}.report.json"
           attempt=0
           max_attempts=3
           embed_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
-            echo "::group::embed attempt $attempt/$max_attempts (series ${{ matrix.series }})"
+            echo "::group::embed attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
             # --require-semantic refuses to no-op if the embedder isn't enabled.
             # The gate checks the model + that NO at/above-floor clause is left
             # without a vector (null_embeddings==0 means the shard is fully
@@ -603,10 +649,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: shard-${{ matrix.series }}
+          name: shard-${{ steps.shard.outputs.tag }}
           path: |
-            dist/shard-${{ matrix.series }}.duckdb
-            dist/shard-${{ matrix.series }}.report.json
+            dist/shard-${{ steps.shard.outputs.tag }}.duckdb
+            dist/shard-${{ steps.shard.outputs.tag }}.report.json
           retention-days: 1
           if-no-files-found: ignore
           overwrite: true   # each attempt of this matrix slice replaces the prior partial

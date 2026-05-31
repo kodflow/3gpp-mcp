@@ -1,28 +1,33 @@
-# Auto-rerun corpus-matrix when build-shards hit the GitHub-hosted-runner 6h
-# job cap. Pairs with the --resume infrastructure shipped in PR #47:
+# =============================================================================
+#  Corpus · Auto-resume   (re-runs shards killed by the 6h runner cap)
+# =============================================================================
 #
-#   1. corpus-matrix dispatches → build-shards run
-#   2. big series (e.g. 24, 196 specs) ~8-10h ingest → killed at 360 min
-#      with conclusion="cancelled" (NOT failure — the platform terminates the
-#      runner, doesn't error the step), whole run becomes "cancelled"
-#   3. THIS workflow fires on the workflow_run completion event, detects
-#      cancelled build-shards, calls `gh run rerun --failed` (which reruns
-#      cancelled AND failed jobs)
-#   4. the rerun's `Restore prior shard artifact` pulls back the partial DB
-#      uploaded by the previous attempt's `if: always()` step; --resume skips
-#      'done' specs and purges+redoes 'started' ones — so the rerun makes
-#      ADDITIONAL progress in its next 6h slot
-#   5. repeat until either all shards green (publish-vec fires) or the
-#      max_attempts safety cap kicks in
+#  WHEN it runs   AUTOMATICALLY, on every completion of "Corpus · Build"
+#                 (workflow_run trigger). You never start it by hand.
 #
-# Why this beats per-(series,release) matrix splitting: it's a single ~50-line
-# YAML, requires zero code change, and ANY future 6h-bound shard auto-recovers
-# regardless of which spec made it big.
-name: Corpus Matrix — auto-rerun on 6h cap
+#  WHAT it does   When a build-shard is killed at the 360-min GitHub cap (status
+#                 "cancelled", not "failure"), it calls `gh run rerun --failed`
+#                 to relaunch ONLY the cancelled/failed shards. The rerun's
+#                 "Restore prior shard artifact" pulls back the partial DB the
+#                 killed attempt uploaded, and --resume skips already-'done'
+#                 specs (and, for embed, already-vectorised clauses via
+#                 embedding_hash) → each slot makes additional forward progress.
+#                 Repeats until all shards are green or MAX_ATTEMPTS is hit.
+#
+#  WHAT it does NOT do   It does NOT resurrect a run the operator cancelled on
+#                 purpose (the user-cancel heuristic compares elapsed vs the
+#                 timeout). It does not change inputs or publish anything itself
+#                 — it just re-runs the source "Corpus · Build" jobs.
+#
+#  NOTE   Sub-sharding big series by (series|release) via series_scope is the
+#         pro-active way to stay UNDER the cap; this workflow is the safety net
+#         for whatever still overruns.
+# =============================================================================
+name: Corpus · Auto-resume (6h cap)
 
 on:
   workflow_run:
-    workflows: ["Corpus Matrix"]
+    workflows: ["Corpus · Build"]
     types: [completed]
 
 # Serialize per source run so two completion events in quick succession can't
