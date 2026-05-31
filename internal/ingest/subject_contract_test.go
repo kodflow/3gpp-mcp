@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
-	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subject"
 )
@@ -136,8 +135,10 @@ func TestResumeFansOutSubjectPurge(t *testing.T) {
 	}
 }
 
-// pipelineVersionForTest mirrors Run's pipeline-version derivation for the
-// Disabled embedder so the test can query IsIngestDone with the same key.
+// pipelineVersionForTest mirrors Run's resume-gate derivation so the test can
+// query IsIngestDone with the same key. Since plan PR-3 the gate is the
+// SpecIngestIdentity (parser/chunking/schema + subject footprints), NOT the
+// legacy PipelineVersion — model-independent, so the Disabled embedder is moot.
 func pipelineVersionForTest() string {
-	return model.PipelineVersion(embed.Disabled{}.ModelID())
+	return specIngestIdentity()
 }

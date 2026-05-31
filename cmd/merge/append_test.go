@@ -61,7 +61,7 @@ func TestIncrementalAppendKeepsUntouchedSeries(t *testing.T) {
 		_ = st.SetMeta("pipeline_version", lexPV)
 	})
 
-	if err := run(ctx, out, []string{delta}, false, "", base, false, ""); err != nil {
+	if err := run(ctx, out, []string{delta}, false, "", base, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -121,7 +121,7 @@ func TestStripEmbeddingsStampsLexicalPipeline(t *testing.T) {
 		_ = st.SetMeta("embedding_model", "bge-m3")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -162,7 +162,7 @@ func TestMergeEmitsSubjectIndex(t *testing.T) {
 		})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", false, subjIdx); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", false, subjIdx, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,7 +236,7 @@ func TestSubjectFootprintNotAdvancedWhenSeriesNotRebuilt(t *testing.T) {
 		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.1.0", "5")})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false, subjIdx); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, subjIdx, ""); err != nil {
 		t.Fatal(err)
 	}
 
