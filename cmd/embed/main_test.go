@@ -143,4 +143,14 @@ func TestEmbedFloorSkipsOldReleases(t *testing.T) {
 	if n := nullEmb(t, dbPath); n != 1 {
 		t.Errorf("floor: %d null embeddings, want 1 (the below-floor clause)", n)
 	}
+	// The global null count is 1 (the below-floor clause), but the CI completeness
+	// gate keys on NullAtFloor, which MUST be 0 — every at/above-floor clause is
+	// vectorised. This is the exact regression that failed the embed run: the gate
+	// must NOT count intentionally-skipped below-floor clauses as a failure.
+	if rep.NullAfter != 1 {
+		t.Errorf("floor: NullAfter=%d, want 1 (global, incl. below-floor)", rep.NullAfter)
+	}
+	if rep.NullAtFloor != 0 {
+		t.Errorf("floor: NullAtFloor=%d, want 0 (no at/above-floor clause left unembedded)", rep.NullAtFloor)
+	}
 }

@@ -908,6 +908,32 @@ func (s *Store) CountNullEmbeddings(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// NullEmbeddingsByRelease returns, per release, how many clauses still lack a
+// vector. The caller sums only at/above its embed floor: a floored embed run
+// LEGITIMATELY leaves below-floor clauses NULL, so the global
+// CountNullEmbeddings never reaches 0 and is the wrong completeness signal for
+// a floored build. Releases are not SQL-orderable (Rel-99 sorts before Rel-4),
+// so the floor comparison is done in Go via model.ReleaseOrdinal.
+func (s *Store) NullEmbeddingsByRelease(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(release, '') AS release, count(*)
+		   FROM clauses WHERE embedding IS NULL GROUP BY release`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[string]int)
+	for rows.Next() {
+		var rel string
+		var n int
+		if err := rows.Scan(&rel, &n); err != nil {
+			return nil, err
+		}
+		out[rel] = n
+	}
+	return out, rows.Err()
+}
+
 // vecOverFetch / vecMaxFetch bound how many extra neighbours SearchVectors pulls
 // when a SpecFilter is set, so the Go post-filter can still return topK.
 const (
