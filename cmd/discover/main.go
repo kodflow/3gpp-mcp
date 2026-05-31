@@ -2,37 +2,43 @@
 // matrix is sized to the actual delta instead of being frozen or always-full.
 //
 // It fetches the 3GPP global status report (one ~5 MB GET that lists the latest
-// version of every spec), compares each spec's site version against a small
-// corpus-index.json (spec_id -> indexed version, published alongside the DB),
-// and prints a JSON array of the series that changed — for a GitHub Actions
-// matrix (fromJSON). No index (first run) or --all => every series (full build).
+// version of every spec PER RELEASE section), compares each (spec, release)'s
+// site version against a small corpus-index.json ("spec_id|release" -> indexed
+// version, published alongside the DB), and prints a JSON array of the series
+// that changed — for a GitHub Actions matrix (fromJSON). No index (first run) or
+// --all => every series (full build).
 //
 //	discover --index corpus-index.json --floor Rel-4    # delta
 //	discover --all                                       # full (all series)
+//
+// The index key is per-(spec, release) — NOT one scalar per spec (plan PR-5,
+// finding delta-blind-to-nonmonotonic-lower-release-update). A frozen release
+// keeps receiving maintenance versions (CLAUDE.md §8 #8), so collapsing a spec to
+// its single highest X.Y.Z hid a Rel-16 bump whenever Rel-19 was higher. We reuse
+// catalog.ParseStatusReport (the same per-(spec,release) parser the metadata
+// overlay uses) instead of a flat regex, so the release attribution is shared.
 //
 // Pure Go (no CGO): the heavy DuckDB work stays in ingest/merge. 3gpp.org needs
 // a browser User-Agent (it 403s bots), so we send one.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kodflow/3gpp-mcp/internal/catalog"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
-
-// One status-report row: <td>TS|TR</td><td><a..>NN.NNN[-p]</a></td><td>title</td><td>X.Y.Z</td>...
-var rowRE = regexp.MustCompile(`(?s)<td>(?:TS|TR)</td>\s*<td><a[^>]*>(\d{2}\.\d{3})(?:-\d+)?</a></td>\s*<td>.*?</td>\s*<td>(\d+\.\d+\.\d+)</td>`)
 
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
@@ -53,15 +59,7 @@ func main() {
 	full := *all || len(idx) == 0
 	floorMajor := major(*floor)
 
-	series := map[string]bool{}
-	for spec, ver := range site {
-		if major(ver) < floorMajor {
-			continue // draft / below floor — not indexed
-		}
-		if full || cmpVer(ver, idx[spec]) > 0 { // missing in index => idx[spec]=="" => changed
-			series[spec[:2]] = true
-		}
-	}
+	series := deltaSeries(site, idx, floorMajor, full)
 
 	// Subject delta (plan TROU #1): a subject whose code changed (footprint shifts
 	// vs the published subject-index.json) forces its owning series back into the
@@ -98,8 +96,9 @@ func main() {
 			}
 		}
 		if forceAll {
-			for spec, ver := range site {
-				if major(ver) >= floorMajor {
+			for key := range site {
+				spec, rel := splitKey(key)
+				if major(rel) >= floorMajor {
 					series[spec[:2]] = true
 				}
 			}
@@ -115,12 +114,17 @@ func main() {
 	if full {
 		mode = "full"
 	}
-	fmt.Fprintf(os.Stderr, "discover: mode=%s site_specs=%d indexed=%d subject-changed=%v identity-drift=%v -> %d series: %v\n",
+	fmt.Fprintf(os.Stderr, "discover: mode=%s site_keys=%d indexed=%d subject-changed=%v identity-drift=%v -> %d series: %v\n",
 		mode, len(site), len(idx), subjChanged, identityDrift, len(out), out)
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b)) // stdout = the JSON matrix
 }
 
+// fetchStatus GETs the status report and returns the highest version per
+// (spec, release), keyed "spec_id|Rel-NN". It reuses catalog.ParseStatusReport —
+// the same per-release parser the metadata overlay uses — so release attribution
+// (the activeRel-/deadRel- section anchors) is shared, not re-derived from a flat
+// regex that only saw the single highest version of each spec.
 func fetchStatus(url string) (map[string]string, error) {
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) discover")
@@ -137,17 +141,66 @@ func fetchStatus(url string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseStatus(body)
+}
+
+// parseStatus turns the status-report HTML into a "spec_id|Rel-NN" -> highest
+// version map. Split from fetchStatus so tests can exercise the per-(spec,release)
+// collapse without a network round-trip.
+func parseStatus(body []byte) (map[string]string, error) {
+	_, vers, err := catalog.ParseStatusReport(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]string{}
-	for _, m := range rowRE.FindAllStringSubmatch(string(body), -1) {
-		spec, ver := m[1], m[2]
-		if cmpVer(ver, out[spec]) > 0 { // keep the highest version per spec
-			out[spec] = ver
+	for _, vr := range vers {
+		if vr.Release == "" || vr.Version == "" {
+			continue
+		}
+		key := vr.SpecID + "|" + vr.Release
+		if cmpVer(vr.Version, out[key]) > 0 { // keep the highest version per (spec,release)
+			out[key] = vr.Version
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("parsed 0 specs from status report (layout changed?)")
+		return nil, fmt.Errorf("parsed 0 (spec,release) rows from status report (layout changed?)")
 	}
 	return out, nil
+}
+
+// deltaSeries returns the set of 2-digit series that need (re)indexing, comparing
+// the live site versions against the published index PER (spec, release). This is
+// the keystone of plan PR-5: because both site and idx are keyed "spec_id|Rel-NN",
+// a maintenance bump to a LOWER release (e.g. Rel-16 16.16.0) is detected even
+// when a HIGHER release of the same spec (e.g. Rel-19) is present and unchanged —
+// the old scalar-per-spec collapse to the highest X.Y.Z hid exactly that case.
+// The release floor is applied per-key on the release, not after a max-version
+// collapse. On a full build every above-floor series is selected unconditionally.
+func deltaSeries(site, idx map[string]string, floorMajor int, full bool) map[string]bool {
+	series := map[string]bool{}
+	for key, ver := range site {
+		spec, rel := splitKey(key)
+		if major(rel) < floorMajor {
+			continue // draft / release below floor — not indexed
+		}
+		// idx is keyed per-(spec,release); a missing key (new release, or a
+		// lower-release maintenance bump never indexed) => idx[key]=="" => changed.
+		if full || cmpVer(ver, idx[key]) > 0 {
+			series[spec[:2]] = true
+		}
+	}
+	return series
+}
+
+// splitKey splits a corpus-index / site key "spec_id|Rel-NN" into its parts. A
+// key without the separator (legacy flat index, or a malformed entry) yields an
+// empty release, whose major()==0 falls below any real floor → treated as draft
+// and skipped, which is the safe direction (the next full rebuild reseeds it).
+func splitKey(key string) (spec, release string) {
+	if i := strings.IndexByte(key, '|'); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return key, ""
 }
 
 func loadIndex(path string) map[string]string {
