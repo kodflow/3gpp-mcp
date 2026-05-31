@@ -58,6 +58,16 @@ func (*Subject) Ingest(ctx context.Context, db *store.Store, ic subject.IngestCo
 	return len(m.Events), nil
 }
 
+// Purge clears every LI-owned row for (specID, release) so a --resume redo of
+// TS 33.128 re-ingests from a clean slate (subject.Purger). version is unused:
+// LI's tables are release-scoped.
+func (s *Subject) Purge(ctx context.Context, db *store.Store, sid, release, _ string) error {
+	if !s.Activates(sid) {
+		return nil
+	}
+	return Purge(ctx, db, release)
+}
+
 // Tools contributes the li_events MCP tool.
 func (*Subject) Tools(db *store.Store, baseline string) []subject.ToolRegistration {
 	return []subject.ToolRegistration{{
@@ -203,5 +213,6 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 var (
 	_ subject.Subject      = (*Subject)(nil)
 	_ subject.TermEnricher = (*Subject)(nil)
+	_ subject.Purger       = (*Subject)(nil)
 	_                      = server.ToolHandlerFunc(nil)
 )
