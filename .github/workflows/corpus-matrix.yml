@@ -624,11 +624,15 @@ jobs:
             echo "::group::embed attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
             # --require-semantic refuses to no-op if the embedder isn't enabled.
             # The gate checks the model + that NO at/above-floor clause is left
-            # without a vector (null_embeddings==0 means the shard is fully
-            # vectorised; a 6h-cap partial leaves >0 and fails → rerun resumes).
+            # without a vector. We key on null_embeddings_at_floor, NOT the global
+            # null_embeddings: with --embed-floor set, below-floor clauses are
+            # LEFT NULL on purpose (lexical-only), so global null is never 0 and
+            # would fail every shard with older releases. _at_floor==0 means the
+            # shard is fully vectorised at/above the floor; a 6h-cap partial
+            # leaves >0 and fails → the rerun resumes via embedding_hash.
             if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
                  --require-semantic --report json | tee "$RPT" \
-               && jq -e '.model=="bge-m3" and .null_embeddings==0' "$RPT"; then
+               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0' "$RPT"; then
               embed_ok=1
             fi
             echo "::endgroup::"

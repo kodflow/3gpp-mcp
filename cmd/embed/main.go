@@ -75,20 +75,21 @@ func main() {
 		return
 	}
 	fmt.Printf("embed done in %s (model=%s)\n", rep.Elapsed, rep.Model)
-	fmt.Printf("  db=%s\n  candidates=%d embedded=%d skipped=%d null_after=%d hnsw=%v\n",
-		*dbPath, rep.Candidates, rep.Embedded, rep.Skipped, rep.NullAfter, rep.HNSW)
+	fmt.Printf("  db=%s\n  candidates=%d embedded=%d skipped=%d null_after=%d null_at_floor=%d hnsw=%v\n",
+		*dbPath, rep.Candidates, rep.Embedded, rep.Skipped, rep.NullAfter, rep.NullAtFloor, rep.HNSW)
 }
 
 // reportJSON is the machine summary (used by CI gates + the text printer).
 type reportJSON struct {
-	Model      string `json:"model"`
-	Candidates int    `json:"candidates"`       // clauses examined (after floor)
-	Embedded   int    `json:"embedded_clauses"` // actually (re)embedded this run
-	Skipped    int    `json:"skipped_clauses"`  // hash already current → reused
-	NullAfter  int    `json:"null_embeddings"`  // clauses still without a vector
-	HNSW       bool   `json:"hnsw"`
-	Version    string `json:"version"`
-	Elapsed    string `json:"elapsed"`
+	Model       string `json:"model"`
+	Candidates  int    `json:"candidates"`               // clauses examined (after floor)
+	Embedded    int    `json:"embedded_clauses"`         // actually (re)embedded this run
+	Skipped     int    `json:"skipped_clauses"`          // hash already current → reused
+	NullAfter   int    `json:"null_embeddings"`          // clauses still without a vector (GLOBAL — incl. below-floor)
+	NullAtFloor int    `json:"null_embeddings_at_floor"` // at/above-floor clauses still NULL — the CI completeness gate
+	HNSW        bool   `json:"hnsw"`
+	Version     string `json:"version"`
+	Elapsed     string `json:"elapsed"`
 }
 
 func run(ctx context.Context, dbPath string, e embed.Embedder, embedFloor string, buildHNSW bool) (reportJSON, error) {
@@ -173,6 +174,19 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, embedFloor string
 
 	if n, err := db.CountNullEmbeddings(ctx); err == nil {
 		rep.NullAfter = n
+	}
+	// Floor-scoped completeness: a floored run leaves below-floor clauses NULL on
+	// purpose, so the global count never hits 0. The CI gate keys on NullAtFloor —
+	// at/above-floor clauses that should have a vector but don't (a real failure).
+	if byRel, err := db.NullEmbeddingsByRelease(ctx); err == nil {
+		for rel, n := range byRel {
+			if floorOrd > 0 {
+				if o, ok := model.ReleaseOrdinal(rel); !ok || o < floorOrd {
+					continue // below floor: NULL is expected, not a failure
+				}
+			}
+			rep.NullAtFloor += n
+		}
 	}
 	return rep, nil
 }
