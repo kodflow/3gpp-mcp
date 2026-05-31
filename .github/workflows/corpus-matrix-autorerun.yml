@@ -70,14 +70,18 @@ jobs:
       # their full slot (= real progress or a hard cap) get rerun. 999 ≈ "until
       # it's done".
       MAX_ATTEMPTS: "999"
-      # Source run's shard_timeout_minutes. workflow_run events DO NOT propagate
-      # workflow_dispatch inputs from the source run — `github.event.workflow_run.inputs`
-      # is not a valid expression on this trigger (parser rejects the whole YAML).
-      # Hardcoded to match the value used by current production dispatches; bump
-      # in lockstep with corpus-matrix.yml's shard_timeout_minutes input default
-      # if production switches away from 60 (e.g. back to 360). Worth a small
-      # maintenance tax for the readable user-cancel-vs-cap heuristic below.
-      TIMEOUT_MIN: "60"
+      # Source run's effective shard_timeout_minutes. workflow_run events DO NOT
+      # propagate workflow_dispatch inputs (`github.event.workflow_run.inputs` is
+      # not a valid expression on this trigger — the parser rejects the YAML), so
+      # we read it from the `shard-timeout` artifact every build-shard stamps
+      # (PR-1, timeout-min-drift-resurrects-operator-cancel). This is drift-proof:
+      # the value the cap-vs-user-cancel heuristic compares against is the SAME
+      # value the source run actually applied as timeout-minutes, regardless of
+      # which default corpus-matrix.yml ships. TIMEOUT_FALLBACK only applies when
+      # the artifact is absent (an old source run from before the stamp existed);
+      # it matches corpus-matrix.yml's shard_timeout_minutes default AND the free-
+      # runner hard cap (both 360) so a pre-stamp run is treated conservatively.
+      TIMEOUT_FALLBACK: "360"
     steps:
       - name: Decide whether to rerun
         id: decide
@@ -89,62 +93,73 @@ jobs:
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # TIMEOUT_MIN is wired via the job-level env var above (hardcoded for
-          # now — workflow_run events do not propagate source workflow_dispatch
-          # inputs, see comment on the env declaration).
+          # Resolve the EFFECTIVE timeout from the stamp the source run uploaded
+          # (PR-1). workflow_run can't see the dispatch inputs but CAN download
+          # the source run's artifacts. Fall back to TIMEOUT_FALLBACK only when
+          # the stamp is missing (a pre-stamp source run).
+          TIMEOUT_MIN="$TIMEOUT_FALLBACK"
+          if gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" -n shard-timeout -D _stamp 2>/dev/null \
+             && [ -f _stamp/shard-timeout.txt ]; then
+            stamped="$(tr -dc '0-9' < _stamp/shard-timeout.txt)"
+            if printf '%s' "$stamped" | grep -qE '^[1-9][0-9]*$'; then
+              TIMEOUT_MIN="$stamped"
+              echo "read effective shard timeout from stamp: ${TIMEOUT_MIN} min"
+            else
+              echo "::warning::shard-timeout stamp present but unparseable ('$stamped') — using fallback ${TIMEOUT_FALLBACK}"
+            fi
+          else
+            echo "::notice::no shard-timeout stamp on source run — using fallback ${TIMEOUT_FALLBACK} min"
+          fi
           echo "source timeout=${TIMEOUT_MIN} min"
-          # Sanity: TIMEOUT_MIN must be a positive integer (paranoia: workflow_run
-          # inputs are repo-collaborator-controlled but we still validate before
-          # using it in arithmetic).
+          # Sanity: TIMEOUT_MIN must be a positive integer before arithmetic.
           if ! printf '%s' "$TIMEOUT_MIN" | grep -qE '^[1-9][0-9]*$'; then
             echo "::error::TIMEOUT_MIN='$TIMEOUT_MIN' is not a positive integer"; exit 1
           fi
-          # Pull all cancelled/failed build-shards with their elapsed time.
-          # A platform-cap kill has elapsed_min == TIMEOUT_MIN (within 1 min
-          # of slack for runner teardown). A user cancel has elapsed_min
-          # strictly less. We refuse to rerun if MAJORITY of cancellations
-          # look like user-cancels (this protects against an operator who
-          # `gh run cancel`'d a run from being auto-resurrected — exactly
-          # the bug the prod v1 26661646421 hit after I cancelled it).
-          CANCELLED_AT_CAP=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
-                          | select(.run_attempt == $SOURCE_ATTEMPT)
-                          | select(.conclusion==\"cancelled\")
-                          | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)
-                          | select(. >= $TIMEOUT_MIN - 1)] | length")
-          USER_CANCELLED=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
-                          | select(.run_attempt == $SOURCE_ATTEMPT)
-                          | select(.conclusion==\"cancelled\")
-                          | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor)
-                          | select(. < $TIMEOUT_MIN - 1)] | length")
-          echo "cancelled @ cap: $CANCELLED_AT_CAP   user-cancelled: $USER_CANCELLED"
-          if [ "$USER_CANCELLED" -gt "$CANCELLED_AT_CAP" ]; then
-            echo "::warning::source run looks USER-cancelled (most shards elapsed < timeout=$TIMEOUT_MIN) — refusing to rerun"
+          # Pull this attempt's jobs ONCE and classify each terminal state.
+          # `filter=latest` (the API default, pinned here so a default change
+          # can't silently sum across prior attempts) restricts to the most
+          # recent attempt; we also re-filter on run_attempt for safety.
+          #
+          # Note: `gh api --jq` accepts ONE jq-expression argument (no jq
+          # --argjson — PR #48 tried that and got "accepts 1 arg(s)"), so
+          # $SOURCE_ATTEMPT / $TIMEOUT_MIN are inlined via shell expansion;
+          # both come from trusted small-integer contexts.
+          JOBS=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100")
+          jqcount() { printf '%s' "$JOBS" | jq "$1"; }
+          ATT="$SOURCE_ATTEMPT"; CAP="$TIMEOUT_MIN"
+          # build-shard, cancelled, ran to (near) the cap → genuine 6h-cap kill, resumable.
+          SHARD_CAP=$(jqcount "[.jobs[] | select(.name|startswith(\"build-shard\")) | select(.run_attempt==$ATT) | select(.conclusion==\"cancelled\") | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor) | select(.>=$CAP-1)] | length")
+          # build-shard, cancelled, ended well under the cap → an operator `gh run cancel`.
+          SHARD_USER_CANCEL=$(jqcount "[.jobs[] | select(.name|startswith(\"build-shard\")) | select(.run_attempt==$ATT) | select(.conclusion==\"cancelled\") | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor) | select(.<$CAP-1)] | length")
+          # build-shard, FAILED at (near) the cap → resource exhaustion near the
+          # deadline (OOM/disk) — resumable, treat like a cap kill.
+          SHARD_FAIL_CAP=$(jqcount "[.jobs[] | select(.name|startswith(\"build-shard\")) | select(.run_attempt==$ATT) | select(.conclusion==\"failure\") | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor) | select(.>=$CAP-1)] | length")
+          # build-shard, FAILED fast (well under the cap) → almost always a real
+          # bug; auto-rerunning it would be the fast-failure-infinite-rerun loop.
+          SHARD_FAIL_FAST=$(jqcount "[.jobs[] | select(.name|startswith(\"build-shard\")) | select(.run_attempt==$ATT) | select(.conclusion==\"failure\") | (((.completed_at|fromdate)-(.started_at|fromdate))/60|floor) | select(.<$CAP-1)] | length")
+          # Non-build-shard jobs that failed (merge / publish-vec / preflight / model):
+          # the rerun-failed-blast-radius — `gh run rerun --failed` WILL relaunch
+          # these too, so the decide step must count them or it would skip a run
+          # whose only failure was a transient merge/publish step.
+          OTHER_FAIL=$(jqcount "[.jobs[] | select(.name|startswith(\"build-shard\")|not) | select(.run_attempt==$ATT) | select(.conclusion==\"cancelled\" or .conclusion==\"failure\")] | length")
+          echo "classification: shard_cap=$SHARD_CAP shard_user_cancel=$SHARD_USER_CANCEL shard_fail_cap=$SHARD_FAIL_CAP shard_fail_fast=$SHARD_FAIL_FAST other_fail=$OTHER_FAIL (timeout=${CAP}m)"
+          # GUARD: refuse to resurrect when the dominant signal is a deliberate
+          # stop or a fast failure. This bounds BOTH `cancelled` (operator cancel)
+          # AND `failure` (fast-failing shard) so neither can spin the rerun loop.
+          STOP_SIGNALS=$((SHARD_USER_CANCEL + SHARD_FAIL_FAST))
+          GO_SIGNALS=$((SHARD_CAP + SHARD_FAIL_CAP))
+          if [ "$STOP_SIGNALS" -gt "$GO_SIGNALS" ]; then
+            echo "::warning::source run looks USER-cancelled or fast-failing (stop=$STOP_SIGNALS > cap=$GO_SIGNALS, timeout=${CAP}m) — refusing to rerun"
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Count build-shard jobs that ended cancelled or failure on THIS
-          # attempt. The GH API endpoint defaults to `filter=latest` (only
-          # the most-recent attempt's jobs), but we pin it explicitly: a
-          # default change would silently start summing across all prior
-          # attempts and inflate the count.
-          #
-          # Note: `gh api --jq` accepts ONE argument (the jq expression). We
-          # can't use jq's --argjson here (that's a flag of the standalone
-          # jq binary, not of gh's --jq wrapper — the previous attempt PR #48
-          # tried that and got "accepts 1 arg(s), received 4"). So we inline
-          # $SOURCE_ATTEMPT into the jq expression via shell expansion (double
-          # quotes), which is safe because the variable comes from a trusted
-          # GitHub-controlled context (workflow_run.run_attempt is always a
-          # small integer set by the platform itself).
-          to_rerun=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq "[.jobs[] | select(.name | startswith(\"build-shard\"))
-                          | select(.run_attempt == $SOURCE_ATTEMPT)
-                          | select(.conclusion==\"cancelled\" or .conclusion==\"failure\")] | length")
-          echo "build-shards needing rerun: $to_rerun"
+          # Rerun when there is anything `gh run rerun --failed` would make
+          # forward progress on: a capped/failed-at-cap shard (--resume resumes),
+          # or any other failed job in the blast radius (transient merge/publish).
+          to_rerun=$((SHARD_CAP + SHARD_FAIL_CAP + OTHER_FAIL))
+          echo "jobs eligible for rerun: $to_rerun"
           if [ "$to_rerun" -eq 0 ]; then
-            echo "::notice::no cancelled/failed build-shards on attempt $SOURCE_ATTEMPT — nothing to rerun"
+            echo "::notice::no cap-killed shards or transient post-shard failures on attempt $SOURCE_ATTEMPT — nothing to rerun"
             echo "rerun=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
