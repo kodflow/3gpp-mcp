@@ -1,19 +1,23 @@
-# Phase-0 — semantic feasibility MEASUREMENT (throwaway, MR1).
+# =============================================================================
+#  Corpus · Probe (diagnostics)   — one-off feasibility MEASUREMENT, not a build
+# =============================================================================
 #
-# Produces the go/no-go numbers BEFORE any semantic activation. STRICT no-product-
-# change: never touches serve, the published DB, release workflows, `latest`, or
-# the binaries — it only emits measurement artifacts.
+#  WHEN it runs   MANUAL ONLY (workflow_dispatch), on demand.
 #
-#   hnsw-probe  → peak RSS of the GLOBAL HNSW build at candidate scope (synthetic
-#                 vectors, NO model). HARD GATE: fail if peak RSS >= 13 GiB.
-#   disk-probe  → real series download→convert→cleanup→lexical-ingest→count-only;
-#                 df before/after = worst real shard disk (model adds a fixed
-#                 ~2.3 GiB on top). HARD GATE: fail if free disk < 1 GiB.
-#   embed-probe → (opt-in, needs the model) build -tags onnx, embed a real series,
-#                 derive fp32 clauses/s. CONSULTATIVE; never blocks.
+#  WHAT it does   Emits go/no-go numbers for the semantic path WITHOUT changing
+#                 any product: never touches serve, the published DB, `latest`,
+#                 the release binaries — artifacts only.
+#                   hnsw-probe  → peak RSS of a global HNSW build (synthetic
+#                                 vectors, no model). HARD GATE >= 13 GiB.
+#                   disk-probe  → real download→convert→cleanup→ingest→count;
+#                                 worst-shard disk. HARD GATE free < 1 GiB.
+#                   embed-probe → (opt-in, needs model) real fp32 clauses/s.
+#                                 CONSULTATIVE; never blocks.
 #
-# Decides: Rel-17+ vs Rel-15+ HNSW fits 16 GB? real disk under 14 GB? fp32 c/s?
-name: Phase-0 Measure
+#  STATUS   Historically the Phase-0 gate (the Option-B verdict it produced is
+#           already decided + shipped). Kept as an on-demand diagnostic; it is
+#           NOT part of the normal build/publish flow.
+name: Corpus · Probe (feasibility diagnostics)
 
 on:
   workflow_dispatch:
