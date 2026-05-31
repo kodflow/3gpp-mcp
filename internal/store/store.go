@@ -85,6 +85,18 @@ func (s *Store) migrate() error {
 		`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
 		return fmt.Errorf("add embedding_hash column: %w", err)
 	}
+	// Additive upgrade (plan PR-4): provenance on the subject-owned global
+	// `acronyms` table. Without an owning-series column the incremental merge
+	// cannot scope-purge a changed/regressed glossary subject's rows (acronyms
+	// has no spec_id/release), so a corrected/removed term's stale row survives
+	// forever (ON CONFLICT DO NOTHING on the fold can't overwrite it). The column
+	// is metadata ABOUT provenance, not lexical content, so it deliberately does
+	// NOT bump schema_version. A pre-PR-4 DB gets the column added in place; its
+	// existing rows carry NULL source_series until the owning series is re-ingested.
+	if _, err := s.db.Exec(
+		`ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS source_series VARCHAR`); err != nil {
+		return fmt.Errorf("add acronyms source_series column: %w", err)
+	}
 	return nil
 }
 
@@ -335,11 +347,12 @@ func (s *Store) InsertChanges(changes []model.Change) error {
 // UpsertAcronym inserts or updates a glossary entry.
 func (s *Store) UpsertAcronym(a model.Acronym) error {
 	_, err := s.db.Exec(
-		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
-		   first_release=excluded.first_release, last_release=excluded.last_release`,
-		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease)
+		   first_release=excluded.first_release, last_release=excluded.last_release,
+		   source_series=excluded.source_series`,
+		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease, a.SourceSeries)
 	return err
 }
 

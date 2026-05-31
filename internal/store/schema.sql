@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS acronyms (
     domain        VARCHAR,               -- '5GC'|'EPC'|'IMS'|'RAN'|''
     first_release VARCHAR,
     last_release  VARCHAR,
+    source_series VARCHAR,               -- owning subject's 3GPP series (e.g. '21' for glossary)
     PRIMARY KEY (term, expansion, domain)
 );
 
