@@ -37,6 +37,7 @@ import (
 
 	"github.com/kodflow/3gpp-mcp/internal/catalog"
 	"github.com/kodflow/3gpp-mcp/internal/embed"
+	"github.com/kodflow/3gpp-mcp/internal/enrichmeta"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
@@ -74,14 +75,15 @@ func main() {
 		}
 	}
 
-	// Build-identity delta (plan PR-3): a parser/chunking/schema change
-	// (SpecIngestIdentity) or a model change (EmbedIdentity) moves NO spec version
-	// and NO subject footprint, so the checks above are blind to it. Compare the
-	// published build-index against the current code's identities; a drift in the
-	// spec-ingest or embed identity is corpus-global (it affects every series'
-	// content or vectors), so force EVERY site series above the floor into the
-	// matrix. The global-enrichment identity is published for completeness but is
-	// owned by PR-7's enricher refresh, so it does not size the per-spec matrix here.
+	// Build-identity delta (plan PR-3 + PR-7): a parser/chunking/schema change
+	// (SpecIngestIdentity), a model change (EmbedIdentity), or a global-enricher
+	// change (GlobalEnrichmentIdentity — catalog overlay code, OpenAPI extraction,
+	// or the evolutions seed) moves NO spec version and NO subject footprint, so the
+	// checks above are blind to it. Compare the published build-index against the
+	// current code's identities; any of the three drifts is corpus-global, so force
+	// EVERY site series above the floor into the matrix (a spec-ingest/embed drift
+	// re-ingests/re-embeds; a global-enrichment drift makes the merge job run so its
+	// idempotent overlays + the authoritative evolutions reseed refresh).
 	var identityDrift []string
 	if !full && *buildIndexPath != "" {
 		published := loadBuildIndex(*buildIndexPath)
@@ -93,12 +95,20 @@ func main() {
 		current := model.CurrentBuildIndex(
 			subjectmeta.IngestFootprints(), subjectmeta.ASN1ScannerVersion,
 			embed.ResolveModelID(*expectModel),
-			model.GlobalEnrichmentParts{},
+			enrichmeta.Current(),
 		)
 		identityDrift = published.Differs(current)
 		forceAll := false
 		for _, d := range identityDrift {
-			if d == "spec_ingest_identity" || d == "embed_identity" {
+			// A spec-ingest or embed drift is per-spec/per-vector (re-ingest /
+			// re-embed). A global-enrichment drift (catalog overlay code, OpenAPI
+			// extraction, or the evolutions seed — PR-7) is corpus-global and runs in
+			// the merge job, which is gated on a non-empty matrix; forcing every
+			// above-floor series in makes merge run so the idempotent overlays + the
+			// authoritative evolutions reseed refresh the published DB even though no
+			// spec version moved (catalog-source-change-not-detected,
+			// openapi-not-in-any-footprint, evolutions-seed-never-propagates-in-delta).
+			if d == "spec_ingest_identity" || d == "embed_identity" || d == "global_enrichment_identity" {
 				forceAll = true
 			}
 		}

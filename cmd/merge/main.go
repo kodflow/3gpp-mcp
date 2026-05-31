@@ -7,8 +7,9 @@
 // the merge is a concatenation: synthetic primary keys (chunk_id, op_id,
 // schema_id) are offset to stay unique; natural-key tables dedup via ON CONFLICT
 // DO NOTHING (a spec row repeats across release shards); the curated evolutions
-// seed — identical in every shard — is taken from the first shard only. FTS is
-// rebuilt on the merged DB (per-shard FTS indexes can't be concatenated).
+// seed is reseeded AUTHORITATIVELY from the current code after all folds (never
+// copied from a shard, so a seed edit can't be lost to fold order on a delta).
+// FTS is rebuilt on the merged DB (per-shard FTS indexes can't be concatenated).
 package main
 
 import (
@@ -21,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/enrichmeta"
+	"github.com/kodflow/3gpp-mcp/internal/evolseed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
@@ -116,7 +119,7 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 				return fmt.Errorf("purge scope for %s: %w", in, err)
 			}
 		}
-		if err := mergeOne(ctx, sqldb, i == 0); err != nil {
+		if err := mergeOne(ctx, sqldb); err != nil {
 			return fmt.Errorf("merge %s: %w", in, err)
 		}
 		if _, err := sqldb.ExecContext(ctx, `DETACH src`); err != nil {
@@ -134,6 +137,19 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	// never masks a regression of the delete-before-fold guarantee.
 	if err := dedupChanges(ctx, sqldb); err != nil {
 		return fmt.Errorf("dedup changes: %w", err)
+	}
+
+	// Reseed evolutions AUTHORITATIVELY from the current code (PR-7). The curated
+	// NE<->NF seed is corpus-GLOBAL, not series-scoped, so it cannot be folded per
+	// shard: on a delta the fold list is [base, shard...] and the base folds first,
+	// so a fold-from-first rule would copy the STALE base seed and a seed edit
+	// shipped in the shards would never land (evolutions-seed-edit-never-lands-in-
+	// delta-merge). ReplaceEvolutions truncates + reloads, so the merged DB always
+	// carries exactly the current code's seed regardless of base/shard provenance
+	// or fold order. Its digest is published in the build index (evolutions_seed_hash
+	// → GlobalEnrichmentIdentity) so discover can also force the refresh.
+	if err := db.ReplaceEvolutions(ctx, evolseed.Seed()); err != nil {
+		return fmt.Errorf("reseed evolutions: %w", err)
 	}
 
 	// Strip vectors BEFORE the FTS rebuild + before counting/index-out, so the
@@ -282,7 +298,7 @@ func buildIndexFor(effFP map[string]string, outModelID string) model.BuildIndex 
 	for _, fp := range effFP {
 		fps = append(fps, fp)
 	}
-	return model.CurrentBuildIndex(fps, subjectmeta.ASN1ScannerVersion, outModelID, model.GlobalEnrichmentParts{})
+	return model.CurrentBuildIndex(fps, subjectmeta.ASN1ScannerVersion, outModelID, enrichmeta.Current())
 }
 
 // effectiveSubjectFootprints returns name->footprint for every subject, where a
@@ -605,16 +621,17 @@ var mergeTables = []tableSpec{
 // mergeOne folds the ATTACHed `src` DB into the main DB, column-by-column on the
 // INTERSECTION of src/main columns so it tolerates schema drift (an older base
 // DB with fewer columns merges fine; new columns just take their default).
-// first=true copies the curated evolutions seed (identical in every shard).
-func mergeOne(ctx context.Context, sqldb *sql.DB, first bool) error {
+//
+// The curated evolutions table is deliberately NOT folded here: it is corpus-
+// global and reseeded authoritatively from the current code AFTER all folds (see
+// run), so folding it per shard (which previously copied only fold #0 = the stale
+// base on a delta) is both unnecessary and was the source of the seed-staleness
+// bug. Leaving it out of mergeTables keeps the merged table empty until the
+// authoritative reseed populates it.
+func mergeOne(ctx context.Context, sqldb *sql.DB) error {
 	for _, t := range mergeTables {
 		if err := foldTable(ctx, sqldb, t); err != nil {
 			return fmt.Errorf("fold %s: %w", t.name, err)
-		}
-	}
-	if first {
-		if err := foldTable(ctx, sqldb, tableSpec{"evolutions", "", false}); err != nil {
-			return fmt.Errorf("fold evolutions: %w", err)
 		}
 	}
 	return nil
