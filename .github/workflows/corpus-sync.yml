@@ -1,17 +1,25 @@
-# Corpus Sync — download 3GPP specs, convert (LibreOffice), ingest, and publish
-# the consolidated DuckDB to the rolling "latest" release.
+# =============================================================================
+#  Corpus · Sync (single-runner, bounded)   — SIMPLE alternative to Corpus·Build
+# =============================================================================
 #
-# This is the REAL pipeline (no longer a stub). It is SCOPE-BOUNDED: a hosted
-# runner has ~14 GB disk, so it cannot build the full ~20 GB corpus in one job.
-# It downloads/consolidates a configurable subset (series + release floor). The
-# full back-catalogue consolidation runs locally / on a large runner; this CI
-# job covers incremental, bounded, or MVP-scope refreshes and proves the chain
-# end-to-end (3gpp.org → HTML → DuckDB → latest).
+#  WHEN it runs   MANUAL ONLY (workflow_dispatch).
 #
-# publish_to_latest=false (default) → DB uploaded as a workflow artifact only,
-# so a small/test run never shrinks the canonical DB on `latest`.
+#  WHAT it does   The same chain as "Corpus · Build" but in ONE job (no matrix,
+#                 no per-series parallelism, no embed): download → convert →
+#                 lexical ingest → publish. Scope-bounded (a 14 GB runner can't
+#                 hold the full ~20 GB corpus), so it's for a SMALL series subset
+#                 or a quick end-to-end smoke of the chain.
+#
+#  WHEN to use which:
+#                 • Corpus · Build  → the real pipeline (parallel, delta-aware,
+#                                     embed-capable, auto-resumed). Use this.
+#                 • Corpus · Sync   → a quick bounded one-shot when you don't need
+#                                     the matrix machinery.
+#
+#  WHAT it PUBLISHES   publish_to_latest=false (default) → artifact only, so a
+#                 small/test run never shrinks the canonical DB on `latest`.
 
-name: Corpus Sync
+name: Corpus · Sync (bounded, single-runner)
 
 on:
   workflow_dispatch:
