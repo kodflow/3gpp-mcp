@@ -7,9 +7,15 @@
 #
 # Posture (matches the project's "creds never leave the laptop" rule): the kernel
 # itself carries NO credentials — it embeds and writes /kaggle/working/3gpp-embedded.duckdb;
-# THIS driver (running on your box, where ~/.kaggle/kaggle.json lives) pulls that
-# output and runs `kaggle datasets version` to publish the resume state. The kernel's
-# optional self-version tail only fires if you instead attach Kaggle Secrets to it.
+# THIS driver (running on your box / a trusted runner, where the kaggle access token
+# lives) pulls that output and runs `kaggle datasets version` to publish the resume
+# state. The kernel's optional self-version tail only fires if you instead attach
+# Kaggle Secrets to it.
+#
+# Auth: the kaggle CLI 2.x reads its access token from KAGGLE_API_TOKEN (the KGAT_…
+# value from Settings → API) or ~/.kaggle/access_token — NOT the retired
+# KAGGLE_USERNAME/KAGGLE_KEY env pair. This driver only needs KAGGLE_USER (your
+# handle) to namespace the kernel/dataset slugs; the CLI handles auth itself.
 #
 # Kaggle is a best-effort MANUAL acceleration path, NOT a CI base (12h ephemeral
 # sessions, ~30 GPU-h/week, throttling, ToS). Run this locally or from a trusted
