@@ -898,7 +898,10 @@ jobs:
           ./bin/ingest-catalog --out data/3gpp.duckdb --cache data/catalog \
             || echo "[merge] catalog overlay degraded (kept filename-derived metadata)"
           go build -trimpath -o bin/ingest-openapi ./cmd/ingest-openapi
-          ./scripts/fetch-5g-apis.sh REL-17 REL-18 REL-19 \
+          # auto = fetch EVERY REL-* branch the Forge currently has, so a newly
+          # published release (REL-20, REL-21, …) is picked up by a cron build with
+          # no code change — and any release before the old hardcoded floor too.
+          ./scripts/fetch-5g-apis.sh auto \
             || echo "[merge] 5g-apis fetch degraded"
           ./bin/ingest-openapi --out data/3gpp.duckdb \
             || echo "[merge] openapi ingest degraded"
