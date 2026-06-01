@@ -104,11 +104,12 @@ on:
       - 'scripts/lib/convert.sh'
       - 'scripts/convert-origin.sh'
       - '.github/workflows/corpus-matrix.yml'
-  # HANDS-OFF weekly refresh: a delta build that picks up new 3GPP spec versions
+  # HANDS-OFF daily refresh: a delta build that picks up new 3GPP spec versions
   # (discover diffs the live status report) AND new 5GC OpenAPI releases (fetch auto).
-  # Near-no-op when nothing moved. Publishes `latest`, includes Phase 1/2. No embed.
+  # Near-no-op when nothing moved (~1-2 min discover, empty matrix). Publishes `latest`,
+  # includes Phase 1/2. NEVER embeds — that's the separate manual Kaggle job.
   schedule:
-    - cron: "17 4 * * 1"   # Mondays ~04:17 UTC
+    - cron: "17 4 * * *"   # every day ~04:17 UTC (off-peak, not midnight)
 
 # One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
 # let the newest one supersede it: a delta build diffs against the published `latest`,
