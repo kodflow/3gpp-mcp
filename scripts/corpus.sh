@@ -216,12 +216,24 @@ if [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
   xargs -P "$ENUM_JOBS" -n2 bash -c 'emit_spec "$0" "$1"' < "$WORKDIR/pairs" || true
   cat "$WORKDIR"/*.lines 2>/dev/null | sort -u > "$MANIFEST" || true
 fi
-log "manifest: $(wc -l < "$MANIFEST" 2>/dev/null || echo 0) files (releases >= $SET)"
+TOTAL=$(wc -l < "$MANIFEST" 2>/dev/null || echo 0); TOTAL="${TOTAL//[[:space:]]/}"
+log "manifest: $TOTAL files (releases >= $SET)"
 
 # ----- process on the fly (download + unzip + convert per spec) -----
 log "processing on the fly (jobs=$JOBS): download -> unzip -> HTML ..."
-# heartbeat: prove liveness + make a stall visible (frozen count = stuck)
-( while sleep 120; do log "heartbeat: $(find "$CONVERT" -name '*.html' 2>/dev/null | wc -l) html so far"; done ) &
+# Progress bar: converted/total with a percentage + a 20-cell bar. A frozen count
+# across ticks = a stall (visible at a glance). Counts HTML in the convert dir, so a
+# warm cache legitimately starts above 0.
+( while sleep 120; do
+    n=$(find "$CONVERT" -name '*.html' 2>/dev/null | wc -l); n="${n//[[:space:]]/}"
+    if [[ "${TOTAL:-0}" -gt 0 ]]; then
+      pct=$(( n * 100 / TOTAL )); (( pct > 100 )) && pct=100
+      fill=$(( pct / 5 )); bar=$(printf '%*s' "$fill" '' | tr ' ' '#')$(printf '%*s' $(( 20 - fill )) '' | tr ' ' '.')
+      log "progress: [$bar] ${pct}%  ($n/$TOTAL html)"
+    else
+      log "progress: $n html so far"
+    fi
+  done ) &
 HB=$!
 xargs -P "$JOBS" -n3 bash -c 'process_spec "$0" "$1" "$2"' < "$MANIFEST" || true
 kill "$HB" 2>/dev/null || true

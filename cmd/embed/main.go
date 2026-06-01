@@ -43,6 +43,7 @@ func main() {
 		order     = flag.String("order", "recent", "work-list order: recent (newest release first) | chunk (chunk_id order)")
 		resume    = flag.Bool("resume", false, "fast resume: embed ONLY never-embedded clauses (skip the Go hash re-check). Pair with --limit for bounded sessions.")
 		ckptEvery = flag.Int("checkpoint-every", 0, "CHECKPOINT the DB every N embedded clauses for crash-resumable durability. 0 = only at end.")
+		progEvery = flag.Int("progress-every", 2000, "log a live progress line (count + cl/s) every N embedded clauses; 0 = silent until the end.")
 		countNull = flag.Bool("count-null-at-floor", false, "read-only: print null-at-floor (+series) and exit WITHOUT embedding (completeness oracle for the driver)")
 		reqSem    = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1)")
 		report    = flag.String("report", "text", "end-of-run summary: text | json")
@@ -81,6 +82,7 @@ func main() {
 		order:           *order,
 		resume:          *resume,
 		checkpointEvery: *ckptEvery,
+		progressEvery:   *progEvery,
 		buildHNSW:       !*noHNSW,
 	})
 	if err != nil {
@@ -122,6 +124,7 @@ type embedConfig struct {
 	order           string // --order: "recent" (default) | "chunk"
 	resume          bool   // --resume: only never-embedded rows
 	checkpointEvery int    // --checkpoint-every N; 0 = checkpoint only at end
+	progressEvery   int    // --progress-every N; 0 = no live progress line
 	buildHNSW       bool   // !--no-hnsw
 }
 
@@ -193,19 +196,36 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 	// instead of one autocommit per clause — the write path that keeps a 10M embed flat.
 	// --checkpoint-every additionally flushes the DB durably every N embeds, so a session
 	// killed by the Kaggle 12h cap resumes from the last checkpoint, not the run start.
-	var batchSet embed.BatchSetFunc = db.SetEmbeddingsBatch
-	if cfg.checkpointEvery > 0 {
-		sinceCkpt := 0
-		batchSet = func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
-			if err := db.SetEmbeddingsBatch(ctx, ids, vecs, hashes); err != nil {
-				return err
-			}
+	// One wrapper does the batched write + optional durable checkpoint + a live
+	// progress line (count + cl/s), so a long Kaggle embed shows forward motion in
+	// the kernel log instead of going silent for hours. All knobs are independent.
+	embStart := time.Now()
+	done, sinceCkpt, sinceLog := 0, 0, 0
+	batchSet := func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+		if err := db.SetEmbeddingsBatch(ctx, ids, vecs, hashes); err != nil {
+			return err
+		}
+		done += len(ids)
+		if cfg.checkpointEvery > 0 {
 			if sinceCkpt += len(ids); sinceCkpt >= cfg.checkpointEvery {
 				sinceCkpt = 0
-				return db.Checkpoint(ctx)
+				if err := db.Checkpoint(ctx); err != nil {
+					return err
+				}
 			}
-			return nil
 		}
+		if cfg.progressEvery > 0 {
+			if sinceLog += len(ids); sinceLog >= cfg.progressEvery {
+				sinceLog = 0
+				el := time.Since(embStart).Seconds()
+				rate := 0.0
+				if el > 0 {
+					rate = float64(done) / el
+				}
+				fmt.Fprintf(os.Stderr, "embed progress: %d embedded (%.1f cl/s, %.0fs elapsed)\n", done, rate, el)
+			}
+		}
+		return nil
 	}
 
 	embedded, err := embed.ApplyBatched(ctx, e, items, batchSet)
