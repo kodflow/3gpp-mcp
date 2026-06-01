@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -112,7 +113,16 @@ func Apply(ctx context.Context, e Embedder, items []Item, set SetFunc) (int, err
 		windowSize = applyBatch // never emit short batches just because the window is tiny
 	}
 
-	flushBatch := func(jobs []job) error {
+	// processWindow length-sorts (when enabled) then hands the whole window to the
+	// embedder in ONE call, so the backend can internally batch (by batchSize) and
+	// pipeline tokenisation against GPU inference across those batches. set() is
+	// then applied per clause (keyed by chunk_id), so output order is irrelevant.
+	processWindow := func(jobs []job) error {
+		if sortWithin {
+			sort.SliceStable(jobs, func(i, j int) bool {
+				return embedLen(jobs[i].item) < embedLen(jobs[j].item)
+			})
+		}
 		texts := make([]string, len(jobs))
 		for i, j := range jobs {
 			texts[i] = EmbedText(j.item.Heading, j.item.Text)
@@ -121,32 +131,14 @@ func Apply(ctx context.Context, e Embedder, items []Item, set SetFunc) (int, err
 		if err != nil {
 			return err
 		}
+		if len(vecs) != len(jobs) {
+			return fmt.Errorf("embedder returned %d vectors for %d texts", len(vecs), len(jobs))
+		}
 		for i, v := range vecs {
 			if err := set(ctx, jobs[i].item.ChunkID, v, jobs[i].hash); err != nil {
 				return err
 			}
 			embedded++
-		}
-		return nil
-	}
-
-	// processWindow length-sorts (when enabled) then emits the window in fixed-size
-	// batches so the model always sees full batches regardless of how many upstream
-	// items were skipped.
-	processWindow := func(jobs []job) error {
-		if sortWithin {
-			sort.SliceStable(jobs, func(i, j int) bool {
-				return embedLen(jobs[i].item) < embedLen(jobs[j].item)
-			})
-		}
-		for start := 0; start < len(jobs); start += applyBatch {
-			end := start + applyBatch
-			if end > len(jobs) {
-				end = len(jobs)
-			}
-			if err := flushBatch(jobs[start:end]); err != nil {
-				return err
-			}
 		}
 		return nil
 	}
