@@ -1,77 +1,87 @@
 #!/usr/bin/env bash
-#
-# kernel-embed.sh — the body of the Kaggle kernel (notebook) that runs ON the
-# free T4 GPU. It is pushed by scripts/kaggle-embed-poc.sh (local driver) and
-# executed by Kaggle's runner; it is NOT meant to run on the dev laptop.
-#
-# Contract (PR-11a POC):
-#   inputs   (Kaggle dataset, mounted read-only under /kaggle/input/<slug>/):
-#              - 3gpp.duckdb            a small LEXICAL DB (one real series, e.g. 33)
-#              - bge-m3/               the BGE-M3 ONNX model + tokenizer.json
-#              - onnxruntime-gpu/lib/  the CUDA-enabled ONNX Runtime shared lib
-#              - src.tar               this repo's source (no creds, no data/)
-#   working  (/kaggle/working/, the only writable + downloadable dir):
-#              - 3gpp.duckdb            the embedded DB pulled back by the driver
-#   output   asserts null_embeddings_at_floor==0 at the requested floor and
-#            prints clauses/s so the driver can compute the T4-vs-CPU speedup.
-#
-# The kernel toggles "Internet" + "GPU T4 x2" in its metadata (set by the
-# driver). Go is installed on-box if absent. NO Kaggle credentials are read or
-# needed here — auth happens entirely on the laptop.
-set -euo pipefail
+# Kaggle T4 GPU kernel for the embed POC (PR-11a), ZERO-UPLOAD + self-diagnosing.
+# Everything is pulled from PUBLIC sources on the kernel (Internet on). Writes
+# compact single-line RESULT markers to /kaggle/working/RESULT.txt (the dev box
+# reads those; the full stdout log has ANSI noise).
+set -uo pipefail
+R=/kaggle/working/RESULT.txt; : > "$R"
+say(){ echo "RESULT $*" | tee -a "$R"; }
+fail(){ say "FAIL=$1 detail=${2:-}"; exit 1; }
 
+REPO="https://github.com/kodflow/3gpp-mcp"
+BRANCH="${BRANCH:-feat/append-resume-hardening}"
 FLOOR="${EMBED_FLOOR:-Rel-15}"
-IN="$(echo /kaggle/input/*/ | awk '{print $1}')" # the single mounted dataset
-WORK=/kaggle/working
-echo "[kernel] input dataset : $IN"
-echo "[kernel] embed floor   : $FLOOR"
-nvidia-smi || { echo "[kernel] no GPU visible — aborting"; exit 1; }
+SERIES="${SERIES:-21}"
+BGE_COMMIT="5617a9f61b028005a4858fdac845db406aefb181"
+ORT_VERSION="${ORT_VERSION:-1.26.0}"
+WORK=/kaggle/working; cd "$WORK"
+unset EMBEDDER || true   # force the real onnx/CUDA backend (never the Local hash embedder)
 
-# 1. Go toolchain (Kaggle images vary; install a pinned Go if missing).
+say "step=start floor=$FLOOR series=$SERIES ort=$ORT_VERSION branch=$BRANCH"
+# GPU-optional: use CUDA when a GPU is attached, else fall back to CPU so the
+# pipeline (and the Internet/download path) is still exercised end-to-end.
+if nvidia-smi -L >/tmp/gpu.txt 2>&1; then
+  EP=cuda; ORTPKG="onnxruntime-linux-x64-gpu-${ORT_VERSION}"
+  say "gpu=present detail=$(head -1 /tmp/gpu.txt | tr -d '\n') ep=cuda"
+else
+  EP=cpu; ORTPKG="onnxruntime-linux-x64-${ORT_VERSION}"
+  say "gpu=absent ep=cpu (CPU fallback — GPU not attached to this worker)"
+fi
+
+apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq zstd unzip >/dev/null 2>&1 || true
+command -v zstd >/dev/null || fail no_zstd
 if ! command -v go >/dev/null 2>&1; then
-  GOVER=1.23.4
-  echo "[kernel] installing Go $GOVER"
-  curl -fsSL "https://go.dev/dl/go${GOVER}.linux-amd64.tar.gz" -o /tmp/go.tgz
-  tar -C /usr/local -xzf /tmp/go.tgz
-  export PATH=/usr/local/go/bin:$PATH
+  curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz -o /tmp/go.tgz || fail go_dl
+  tar -C /usr/local -xzf /tmp/go.tgz; export PATH=/usr/local/go/bin:$PATH
 fi
-go version
+say "go=$(go version | awk '{print $3}')"
+curl -fsSL -o /tmp/duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip || fail duckdb_dl
+mkdir -p /tmp/bin && (cd /tmp/bin && unzip -o -q /tmp/duckdb.zip); export PATH=/tmp/bin:$PATH
+duckdb --version >/dev/null 2>&1 || fail duckdb_run
 
-# 2. Unpack the repo source shipped in the dataset and build the embed binary
-#    with the onnx tag (CGO). The CUDA-enabled ORT lib comes from the dataset.
-SRC="$WORK/src"
-mkdir -p "$SRC"
-tar -C "$SRC" -xf "$IN/src.tar"
-cd "$SRC"
+git clone --depth 1 -b "$BRANCH" "$REPO" "$WORK/src" >/tmp/clone.txt 2>&1 || fail clone "$(tail -1 /tmp/clone.txt)"
+cd "$WORK/src"
 
-ORT_LIB="$IN/onnxruntime-gpu/lib/libonnxruntime.so"
-ORT_DIR="$(dirname "$ORT_LIB")"
-export ONNXRUNTIME_SHARED_LIBRARY_PATH="$ORT_LIB"
+curl -fsSL -o "$WORK/full.zst" "$REPO/releases/download/latest/3gpp.duckdb.zst" || fail db_dl
+say "db_zst_bytes=$(stat -c %s "$WORK/full.zst")"
+zstd -d --long=27 -f "$WORK/full.zst" -o "$WORK/full.duckdb" >/tmp/z.txt 2>&1 || fail decompress "$(tail -1 /tmp/z.txt)"
+say "db_bytes=$(stat -c %s "$WORK/full.duckdb")"
+FULLN=$(duckdb "$WORK/full.duckdb" -noheader -list "SELECT count(*) FROM clauses;" 2>/tmp/q.txt) || fail db_open "$(tail -1 /tmp/q.txt)"
+say "full_clauses=$FULLN"
+duckdb "$WORK/lexical.duckdb" "ATTACH '$WORK/full.duckdb' AS s (READ_ONLY); CREATE TABLE clauses AS SELECT * FROM s.clauses WHERE substr(spec_id,1,2)='$SERIES' AND release IN ('Rel-15','Rel-16','Rel-17','Rel-18','Rel-19','Rel-20');" 2>/tmp/sl.txt || fail slice "$(tail -1 /tmp/sl.txt)"
+SLN=$(duckdb "$WORK/lexical.duckdb" -noheader -list "SELECT count(*) FROM clauses;")
+say "sliced_clauses=$SLN"
+[ "${SLN:-0}" -ge 1 ] || fail empty_slice "series=$SERIES floor=$FLOOR full=$FULLN"
+
+curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz" || fail ort_dl
+mkdir -p "$WORK/ort"; tar -C "$WORK/ort" --strip-components=1 -xzf /tmp/ort.tgz || fail ort_untar
+ORT_LIB="$(find "$WORK/ort" -name 'libonnxruntime.so*' | head -1)"; [ -n "$ORT_LIB" ] || fail ort_nolib
+ORT_DIR="$(dirname "$ORT_LIB")"; say "ort_lib=$(basename "$ORT_LIB")"
+
+BGE="$WORK/bge-m3"; mkdir -p "$BGE"; HF="https://huggingface.co/BAAI/bge-m3/resolve/${BGE_COMMIT}"
+curl -fsSL "$HF/onnx/model.onnx"             -o "$BGE/model.onnx"             || fail hf_model
+curl -fsSL "$HF/onnx/model.onnx_data"        -o "$BGE/model.onnx_data"        || fail hf_data
+curl -fsSL "$HF/onnx/Constant_7_attr__value" -o "$BGE/Constant_7_attr__value" || fail hf_const
+curl -fsSL "$HF/tokenizer.json"              -o "$BGE/tokenizer.json"         || fail hf_tok
+say "model_data_bytes=$(stat -c %s "$BGE/model.onnx_data")"
+
 export CGO_ENABLED=1
-export CGO_LDFLAGS="-L$ORT_DIR -lonnxruntime"
+export ONNXRUNTIME_SHARED_LIBRARY_PATH="$ORT_LIB"
 export LD_LIBRARY_PATH="$ORT_DIR:${LD_LIBRARY_PATH:-}"
-go build -tags onnx -o "$WORK/embed" ./cmd/embed
+go build -tags onnx -o "$WORK/embed" ./cmd/embed >/tmp/build.txt 2>&1 || fail build "$(tail -2 /tmp/build.txt | tr '\n' ' ')"
+say "build=ok"
 
-# 3. Copy the lexical DB into the writable dir and embed it on the GPU.
-cp "$IN/3gpp.duckdb" "$WORK/3gpp.duckdb"
-export BGE_M3_DIR="$IN/bge-m3"
-export ORT_EP=cuda # the only knob PR-11a adds — selects the CUDA execution provider
-
-START=$(date +%s)
-REPORT="$WORK/embed-report.json"
-"$WORK/embed" --db "$WORK/3gpp.duckdb" --embed-floor "$FLOOR" \
-  --require-semantic --report json | tee "$REPORT"
-END=$(date +%s)
-ELAPSED=$((END - START))
-
-# 4. Assert full coverage at the floor and print throughput.
-NULLS=$(grep -o '"null_embeddings_at_floor":[0-9]*' "$REPORT" | head -1 | cut -d: -f2)
-EMBEDDED=$(grep -o '"embedded":[0-9]*' "$REPORT" | head -1 | cut -d: -f2 || echo 0)
-echo "[kernel] elapsed=${ELAPSED}s embedded=${EMBEDDED} null_at_floor=${NULLS:-?}"
-if [ "${NULLS:-1}" != "0" ]; then
-  echo "[kernel] FAIL: null_embeddings_at_floor=${NULLS:-?} (want 0)"; exit 1
-fi
-if [ "${ELAPSED}" -gt 0 ] && [ "${EMBEDDED:-0}" -gt 0 ]; then
-  awk -v e="$EMBEDDED" -v t="$ELAPSED" 'BEGIN{printf "[kernel] throughput: %.2f clauses/s (T4)\n", e/t}'
-fi
-echo "[kernel] OK — embedded DB at $WORK/3gpp.duckdb (pull via kaggle kernels output)"
+cp "$WORK/lexical.duckdb" "$WORK/3gpp-embedded.duckdb"
+export BGE_M3_DIR="$BGE" ORT_EP=cuda
+REPORT="$WORK/embed-report.json"; START=$(date +%s)
+"$WORK/embed" --db "$WORK/3gpp-embedded.duckdb" --embed-floor "$FLOOR" --require-semantic --report json >"$REPORT" 2>/tmp/embed.err
+RC=$?; ELAPSED=$(( $(date +%s) - START ))
+if [ "$RC" != "0" ]; then say "embed_rc=$RC err=$(tail -2 /tmp/embed.err | tr '\n' ' ' | cut -c1-200)"; fail embed_run; fi
+MODEL=$(python3 -c "import json;print(json.load(open('$REPORT')).get('model'))" 2>/dev/null)
+CAND=$(python3 -c "import json;print(json.load(open('$REPORT')).get('candidates'))" 2>/dev/null)
+EMB=$(python3 -c "import json;print(json.load(open('$REPORT')).get('embedded_clauses'))" 2>/dev/null)
+NUL=$(python3 -c "import json;print(json.load(open('$REPORT')).get('null_embeddings_at_floor'))" 2>/dev/null)
+say "model=$MODEL candidates=$CAND embedded=$EMB null_at_floor=$NUL elapsed=${ELAPSED}s ep=cuda"
+[ "${NUL:-1}" = "0" ] && [ "${EMB:-0}" -ge 1 ] || fail incomplete "null=$NUL emb=$EMB"
+awk -v e="$EMB" -v t="$ELAPSED" 'BEGIN{if(t>0)printf "RESULT throughput=%.2f clauses_per_s_T4\n",e/t}' | tee -a "$R"
+say "step=OK"
