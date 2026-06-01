@@ -67,6 +67,21 @@ func ReleaseOrdinal(rel string) (int, bool) {
 	return n, true
 }
 
+// ReleaseGSM is the coarse, HONEST release bucket for legacy GSM Phase-1/2 specs
+// (the 4-digit spec numbers / series 00-13). Their filename version-code scheme is
+// reverse-engineered and cannot be decoded to an exact 3GPP release line, so — by an
+// explicit architectural decision (CLAUDE.md §0; the cite-exactly rule §1) — they are
+// labelled with this single factual bucket instead of a guessed release. spec_id,
+// clause, the literal code-derived version, and url all stay exact. ReleaseOrdinal
+// returns (0,false) for "GSM", so legacy clauses sit below ANY embed floor: they are
+// indexed LEXICALLY but never vectorised (vectors are recent-release-only).
+const ReleaseGSM = "GSM"
+
+// IsLegacyGSM reports whether a spec NUMBER (digits only, e.g. "0408") is a legacy
+// GSM Phase-1/2 spec: the 4-digit numbers (GSM 04.08), as opposed to the modern
+// 5-digit 3GPP specs (TS 23.501 = "23501"). Mirrors corpus.sh's 4-digit gate.
+func IsLegacyGSM(specNum string) bool { return len(specNum) == 4 }
+
 // DecodeVersionCode turns a 3-char code ("i60") into its release ("Rel-18")
 // and dotted version ("18.6.0"). ok is false when the code is malformed.
 func DecodeVersionCode(code string) (release, version string, ok bool) {

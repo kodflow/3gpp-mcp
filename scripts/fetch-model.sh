@@ -114,6 +114,33 @@ if [[ "${WITH_RERANKER:-0}" == "1" ]]; then
   dl "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e/tokenizer.json" "$RR_DIR/tokenizer.json"
 fi
 
+# ---------------------------------------------------------------------------
+# 4. (optional) fp16 BGE-M3 export for the T4 Tensor-Core path (model "bge-m3-fp16"
+#    in the embed registry). We do NOT pin a default fp16 source: converting fp32→
+#    fp16 needs an offline toolchain (out of this repo's scope), and a community
+#    fp16 export must be VALIDATED before it becomes a permanent 10M index. So the
+#    operator supplies FP16_ONNX_URL (+ FP16_DATA_URL for external weights). The
+#    registry then exposes it as EMBED_MODEL=bge-m3-fp16; the acceptance gate
+#    (go test -tags onnx -run TestFP16GateVsFP32, cos>=0.9995) must pass first.
+# ---------------------------------------------------------------------------
+if [[ "${WITH_FP16:-0}" == "1" ]]; then
+  FP16_DIR="$MODELS/bge-m3-fp16"
+  if [[ -z "${FP16_ONNX_URL:-}" ]]; then
+    echo "WITH_FP16=1 but FP16_ONNX_URL is unset." >&2
+    echo "  Supply a VALIDATED fp16 BGE-M3 dense ONNX export, e.g.:" >&2
+    echo "    FP16_ONNX_URL=<...model.onnx> FP16_DATA_URL=<...model.onnx_data> WITH_FP16=1 $0" >&2
+    echo "  Then gate it: EMBED_MODELS_BASE=\$PWD go test -tags onnx ./internal/embed -run TestFP16GateVsFP32" >&2
+    exit 2
+  fi
+  mkdir -p "$FP16_DIR"
+  echo "→ fp16 BGE-M3 ONNX (operator-supplied, must pass the cos>=0.9995 gate)"
+  dl "$FP16_ONNX_URL" "$FP16_DIR/model.onnx"
+  [[ -n "${FP16_DATA_URL:-}" ]] && dl "$FP16_DATA_URL" "$FP16_DIR/model.onnx_data"
+  # tokenizer is precision-independent; the registry's bge-m3-fp16 entry points its
+  # tokenizer_dir at the fp32 dir, so no separate tokenizer fetch is required.
+  echo "  fp16 ready: EMBED_MODEL=bge-m3-fp16 (validate with TestFP16GateVsFP32 before any bulk run)"
+fi
+
 echo "✓ models ready in $MODELS"
 echo "  ORT lib : $ORT_DIR/lib/$ORT_LIBNAME"
 echo "  build   : make build-onnx"
