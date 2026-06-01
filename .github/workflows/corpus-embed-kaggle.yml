@@ -155,6 +155,7 @@ jobs:
       contents: read
     env:
       ORAS_VERSION: "1.2.0"
+      EMBED_PRECISION: ${{ github.event.inputs.precision }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -173,7 +174,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          REF="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest"
+          # Channel + manifest model are PRECISION-SCOPED so fp16 and fp32 sub-bases
+          # can never share one OCI tag (and thus one HNSW): an fp16 corpus and an
+          # fp32 query must never mix (EmbedIdentity invariant). fp32 keeps :latest.
+          PREC="${EMBED_PRECISION:-fp32}"
+          if [ "$PREC" = fp32 ]; then TAG="latest"; MODEL="bge-m3"; else TAG="latest-$PREC"; MODEL="bge-m3-$PREC"; fi
+          REF="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:$TAG"
+          echo "publishing to $REF (embedding_model=$MODEL)"
           mkdir -p vec
           # 1) Seed vec/ from the EXISTING channel so OTHER series' sub-bases survive a
           #    single-series re-publish (absent → first publish, start empty).
@@ -203,7 +210,8 @@ jobs:
           subs="$(jq -cn --argjson s "$subs" --argjson p "$present" '[ $s[] | select(. as $x | $p | any(. == $x)) ]')"
           printf '%s' "$subs" | jq \
             --arg floor "${{ github.event.inputs.embed_floor }}" \
-            '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
+            --arg model "$MODEL" \
+            '{embedding_model:$model, embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
           cat vec/vec-manifest.json
           test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no sub-bases to publish"; exit 1; }
           # 4) Push the MERGED set (existing survivors + this run's series).

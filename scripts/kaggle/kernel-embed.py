@@ -193,23 +193,33 @@ MODEL_DIR_ACTIVE = BGE
 EMBED_ENV = {}
 if PRECISION == "fp16":
     say("fp16=convert start (src=%s)" % BGE)
-    if sh("pip install --quiet onnx onnxconverter_common").returncode != 0:
+    # ONNX Runtime's OWN transformer fp16 converter — NOT onnxconverter_common.
+    # The latter blocks ops like CumSum/Range (XLM-RoBERTa position-ids, which MUST
+    # stay fp32: a >2048-token cumsum is inexact in fp16) but, under the
+    # disable_shape_infer we need for a >2GB model, omits the Cast back to fp32 at
+    # those boundaries — ORT then rejects the graph (Type float16 vs float at
+    # /0/auto_model/Cast). onnxruntime.transformers.OnnxModel is Microsoft's BERT/
+    # RoBERTa fp16 tool: symbolic shape inference (handles >2GB) + a transformer-tuned
+    # block list + CORRECT boundary Cast insertion. keep_io_types keeps the fp32 IO
+    # so the Go side still feeds int64 ids/mask and reads a float32 sentence_embedding.
+    if sh("pip install --quiet onnx onnxruntime").returncode != 0:
         fail("fp16_deps")
     os.makedirs(BGE16, exist_ok=True)
     conv_py = "%s/convfp16.py" % WORK
     with open(conv_py, "w") as cf:
         cf.write(
             "import onnx\n"
-            "from onnxconverter_common import float16\n"
+            "from onnxruntime.transformers.onnx_model import OnnxModel\n"
             "m = onnx.load(%r)\n"
-            "m16 = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=True)\n"
-            "onnx.save(m16, %r, save_as_external_data=True, all_tensors_to_one_file=True, location='model.onnx_data')\n"
+            "om = OnnxModel(m)\n"
+            "om.convert_float_to_float16(keep_io_types=True)\n"
+            "onnx.save(om.model, %r, save_as_external_data=True, all_tensors_to_one_file=True, location='model.onnx_data')\n"
             "print('fp16_saved')\n"
             % ("%s/model.onnx" % BGE, "%s/model.onnx" % BGE16)
         )
     conv = sh('python3 "%s"' % conv_py)
     if conv.returncode != 0 or not os.path.isfile("%s/model.onnx" % BGE16):
-        fail("fp16_convert", ((conv.stderr or "") + (conv.stdout or "")).replace("\n", " ")[-200:])
+        fail("fp16_convert", ((conv.stderr or "") + (conv.stdout or "")).replace("\n", " ")[-1500:])
     shutil.copy("%s/tokenizer.json" % BGE, "%s/tokenizer.json" % BGE16)
     with open("%s/models.yaml" % WORK, "w") as mf:
         mf.write(
@@ -283,7 +293,7 @@ if rc == 124:
 elif rc != 0:
     err = ""
     try:
-        err = open("/tmp/embed.err").read().replace("\n", " ")[-200:]
+        err = open("/tmp/embed.err").read().replace("\n", " ")[-1500:]
     except Exception:
         pass
     say("embed_rc=%d err=%s" % (rc, err))
