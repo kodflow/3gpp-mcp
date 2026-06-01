@@ -33,8 +33,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${STAGE:-$ROOT/.kaggle-campaign}"
-EMBED_FLOOR="${EMBED_FLOOR:-Rel-15}"
-BRANCH="${BRANCH:-feat/embed-maximization}"
+EMBED_FLOOR="${EMBED_FLOOR:-Rel-17}"
+BRANCH="${BRANCH:-main}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-2000}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 SERIES_LIST="${SERIES_LIST:-23 24 29 33 38 21 22 25 26 27 28 31 32 35 36 37}"
