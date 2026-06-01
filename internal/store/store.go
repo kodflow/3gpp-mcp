@@ -540,19 +540,69 @@ type EmbedCandidate struct {
 	StoredHash string
 }
 
-// ClausesNeedingEmbedding streams the clauses that might need a vector: those with
-// no embedding yet, OR a stale/absent hash. A clause whose StoredHash already
-// equals the freshly-computed hash is returned but skipped by the caller — we
-// surface it rather than filtering in SQL so the hash function lives in one place
-// (Go), and so a model change (which the SQL can't know about) still re-embeds.
-// floorOrd > 0 restricts to clauses at/above that release ordinal (vectors are
-// recent-only; lexical coverage is unaffected). The rows() are streamed; the
-// caller must drain them.
-func (s *Store) ClausesNeedingEmbedding(ctx context.Context) (*sql.Rows, error) {
-	return s.db.QueryContext(ctx, `
-		SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '')
-		FROM clauses
-		ORDER BY chunk_id`)
+// EmbedScan parametrises the work-list query of ClausesNeedingEmbedding. Pushing
+// the floor / series / order / limit into SQL (rather than streaming the whole
+// table into a Go slice and filtering there) is what keeps the embed step flat on
+// a 10M-clause DB.
+type EmbedScan struct {
+	// FloorOrd > 0 restricts to clauses whose release recency >= FloorOrd (vectors
+	// are recent-only; lexical coverage is unaffected). 0 = all releases.
+	FloorOrd int
+	// SeriesPrefix != "" restricts to spec_ids in that 2-digit series ("23"), so a
+	// bounded Kaggle kernel can embed one series-shard at a time. "" = all series.
+	SeriesPrefix string
+	// Limit > 0 caps the work-list — a bounded session (Kaggle 12h cap) embeds the
+	// top-Limit rows of the order below, then resumes next run. 0 = no limit.
+	Limit int
+	// OldestFirst flips the order to chunk_id ASC. Default (false) is
+	// RECENT-RELEASE-FIRST (Rel-20 → … → Rel-99), so a session killed mid-run leaves
+	// the most-recent — and most-queried — releases embedded, not a random prefix.
+	OldestFirst bool
+	// ResumeOnly returns ONLY rows with no embedding_hash yet (NULL/empty) — the
+	// fast resume path for a fresh-model-per-run kernel. Default (false) streams all
+	// candidates so embed.Apply's Go hash-compare still re-embeds a clause whose
+	// text OR model changed (which SQL alone can't detect).
+	ResumeOnly bool
+}
+
+// ClausesNeedingEmbedding streams the clauses that might need a vector. By default
+// every clause is surfaced and the caller's hash-compare (embed.Apply) decides
+// what to (re)embed — we keep the hash logic in one place (Go) so a model change,
+// invisible to SQL, still re-embeds. ResumeOnly narrows to never-embedded rows for
+// a fast resume. Rows are streamed in RECENT-RELEASE-FIRST order (the user-facing
+// priority) unless OldestFirst is set. The caller must drain the rows.
+func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*sql.Rows, error) {
+	var b strings.Builder
+	b.WriteString(`SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '') FROM clauses`)
+	var (
+		conds []string
+		args  []any
+	)
+	if scan.ResumeOnly {
+		conds = append(conds, `(embedding_hash IS NULL OR embedding_hash = '')`)
+	}
+	if scan.SeriesPrefix != "" {
+		conds = append(conds, `substr(spec_id, 1, 2) = ?`)
+		args = append(args, scan.SeriesPrefix)
+	}
+	if scan.FloorOrd > 0 {
+		conds = append(conds, `(`+releaseRecencySQL("release")+`) >= ?`)
+		args = append(args, scan.FloorOrd)
+	}
+	if len(conds) > 0 {
+		b.WriteString(" WHERE " + strings.Join(conds, " AND "))
+	}
+	if scan.OldestFirst {
+		b.WriteString(" ORDER BY chunk_id ASC")
+	} else {
+		// Recency DESC then chunk_id ASC: a deterministic tiebreak so a --limit
+		// prefix is stable across resume runs.
+		b.WriteString(" ORDER BY (" + releaseRecencySQL("release") + ") DESC, chunk_id ASC")
+	}
+	if scan.Limit > 0 {
+		fmt.Fprintf(&b, " LIMIT %d", scan.Limit)
+	}
+	return s.db.QueryContext(ctx, b.String(), args...)
 }
 
 // Reset truncates all data tables (full deterministic rebuild).
@@ -957,6 +1007,38 @@ func (s *Store) count(ctx context.Context, table string) (int, error) {
 func (s *Store) CountNullEmbeddings(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NULL`).Scan(&n)
+	return n, err
+}
+
+// Checkpoint forces a DuckDB CHECKPOINT so in-progress embed writes are flushed
+// durably to the file. A bounded embed session killed by the Kaggle 12h cap then
+// resumes from the last checkpoint (the embedding_hash markers survive) instead of
+// losing everything written since the run began.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CHECKPOINT`)
+	return err
+}
+
+// CountNullAtFloor counts clauses that SHOULD carry a vector but do not: those at/
+// above the release floor and, when seriesPrefix != "", in that 2-digit series,
+// still NULL. floorOrd <= 0 means "all releases". This is the series-aware
+// completeness oracle the per-shard CI gate keys on — unlike the global
+// CountNullEmbeddings it never counts intentionally-skipped below-floor or
+// other-series clauses as a failure.
+func (s *Store) CountNullAtFloor(ctx context.Context, floorOrd int, seriesPrefix string) (int, error) {
+	var b strings.Builder
+	b.WriteString(`SELECT count(*) FROM clauses WHERE embedding IS NULL`)
+	var args []any
+	if seriesPrefix != "" {
+		b.WriteString(` AND substr(spec_id, 1, 2) = ?`)
+		args = append(args, seriesPrefix)
+	}
+	if floorOrd > 0 {
+		b.WriteString(` AND (` + releaseRecencySQL("release") + `) >= ?`)
+		args = append(args, floorOrd)
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, b.String(), args...).Scan(&n)
 	return n, err
 }
 
