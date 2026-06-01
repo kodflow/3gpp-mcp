@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 WORK = "/kaggle/working"
@@ -197,11 +198,28 @@ cmd = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" '
        % (WORK, EMBEDDED_DB, FLOOR, SERIES, CHECKPOINT_EVERY))
 start = time.time()
 rc = 0
+# Stream the embedder's progress (stderr) LIVE to the Kaggle log so a long GPU run
+# shows `embed progress: N embedded (R cl/s)` instead of silence after build=ok. The
+# JSON report still goes to REPORT (stdout); stderr is BOTH echoed and saved to
+# /tmp/embed.err for the FAIL detail. A threading.Timer enforces the time budget even
+# if the process stops emitting (a blocking read would never see the deadline); a
+# timer-kill surfaces as a negative wait() status, mapped to the 124 timeout path.
 with open(REPORT, "w") as out, open("/tmp/embed.err", "w") as errf:
+    proc = subprocess.Popen(cmd, shell=True, env=env, stdout=out,
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
+    killer = threading.Timer(TIME_BUDGET, proc.kill)
+    killer.start()
     try:
-        rc = subprocess.run(cmd, shell=True, env=env, stdout=out,
-                            stderr=errf, timeout=TIME_BUDGET).returncode
-    except subprocess.TimeoutExpired:
+        for line in proc.stderr:
+            errf.write(line)
+            s = line.rstrip()
+            if s and ("progress" in s or "error" in s.lower() or "warn" in s.lower()):
+                sys.stdout.write("embed| %s\n" % s[-180:])
+                sys.stdout.flush()
+        rc = proc.wait()
+    finally:
+        killer.cancel()
+    if rc < 0:  # killed by the budget timer (-SIGKILL) → treat as time-budget hit
         rc = 124
 elapsed = int(time.time() - start)
 if rc == 124:
