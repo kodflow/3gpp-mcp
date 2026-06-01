@@ -144,13 +144,16 @@ full re-embed, so decide ONCE before any large run):**
 Until an fp16 artifact is provided + gated, the campaign runs fp32 (identity-safe,
 already fast via §1's identity-safe levers — all on by default).
 
-**Phase 1/2 (pre-Rel-99 GSM) — deferred, needs YOUR §0 sign-off.** The whole MODERN
-corpus (Rel-99→Rel-20) is the default lexical build. Phase 1/2 stays out because the
-legacy 4-digit / series-00-13 version-code scheme is reverse-engineered + approximate
-and cannot yield an exact `{release, version}` — emitting it would violate §1
-(cite-exactly). `INCLUDE_LEGACY_GSM=1` hits an explicit guard in `scripts/corpus.sh`.
-Enabling it is an architectural decision (§0): it needs an authoritative legacy
-mapping + your written sign-off.
+**Phase 1/2 (pre-Rel-99 GSM) — IMPLEMENTED (lexical-only, §0-approved).** The whole
+MODERN corpus (Rel-99→Rel-20) is the default lexical build. Legacy GSM Phase 1/2 is
+now indexable LEXICALLY under the single honest `release="GSM"` bucket (the ingest
+stamps it for 4-digit specs; `spec_id`, `clause`, the literal code-version and `url`
+stay exact). Because `ReleaseOrdinal("GSM")` is false, GSM clauses are below EVERY
+embed floor → searchable via BM25/LIKE but **never vectorised** (vectors stay
+Rel-99→latest, exactly as you asked). Enable it:
+- locally: `INCLUDE_LEGACY_GSM=1 scripts/corpus.sh --series "04 05 08"` (legacy series);
+- in CI: the single ingest job (`corpus-matrix.yml`) input `include_legacy_gsm=true`
+  paired with the legacy series in `series_scope`.
 
 ## 8. Pointers
 
