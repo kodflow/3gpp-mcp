@@ -2,9 +2,12 @@
 #  Corpus · Build      (3gpp.org → DuckDB → published `latest` release)
 # =============================================================================
 #
-#  WHEN it runs      MANUAL ONLY (workflow_dispatch). Never on push/PR/schedule.
-#                    You start it from the Actions tab and choose the inputs.
-#                    (A killed shard is auto-resumed by "Corpus · Auto-resume".)
+#  WHEN it runs      (1) workflow_dispatch — manual, you choose the inputs;
+#                    (2) push to main — only when a corpus/pipeline file changes
+#                        (paths filter); a delta build that republishes `latest`;
+#                    (3) schedule — weekly hands-off delta (new specs + OpenAPI).
+#                    A no-op delta costs ~1 min (empty matrix). A killed shard is
+#                    auto-resumed by "Corpus · Auto-resume".
 #
 #  WHAT it does      Builds the 3GPP corpus into a DuckDB snapshot, in parallel:
 #                      discover      → which series to (re)build (delta vs the
@@ -25,10 +28,11 @@
 #                    lexical DB + indexes; embed=true also pushes GHCR 3gpp-vec.
 #                    A scoped/test run = ARTIFACTS ONLY (never clobbers `latest`).
 #
-#  WHAT it does NOT  No semantic by default (embed=false → lexical only). Does not
-#                    build the user binaries (that's "Release"). Does not run on
-#                    code changes. Free runners cap each shard at 6h → big series
-#                    are auto-resumed, not lost.
+#  WHAT it does NOT  No semantic by default (embed=false → lexical only; embedding
+#                    is the separate manual "Corpus · Embed (Kaggle GPU)" job). Does
+#                    not build the user binaries (that's "Release"). Does not run on
+#                    non-pipeline code changes (paths filter). Free runners cap each
+#                    shard at 6h → big series are auto-resumed, not lost.
 # =============================================================================
 
 name: Corpus · Build
@@ -100,6 +104,11 @@ on:
       - 'scripts/lib/convert.sh'
       - 'scripts/convert-origin.sh'
       - '.github/workflows/corpus-matrix.yml'
+  # HANDS-OFF weekly refresh: a delta build that picks up new 3GPP spec versions
+  # (discover diffs the live status report) AND new 5GC OpenAPI releases (fetch auto).
+  # Near-no-op when nothing moved. Publishes `latest`, includes Phase 1/2. No embed.
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays ~04:17 UTC
 
 # One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
 # let the newest one supersede it: a delta build diffs against the published `latest`,
@@ -258,7 +267,7 @@ jobs:
             # that turns on INCLUDE_LEGACY_GSM for the convert step (repo variable /
             # dispatch checkbox / auto push) — otherwise discover never surfaces them
             # and Phase 1/2 is never built despite the convert flag.
-            legacy="${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '--include-legacy-gsm' || '' }}"
+            legacy="${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push' || github.event_name == 'schedule') && '--include-legacy-gsm' || '' }}"
             if [ "$full" = "true" ]; then
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
             else
@@ -281,7 +290,7 @@ jobs:
           # require an unscoped (whole-corpus) run — a scoped test never clobbers latest.
           publish=false
           if [ "${{ github.event_name }}" != "pull_request" ] \
-             && { [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; } \
+             && { [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; } \
              && [ -z "$scope" ]; then
             publish=true
           fi
@@ -597,7 +606,7 @@ jobs:
           # a set-and-forget repo toggle), the per-dispatch include_legacy_gsm checkbox, or
           # an automatic push build (whole corpus Phase 1 → Rel-20). These clauses are below
           # every embed floor → indexed for BM25/LIKE but never vectorised.
-          INCLUDE_LEGACY_GSM: ${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '1' || '0' }}
+          INCLUDE_LEGACY_GSM: ${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push' || github.event_name == 'schedule') && '1' || '0' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
       # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
       # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE
