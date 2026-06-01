@@ -36,9 +36,17 @@ on:
         required: false
         default: ""
       embed_floor:
-        description: "Release floor to embed (vectors are recent-only; lexical unaffected). First campaign: Rel-17 (Rel-17..20); a later MR lowers it toward Rel-99."
+        description: "Release floor to embed (vectors are recent-only; lexical unaffected). Rel-99 = all real releases (R99..R20). Rel-17 = R17..R20 only."
         required: false
-        default: "Rel-17"
+        default: "Rel-99"
+      precision:
+        description: "fp16 (default; ~2-6x on T4 Tensor Cores, converted in-kernel from the pinned fp32 ONNX) or fp32 (slower, the proven baseline). Switching precision re-embeds (EmbedIdentity flips)."
+        required: false
+        default: "fp16"
+      accelerator:
+        description: "Kaggle GPU to request: NvidiaTeslaT4 (default; fp16 Tensor Cores) or NvidiaTeslaP100."
+        required: false
+        default: "NvidiaTeslaT4"
       max_retries:
         description: "Per-series ERROR retries before moving on"
         required: false
@@ -82,7 +90,7 @@ jobs:
           echo "series matrix: $json"
 
   # ---- embed: one job per series, ≤2 concurrent (Kaggle ~2 GPU sessions). Each
-  # drives kaggle-rel15-20.sh, time-boxed under the runner cap; a box-out leaves a
+  # drives kaggle-embed-campaign.sh, time-boxed under the runner cap; a box-out leaves a
   # resumable Dataset for the next dispatch. continue-on-error so one stuck series
   # never sinks the matrix. --------------------------------------------------------
   embed:
@@ -102,6 +110,8 @@ jobs:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_USER: ${{ secrets.KAGGLE_USERNAME }}
       EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
+      EMBED_PRECISION: ${{ github.event.inputs.precision }}
+      KAGGLE_ACCELERATOR: ${{ github.event.inputs.accelerator }}
       MAX_RETRIES: ${{ github.event.inputs.max_retries }}
       BRANCH: ${{ github.ref_name }}
     steps:
@@ -109,7 +119,7 @@ jobs:
       - name: Guard — secrets present
         run: |
           if [ -z "${KAGGLE_API_TOKEN}" ]; then
-            echo "::error::KAGGLE_API_TOKEN secret is not set. Generate one at https://www.kaggle.com/settings/api → 'Generate New Token' (KGAT_…) and add it under Settings → Secrets and variables → Actions. See docs/automation/kaggle-rel15-20-ci.md."
+            echo "::error::KAGGLE_API_TOKEN secret is not set. Generate one at https://www.kaggle.com/settings/api → 'Generate New Token' (KGAT_…) and add it under Settings → Secrets and variables → Actions. See docs/automation/kaggle-embed-ci.md."
             exit 1
           fi
           if [ -z "${KAGGLE_USER}" ]; then
@@ -123,7 +133,7 @@ jobs:
       - name: Drive series ${{ matrix.series }} (time-boxed; resumes next dispatch)
         run: |
           mins="${{ github.event.inputs.runner_minutes }}"
-          timeout "${mins:-330}m" scripts/kaggle-rel15-20.sh one "${{ matrix.series }}" || \
+          timeout "${mins:-330}m" scripts/kaggle-embed-campaign.sh one "${{ matrix.series }}" || \
             echo "::notice::series ${{ matrix.series }} timed out / incomplete — resume on next dispatch (lossless)"
       - name: Upload pulled sub-base (if any)
         if: always()

@@ -4,7 +4,7 @@
 # on). Writes compact single-line "RESULT ..." markers to /kaggle/working/RESULT.txt
 # (the driver reads those; full stdout has noise).
 #
-# Config comes from os.environ — the driver (kaggle-rel15-20.sh) PREPENDS a few
+# Config comes from os.environ — the driver (kaggle-embed-campaign.sh) PREPENDS a few
 # os.environ.setdefault(...) lines before this body, since Kaggle passes no env.
 #
 # Resume model (load-bearing for the 12h cap): each series keeps ONE output Kaggle
@@ -59,6 +59,11 @@ BRANCH = os.environ.get("BRANCH", "main")
 FLOOR = os.environ.get("EMBED_FLOOR", "Rel-17")
 SERIES = os.environ.get("SERIES", "21")
 BGE_COMMIT = "5617a9f61b028005a4858fdac845db406aefb181"
+# fp32 (default, proven) | fp16 (half precision: ~2-6x faster on T4 Tensor Cores).
+# fp16 is produced by converting OUR pinned fp32 ONNX in-kernel (keep_io_types) so the
+# graph/IO nodes stay identical — only the weights become fp16; the EmbedIdentity flips
+# to fp16 so it never mixes with fp32 in one HNSW.
+PRECISION = os.environ.get("EMBED_PRECISION", "fp32").lower()
 ORT_VERSION = os.environ.get("ORT_VERSION", "1.26.0")
 CHECKPOINT_EVERY = os.environ.get("CHECKPOINT_EVERY", "2000")
 # Stop ~10.8h in so the version/validate tail always runs before Kaggle's 12h kill.
@@ -66,8 +71,8 @@ TIME_BUDGET = int(os.environ.get("EMBED_TIME_BUDGET", "39000"))
 os.chdir(WORK)
 os.environ.pop("EMBEDDER", None)  # force the real onnx/CUDA backend (never Local)
 
-say("step=start floor=%s series=%s ort=%s branch=%s budget=%ds"
-    % (FLOOR, SERIES, ORT_VERSION, BRANCH, TIME_BUDGET))
+say("step=start floor=%s series=%s precision=%s ort=%s branch=%s budget=%ds"
+    % (FLOOR, SERIES, PRECISION, ORT_VERSION, BRANCH, TIME_BUDGET))
 
 # GPU-optional: CUDA when a GPU is attached (T4 Tensor-Core fp16 path), else CPU so
 # the pipeline + download path are still exercised end-to-end.
@@ -177,6 +182,56 @@ for url, dest, code in [
         fail(code)
 say("model_data_bytes=%d" % os.path.getsize("%s/model.onnx_data" % BGE))
 
+# ---- optional fp16: convert OUR fp32 ONNX in-kernel (keep_io_types) ---------
+# Converting the SAME graph (vs fetching a third-party fp16 export) guarantees the
+# input/output nodes stay input_ids/attention_mask -> sentence_embedding, so the Go
+# embedder is unchanged; only the float weights become fp16. keep_io_types keeps the
+# output fp32 (the Go side reads []float32). A kernel-local models.yaml (absolute dir,
+# precision: fp16) selects it via EMBED_MODELS_CONFIG/EMBED_MODEL.
+BGE16 = "%s/bge-m3-fp16" % WORK
+MODEL_DIR_ACTIVE = BGE
+EMBED_ENV = {}
+if PRECISION == "fp16":
+    say("fp16=convert start (src=%s)" % BGE)
+    if sh("pip install --quiet onnx onnxconverter_common").returncode != 0:
+        fail("fp16_deps")
+    os.makedirs(BGE16, exist_ok=True)
+    conv_py = "%s/convfp16.py" % WORK
+    with open(conv_py, "w") as cf:
+        cf.write(
+            "import onnx\n"
+            "from onnxconverter_common import float16\n"
+            "m = onnx.load(%r)\n"
+            "m16 = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=True)\n"
+            "onnx.save(m16, %r, save_as_external_data=True, all_tensors_to_one_file=True, location='model.onnx_data')\n"
+            "print('fp16_saved')\n"
+            % ("%s/model.onnx" % BGE, "%s/model.onnx" % BGE16)
+        )
+    conv = sh('python3 "%s"' % conv_py)
+    if conv.returncode != 0 or not os.path.isfile("%s/model.onnx" % BGE16):
+        fail("fp16_convert", ((conv.stderr or "") + (conv.stdout or "")).replace("\n", " ")[-200:])
+    shutil.copy("%s/tokenizer.json" % BGE, "%s/tokenizer.json" % BGE16)
+    with open("%s/models.yaml" % WORK, "w") as mf:
+        mf.write(
+            "active: bge-m3-fp16\n"
+            "models:\n"
+            "  - name: bge-m3-fp16\n"
+            "    family: bge-m3\n"
+            "    dir: %s\n"
+            "    precision: fp16\n"
+            "    dim: 1024\n"
+            "    normalization: l2\n"
+            "    revision: %s\n"
+            "    tokenizer_revision: %s\n"
+            "    tokenizer_dir: %s\n"
+            "    inputs: [input_ids, attention_mask]\n"
+            "    output: sentence_embedding\n"
+            % (BGE16, BGE_COMMIT[:7], BGE_COMMIT[:7], BGE16)
+        )
+    MODEL_DIR_ACTIVE = BGE16
+    EMBED_ENV = {"EMBED_MODELS_CONFIG": "%s/models.yaml" % WORK, "EMBED_MODEL": "bge-m3-fp16"}
+    say("fp16=ready bytes=%d" % os.path.getsize("%s/model.onnx_data" % BGE16))
+
 # ---- build the onnx embed binary -------------------------------------------
 env = dict(os.environ)
 env["CGO_ENABLED"] = "1"
@@ -188,9 +243,10 @@ if build.returncode != 0:
 say("build=ok")
 
 # ---- EMBED (recent-first, resumable, time-bounded) -------------------------
-env["EMBED_MODEL_DIR"] = BGE
+env["EMBED_MODEL_DIR"] = MODEL_DIR_ACTIVE
 env["ORT_EP"] = EP
 env["EMBED_GRAPH_OPT"] = "1"
+env.update(EMBED_ENV)  # fp16: EMBED_MODELS_CONFIG + EMBED_MODEL=bge-m3-fp16
 REPORT = "%s/embed-report.json" % WORK
 cmd = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" '
        "--order recent --resume --checkpoint-every \"%s\" --no-hnsw "
