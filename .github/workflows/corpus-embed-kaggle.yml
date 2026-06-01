@@ -12,12 +12,17 @@
 #                  immutable `latest` lexical Release (the resume baseline) and only
 #                  writes the GHCR 3gpp-vec semantic channel. Lexical = corpus-matrix.yml.
 #
-#  CREDENTIALS     KAGGLE_USERNAME / KAGGLE_KEY repository secrets
-#                  (Settings → Secrets and variables → Actions). The kaggle CLI reads
-#                  them from env; they are never written to disk or into a kernel.
+#  CREDENTIALS     KAGGLE_API_TOKEN repository secret — the modern access token
+#                  (KGAT_… from Settings → API → "Generate New Token"). The rewritten
+#                  kaggle CLI (2.x) DROPPED the old KAGGLE_USERNAME/KAGGLE_KEY env
+#                  auth; it reads KAGGLE_API_TOKEN directly (or ~/.kaggle/access_token)
+#                  and introspects it server-side. KAGGLE_USERNAME is still consumed,
+#                  but only as the handle that namespaces the kernel/dataset slugs
+#                  (KAGGLE_USER), never for auth. Creds are never written into a kernel.
 #
-#  ⚠ UNVALIDATED   A real run needs a phone-verified Kaggle account (GPU + Internet)
-#                  and the two secrets. The kernel runs up to ~12h on Kaggle, longer
+#  ⚠ UNVALIDATED   A real run needs a phone-verified Kaggle account (GPU + Internet),
+#                  the KAGGLE_API_TOKEN secret, and KAGGLE_USERNAME (the handle). The
+#                  kernel runs up to ~12h on Kaggle, longer
 #                  than a GitHub runner's 6h cap, so each job is time-boxed and the
 #                  campaign resumes on the next dispatch (lossless via embedding_hash).
 # =============================================================================
@@ -92,8 +97,9 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      # Modern access-token auth (kaggle CLI 2.x). The CLI reads KAGGLE_API_TOKEN
+      # directly and introspects it; KAGGLE_USER is only the slug namespace handle.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_USER: ${{ secrets.KAGGLE_USERNAME }}
       EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
       MAX_RETRIES: ${{ github.event.inputs.max_retries }}
@@ -102,12 +108,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Guard — secrets present
         run: |
-          if [ -z "${KAGGLE_USERNAME}" ] || [ -z "${KAGGLE_KEY}" ]; then
-            echo "::error::KAGGLE_USERNAME / KAGGLE_KEY secrets are not set — see the runbook (docs/automation/kaggle-rel15-20-ci.md)"
+          if [ -z "${KAGGLE_API_TOKEN}" ]; then
+            echo "::error::KAGGLE_API_TOKEN secret is not set. Generate one at https://www.kaggle.com/settings/api → 'Generate New Token' (KGAT_…) and add it under Settings → Secrets and variables → Actions. See docs/automation/kaggle-rel15-20-ci.md."
             exit 1
           fi
-      - name: Install kaggle CLI
-        run: pipx install kaggle || pip install --user kaggle
+          if [ -z "${KAGGLE_USER}" ]; then
+            echo "::error::KAGGLE_USERNAME secret is not set — needed as the handle that namespaces the kernel/dataset slugs."
+            exit 1
+          fi
+      - name: Install kaggle CLI (pin 2.2.0 — access-token auth)
+        run: |
+          pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
+          kaggle --version
       - name: Drive series ${{ matrix.series }} (time-boxed; resumes next dispatch)
         run: |
           mins="${{ github.event.inputs.runner_minutes }}"
