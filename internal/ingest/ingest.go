@@ -90,7 +90,30 @@ type Stats struct {
 // suffix for multi-part specs (e.g. 36213-j30_s10-s13). 5-digit = 3GPP specs.
 // (GSM Phase 1/2 = 4-digit series 00-12, different numbering — out of scope.)
 // Junk inner docs from embedded media lack the prefix and are excluded.
-var reFile = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
+// 5-digit = modern 3GPP spec (23501); 4-digit = legacy GSM Phase-1/2 (0408).
+var reFile = regexp.MustCompile(`^([0-9]{4,5})-([0-9a-z]{3})(?:_.*)?$`)
+
+// classifyFile maps a converted spec filename stem (e.g. "23501-i60" or "0408-720")
+// to its (specID, num, release, version). Modern specs decode via the 3GPP version
+// code; legacy GSM Phase-1/2 (4-digit) get the honest "GSM" release bucket (§0) — the
+// modern code→release line is invalid for them — while keeping the literal code
+// version + exact spec_id. ok is false for non-matching names or undecodable codes.
+func classifyFile(base string) (specID, num, release, version string, ok bool) {
+	m := reFile.FindStringSubmatch(base)
+	if m == nil {
+		return "", "", "", "", false
+	}
+	num = m[1]
+	specID = num[:2] + "." + num[2:]
+	release, version, ok = model.DecodeVersionCode(m[2])
+	if !ok {
+		return "", "", "", "", false
+	}
+	if model.IsLegacyGSM(num) {
+		release = model.ReleaseGSM
+	}
+	return specID, num, release, version, true
+}
 
 // ingestJob is one (spec, version) tuple to process. Promoted to a named type
 // (was anonymous inside Run) so filterResumeJobs can take it as a parameter
@@ -124,13 +147,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	relSet, serSet, specSet := set(opt.Releases), set(opt.Series), set(opt.SpecIDs)
 	for _, p := range files {
 		base := strings.TrimSuffix(filepath.Base(p), ext)
-		m := reFile.FindStringSubmatch(base)
-		if m == nil {
-			continue
-		}
-		num := m[1]
-		specID := num[:2] + "." + num[2:]
-		release, version, ok := model.DecodeVersionCode(m[2])
+		specID, num, release, version, ok := classifyFile(base)
 		if !ok {
 			continue
 		}
