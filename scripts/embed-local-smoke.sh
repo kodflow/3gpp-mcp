@@ -72,8 +72,8 @@ if [ -f "$BGE_DIR/model.onnx" ] && [ -f "$ORT_LIB" ]; then
   info "model present → building onnx CLI + running real BGE-M3 on CPU"
   CGO_ENABLED=1 "$GO" build -tags onnx -o "$TMP/embed-onnx" ./cmd/embed || die "build onnx cmd/embed"
   export ONNXRUNTIME_SHARED_LIBRARY_PATH="$ORT_LIB"
-  export LD_LIBRARY_PATH="$(dirname "$ORT_LIB"):${LD_LIBRARY_PATH:-}"
-  export BGE_M3_DIR="$BGE_DIR" ORT_EP=cpu
+  LD_LIBRARY_PATH="$(dirname "$ORT_LIB"):${LD_LIBRARY_PATH:-}"; export LD_LIBRARY_PATH
+  export EMBED_MODEL_DIR="$BGE_DIR" ORT_EP=cpu   # point the active model at the abs dir (registry seam)
   unset EMBEDDER || true   # force the real onnx backend, never the hash embedder
   cli_smoke "$TMP/embed-onnx" "real-bge-m3-onnx-cpu"
 

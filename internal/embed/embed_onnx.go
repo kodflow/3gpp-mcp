@@ -54,10 +54,29 @@ type onnxEmbedder struct {
 // newEmbedder (onnx build) returns the BGE-M3 embedder, or Disabled{} if the
 // runtime/model is not present (degrade, never block).
 func newEmbedder() Embedder {
-	modelDir := envOr("BGE_M3_DIR", "data/models/bge-m3")
+	// The active model (registry / EMBED_MODEL) declares the dir, I/O node names,
+	// precision and dim. If its files are absent we DISABLE rather than silently fall
+	// back to another model — running fp32 weights under an fp16 identity (or any
+	// model under another's identity) would poison the serve-time coherence guard.
+	spec := ActiveModel()
+	if len(spec.Inputs) != 2 || spec.Output == "" {
+		log.Printf("embed: model %q has invalid I/O wiring (inputs=%v output=%q) — disabling", spec.Name, spec.Inputs, spec.Output)
+		return Disabled{}
+	}
+	// This build's tensor plumbing is fixed at Dim; a model declaring a different dim
+	// would publish vectors whose identity (dim component) disagrees with the stored
+	// FLOAT[Dim] column — refuse instead of corrupting the HNSW.
+	if spec.Dim != Dim {
+		log.Printf("embed: model %q dim=%d but this build is fixed at %d — disabling", spec.Name, spec.Dim, Dim)
+		return Disabled{}
+	}
+	modelDir := activeModelDir(spec)
 	modelPath := filepath.Join(modelDir, "model.onnx")
-	tokPath := filepath.Join(modelDir, "tokenizer.json")
+	tokPath := filepath.Join(resolveBase(spec.tokenizerDirOrModel()), "tokenizer.json")
 	if !fileExists(onnxrt.LibPath()) || !fileExists(modelPath) || !fileExists(tokPath) {
+		if spec.Precision == PrecisionFP16 {
+			log.Printf("embed: model %q (fp16) not present at %s — disabling vectors (refusing to run another model under an fp16 identity)", spec.Name, modelDir)
+		}
 		return Disabled{}
 	}
 	tok, err := pretrained.FromFile(tokPath)
@@ -80,9 +99,13 @@ func newEmbedder() Embedder {
 	if opts != nil {
 		defer func() { _ = opts.Destroy() }()
 	}
+	// I/O node names come from the model spec, so a different export (e.g. an fp16
+	// one whose nodes are named differently) is wired by config, not code. A wrong
+	// name simply fails NewDynamicAdvancedSession → Disabled (degrade).
 	sess, err := ort.NewDynamicAdvancedSession(modelPath,
-		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, opts)
+		[]string{spec.Inputs[0], spec.Inputs[1]}, []string{spec.Output}, opts)
 	if err != nil {
+		log.Printf("embed: model %q session load failed (%v) — check inputs/output in the registry match the export", spec.Name, err)
 		return Disabled{}
 	}
 	return &onnxEmbedder{
