@@ -130,3 +130,25 @@ func seriesList(set map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestLegacyGSMSeries pins the legacy series range used by --include-legacy-gsm:
+// all 2-digit, all below the modern series floor (21), and distinct — so adding
+// them can never collide with a modern series the status report already surfaces.
+func TestLegacyGSMSeries(t *testing.T) {
+	if len(legacyGSMSeries) == 0 {
+		t.Fatal("legacyGSMSeries is empty")
+	}
+	seen := map[string]bool{}
+	for _, s := range legacyGSMSeries {
+		if len(s) != 2 {
+			t.Errorf("legacy series %q is not 2 digits", s)
+		}
+		if s >= "21" {
+			t.Errorf("legacy series %q is in the modern range (>=21) — would double-count", s)
+		}
+		if seen[s] {
+			t.Errorf("duplicate legacy series %q", s)
+		}
+		seen[s] = true
+	}
+}
