@@ -66,15 +66,19 @@ Embed is micro-granular and **now resumable across sessions**:
 Repo → **Settings → Secrets and variables → Actions → New repository secret**.
 Direct URL: `https://github.com/kodflow/3gpp-mcp/settings/secrets/actions`
 
-Create **two** secrets (the Kaggle CLI reads `KAGGLE_USERNAME` + `KAGGLE_KEY`):
+The rewritten Kaggle CLI (2.x) **dropped** the old `KAGGLE_USERNAME` + `KAGGLE_KEY`
+env auth. It now uses an **access token** (`KGAT_…`). Create **two** secrets:
 
 | Secret name | Value |
 |---|---|
-| `KAGGLE_USERNAME` | `makingcodes` |
-| `KAGGLE_KEY` | the `key` field from a fresh `kaggle.json` (kaggle.com → Account → *Create New API Token*) |
+| `KAGGLE_API_TOKEN` | the access token from kaggle.com → **Settings → API → "Generate New Token"** (`KGAT_…`). Shown once — copy it immediately. |
+| `KAGGLE_USERNAME` | `makingcodes` — used **only** as the handle that namespaces the kernel/dataset slugs (`KAGGLE_USER`), never for auth. |
 
-The CI workflow exports both as env so the `kaggle` CLI authenticates with zero
-files on disk. NEVER commit the token or paste it into a kernel's code.
+The CI workflow exports `KAGGLE_API_TOKEN` as env; the `kaggle` CLI reads it
+directly (or `~/.kaggle/access_token`) and introspects it server-side — zero files
+on disk, zero creds in the kernel. NEVER commit the token or paste it into a kernel.
+To rotate: generate a new token, update the secret; the old one can be revoked under
+Settings → API.
 
 ## 4. What is implemented (the artifacts)
 
@@ -100,7 +104,8 @@ files on disk. NEVER commit the token or paste it into a kernel's code.
   the published `latest`, embeds on Kaggle GPU, publishes vectors to GHCR `3gpp-vec`.
 
 ```bash
-# 0. one-time: set KAGGLE_USERNAME (=makingcodes) + KAGGLE_KEY repo secrets (§3).
+# 0. one-time: set KAGGLE_API_TOKEN (KGAT_… access token) + KAGGLE_USERNAME
+#    (=makingcodes, slug handle) repo secrets (§3).
 
 # 1. FIRST full lexical build (one-time, to seed `latest` with the whole corpus
 #    Phase 1 → Rel-20): Actions → "Corpus · Build" → Run workflow:
@@ -114,8 +119,9 @@ files on disk. NEVER commit the token or paste it into a kernel's code.
 #      publish     = true
 #    A later MR lowers embed_floor toward Rel-99 once this works.
 
-# 2'. …or locally (operator box with ~/.kaggle/kaggle.json):
-KAGGLE_USER=makingcodes EMBED_FLOOR=Rel-17 scripts/kaggle-rel15-20.sh one 33
+# 2'. …or locally (operator box; auth via KAGGLE_API_TOKEN or ~/.kaggle/access_token):
+KAGGLE_API_TOKEN=KGAT_xxx KAGGLE_USER=makingcodes EMBED_FLOOR=Rel-17 \
+  scripts/kaggle-rel15-20.sh one 33
 
 # 3. PROVE IT WORKS LOCALLY (no Kaggle, no GPU; real BGE-M3 on CPU if present):
 make embed-smoke
