@@ -115,12 +115,28 @@ version_state() {
     || log "series $s: dataset version failed (see kaggle logs)"
 }
 
-# run_one SERIES — push → poll → pull → version, retrying on ERROR, until the
-# series reports complete or retries are exhausted.
+# recover_orphan SERIES — DURABILITY KEYSTONE. Pull whatever the kernel left as its
+# LAST output and promote any partial embedded DB into the resume Dataset, BEFORE we
+# push again. This recovers progress orphaned when a prior driver process was killed
+# (e.g. the GitHub runner's 6h cap) AFTER the Kaggle kernel finished its work but
+# BEFORE the driver could version it: the kernel's `timeout 39000` makes it exit
+# cleanly under Kaggle's 12h cap, so Kaggle auto-saves /kaggle/working as the kernel
+# output, and this step pulls it forward so the next kernel mounts it and resumes via
+# embedding_hash. No credentials ever live in the kernel — only the driver versions.
+recover_orphan() {
+  local s="$1"
+  mkdir -p "$STAGE/out-$s"
+  kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
+  version_state "$s"   # no-op when there is no prior output; promotes a partial otherwise
+}
+
+# run_one SERIES — recover any orphaned partial, then push → poll → pull → version,
+# retrying on ERROR, until the series reports complete or retries are exhausted.
 run_one() {
   require_cli
   local s="$1" attempt=0; local dir="$STAGE/kernel-$s"
   ensure_state_dataset "$s"
+  recover_orphan "$s"    # resume a partial left by a killed prior run (GH 6h cap, etc.)
   while [ "$attempt" -le "$MAX_RETRIES" ]; do
     attempt=$((attempt+1))
     log "series $s: attempt $attempt/$((MAX_RETRIES+1)) — push"
