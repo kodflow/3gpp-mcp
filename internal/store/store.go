@@ -718,11 +718,32 @@ func (s *Store) ClauseLineage(ctx context.Context, specID, prefix string) (map[s
 	return out, nil
 }
 
-// releasesOrdered returns a spec's releases oldest-first by major ordinal.
+// releaseRecencySQL builds a SQL expression yielding a release label's recency
+// ordinal, mirroring model.ReleaseOrdinal: 'Rel-99' -> 3 (the OLDEST 3GPP
+// release — Release 1999, version major 3), 'Rel-4'..'Rel-20' -> 4..20, and
+// everything else (drafts, GSM Phase-1/2, unparseable) -> -1 (sorted oldest).
+//
+// A bare regexp_extract(release,'[0-9]+') is WRONG here: 'Rel-99' carries the
+// digits 99 and would sort as the NEWEST release, when it is in fact the oldest.
+// That naive form previously sat in releasesOrdered + ListReleases; this is the
+// single correct definition. col must be a trusted column identifier (the caller
+// controls it — never interpolate user input here).
+func releaseRecencySQL(col string) string {
+	return `CASE
+		WHEN ` + col + ` = 'Rel-99' THEN 3
+		WHEN regexp_full_match(` + col + `, 'Rel-[0-9]+')
+		     AND CAST(regexp_extract(` + col + `, '[0-9]+') AS INTEGER) >= 4
+		  THEN CAST(regexp_extract(` + col + `, '[0-9]+') AS INTEGER)
+		ELSE -1
+	END`
+}
+
+// releasesOrdered returns a spec's releases oldest-first by release recency
+// (Rel-99 first, then Rel-4..Rel-20), via the shared releaseRecencySQL.
 func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT DISTINCT release FROM spec_versions WHERE spec_id = ?
-		 ORDER BY CAST(regexp_extract(release, '[0-9]+') AS INTEGER)`, specID)
+		 ORDER BY `+releaseRecencySQL("release"), specID)
 	if err != nil {
 		return nil, err
 	}
@@ -804,7 +825,7 @@ func (s *Store) ListReleases(ctx context.Context, specID string) ([]model.SpecVe
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT spec_id, release, version, freeze_date, docx_url
 		 FROM spec_versions WHERE spec_id = ?
-		 ORDER BY CAST(regexp_extract(release, '[0-9]+') AS INTEGER) DESC,
+		 ORDER BY `+releaseRecencySQL("release")+` DESC,
 		          version DESC, freeze_date DESC NULLS LAST`, specID)
 	if err != nil {
 		return nil, err
