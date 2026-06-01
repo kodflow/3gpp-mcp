@@ -48,9 +48,9 @@ on:
         required: false
         default: "330"
       publish:
-        description: "Push the pulled sub-bases to GHCR 3gpp-vec:latest when done"
+        description: "Push the pulled sub-bases to GHCR 3gpp-vec:latest when done. Default true — there is no point spending GPU on an embed you don't publish. Set false only for a throwaway shakedown."
         required: false
-        default: "false"
+        default: "true"
   # Keep nibbling the weekly Kaggle quota unattended. Disabled by default — uncomment
   # and rely on Kaggle Secrets attached to the kernels for self-versioning.
   # schedule:
