@@ -51,6 +51,25 @@ type Item struct {
 // store.SetEmbeddingWithHash). Returning an error aborts the batch.
 type SetFunc func(ctx context.Context, chunkID uint64, vec []float32, hash string) error
 
+// BatchSetFunc persists a whole batch of (vector, hash) pairs in one shot (e.g.
+// store.SetEmbeddingsBatch, one transaction). ids/vecs/hashes are parallel slices.
+// Preferred over SetFunc at scale: one commit per batch instead of one per clause.
+type BatchSetFunc func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error
+
+// PerRow adapts a per-clause SetFunc into a BatchSetFunc by looping — so a caller
+// that only has a per-row writer (e.g. the inline ingest path) still satisfies the
+// batched Apply without changing its store call.
+func PerRow(set SetFunc) BatchSetFunc {
+	return func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+		for i := range ids {
+			if err := set(ctx, ids[i], vecs[i], hashes[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // applyBatch is the fixed batch size handed to the embedder (BGE-M3 reproducibility
 // contract; overridable on the GPU path via BGE_BATCH inside the onnx backend).
 const applyBatch = 32
@@ -93,8 +112,16 @@ func embedLen(it Item) int { return len(it.Heading) + len(it.Text) }
 // the reordering changes nothing stored. Disable with EMBED_BUCKET_WINDOW<32.
 //
 // Shared by the inline ingest path and the standalone cmd/embed binary so the
-// batching, hashing, and skip logic live in exactly one place.
+// batching, hashing, and skip logic live in exactly one place. Apply uses a per-row
+// writer; ApplyBatched takes a batch writer for one commit per window at scale.
 func Apply(ctx context.Context, e Embedder, items []Item, set SetFunc) (int, error) {
+	return ApplyBatched(ctx, e, items, PerRow(set))
+}
+
+// ApplyBatched is Apply with a batch-native writer: each length-bucketed window is
+// embedded and then persisted in ONE batchSet call (e.g. store.SetEmbeddingsBatch's
+// single transaction), so the write cost is one commit per window, not per clause.
+func ApplyBatched(ctx context.Context, e Embedder, items []Item, batchSet BatchSetFunc) (int, error) {
 	if !e.Enabled() || len(items) == 0 {
 		return 0, nil
 	}
@@ -134,12 +161,16 @@ func Apply(ctx context.Context, e Embedder, items []Item, set SetFunc) (int, err
 		if len(vecs) != len(jobs) {
 			return fmt.Errorf("embedder returned %d vectors for %d texts", len(vecs), len(jobs))
 		}
-		for i, v := range vecs {
-			if err := set(ctx, jobs[i].item.ChunkID, v, jobs[i].hash); err != nil {
-				return err
-			}
-			embedded++
+		ids := make([]uint64, len(jobs))
+		hashes := make([]string, len(jobs))
+		for i, j := range jobs {
+			ids[i] = j.item.ChunkID
+			hashes[i] = j.hash
 		}
+		if err := batchSet(ctx, ids, vecs, hashes); err != nil {
+			return err
+		}
+		embedded += len(jobs)
 		return nil
 	}
 
