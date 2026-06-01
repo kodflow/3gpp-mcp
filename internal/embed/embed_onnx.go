@@ -41,6 +41,14 @@ type onnxEmbedder struct {
 	session   *ort.DynamicAdvancedSession
 	mu        sync.Mutex // ORT session Run is not guaranteed concurrent-safe
 	windowing string     // "" = truncate at maxTokens (default); "mean_pool" = window long clauses + mean-pool (EMBED_WINDOWING)
+	// outBuf is a reusable host backing store for the output tensor (cap
+	// batchSize*Dim). ort.NewTensor ALIASES its Go slice (no copy — see the binding's
+	// CreateOrtTensorWithShape), so the output tensor can share this buffer across
+	// runs as long as every Run + copy-out happens under mu (serialised). This drops
+	// one tensor alloc+free per batch. NOTE: the binding's ortMemoryInfo is CPU-pinned
+	// (no device-tensor API), so true GPU-resident IO-binding / cudaGraph capture is
+	// unreachable here — buffer reuse is the achievable part.
+	outBuf []float32
 }
 
 // newEmbedder (onnx build) returns the BGE-M3 embedder, or Disabled{} if the
@@ -77,7 +85,12 @@ func newEmbedder() Embedder {
 	if err != nil {
 		return Disabled{}
 	}
-	return &onnxEmbedder{tok: tok, session: sess, windowing: envOr("EMBED_WINDOWING", "")}
+	return &onnxEmbedder{
+		tok:       tok,
+		session:   sess,
+		windowing: envOr("EMBED_WINDOWING", ""),
+		outBuf:    make([]float32, batchSize*Dim),
+	}
 }
 
 func (*onnxEmbedder) Enabled() bool { return true }
@@ -310,19 +323,20 @@ func (e *onnxEmbedder) runPrepared(pb preparedBatch, out [][]float32) error {
 		return err
 	}
 	defer func() { _ = maskT.Destroy() }()
-	outT, err := ort.NewEmptyTensor[float32](ort.NewShape(int64(pb.n), int64(Dim)))
+	// The output tensor aliases the reusable e.outBuf (cap batchSize*Dim). Because
+	// the tensor shares that buffer across calls, the lock must span NewTensor + Run
+	// + the copy-out, so concurrent Embed callers never read each other's results.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	outT, err := ort.NewTensor(ort.NewShape(int64(pb.n), int64(Dim)), e.outBuf[:pb.n*Dim])
 	if err != nil {
 		return err
 	}
 	defer func() { _ = outT.Destroy() }()
-
-	e.mu.Lock()
-	err = e.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT})
-	e.mu.Unlock()
-	if err != nil {
+	if err := e.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT}); err != nil {
 		return fmt.Errorf("onnx run: %w", err)
 	}
-	data := outT.GetData() // flat [n * Dim]
+	data := outT.GetData() // flat [n * Dim], aliasing e.outBuf
 	for i := 0; i < pb.n; i++ {
 		vec := append([]float32(nil), data[i*Dim:(i+1)*Dim]...)
 		l2normalize(vec)
