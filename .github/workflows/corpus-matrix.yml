@@ -68,6 +68,23 @@ on:
         description: "Per-shard timeout (max 360 on free hosted runners; lower to force the auto-resume chain quickly during testing — e.g. 10 to validate resume in ~30min)."
         type: string
         default: "360"
+  # AUTOMATIC on merge to main: a delta (append) lexical build — FULL the first time
+  # (no published index yet), then only the changed series on later merges. discover
+  # diffs the live 3GPP status + the build identities vs the published `latest`, so a
+  # no-op merge produces an empty matrix and costs ~1 min. Publishes to `latest` and
+  # includes Phase 1/2 (legacy GSM). Embedding is NOT done here — it is the separate,
+  # manual Kaggle job (corpus-embed-kaggle.yml).
+  push:
+    branches: [main]
+
+# One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
+# let the newest one supersede it: a delta build diffs against the published `latest`,
+# so the superseding run is a SUPERSET (it re-does anything the cancelled run dropped)
+# and ends by re-publishing `latest` — the final state is always the newest merge's.
+# This guarantees we never stack two identical corpus builds.
+concurrency:
+  group: corpus-build
+  cancel-in-progress: true
 
 permissions:
   contents: read # discover/build-shard read-only; merge elevates per-job
@@ -189,6 +206,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             scope="21 24"; floor="Rel-19"; full="false"
           fi
+          # AUTO (push to main): no dispatch inputs are present, so default the floor
+          # to Rel-99 (whole modern corpus). scope stays empty → delta-or-full discover;
+          # publish is enabled below; INCLUDE_LEGACY_GSM (Phase 1/2) is set on convert.
+          [ -n "$floor" ] || floor="Rel-99"
           if [ -n "$scope" ]; then
             matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)   # explicit series
           else
@@ -226,9 +247,12 @@ jobs:
           # was passed. This is the guard that stops a "small test scenario" from
           # shrinking latest (e.g. the 3031→149 clobber that motivated it): latest
           # is written exclusively by the job that builds the entire corpus.
+          # A whole-corpus run publishes `latest` when EITHER publish_to_latest=true
+          # (manual dispatch) OR it's an automatic push-to-main build. Both still
+          # require an unscoped (whole-corpus) run — a scoped test never clobbers latest.
           publish=false
           if [ "${{ github.event_name }}" != "pull_request" ] \
-             && [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] \
+             && { [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; } \
              && [ -z "$scope" ]; then
             publish=true
           fi
@@ -539,10 +563,11 @@ jobs:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
-          # Opt-in (§0): index legacy GSM Phase 1/2 lexically under the honest "GSM"
-          # bucket. Pair with a legacy series in series_scope (e.g. "04 05 08"); these
-          # clauses are below every embed floor → never vectorised.
-          INCLUDE_LEGACY_GSM: ${{ github.event.inputs.include_legacy_gsm == 'true' && '1' || '0' }}
+          # Index legacy GSM Phase 1/2 lexically under the honest "GSM" bucket — ON for
+          # the automatic whole-corpus push build (Phase 1 → Rel-20) and for a manual
+          # dispatch with include_legacy_gsm=true. These clauses are below every embed
+          # floor → indexed for BM25/LIKE but never vectorised.
+          INCLUDE_LEGACY_GSM: ${{ (github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '1' || '0' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
       # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
       # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE

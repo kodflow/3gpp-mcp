@@ -24,8 +24,8 @@ say(){ echo "RESULT $*" | tee -a "$R"; }
 fail(){ say "FAIL=$1 detail=${2:-}"; exit 1; }
 
 REPO="https://github.com/kodflow/3gpp-mcp"
-BRANCH="${BRANCH:-feat/embed-maximization}"
-FLOOR="${EMBED_FLOOR:-Rel-15}"
+BRANCH="${BRANCH:-main}"
+FLOOR="${EMBED_FLOOR:-Rel-17}"
 SERIES="${SERIES:-21}"
 BGE_COMMIT="5617a9f61b028005a4858fdac845db406aefb181"
 ORT_VERSION="${ORT_VERSION:-1.26.0}"
