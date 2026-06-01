@@ -53,6 +53,21 @@ type Subject interface {
 	Tools(db *store.Store, baseline string) []ToolRegistration
 }
 
+// Purger is an optional capability: a subject that owns derived tables can clear
+// the rows it wrote for one (spec, release) so a --resume redo starts from a
+// clean slate. The generic PurgeSpecScope only knows the core tables (clauses,
+// spec_versions, ingest_log); subject-owned tables (li_events, asn1_types, …) are
+// invisible to it. Without this hook the resume "purge-then-redo-fresh" contract
+// silently skips subject rows, so a corrected norm's rows can never overwrite a
+// stale prior parse (ON CONFLICT DO NOTHING) and removed events linger forever.
+type Purger interface {
+	// Purge deletes every row this subject wrote for (specID, release). Called
+	// from the resume redo path alongside the core PurgeSpecScope, only for
+	// subjects whose Activates(specID) is true. version is provided for subjects
+	// keyed by version rather than release.
+	Purge(ctx context.Context, db *store.Store, specID, release, version string) error
+}
+
 // TermEnricher is an optional capability: a subject can enrich the core
 // resolve_term tool when a term belongs to its domain (e.g. an ASN.1 type).
 type TermEnricher interface {
@@ -87,6 +102,22 @@ func (r *Registry) TermEnrichers() []TermEnricher {
 	for _, s := range r.subjects {
 		if te, ok := s.(TermEnricher); ok {
 			out = append(out, te)
+		}
+	}
+	return out
+}
+
+// Purgers returns the subjects that both activate on specID and implement the
+// Purger capability — i.e. the subjects whose derived rows a resume redo of
+// specID must clear before re-ingesting.
+func (r *Registry) Purgers(specID string) []Purger {
+	var out []Purger
+	for _, s := range r.subjects {
+		if !s.Activates(specID) {
+			continue
+		}
+		if p, ok := s.(Purger); ok {
+			out = append(out, p)
 		}
 	}
 	return out

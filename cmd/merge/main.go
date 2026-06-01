@@ -7,8 +7,9 @@
 // the merge is a concatenation: synthetic primary keys (chunk_id, op_id,
 // schema_id) are offset to stay unique; natural-key tables dedup via ON CONFLICT
 // DO NOTHING (a spec row repeats across release shards); the curated evolutions
-// seed — identical in every shard — is taken from the first shard only. FTS is
-// rebuilt on the merged DB (per-shard FTS indexes can't be concatenated).
+// seed is reseeded AUTHORITATIVELY from the current code after all folds (never
+// copied from a shard, so a seed edit can't be lost to fold order on a delta).
+// FTS is rebuilt on the merged DB (per-shard FTS indexes can't be concatenated).
 package main
 
 import (
@@ -21,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/enrichmeta"
+	"github.com/kodflow/3gpp-mcp/internal/evolseed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
@@ -33,6 +36,7 @@ func main() {
 	fts := flag.Bool("fts", true, "rebuild the BM25 FTS index on the merged DB")
 	indexOut := flag.String("index-out", "", "also write a corpus-index.json (spec_id -> latest version) for incremental discover")
 	subjectIndexOut := flag.String("subject-index-out", "", "also write a subject-index.json (subject -> footprint) so discover can detect a changed subject")
+	buildIndexOut := flag.String("build-index-out", "", "also write a build-index.json (the three canonical identities) so discover can force ingest/enricher/embed refresh on an identity drift")
 	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
 	stripEmbeddings := flag.Bool("strip-embeddings", false,
 		"after merge, DROP COLUMN embedding so the GitHub Release asset stays slim (vectors live in the GHCR per-series sub-bases)")
@@ -42,13 +46,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "merge: no input DBs given")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut); err != nil {
+	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut, *buildIndexOut); err != nil {
 		fmt.Fprintln(os.Stderr, "merge:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut string) error {
+func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut, buildIndexOut string) error {
 	_ = os.Remove(out)
 	db, err := store.Open(out)
 	if err != nil {
@@ -115,13 +119,37 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 				return fmt.Errorf("purge scope for %s: %w", in, err)
 			}
 		}
-		if err := mergeOne(ctx, sqldb, i == 0); err != nil {
+		if err := mergeOne(ctx, sqldb); err != nil {
 			return fmt.Errorf("merge %s: %w", in, err)
 		}
 		if _, err := sqldb.ExecContext(ctx, `DETACH src`); err != nil {
 			return fmt.Errorf("detach %s: %w", in, err)
 		}
 		fmt.Fprintf(os.Stderr, "[merge] folded %s\n", in)
+	}
+
+	// DEFENSIVE one-shot dedup of `changes` (plan PR-4). The delete-before-fold
+	// purge above is the real idempotency contract; this is a SAFETY NET that
+	// heals a base ALREADY corrupted by the prior (series, major) purge — those
+	// duplicate sub-floor CRs predate this build and can't be undone by a clean
+	// fold. We collapse to one row per (spec_id, cr_number, cr_revision,
+	// to_version). It is a no-op on a base built under the fixed contract, so it
+	// never masks a regression of the delete-before-fold guarantee.
+	if err := dedupChanges(ctx, sqldb); err != nil {
+		return fmt.Errorf("dedup changes: %w", err)
+	}
+
+	// Reseed evolutions AUTHORITATIVELY from the current code (PR-7). The curated
+	// NE<->NF seed is corpus-GLOBAL, not series-scoped, so it cannot be folded per
+	// shard: on a delta the fold list is [base, shard...] and the base folds first,
+	// so a fold-from-first rule would copy the STALE base seed and a seed edit
+	// shipped in the shards would never land (evolutions-seed-edit-never-lands-in-
+	// delta-merge). ReplaceEvolutions truncates + reloads, so the merged DB always
+	// carries exactly the current code's seed regardless of base/shard provenance
+	// or fold order. Its digest is published in the build index (evolutions_seed_hash
+	// → GlobalEnrichmentIdentity) so discover can also force the refresh.
+	if err := db.ReplaceEvolutions(ctx, evolseed.Seed()); err != nil {
+		return fmt.Errorf("reseed evolutions: %w", err)
 	}
 
 	// Strip vectors BEFORE the FTS rebuild + before counting/index-out, so the
@@ -136,8 +164,11 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		// Drop any leftover meta that's vector-specific so the slim DB doesn't
 		// claim semantic capability the consumer can't realise. Errors are
 		// SURFACED (a silent drop would let the slim DB advertise stale
-		// embedding_model/dim/count that no longer match its schema).
-		if _, err := sqldb.ExecContext(ctx, `DELETE FROM schema_meta WHERE key IN ('embedding_model','embedding_dim','embedding_count','hnsw_state')`); err != nil {
+		// embedding_model/dim/count that no longer match its schema). The IN-list
+		// is built from store.VectorMetaKeys — the SAME slice BuildAndFreezeHNSW
+		// stamps — so the purge can never omit a key the freeze writes (the
+		// hnsw_metric omission that hnsw-metric-omitted-from-strip-cleanup found).
+		if err := clearVectorMeta(ctx, sqldb); err != nil {
 			return fmt.Errorf("clear vector meta: %w", err)
 		}
 		// Reclaim space so the .duckdb file shrinks before zstd. Same reasoning
@@ -147,6 +178,17 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 			return fmt.Errorf("checkpoint after strip: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
+	} else if err := rebuildHNSWIfVectorized(ctx, db, sqldb); err != nil {
+		// NOT stripping: if any folded clause carries a vector, the merged DB must
+		// ship with a usable, frozen HNSW. foldTable concatenates only ROWS, never
+		// the per-shard indexes, and schema_meta is not folded — so without this a
+		// non-stripped merge of vectorized shards yields a vectorized-but-UNINDEXED
+		// DB (hnsw_state='' → serve's LoadVSS fails → silent O(N) exact-scan recall
+		// regression). merge-never-builds-hnsw-default-ships-unindexed-vectors. We
+		// rebuild here (HNSW build needs only the vss extension, no embedder, so it
+		// works on the default non-onnx build); a build failure is FATAL rather than
+		// shipping an unindexed-but-vectorized DB.
+		return fmt.Errorf("rebuild hnsw on vectorized merge: %w", err)
 	}
 	// Stamp the output's pipeline_version (lost otherwise — schema_meta is NOT in
 	// the fold list, by design, so each provenance key is set deliberately here).
@@ -169,7 +211,23 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 	// auto-delta would see "unchanged" and never rebuild it (a footprint that
 	// lies). When not advancing, we carry the base's stored footprint forward, so
 	// the next auto-delta still detects the pending change and rebuilds it.
-	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, base)
+	//
+	// subject-fp honesty (plan PR-4): the carry-forward reads the BASE's footprint
+	// only when the base actually contributed its rows to the merged DB. When the
+	// pipeline_version gate above dropped the base (incremental=false over a narrow
+	// discover-sized matrix — a FORCED full rebuild, not a real --all), the merged
+	// DB holds ONLY the shards: an unrebuilt subject's rows (li_events, acronyms)
+	// are GONE. Carrying the dropped base's footprint forward would publish a
+	// subject-index claiming the subject is up-to-date while its data is absent,
+	// and the next discover would see "unchanged" and never heal it. Passing
+	// fpBase="" makes an unrebuilt subject's effective footprint "" → discover
+	// treats it as changed → its series is rebuilt next run (self-healing), exactly
+	// as the corpus-index path already self-heals from a shrunken post-fold DB.
+	fpBase := base
+	if !incremental {
+		fpBase = ""
+	}
+	effFP, err := effectiveSubjectFootprints(ctx, sqldb, inputs, fpBase)
 	if err != nil {
 		return fmt.Errorf("compute subject footprints: %w", err)
 	}
@@ -209,7 +267,52 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 		}
 		fmt.Fprintf(os.Stderr, "[merge] subject-index: %s — %d subjects\n", subjectIndexOut, len(effFP))
 	}
+	// Stamp + publish the three canonical build identities (plan PR-3). The
+	// SpecIngestIdentity describes the spec content the merged DB carries (its
+	// subject footprints are the EFFECTIVE ones, so an unrebuilt subject keeps the
+	// base's footprint and the published identity never claims a version whose rows
+	// are absent); EmbedIdentity reflects the output's actual model (lexical "" when
+	// vectors were stripped, mirroring pipeline_version above). discover reads this
+	// manifest and forces the matching refresh (re-ingest / re-embed / enricher) on
+	// a drift, so an identity change is detected even when no spec version moved.
+	bi := buildIndexFor(effFP, outModelID)
+	if err := db.SetMeta("spec_ingest_identity", bi.SpecIngestIdentity); err != nil {
+		return fmt.Errorf("stamp spec_ingest_identity: %w", err)
+	}
+	if err := db.SetMeta("global_enrichment_identity", bi.GlobalEnrichmentIdentity); err != nil {
+		return fmt.Errorf("stamp global_enrichment_identity: %w", err)
+	}
+	if err := db.SetMeta("embed_identity", bi.EmbedIdentity); err != nil {
+		return fmt.Errorf("stamp embed_identity: %w", err)
+	}
+	if buildIndexOut != "" {
+		b, err := json.MarshalIndent(bi, "", " ")
+		if err != nil {
+			return fmt.Errorf("marshal build index: %w", err)
+		}
+		if err := os.WriteFile(buildIndexOut, b, 0o644); err != nil {
+			return fmt.Errorf("write build index %s: %w", buildIndexOut, err)
+		}
+		fmt.Fprintf(os.Stderr, "[merge] build-index: %s\n", buildIndexOut)
+	}
 	return nil
+}
+
+// buildIndexFor composes the merged DB's three canonical identities (plan PR-3).
+// The SpecIngestIdentity uses the EFFECTIVE subject footprints (effFP) — the ones
+// actually backing the merged DB's rows — so a subject that wasn't rebuilt this
+// run keeps its base footprint and the published identity never overstates what
+// the DB contains. The ASN.1 scanner tag comes from the current code: it is folded
+// into the LI footprint already (subjectmeta.Footprint), so effFP carries it for a
+// rebuilt LI and the base value for an unrebuilt one — passing the current tag
+// here is consistent because the LI footprint is the authoritative carrier.
+// outModelID is "" for a lexical (stripped) output, mirroring pipeline_version.
+func buildIndexFor(effFP map[string]string, outModelID string) model.BuildIndex {
+	fps := make([]string, 0, len(effFP))
+	for _, fp := range effFP {
+		fps = append(fps, fp)
+	}
+	return model.CurrentBuildIndex(fps, subjectmeta.ASN1ScannerVersion, outModelID, enrichmeta.Current())
 }
 
 // effectiveSubjectFootprints returns name->footprint for every subject, where a
@@ -289,23 +392,28 @@ func metaValue(ctx context.Context, sqldb *sql.DB, path, key string) string {
 	return v
 }
 
-// writeIndex emits corpus-index.json = {spec_id: latest version}, the small
-// manifest `discover` diffs against the live 3GPP status report to size the
-// next matrix. "Latest" = the highest numeric X.Y.Z across the spec's versions.
+// writeIndex emits corpus-index.json = {"spec_id|release": latest version}, the
+// small manifest `discover` diffs against the live 3GPP status report to size the
+// next matrix. The key is per-(spec_id, release) — NOT a single scalar per spec
+// (plan PR-5, finding delta-blind-to-nonmonotonic-lower-release-update): a frozen
+// release keeps getting maintenance versions (CLAUDE.md §8 #8), so collapsing a
+// spec to its single highest X.Y.Z hid a Rel-16 bump whenever Rel-19 was higher.
+// "Latest" = the highest numeric X.Y.Z within each (spec, release) bucket.
 func writeIndex(ctx context.Context, sqldb *sql.DB, path string) (int, error) {
-	rows, err := sqldb.QueryContext(ctx, `SELECT spec_id, version FROM spec_versions`)
+	rows, err := sqldb.QueryContext(ctx, `SELECT spec_id, release, version FROM spec_versions`)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = rows.Close() }()
 	idx := map[string]string{}
 	for rows.Next() {
-		var spec, ver string
-		if err := rows.Scan(&spec, &ver); err != nil {
+		var spec, rel, ver string
+		if err := rows.Scan(&spec, &rel, &ver); err != nil {
 			return 0, err
 		}
-		if cmpVer(ver, idx[spec]) > 0 {
-			idx[spec] = ver
+		key := spec + "|" + rel
+		if cmpVer(ver, idx[key]) > 0 {
+			idx[key] = ver
 		}
 	}
 	b, err := json.MarshalIndent(idx, "", " ")
@@ -340,43 +448,64 @@ func triple(s string) [3]int {
 	return t
 }
 
-// purgeShardScope removes, from the main DB, only the (series, release) buckets
-// the ATTACHed `src` shard actually carries — so a per-release sub-shard replaces
-// its own buckets without clobbering sibling sub-shards of the same series.
+// purgeShardScope removes, from the main DB, exactly the rows the ATTACHed `src`
+// shard is about to re-fold — so a delta replaces its own buckets without
+// clobbering siblings AND without leaving duplicates. The purge SET must equal
+// (or contain) the fold's WRITE set, per table:
 //
-//   - the 8 release-bearing tables → scoped by (series, release);
-//   - `changes` (no release column) → scoped by (series, major-of-to_version),
-//     mapping each release to its version major via ReleaseOrdinal (drafts that
-//     don't map are skipped, so unrelated CRs are never deleted);
+//   - the 8 release-bearing tables → scoped by (spec_id, release) read from the
+//     shard's actual spec_versions. NOT (series, release): a sub-shard may carry
+//     a SUBSET of a series' specs (operator series_scope, a partial corpus on
+//     disk, or future per-spec sharding), and a series-wide delete would wipe
+//     sibling specs the shard never re-inserts (sibling-spec-loss).
+//   - `changes` → scoped by spec_id. The Change-History annex is CUMULATIVE per
+//     spec (every CR since inception, to_version spanning many majors) and is
+//     re-folded WHOLE for each spec the shard carries. Purging by major-of-
+//     to_version (the prior behaviour) deleted only the shard's release-major
+//     while the fold re-inserted ALL majors → sub-floor CRs duplicated on every
+//     delta. Deleting the whole spec_id bucket guarantees delete ⊇ insert.
+//   - `acronyms` → scoped by source_series (the owning subject's series). It is a
+//     global subject-owned table with no spec_id/release, so a changed/regressed
+//     glossary subject's stale rows would otherwise survive the ON-CONFLICT-DO-
+//     NOTHING fold forever. Rows without provenance (pre-PR-4 base) are left
+//     alone — they are healed once the owning series is re-ingested with the
+//     provenance column populated.
 //   - `specs` (no release; one row shared across releases) → NOT purged: a
-//     release sub-shard may not carry every spec of the series, so deleting by
-//     series would drop siblings. ON CONFLICT DO NOTHING on re-fold keeps it.
+//     sub-shard may not carry every spec, so deleting by series would drop
+//     siblings. ON CONFLICT DO NOTHING on re-fold keeps it.
 func purgeShardScope(ctx context.Context, sqldb *sql.DB) error {
-	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT substr(spec_id,1,2) AS series, release FROM src.spec_versions`)
+	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT spec_id, release FROM src.spec_versions`)
 	if err != nil {
 		return err
 	}
-	type pair struct{ series, release string }
+	type pair struct{ specID, release string }
 	var pairs []pair
+	specIDSet := map[string]bool{}
+	seriesSet := map[string]bool{}
 	for rows.Next() {
 		var p pair
-		if err := rows.Scan(&p.series, &p.release); err != nil {
+		if err := rows.Scan(&p.specID, &p.release); err != nil {
 			_ = rows.Close()
 			return err
 		}
 		pairs = append(pairs, p)
+		specIDSet[p.specID] = true
+		if len(p.specID) >= 2 {
+			seriesSet[p.specID[:2]] = true
+		}
 	}
 	_ = rows.Close()
 	if len(pairs) == 0 {
 		return nil
 	}
 
-	// (a) release-bearing tables: DELETE WHERE (series, release) matches a bucket.
+	// (a) release-bearing tables: DELETE WHERE (spec_id, release) matches a bucket
+	// the shard carries — never a broad series sweep (sibling-spec-loss).
 	relPred := make([]string, 0, len(pairs))
 	relArgs := make([]any, 0, len(pairs)*2)
 	for _, p := range pairs {
-		relPred = append(relPred, "(substr(spec_id,1,2) = ? AND release = ?)")
-		relArgs = append(relArgs, p.series, p.release)
+		relPred = append(relPred, "(spec_id = ? AND release = ?)")
+		relArgs = append(relArgs, p.specID, p.release)
 	}
 	relWhere := strings.Join(relPred, " OR ")
 	for _, t := range []string{
@@ -389,29 +518,94 @@ func purgeShardScope(ctx context.Context, sqldb *sql.DB) error {
 		}
 	}
 
-	// (b) changes: no release column → scope by (series, major-of-to_version).
-	seen := map[string]bool{}
-	chPred := make([]string, 0, len(pairs))
-	chArgs := make([]any, 0, len(pairs)*2)
-	for _, p := range pairs {
-		ord, ok := model.ReleaseOrdinal(p.release)
-		if !ok {
-			continue // draft / unmapped — don't risk deleting unrelated CRs
-		}
-		maj := strconv.Itoa(ord)
-		key := p.series + "/" + maj
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		chPred = append(chPred, "(substr(spec_id,1,2) = ? AND split_part(to_version,'.',1) = ?)")
-		chArgs = append(chArgs, p.series, maj)
+	// (b) changes: delete-before-fold by spec_id (the cumulative annex is
+	// re-folded whole per spec). This is the PRIMARY idempotency contract.
+	specArgs := make([]any, 0, len(specIDSet))
+	specPlace := make([]string, 0, len(specIDSet))
+	for id := range specIDSet {
+		specArgs = append(specArgs, id)
+		specPlace = append(specPlace, "?")
 	}
-	if len(chPred) > 0 {
-		if _, err := sqldb.ExecContext(ctx, `DELETE FROM changes WHERE `+strings.Join(chPred, " OR "), chArgs...); err != nil {
-			return fmt.Errorf("changes: %w", err)
+	if _, err := sqldb.ExecContext(ctx,
+		`DELETE FROM changes WHERE spec_id IN (`+strings.Join(specPlace, ",")+`)`, specArgs...); err != nil {
+		return fmt.Errorf("changes: %w", err)
+	}
+
+	// (c) acronyms: scope-purge the subject-owned global table by the series this
+	// shard rebuilds, so a corrected/removed glossary term replaces the stale base
+	// row instead of coexisting with it (ON CONFLICT DO NOTHING can't overwrite).
+	serArgs := make([]any, 0, len(seriesSet))
+	serPlace := make([]string, 0, len(seriesSet))
+	for s := range seriesSet {
+		serArgs = append(serArgs, s)
+		serPlace = append(serPlace, "?")
+	}
+	if len(serArgs) > 0 {
+		if _, err := sqldb.ExecContext(ctx,
+			`DELETE FROM acronyms WHERE source_series IN (`+strings.Join(serPlace, ",")+`)`, serArgs...); err != nil {
+			return fmt.Errorf("acronyms: %w", err)
 		}
 	}
+	return nil
+}
+
+// dedupChanges collapses `changes` to one row per natural key
+// (spec_id, cr_number, cr_revision, to_version), keeping the first occurrence.
+// It is the defensive heal for bases corrupted by the pre-PR-4 (series, major)
+// purge, which duplicated sub-floor CRs on every delta. The `changes` table has
+// no unique constraint (a CR can legitimately touch several specs, but the same
+// CR row for the SAME spec at the SAME to_version is a duplicate), so DuckDB
+// can't dedup it via ON CONFLICT; we rebuild the table keeping ROW_NUMBER()=1.
+// rowid (DuckDB's implicit row identifier) gives a stable tie-break so the pass
+// is deterministic. On a base built under the fixed delete-before-fold contract
+// every group already has exactly one row, so this is a no-op.
+func dedupChanges(ctx context.Context, sqldb *sql.DB) error {
+	tx, err := sqldb.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dedup tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	// COALESCE on the nullable key parts so NULLs group together (a NULL
+	// cr_revision must not split an otherwise-identical duplicate into two rows).
+	const ddl = `CREATE TABLE changes_dedup AS
+		SELECT * EXCLUDE (rn) FROM (
+			SELECT *, ROW_NUMBER() OVER (
+				PARTITION BY spec_id,
+				             COALESCE(cr_number, ''),
+				             COALESCE(CAST(cr_revision AS VARCHAR), ''),
+				             COALESCE(to_version, '')
+				ORDER BY rowid
+			) AS rn
+			FROM changes
+		) WHERE rn = 1`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("build changes_dedup: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE changes`); err != nil {
+		return fmt.Errorf("drop changes: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE changes_dedup RENAME TO changes`); err != nil {
+		return fmt.Errorf("rename changes_dedup: %w", err)
+	}
+	// Re-create the non-unique secondary indexes schema.sql guarantees (the
+	// CREATE-AS-SELECT path does not carry them over).
+	for _, ddl := range []string{
+		`CREATE INDEX IF NOT EXISTS changes_spec ON changes (spec_id)`,
+		`CREATE INDEX IF NOT EXISTS changes_cr   ON changes (cr_number)`,
+	} {
+		if _, err := tx.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("recreate changes index: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dedup tx: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -441,16 +635,17 @@ var mergeTables = []tableSpec{
 // mergeOne folds the ATTACHed `src` DB into the main DB, column-by-column on the
 // INTERSECTION of src/main columns so it tolerates schema drift (an older base
 // DB with fewer columns merges fine; new columns just take their default).
-// first=true copies the curated evolutions seed (identical in every shard).
-func mergeOne(ctx context.Context, sqldb *sql.DB, first bool) error {
+//
+// The curated evolutions table is deliberately NOT folded here: it is corpus-
+// global and reseeded authoritatively from the current code AFTER all folds (see
+// run), so folding it per shard (which previously copied only fold #0 = the stale
+// base on a delta) is both unnecessary and was the source of the seed-staleness
+// bug. Leaving it out of mergeTables keeps the merged table empty until the
+// authoritative reseed populates it.
+func mergeOne(ctx context.Context, sqldb *sql.DB) error {
 	for _, t := range mergeTables {
 		if err := foldTable(ctx, sqldb, t); err != nil {
 			return fmt.Errorf("fold %s: %w", t.name, err)
-		}
-	}
-	if first {
-		if err := foldTable(ctx, sqldb, tableSpec{"evolutions", "", false}); err != nil {
-			return fmt.Errorf("fold evolutions: %w", err)
 		}
 	}
 	return nil
@@ -594,5 +789,50 @@ func stripEmbeddingColumn(ctx context.Context, sqldb *sql.DB) error {
 		return fmt.Errorf("commit strip tx: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+// clearVectorMeta deletes every vector-capability key from schema_meta. The
+// IN-list is derived from store.VectorMetaKeys so it cannot drift from the keys
+// BuildAndFreezeHNSW stamps (hnsw-metric-omitted-from-strip-cleanup). A
+// non-vector key (e.g. pipeline_version) is never in the slice, so the slim DB
+// keeps its provenance meta — the delete is selective, not a blanket wipe.
+func clearVectorMeta(ctx context.Context, sqldb *sql.DB) error {
+	place := make([]string, 0, len(store.VectorMetaKeys))
+	args := make([]any, 0, len(store.VectorMetaKeys))
+	for _, k := range store.VectorMetaKeys {
+		place = append(place, "?")
+		args = append(args, k)
+	}
+	_, err := sqldb.ExecContext(ctx,
+		`DELETE FROM schema_meta WHERE key IN (`+strings.Join(place, ",")+`)`, args...)
+	return err
+}
+
+// rebuildHNSWIfVectorized rebuilds + freezes the HNSW index on the merged DB
+// when (and only when) at least one folded clause carries a non-NULL embedding.
+// A lexical merge (no vectors) is a no-op — the slim/lexical channel must NOT
+// gain a vector index. The index is a disposable cache over the embedding column
+// (axis #6), so building it from the concatenated vectors is correct regardless
+// of which shards contributed them. BuildAndFreezeHNSW handles CHECKPOINT
+// fencing, verification, and the frozen markers; it needs only the vss extension
+// (no embedder), so this path works on the default non-onnx build too.
+func rebuildHNSWIfVectorized(ctx context.Context, db *store.Store, sqldb *sql.DB) error {
+	var n int
+	if err := sqldb.QueryRowContext(ctx,
+		`SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&n); err != nil {
+		return fmt.Errorf("count embeddings: %w", err)
+	}
+	if n == 0 {
+		return nil // lexical merge — no vectors, no index to build
+	}
+	// Read the model off the OPEN output connection (schema_meta is not folded, so
+	// it may be ""); BuildAndFreezeHNSW still freezes a usable index — the model
+	// label is descriptive, the index is over the embedding column either way.
+	model := db.GetMeta(ctx, "embedding_model")
+	if err := db.BuildAndFreezeHNSW(ctx, model); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[merge] built+froze HNSW over %d merged vectors\n", n)
 	return nil
 }

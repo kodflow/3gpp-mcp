@@ -35,13 +35,33 @@ func withTx(st *store.Store, fn func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 
+// Purge deletes every LI-owned row for one (spec_id, release) so a --resume redo
+// of TS 33.128 starts from a clean slate. The generic store.PurgeSpecScope only
+// knows the core tables; without this the resume redo would re-run the inserts
+// over stale rows (a corrected asn1_tag/spec_clause kept by ON CONFLICT, removed
+// events lingering). Release-scoped: LI's tables are keyed by release, not
+// version (version is accepted to satisfy the subject.Purger contract).
+func Purge(ctx context.Context, st *store.Store, release string) error {
+	db := st.DB()
+	for _, table := range []string{"li_events", "li_event_fields", "li_nf_clauses", "asn1_types"} {
+		if _, err := db.ExecContext(ctx,
+			`DELETE FROM `+table+` WHERE spec_id='33.128' AND release=?`, release); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // InsertEvents bulk-inserts parsed ASN.1 events for one TS 33.128 release.
+// INSERT OR REPLACE (not DO NOTHING): a corrected norm re-ingested on --resume
+// must overwrite the stale row keyed by (spec_id, release, interface, event_name)
+// rather than be silently dropped (which would drift li_events from the freshly
+// re-ingested clause text). Purge handles removed/renamed events.
 func InsertEvents(st *store.Store, release, moduleVersion string, evs []asn1.Event) error {
 	return withTx(st, func(tx *sql.Tx) error {
-		stmt, err := tx.Prepare(`INSERT INTO li_events
+		stmt, err := tx.Prepare(`INSERT OR REPLACE INTO li_events
 			(spec_id, release, module_version, interface, event_name, asn1_type, asn1_tag, originating_nf, domain, spec_clause, field_count)
-			VALUES ('33.128', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (spec_id, release, interface, event_name) DO NOTHING`)
+			VALUES ('33.128', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return err
 		}
@@ -58,10 +78,9 @@ func InsertEvents(st *store.Store, release, moduleVersion string, evs []asn1.Eve
 // InsertFields bulk-inserts event IE rows for one release.
 func InsertFields(st *store.Store, release string, fs []asn1.Field) error {
 	return withTx(st, func(tx *sql.Tx) error {
-		stmt, err := tx.Prepare(`INSERT INTO li_event_fields
+		stmt, err := tx.Prepare(`INSERT OR REPLACE INTO li_event_fields
 			(spec_id, release, interface, event_name, field_name, asn1_type, asn1_tag, is_optional, ordinal)
-			VALUES ('33.128', ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (spec_id, release, interface, event_name, field_name) DO NOTHING`)
+			VALUES ('33.128', ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return err
 		}
@@ -78,9 +97,8 @@ func InsertFields(st *store.Store, release string, fs []asn1.Field) error {
 // InsertNFClauses bulk-inserts NF→clause anchors for one release.
 func InsertNFClauses(st *store.Store, release string, ncs []asn1.NFClause) error {
 	return withTx(st, func(tx *sql.Tx) error {
-		stmt, err := tx.Prepare(`INSERT INTO li_nf_clauses
-			(spec_id, release, originating_nf, interface, spec_clause) VALUES ('33.128', ?, ?, ?, ?)
-			ON CONFLICT (spec_id, release, originating_nf, interface) DO NOTHING`)
+		stmt, err := tx.Prepare(`INSERT OR REPLACE INTO li_nf_clauses
+			(spec_id, release, originating_nf, interface, spec_clause) VALUES ('33.128', ?, ?, ?, ?)`)
 		if err != nil {
 			return err
 		}

@@ -75,6 +75,18 @@ done
 SET_MAJOR="$(printf '%s' "$SET" | grep -oE '[0-9]+' | head -1)"; SET_MAJOR="${SET_MAJOR:-3}"
 [[ "$SET" == "Rel-99" ]] && SET_MAJOR=3   # Rel-99 == version major 3 (not 99)
 
+# Whole MODERN corpus (Rel-99 + Rel-4..latest) is the DEFAULT (SET=Rel-99 above).
+#
+# GSM Phase 1/2 (4-digit specs / legacy series 00-13) is OFF by default. Its filenames
+# use a reverse-engineered version-code scheme that CANNOT be decoded to an exact 3GPP
+# release line, so guessing a release would violate the cite-exactly rule (CLAUDE.md §1).
+# By an explicit architectural decision (§0), INCLUDE_LEGACY_GSM=1 ingests them
+# LEXICALLY with the single honest release bucket "GSM" (the Go ingest stamps it;
+# see model.ReleaseGSM): spec_id, clause, the literal code version and url stay exact,
+# and because ReleaseOrdinal("GSM") is false these clauses are below every embed floor
+# → indexed for BM25/LIKE search but NEVER vectorised. Vectors stay Rel-99..latest.
+LEGACY_GSM="${INCLUDE_LEGACY_GSM:-0}"
+
 mkdir -p "$ORIGIN" "$CONVERT"
 
 LOCK="$ROOT/data/sources/.corpus.lock"
@@ -102,12 +114,15 @@ export -f decode_char
 
 # emit "<release> <url> <name>" for the highest version of each release >= SET_MAJOR
 emit_spec() {
-  local s="$1" spec="$2" num dir html files
+  local s="$1" spec="$2" num dir html files legacy=0
   num="${spec/./}"
-  [[ ${#num} -le 4 ]] && return 0                  # 4-digit = legacy GSM Phase 1/2 -> out of scope
+  if [[ ${#num} -le 4 ]]; then                     # 4-digit = legacy GSM Phase 1/2
+    [[ "${LEGACY_GSM:-0}" == "1" ]] || return 0    # only when explicitly opted in (§0)
+    legacy=1
+  fi
   dir="$BASE/${s}_series/${spec}/"
   html="$(fetch "$dir" 2>/dev/null || true)"; [[ -z "$html" ]] && return 0
-  files="$(printf '%s' "$html" | grep -oE '[0-9]{5}-[0-9a-z]{3}\.zip' | sort -u || true)"
+  files="$(printf '%s' "$html" | grep -oE '[0-9]{4,5}-[0-9a-z]{3}\.zip' | sort -u || true)"
   [[ -z "$files" ]] && return 0
   declare -A best
   local f code c1 c2 c3 m v2 v3 key cur
@@ -117,21 +132,23 @@ emit_spec() {
     c1="${code:0:1}"; c2="${code:1:1}"; c3="${code:2:1}"
     m="$(decode_char "$c1")"
     (( m == 999 )) && continue
-    (( m < SET_MAJOR )) && continue                # release floor (excludes Rel-99=major 3)
+    (( legacy == 0 && m < SET_MAJOR )) && continue # release floor (modern only; legacy keeps all)
     v2="$(decode_char "$c2")"; v3="$(decode_char "$c3")"
     (( v2 == 999 )) && v2=0; (( v3 == 999 )) && v3=0
     key=$(( m * 10000 + v2 * 100 + v3 ))
     cur="${best[$m]:-}"
     if [[ -z "$cur" ]] || (( key > ${cur%%:*} )); then best[$m]="${key}:${f}"; fi
   done <<< "$files"
+  # rel here is only the manifest hint; the Go ingest is the source of truth and
+  # stamps "GSM" for 4-digit specs (model.ReleaseGSM) regardless.
   local out="$WORKDIR/${s}.${spec}.lines" rel
   for m in "${!best[@]}"; do
     f="${best[$m]##*:}"
-    if (( m == 3 )); then rel="Rel-99"; else rel="Rel-$m"; fi
+    if (( legacy == 1 )); then rel="GSM"; elif (( m == 3 )); then rel="Rel-99"; else rel="Rel-$m"; fi
     printf '%s %s %s\n' "$rel" "${dir}${f}" "$f" >> "$out"
   done
 }
-export -f emit_spec; export BASE WORKDIR SET_MAJOR
+export -f emit_spec; export BASE WORKDIR SET_MAJOR LEGACY_GSM
 
 # ON-THE-FLY worker: one spec -> download (if missing) -> unzip + convert (if missing)
 process_spec() {
