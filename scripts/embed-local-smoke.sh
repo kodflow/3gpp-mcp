@@ -21,7 +21,7 @@ command -v "$GO" >/dev/null || { echo "FATAL: go not on PATH"; exit 1; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 DB="$TMP/smoke.duckdb"
 ORT_LIB="${ORT_LIB:-$PWD/data/models/onnxruntime/lib/libonnxruntime.so}"
-BGE_DIR="${BGE_M3_DIR:-$PWD/data/models/bge-m3}"
+BGE_DIR="${EMBED_MODEL_DIR:-${BGE_M3_DIR:-$PWD/data/models/bge-m3}}"
 
 pass() { printf '\033[0;32m[PASS]\033[0m %s\n' "$1"; }
 info() { printf '\033[0;36m[ ... ]\033[0m %s\n' "$1"; }
