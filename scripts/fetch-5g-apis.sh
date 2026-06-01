@@ -13,7 +13,12 @@
 #
 #   ./scripts/fetch-5g-apis.sh                 # default: REL-18
 #   ./scripts/fetch-5g-apis.sh REL-17 REL-18   # selected releases
-#   ./scripts/fetch-5g-apis.sh all             # REL-15 .. REL-20
+#   ./scripts/fetch-5g-apis.sh all             # REL-15 .. REL-20 (static list)
+#   ./scripts/fetch-5g-apis.sh auto            # EVERY REL-* branch the Forge has
+#                                              # RIGHT NOW (REL-15..whatever is live,
+#                                              # incl. a freshly-published REL-20/21/…)
+#                                              # → a cron build picks up new releases
+#                                              #   with ZERO code change.
 #
 set -uo pipefail
 
@@ -36,6 +41,24 @@ if [[ "${releases[0]}" == "all" ]]; then
   releases=(REL-15 REL-16 REL-17 REL-18 REL-19 REL-20)
 fi
 
+# list_release_branches -> prints every REL-<n> branch currently on the Forge
+# (paged). This is what makes `auto` self-updating: a release published after this
+# code was written shows up as a new REL-NN branch and is fetched without any edit.
+list_release_branches() {
+  local page=1 names
+  while :; do
+    names=$(curl -fsS -A "$UA" --max-time 60 "$API/branches?per_page=100&page=$page" 2>/dev/null \
+      | python3 -c 'import sys,json,re
+try: d=json.loads(sys.stdin.read(), strict=False)  # commit messages carry raw control chars
+except Exception: d=[]
+[print(b["name"]) for b in d if re.match(r"^REL-[0-9]+$", b.get("name",""))]' 2>/dev/null)
+    [[ -z "$names" ]] && break
+    printf '%s\n' "$names"
+    (( page++ ))
+    (( page > 20 )) && break   # safety bound
+  done
+}
+
 # resolve_sha REF -> prints the head commit SHA of REF, or empty on failure.
 resolve_sha() {
   local ref="$1"
@@ -57,6 +80,17 @@ d=json.load(sys.stdin)
     (( page > 30 )) && break   # safety bound (~3000 files)
   done
 }
+
+# auto: replace the request with every REL-* branch the Forge currently exposes
+# (captures releases BEFORE the hardcoded floor and any NEW one, e.g. REL-20/21).
+if [[ "${releases[0]}" == "auto" ]]; then
+  mapfile -t releases < <(list_release_branches | sort -u)
+  if [[ ${#releases[@]} -eq 0 ]]; then
+    warn "auto: no REL-* branches resolved from the Forge — falling back to REL-18"
+    releases=(REL-18)
+  fi
+  log "auto-detected ${#releases[@]} release branch(es): ${releases[*]}"
+fi
 
 total_files=0
 for ref in "${releases[@]}"; do
