@@ -58,7 +58,7 @@ Embed is micro-granular and **now resumable across sessions**:
   the **newest** releases done.
 - `--checkpoint-every 2000` flushes durably mid-run, so even a hard kill loses at
   most ~2000 clauses of progress.
-- The driver `scripts/kaggle-rel15-20.sh` retries `MAX_RETRIES` times on ERROR and
+- The driver `scripts/kaggle-embed-campaign.sh` retries `MAX_RETRIES` times on ERROR and
   relaunches on a partial; the CI job is `continue-on-error` and resumes next dispatch.
 
 ## 3. Where to put the Kaggle token in GitHub Secrets
@@ -89,7 +89,7 @@ Settings → API.
 | Throughput | length-bucketing (`internal/embed/apply.go`), tokenise/run pipeline + ORT graph-opt/CUDA tuning (`embed_onnx.go`) |
 | Scalable writes | `store.SetEmbeddingsBatch` (one txn/window) via `embed.ApplyBatched` |
 | Resumable kernel | `scripts/kaggle/kernel-embed.sh` (Dataset resume-or-slice + timeout + self-version) |
-| Shard driver | `scripts/kaggle-rel15-20.sh one <series> \| all \| status` |
+| Shard driver | `scripts/kaggle-embed-campaign.sh one <series> \| all \| status` |
 | CI workflow | `.github/workflows/corpus-embed-kaggle.yml` (workflow_dispatch, series matrix, publish-vec → GHCR) |
 | Local proof | `make embed-smoke` → `scripts/embed-local-smoke.sh` (no Kaggle/GPU) |
 
@@ -121,7 +121,7 @@ Settings → API.
 
 # 2'. …or locally (operator box; auth via KAGGLE_API_TOKEN or ~/.kaggle/access_token):
 KAGGLE_API_TOKEN=KGAT_xxx KAGGLE_USER=makingcodes EMBED_FLOOR=Rel-17 \
-  scripts/kaggle-rel15-20.sh one 33
+  scripts/kaggle-embed-campaign.sh one 33
 
 # 3. PROVE IT WORKS LOCALLY (no Kaggle, no GPU; real BGE-M3 on CPU if present):
 make embed-smoke
