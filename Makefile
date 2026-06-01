@@ -8,7 +8,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test poc bench benchgo demo audit model lint fmt vet tidy clean install help
+.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help
 
 all: build ## Build the binary
 
@@ -48,6 +48,9 @@ serve: build ## Start MCP server on stdio
 
 test: ## Run unit tests with race detector
 	$(GO) test -race -count=1 ./...
+
+embed-smoke: ## Prove the embed pipeline works locally (no Kaggle/GPU; uses BGE-M3 on CPU if present)
+	./scripts/embed-local-smoke.sh
 
 poc: ## Run the Lawful-Interception POC end-to-end test (verbose)
 	$(GO) test ./tests/e2e -run LIEvents -v
