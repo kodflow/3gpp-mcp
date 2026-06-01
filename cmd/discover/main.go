@@ -42,6 +42,14 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
+// legacyGSMSeries is the documented GSM Phase-1/2 series range (2-digit, < 21) the
+// modern status report does not list. corpus.sh fetches each `<NN>_series/` directory
+// from the 3GPP FTP and skips any that is empty/absent, so including the whole range
+// is safe — empty ones produce no shard work.
+var legacyGSMSeries = []string{
+	"01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13",
+}
+
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
@@ -50,6 +58,7 @@ func main() {
 	expectModel := flag.String("embed-model", "", "the embedder FAMILY the current build will use (e.g. bge-m3); resolved to the canonical EmbedIdentity and compared against the published one")
 	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
+	includeLegacy := flag.Bool("include-legacy-gsm", false, "also enumerate legacy GSM Phase-1/2 series (2-digit < 21). The status report omits their 4-digit specs and the release floor would drop them, so they are added explicitly; corpus.sh enumerates each series' specs over FTP and skips any that don't exist.")
 	flag.Parse()
 
 	site, err := fetchStatus(*statusURL)
@@ -119,6 +128,18 @@ func main() {
 					series[spec[:2]] = true
 				}
 			}
+		}
+	}
+
+	// Legacy GSM Phase-1/2 (§0 opt-in): add the 2-digit GSM series explicitly. They
+	// carry 4-digit specs that the modern status report omits, and their releases are
+	// below the floor, so deltaSeries never surfaces them. corpus.sh enumerates each
+	// series over FTP and a non-existent one yields an empty (no-op) shard, so adding
+	// the whole documented GSM range is safe. The ingest stamps release="GSM" (below
+	// any embed floor → lexical-only, never vectorised).
+	if *includeLegacy {
+		for _, s := range legacyGSMSeries {
+			series[s] = true
 		}
 	}
 
