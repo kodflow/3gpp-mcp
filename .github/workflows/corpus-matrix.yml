@@ -254,10 +254,15 @@ jobs:
             if [ "${{ github.event.inputs.embed }}" = "true" ]; then
               embed_model="bge-m3"
             fi
+            # Add the legacy GSM Phase-1/2 series to the matrix under the SAME toggle
+            # that turns on INCLUDE_LEGACY_GSM for the convert step (repo variable /
+            # dispatch checkbox / auto push) — otherwise discover never surfaces them
+            # and Phase 1/2 is never built despite the convert flag.
+            legacy="${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '--include-legacy-gsm' || '' }}"
             if [ "$full" = "true" ]; then
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor")
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor")
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy)
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
