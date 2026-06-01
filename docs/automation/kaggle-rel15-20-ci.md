@@ -122,22 +122,35 @@ and — when `data/models/bge-m3` is present (`make model`) — the **real BGE-M
 ONNX on CPU** (`ORT_EP=cpu`, the Kaggle path minus CUDA) plus the byte-identity
 tests (pipeline/batch/graph-opt). Verified green incl. the real model.
 
-## 7. The one gated step left: fp16 (flips EmbedIdentity)
+## 7. Model registry + fp16 (implemented; one operator step + a §0 decision)
 
-fp16 is the only remaining ~2–3× (T4 Tensor Cores) and the ONLY change that flips
-`EmbedIdentity` → it forces a full re-embed, so it must be decided ONCE, **before**
-any large run, and validated:
+Models are now declarative — `internal/embed/models.yaml` (embedded default; override
+at `EMBED_MODELS_CONFIG` or `data/models/models.yaml`) declares each model's dir,
+precision, dim, normalization, revision and ONNX I/O names. Swap model/precision with
+`EMBED_MODEL=<name>` (e.g. `bge-m3-fp16`). Precision is folded into the EmbedIdentity,
+so fp16 and fp32 vectors can never share one HNSW; selecting an absent model DISABLES
+rather than running the wrong one under its identity. Deployment paths stay in env
+(`EMBED_MODELS_BASE` for relative dirs, `EMBED_MODEL_DIR` absolute override).
 
-1. Build `bge-m3_fp16.onnx` offline from the pinned `BAAI/bge-m3 /onnx/model.onnx`
-   via `onnxruntime.transformers.optimizer` → `convert_float_to_float16(keep_io_types=True)`,
-   blocking LayerNorm/Softmax/ReduceMean to fp32. Pin the SHA-256 of *our* artifact.
-2. Stamp `bgePrecision="fp16"` into `internal/embed/identity.go` + the bootstrap manifest.
-3. Gate-accept only if mean `cosine(fp32, fp16) ≥ 0.9995` AND nDCG@10 parity on
-   `internal/eval`. Switch the Kaggle accelerator to **T4×2** (fp16 is a wash on P100).
+**fp16 (the only remaining ~2–3× on T4 Tensor Cores; flips EmbedIdentity → forces a
+full re-embed, so decide ONCE before any large run):**
+1. Provide a validated fp16 dense export at the registry's `bge-m3-fp16` dir:
+   `FP16_ONNX_URL=… FP16_DATA_URL=… WITH_FP16=1 make model`. (Converting fp32→fp16
+   needs an offline toolchain outside this repo; supply a trusted/own export.)
+2. Gate it: `EMBED_MODELS_BASE=$PWD go test -tags onnx ./internal/embed -run TestFP16GateVsFP32`
+   (requires mean `cos(fp32,fp16) ≥ 0.9995`). Add an nDCG@10 parity check on `internal/eval`.
+3. Run fp16: `EMBED_MODEL=bge-m3-fp16` on a **T4** (fp16 is a wash on P100/Pascal).
 
-Until then the campaign runs fp32 (identity-safe, already fast via §1). Phase 1/2
-(pre-Rel-99 GSM) is a separate parser PR (corpus.sh 4-digit gate + ReleaseOrdinal
-for majors 0/1/2 + legacy `DecodeVersionCode`).
+Until an fp16 artifact is provided + gated, the campaign runs fp32 (identity-safe,
+already fast via §1's identity-safe levers — all on by default).
+
+**Phase 1/2 (pre-Rel-99 GSM) — deferred, needs YOUR §0 sign-off.** The whole MODERN
+corpus (Rel-99→Rel-20) is the default lexical build. Phase 1/2 stays out because the
+legacy 4-digit / series-00-13 version-code scheme is reverse-engineered + approximate
+and cannot yield an exact `{release, version}` — emitting it would violate §1
+(cite-exactly). `INCLUDE_LEGACY_GSM=1` hits an explicit guard in `scripts/corpus.sh`.
+Enabling it is an architectural decision (§0): it needs an authoritative legacy
+mapping + your written sign-off.
 
 ## 8. Pointers
 
