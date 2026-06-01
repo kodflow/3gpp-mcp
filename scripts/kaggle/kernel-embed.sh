@@ -103,7 +103,7 @@ go build -tags onnx -o "$WORK/embed" ./cmd/embed >/tmp/build.txt 2>&1 || fail bu
 say "build=ok"
 
 # ---- EMBED (recent-first, resumable, time-bounded) --------------------------
-export BGE_M3_DIR="$BGE" ORT_EP="$EP" EMBED_GRAPH_OPT=1
+export EMBED_MODEL_DIR="$BGE" ORT_EP="$EP" EMBED_GRAPH_OPT=1
 REPORT="$WORK/embed-report.json"; START=$(date +%s)
 # --no-hnsw: this is a per-series sub-base; the HNSW is built once post-merge.
 # `timeout` lets the campaign honour the 12h cap and still reach the version tail.
