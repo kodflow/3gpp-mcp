@@ -58,7 +58,16 @@ require_cli() {
 }
 
 kernel_slug()  { echo "${KAGGLE_USER}/3gpp-embed-s$1"; }
-state_slug()   { echo "${KAGGLE_USER}/3gpp-embedded-s$1"; }
+# Resume datasets are PRECISION-SCOPED. The kernel embeds with --resume, which
+# skips any clause that already carries an embedding_hash — so mounting an fp32
+# partial under an fp16 run would leave the old fp32 vectors in place and only
+# add fp16 ones for never-embedded clauses: a silent mixed-precision DB that the
+# per-sub-base serve guard can't even detect. An fp16 campaign therefore gets its
+# own dataset and starts fresh. fp32 keeps the historical bare slug (no churn).
+state_slug() {
+  if [ "$PRECISION" = fp32 ]; then echo "${KAGGLE_USER}/3gpp-embedded-s$1"
+  else echo "${KAGGLE_USER}/3gpp-embedded-s$1-$PRECISION"; fi
+}
 
 # NOTE: there is intentionally NO pre-created empty resume Dataset. Mounting a
 # freshly-created empty dataset is what Kaggle's `kernels push` rejected on the
@@ -145,8 +154,10 @@ version_state() {
   db="$(find "$out" -name '3gpp-embedded.duckdb' | head -1)"
   [ -n "$db" ] || { log "series $s: no embedded DB in output — skipping version"; return 0; }
   local d="$STAGE/state-$s"; mkdir -p "$d"; cp "$db" "$d/3gpp-embedded.duckdb"
-  printf '{\n "title": "3gpp-embedded-s%s",\n "id": "%s",\n "licenses": [{"name": "CC0-1.0"}]\n}\n' \
-    "$s" "$(state_slug "$s")" > "$d/dataset-metadata.json"
+  # Title mirrors the (precision-scoped) slug tail so the fp16 dataset doesn't share
+  # a display name with its fp32 sibling.
+  printf '{\n "title": "%s",\n "id": "%s",\n "licenses": [{"name": "CC0-1.0"}]\n}\n' \
+    "$(basename "$(state_slug "$s")")" "$(state_slug "$s")" > "$d/dataset-metadata.json"
   log "series $s: versioning resume state -> $(state_slug "$s")"
   # Create-or-version: the resume Dataset is no longer pre-created empty (that empty
   # mount is exactly what Kaggle rejected on the first push), so the FIRST publish
@@ -210,10 +221,17 @@ run_one() {
     # Upstream guard 1 — DETERMINISTIC failure: a retry would fail identically and
     # only burn GPU sessions + block the next dispatch. Abort this series at once.
     if series_fatal "$s"; then
-      local why detail
-      why="$(grep -oE 'FAIL=[a-z_]+' "$STAGE/out-$s/RESULT.txt" | head -1)"
-      detail="$(grep -oE 'detail=.*' "$STAGE/out-$s/RESULT.txt" | head -1 | tail -c 200)"
-      log "series $s: NON-RETRYABLE kernel failure ($why) — aborting (fix the build/kernel; a retry fails identically). $detail"
+      local why diag rf="$STAGE/out-$s/RESULT.txt"
+      why="$(grep -oE 'FAIL=[a-z_]+' "$rf" | head -1)"
+      # The actionable message is the kernel's own diagnostic line (embed_rc/err for
+      # embed_run, or the detail= on the FAIL line for build/slice/ort), NOT the first
+      # detail= in the file — that one belongs to the gpu=present banner and is useless.
+      diag="$(grep -oE '(embed_rc=[-0-9]+ err=.*|FAIL=[a-z_]+ detail=.*)' "$rf" | tail -1 | tail -c 240)"
+      log "series $s: NON-RETRYABLE kernel failure ($why) — aborting (a retry fails identically). $diag"
+      # Echo the RESULT tail so the GitHub log carries the full kernel verdict even when
+      # RESULT.txt is not uploaded as an artifact (saves a re-run just to read the error).
+      log "series $s: --- kernel RESULT tail ---"
+      grep -E '^RESULT ' "$rf" 2>/dev/null | tail -8 | sed "s/^/[kaggle-campaign] s$s| /" >&2 || true
       return 2
     fi
     # Upstream guard 2 — NO FORWARD PROGRESS: an unknown/transient failure that did
