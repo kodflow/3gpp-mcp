@@ -12,7 +12,10 @@ name: Release (latest binaries)
 on:
   push:
     branches: [main]
-    paths: ["cmd/**", "internal/**", "go.mod", "go.sum", ".goreleaser*.yaml", ".github/workflows/release.yml"]
+    # Only when the SHIPPED binary's sources change. cmd/server is the only binary
+    # GoReleaser builds, so a change to CI-only tooling (cmd/discover, cmd/embed, …)
+    # must NOT rebuild identical binaries; internal/** stays (cmd/server imports it).
+    paths: ["cmd/server/**", "internal/**", "go.mod", "go.sum", ".goreleaser*.yaml", ".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
