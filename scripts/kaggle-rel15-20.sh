@@ -113,6 +113,26 @@ series_complete() {
   [ -f "$f" ] && grep -q 'complete=1' "$f"
 }
 
+# series_fatal SERIES — true when the kernel hit a DETERMINISTIC failure that a
+# retry cannot fix (build error, embedder disabled, bad/empty slice, corrupt ORT
+# lib, etc.). These are distinguished from TRANSIENT failures (download/clone
+# hiccups: go_dl, duckdb_dl, ort_dl, db_dl, clone, decompress, hf_*), which a retry
+# may clear. Re-running a deterministic failure just burns Kaggle GPU sessions AND
+# blocks the next dispatch behind the concurrency group — so we abort fast instead.
+series_fatal() {
+  local s="$1"; local f="$STAGE/out-$s/RESULT.txt"
+  [ -f "$f" ] && grep -qE 'FAIL=(build|embed_run|slice|empty_slice|ort_untar|ort_nolib|duckdb_run|no_zstd)\b' "$f"
+}
+
+# series_embedded SERIES — the embedded-clause count from the latest pulled RESULT
+# (0 when the kernel failed before reporting). Used to detect forward progress so a
+# stalled series that makes no progress is abandoned rather than retried forever.
+series_embedded() {
+  local s="$1"; local f="$STAGE/out-$s/RESULT.txt" n
+  n="$(grep -oE 'embedded=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)"
+  echo "${n:-0}"
+}
+
 # version_state SERIES — publish the pulled embedded DB back to the resume dataset
 # FROM THE LAPTOP (where creds live). Next run mounts it and resumes.
 version_state() {
@@ -154,8 +174,9 @@ recover_orphan() {
 # retrying on ERROR, until the series reports complete or retries are exhausted.
 run_one() {
   require_cli
-  local s="$1" attempt=0; local dir="$STAGE/kernel-$s"
+  local s="$1" attempt=0 barren=0 prev_emb; local dir="$STAGE/kernel-$s"
   recover_orphan "$s"    # resume a partial left by a killed prior run (GH 6h cap, etc.)
+  prev_emb="$(series_embedded "$s")"   # progress carried over from any recovered partial
   while [ "$attempt" -le "$MAX_RETRIES" ]; do
     attempt=$((attempt+1))
     log "series $s: attempt $attempt/$((MAX_RETRIES+1)) — push"
@@ -181,9 +202,31 @@ run_one() {
     if series_complete "$s"; then
       log "series $s: COMPLETE (null_at_floor=0)"; return 0
     fi
+    # Upstream guard 1 — DETERMINISTIC failure: a retry would fail identically and
+    # only burn GPU sessions + block the next dispatch. Abort this series at once.
+    if series_fatal "$s"; then
+      local why detail
+      why="$(grep -oE 'FAIL=[a-z_]+' "$STAGE/out-$s/RESULT.txt" | head -1)"
+      detail="$(grep -oE 'detail=.*' "$STAGE/out-$s/RESULT.txt" | head -1 | tail -c 200)"
+      log "series $s: NON-RETRYABLE kernel failure ($why) — aborting (fix the build/kernel; a retry fails identically). $detail"
+      return 2
+    fi
+    # Upstream guard 2 — NO FORWARD PROGRESS: an unknown/transient failure that did
+    # not embed anything new across two consecutive attempts is treated as stuck.
+    local emb; emb="$(series_embedded "$s")"
+    if [ "$emb" -le "$prev_emb" ]; then
+      barren=$((barren+1))
+      if [ "$barren" -ge 2 ]; then
+        log "series $s: no forward progress over $barren attempts (embedded=$emb) — abandoning (resume is lossless; re-dispatch after investigating)"
+        return 2
+      fi
+    else
+      barren=0
+    fi
+    prev_emb="$emb"
     case "$state" in
-      complete) log "series $s: kernel complete but partial (time budget) — relaunching to continue" ;;
-      error|cancel) log "series $s: kernel $state — retrying" ;;
+      complete) log "series $s: kernel complete but partial (time budget) — relaunching to continue (embedded=$emb)" ;;
+      error|cancel) log "series $s: kernel $state — retrying (embedded=$emb)" ;;
     esac
   done
   log "series $s: still incomplete after $((MAX_RETRIES+1)) attempts — re-run 'one $s' to continue (resume is lossless)"
