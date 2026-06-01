@@ -15,6 +15,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,13 +82,24 @@ sh("apt-get update -qq && apt-get install -y -qq zstd unzip")
 if not have("zstd"):
     fail("no_zstd")
 
-if not have("go"):
-    if sh("curl -fsSL --retry 5 https://go.dev/dl/go1.23.4.linux-amd64.tar.gz -o /tmp/go.tgz").returncode != 0:
-        fail("go_dl")
-    sh("tar -C /usr/local -xzf /tmp/go.tgz")
-    os.environ["PATH"] = "/usr/local/go/bin:" + os.environ.get("PATH", "")
+# Go toolchain: Kaggle's image ships an OLDER Go (e.g. go1.23.x) and would let
+# GOTOOLCHAIN=auto silently re-download the go.mod toolchain at build time — leaving
+# `go version` misleading and the build non-deterministic. Install EXACTLY the version
+# go.mod declares (fetched from raw GitHub so it auto-tracks future bumps; pinned
+# fallback if the lookup fails), ALWAYS prepend it to PATH so it shadows the
+# preinstalled Go, and pin GOTOOLCHAIN=local so the build uses it with no hidden fetch.
+GO_FALLBACK = "1.26.3"
+_gomod = sh('curl -fsSL --retry 5 "%s/raw/%s/go.mod"' % (REPO, BRANCH)).stdout
+_m = re.search(r"(?m)^go[ \t]+([0-9]+\.[0-9]+\.[0-9]+)", _gomod)
+GO_VER = _m.group(1) if _m else GO_FALLBACK
+if sh("curl -fsSL --retry 5 https://go.dev/dl/go%s.linux-amd64.tar.gz -o /tmp/go.tgz"
+      % GO_VER).returncode != 0:
+    fail("go_dl", "version=%s" % GO_VER)
+sh("rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz")
+os.environ["PATH"] = "/usr/local/go/bin:" + os.environ.get("PATH", "")
+os.environ["GOTOOLCHAIN"] = "local"  # use the installed toolchain; never silently fetch
 gv = sh("go version").stdout.split()
-say("go=%s" % (gv[2] if len(gv) > 2 else "?"))
+say("go=%s want=go%s" % (gv[2] if len(gv) > 2 else "?", GO_VER))
 
 if sh("curl -fsSL --retry 5 -o /tmp/duckdb.zip "
       "https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip").returncode != 0:
