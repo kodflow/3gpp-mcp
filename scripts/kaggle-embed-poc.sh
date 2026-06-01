@@ -12,7 +12,7 @@
 #   1. assemble  : stage the lexical DB + BGE-M3 model + CUDA ORT lib + a source
 #                  tarball (NO creds, NO data/ corpus) into a dataset dir
 #   2. dataset   : kaggle datasets create|version  (push inputs)
-#   3. push      : kaggle kernels push             (run kernel-embed.sh on T4)
+#   3. push      : kaggle kernels push             (run kernel-embed.py on T4)
 #   4. status    : kaggle kernels status           (poll until complete)
 #   5. output    : kaggle kernels output           (pull the embedded 3gpp.duckdb)
 #
@@ -80,7 +80,7 @@ cmd_assemble() {
   git -C "$ROOT" archive --format=tar -o "$DATASET_DIR/src.tar" HEAD
 
   # Copy the kernel body next to its metadata; the kernel is the runnable script.
-  cp "$ROOT/scripts/kaggle/kernel-embed.sh" "$KERNEL_DIR/kernel-embed.sh"
+  cp "$ROOT/scripts/kaggle/kernel-embed.py" "$KERNEL_DIR/kernel-embed.py"
 
   # dataset metadata (kaggle datasets API).
   cat >"$DATASET_DIR/dataset-metadata.json" <<JSON
@@ -96,8 +96,8 @@ JSON
 {
   "id": "${KAGGLE_USER}/${KERNEL_SLUG}",
   "title": "3GPP embed POC",
-  "code_file": "kernel-embed.sh",
-  "language": "bash",
+  "code_file": "kernel-embed.py",
+  "language": "python",
   "kernel_type": "script",
   "is_private": true,
   "enable_gpu": true,
