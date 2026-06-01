@@ -76,6 +76,30 @@ on:
   # manual Kaggle job (corpus-embed-kaggle.yml).
   push:
     branches: [main]
+    # Only auto-run when something that actually affects the corpus changes — so an
+    # unrelated merge (docs, the embed/serve code, the Kaggle scripts) does NOT kick
+    # off the heavy build. discover still makes a triggered run a near-no-op when the
+    # 3GPP site hasn't moved either.
+    paths:
+      - 'cmd/ingest/**'
+      - 'cmd/merge/**'
+      - 'cmd/discover/**'
+      - 'cmd/ingest-catalog/**'
+      - 'cmd/ingest-openapi/**'
+      - 'internal/ingest/**'
+      - 'internal/htmlparse/**'
+      - 'internal/ooxml/**'
+      - 'internal/model/**'
+      - 'internal/catalog/**'
+      - 'internal/openapi/**'
+      - 'internal/subject/**'
+      - 'internal/subjectmeta/**'
+      - 'internal/registry/**'
+      - 'internal/store/schema.sql'
+      - 'scripts/corpus.sh'
+      - 'scripts/lib/convert.sh'
+      - 'scripts/convert-origin.sh'
+      - '.github/workflows/corpus-matrix.yml'
 
 # One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
 # let the newest one supersede it: a delta build diffs against the published `latest`,
@@ -147,7 +171,7 @@ jobs:
           fi
           echo "OK: ORT_VERSION=$ORT_VERSION"
           # HF commits: 40-hex sha pinned in 3 places (Go const, shell URL, YAML env).
-          check_pin "BGE_COMMIT"    "$BGE_COMMIT"    'bgeCommit\s*=\s*"[0-9a-f]+"'    'BAAI/bge-m3/resolve/[0-9a-f]+'
+          check_pin "BGE_COMMIT"    "$BGE_COMMIT"    'BGECommit\s*=\s*"[0-9a-f]+"'    'BAAI/bge-m3/resolve/[0-9a-f]+'
           check_pin "RERANK_COMMIT" "$RERANK_COMMIT" 'rerankCommit\s*=\s*"[0-9a-f]+"' 'celinehoang/bge-reranker-v2-m3-onnx/resolve/[0-9a-f]+'
       # Workflow-dispatch input validation (Qodo PR #49). Fails CLOSED before
       # any expensive job spends a runner-minute on a bad input.
