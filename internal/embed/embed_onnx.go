@@ -372,30 +372,74 @@ func fileExists(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
+// graphOptOn reports whether ORT graph optimisation + EP tuning is requested
+// (EMBED_GRAPH_OPT set and != "0"). Default OFF so the CPU path stays (nil,nil) —
+// byte-identical to today. Graph-opt is algebraic and bit-stable in principle, but
+// gating it keeps the default reproducible and lets the operator opt in for a bulk
+// GPU run (guarded by the A2/cosine invariants).
+func graphOptOn() bool {
+	v := os.Getenv("EMBED_GRAPH_OPT")
+	return v != "" && v != "0"
+}
+
 // sessionOptionsFor builds the ORT SessionOptions for the requested execution
-// provider. CPU returns (nil, nil) — the ORT default needs no options. CUDA
-// allocates a SessionOptions, appends the CUDA EP (device 0), and returns it;
-// the caller owns Destroy(). NewCUDAProviderOptions/AppendExecutionProviderCUDA
-// return an error on a host whose ORT lib lacks CUDA, so the GPU path degrades
-// cleanly instead of crashing. Any unknown ep falls back to CPU.
+// provider. With neither CUDA nor EMBED_GRAPH_OPT it returns (nil, nil) — the ORT
+// default, byte-identical to the historical CPU path. Otherwise it allocates a
+// SessionOptions (caller owns Destroy()) and, best-effort:
+//   - EMBED_GRAPH_OPT: ENABLE_ALL graph fusion + optional warm-start cache
+//     (EMBED_GRAPH_CACHE) so the fused graph is reused across cold starts.
+//   - CUDA: appends the CUDA EP (device 0) after tuning it for steady-state batch
+//     embedding (heuristic conv search, same-stream copies, stable arena;
+//     gpu_mem_limit only when EMBED_GPU_MEM is set so small GPUs aren't starved).
+//
+// Every ORT call that can fail on a CUDA-less / older runtime tears down and
+// returns an error, so the embedder degrades to Disabled{} instead of crashing.
 func sessionOptionsFor(ep string) (*ort.SessionOptions, error) {
-	if ep != EPCUDA {
+	graphOpt := graphOptOn()
+	if ep != EPCUDA && !graphOpt {
 		return nil, nil
 	}
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, err
 	}
-	cuda, err := ort.NewCUDAProviderOptions()
-	if err != nil {
-		_ = opts.Destroy()
-		return nil, err
+	if graphOpt {
+		if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+		if cache := os.Getenv("EMBED_GRAPH_CACHE"); cache != "" {
+			// Best-effort: a cache-path error must not sink the whole session.
+			if err := opts.SetOptimizedModelFilePath(cache); err != nil {
+				log.Printf("embed: EMBED_GRAPH_CACHE %q ignored: %v", cache, err)
+			}
+		}
+		log.Printf("embed: ONNX graph optimisation = ENABLE_ALL")
 	}
-	defer func() { _ = cuda.Destroy() }()
-	if err := opts.AppendExecutionProviderCUDA(cuda); err != nil {
-		_ = opts.Destroy()
-		return nil, err
+	if ep == EPCUDA {
+		cuda, err := ort.NewCUDAProviderOptions()
+		if err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+		defer func() { _ = cuda.Destroy() }()
+		cudaOpts := map[string]string{
+			"cudnn_conv_algo_search":    "HEURISTIC",        // skip slow per-shape conv autotune across length buckets
+			"do_copy_in_default_stream": "1",                // serialise H2D/D2H on the compute stream
+			"arena_extend_strategy":     "kSameAsRequested", // steady-state allocations, less fragmentation
+		}
+		if lim := os.Getenv("EMBED_GPU_MEM"); lim != "" {
+			cudaOpts["gpu_mem_limit"] = lim
+		}
+		if err := cuda.Update(cudaOpts); err != nil {
+			// Tuning is best-effort; a bad key shouldn't kill the GPU path.
+			log.Printf("embed: CUDA EP option tuning skipped: %v", err)
+		}
+		if err := opts.AppendExecutionProviderCUDA(cuda); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+		log.Printf("embed: ONNX execution provider = cuda (device 0)")
 	}
-	log.Printf("embed: ONNX execution provider = cuda (device 0)")
 	return opts, nil
 }
