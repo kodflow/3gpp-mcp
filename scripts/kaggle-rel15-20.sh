@@ -50,18 +50,11 @@ require_cli() {
 kernel_slug()  { echo "${KAGGLE_USER}/3gpp-embed-s$1"; }
 state_slug()   { echo "${KAGGLE_USER}/3gpp-embedded-s$1"; }
 
-# ensure_state_dataset SERIES — pre-create the (initially empty) embedded-state
-# Dataset so the first run can mount it (a non-existent mount fails the push).
-ensure_state_dataset() {
-  local s="$1" slug; slug="$(state_slug "$s")"
-  if kaggle datasets status "$slug" >/dev/null 2>&1; then return 0; fi
-  log "creating empty resume dataset $slug"
-  local d="$STAGE/state-$s"; mkdir -p "$d"
-  : > "$d/.keep"
-  printf '{\n "title": "3gpp-embedded-s%s",\n "id": "%s",\n "licenses": [{"name": "CC0-1.0"}]\n}\n' \
-    "$s" "$slug" > "$d/dataset-metadata.json"
-  kaggle datasets create -p "$d" >/dev/null 2>&1 || log "create $slug: may already exist, continuing"
-}
+# NOTE: there is intentionally NO pre-created empty resume Dataset. Mounting a
+# freshly-created empty dataset is what Kaggle's `kernels push` rejected on the
+# first run; instead the resume Dataset is created lazily by `version_state` on
+# the first publish (create-or-version), and `stage_kernel` mounts it only once it
+# holds embedded state. The first run needs no mount — the kernel fresh-slices.
 
 # stage_kernel SERIES DIR — write the per-series PYTHON code_file (Kaggle kernels
 # only accept language python/r/rmarkdown, never bash): a tiny os.environ.setdefault
@@ -79,8 +72,17 @@ stage_kernel() {
     echo "os.environ.setdefault('EMBED_STATE_DS', '$(state_slug "$s")')"
     cat "$ROOT/scripts/kaggle/kernel-embed.py"
   } > "$dir/kernel.py"
-  printf '{\n "id": "%s",\n "title": "3gpp embed s%s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": ["%s"],\n "competition_sources": [],\n "kernel_sources": []\n}\n' \
-    "$(kernel_slug "$s")" "$s" "$(state_slug "$s")" > "$dir/kernel-metadata.json"
+  # Mount the resume Dataset ONLY once it actually holds embedded state. On the very
+  # first run nothing is published yet; mounting a freshly-created empty dataset is
+  # what Kaggle's push rejects — and it isn't needed, the kernel does a fresh slice
+  # when no RESUME_DB is present. `recover_orphan` repopulates state-$s from Kaggle
+  # before each push, so this local file is a faithful proxy for "resume published".
+  local sources=""
+  if [ -f "$STAGE/state-$s/3gpp-embedded.duckdb" ]; then
+    sources="\"$(state_slug "$s")\""
+  fi
+  printf '{\n "id": "%s",\n "title": "3gpp embed s%s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": [%s],\n "competition_sources": [],\n "kernel_sources": []\n}\n' \
+    "$(kernel_slug "$s")" "$s" "$sources" > "$dir/kernel-metadata.json"
 }
 
 # poll_kernel SERIES — block until the kernel reaches a terminal state. Echoes
@@ -115,8 +117,16 @@ version_state() {
   printf '{\n "title": "3gpp-embedded-s%s",\n "id": "%s",\n "licenses": [{"name": "CC0-1.0"}]\n}\n' \
     "$s" "$(state_slug "$s")" > "$d/dataset-metadata.json"
   log "series $s: versioning resume state -> $(state_slug "$s")"
-  kaggle datasets version -p "$d" -m "series=$s $(date -u +%FT%TZ)" --dir-mode zip >/dev/null 2>&1 \
-    || log "series $s: dataset version failed (see kaggle logs)"
+  # Create-or-version: the resume Dataset is no longer pre-created empty (that empty
+  # mount is exactly what Kaggle rejected on the first push), so the FIRST publish
+  # must `create`; later publishes `version`. Distinguish by querying its status.
+  if kaggle datasets status "$(state_slug "$s")" >/dev/null 2>&1; then
+    kaggle datasets version -p "$d" -m "series=$s $(date -u +%FT%TZ)" --dir-mode zip >/dev/null 2>&1 \
+      || log "series $s: dataset version failed (see kaggle logs)"
+  else
+    kaggle datasets create -p "$d" --dir-mode zip >/dev/null 2>&1 \
+      || log "series $s: dataset create failed (see kaggle logs)"
+  fi
 }
 
 # recover_orphan SERIES — DURABILITY KEYSTONE. Pull whatever the kernel left as its
@@ -139,13 +149,21 @@ recover_orphan() {
 run_one() {
   require_cli
   local s="$1" attempt=0; local dir="$STAGE/kernel-$s"
-  ensure_state_dataset "$s"
   recover_orphan "$s"    # resume a partial left by a killed prior run (GH 6h cap, etc.)
   while [ "$attempt" -le "$MAX_RETRIES" ]; do
     attempt=$((attempt+1))
     log "series $s: attempt $attempt/$((MAX_RETRIES+1)) — push"
     stage_kernel "$s" "$dir"
-    kaggle kernels push -p "$dir" >/dev/null || { log "series $s: push failed"; sleep 15; continue; }
+    # Capture push output so a failure surfaces its REASON (auth, invalid metadata,
+    # missing/unready dataset source). The CLI exits non-zero on failure — that is the
+    # control gate; the captured text only enriches the log (no fragile string-match
+    # that could mis-flag a successful push).
+    local push_out push_rc
+    push_out="$(kaggle kernels push -p "$dir" 2>&1)"; push_rc=$?
+    if [ "$push_rc" -ne 0 ]; then
+      log "series $s: push failed (rc=$push_rc): $(printf '%s' "$push_out" | tr '\n' ' ' | tail -c 400)"
+      sleep 15; continue
+    fi
     local state; state="$(poll_kernel "$s")"
     mkdir -p "$STAGE/out-$s"
     kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
