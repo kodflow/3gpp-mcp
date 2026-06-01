@@ -72,7 +72,11 @@ func newEmbedder() Embedder {
 	}
 	modelDir := activeModelDir(spec)
 	modelPath := filepath.Join(modelDir, "model.onnx")
-	tokPath := filepath.Join(resolveBase(spec.tokenizerDirOrModel()), "tokenizer.json")
+	// Tokenizer follows the SAME EMBED_MODEL_DIR override as the model (unless the
+	// spec pins an explicit TokenizerDir) — see activeTokenizerDir. Using the bare
+	// relative spec.Dir here was the bug that disabled the Kaggle GPU embedder:
+	// model.onnx resolved via the override but tokenizer.json did not.
+	tokPath := filepath.Join(activeTokenizerDir(spec), "tokenizer.json")
 	if !fileExists(onnxrt.LibPath()) || !fileExists(modelPath) || !fileExists(tokPath) {
 		if spec.Precision == PrecisionFP16 {
 			log.Printf("embed: model %q (fp16) not present at %s — disabling vectors (refusing to run another model under an fp16 identity)", spec.Name, modelDir)
