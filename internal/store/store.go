@@ -528,6 +528,44 @@ func (s *Store) SetEmbeddingWithHash(ctx context.Context, chunkID uint64, vec []
 	return err
 }
 
+// SetEmbeddingsBatch writes a whole batch of (vector, hash) pairs in ONE
+// transaction instead of one autocommit per clause. On DuckDB every autocommit
+// UPDATE forces a WAL flush, so per-row writes dominate the embed wall-clock at
+// scale; folding a window's writes into a single BEGIN…COMMIT amortises that to
+// one flush per window. Each row's vector and hash still land in the same UPDATE,
+// so a mid-window crash either has both or neither for a given clause — the resume
+// marker is never torn from its vector. ids/vecs/hashes must be equal length; an
+// empty vector skips that row.
+func (s *Store) SetEmbeddingsBatch(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(vecs) != len(ids) || len(hashes) != len(ids) {
+		return fmt.Errorf("SetEmbeddingsBatch: ragged input ids=%d vecs=%d hashes=%d", len(ids), len(vecs), len(hashes))
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE clauses SET embedding = CAST(? AS FLOAT[1024]), embedding_hash = ? WHERE chunk_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for i := range ids {
+		if len(vecs[i]) == 0 {
+			continue
+		}
+		if _, err := stmt.ExecContext(ctx, vecLiteral(vecs[i]), hashes[i], ids[i]); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // EmbedCandidate is a clause the embed step may need to (re)embed: the text to
 // embed plus the hash currently stored against its vector ("" when never
 // embedded). The caller recomputes the expected hash and skips rows where it
