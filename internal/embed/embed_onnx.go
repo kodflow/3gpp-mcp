@@ -101,23 +101,71 @@ var batchSize = envInt("BGE_BATCH", 32)
 // batch yields the same vectors as one-at-a-time (asserted in the A2 test).
 const padID int64 = 1
 
+// pipelineOn reports whether the 2-stage tokenise/run pipeline is enabled
+// (EMBED_PIPELINE != "0", default on). When off, Embed runs the legacy serial
+// loop — byte-identical output, just no CPU/GPU overlap.
+func pipelineOn() bool { return envOr("EMBED_PIPELINE", "1") != "0" }
+
 // Embed tokenises and runs BGE-M3 in padded batches of batchSize, returning
 // L2-normalised 1024-dim dense vectors (cosine/HNSW expect unit norm).
-func (e *onnxEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+//
+// With more than one batch and the pipeline enabled, a SINGLE tokeniser goroutine
+// prepares batch N+1 (pure CPU) while the caller goroutine runs batch N on the GPU
+// under e.mu — overlapping the otherwise-serial tokenise and inference. One
+// tokeniser goroutine (never a pool) means e.tok is still touched serially within
+// a call, so this introduces no new concurrency on the tokenizer; the output is
+// byte-identical to the serial path (same tokens, padding, runs, by-index writes).
+func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if e.windowing == "mean_pool" {
 		return e.embedWindowed(texts)
 	}
 	out := make([][]float32, len(texts))
-	for start := 0; start < len(texts); start += batchSize {
-		end := start + batchSize
-		if end > len(texts) {
-			end = len(texts)
+	if len(texts) == 0 {
+		return out, nil
+	}
+	// One batch (or pipeline disabled): nothing to overlap — run serially.
+	if !pipelineOn() || len(texts) <= batchSize {
+		for start := 0; start < len(texts); start += batchSize {
+			end := min(start+batchSize, len(texts))
+			if err := e.embedBatch(texts[start:end], out[start:end]); err != nil {
+				return nil, err
+			}
 		}
-		if err := e.embedBatch(texts[start:end], out[start:end]); err != nil {
+		return out, nil
+	}
+
+	// Producer: tokenise+pack each batch in order on its own goroutine, feeding a
+	// small buffered channel. A defer-recover converts any unexpected tokenizer
+	// panic into an error (degrade-never-block) instead of crashing the process.
+	prepCh := make(chan preparedBatch, 2)
+	var tokErr error
+	go func() {
+		defer close(prepCh)
+		defer func() {
+			if r := recover(); r != nil {
+				tokErr = fmt.Errorf("tokenizer goroutine panicked: %v", r)
+			}
+		}()
+		for start := 0; start < len(texts); start += batchSize {
+			end := min(start+batchSize, len(texts))
+			pb := e.prepareBatch(texts[start:end], start)
+			select {
+			case prepCh <- pb:
+			case <-ctx.Done():
+				tokErr = ctx.Err()
+				return
+			}
+		}
+	}()
+
+	// Consumer (this goroutine): run each prepared batch on the GPU and write its
+	// vectors to their output positions. Serialised by e.mu inside runPrepared.
+	for pb := range prepCh {
+		if err := e.runPrepared(pb, out); err != nil {
 			return nil, err
 		}
 	}
-	return out, nil
+	return out, tokErr
 }
 
 // embedWindowed splits each text into ≤defaultWindowWords word-windows, embeds
@@ -198,12 +246,22 @@ func (e *onnxEmbedder) tokenizeSafe(text string) []int {
 	return []int{xlmrCLS, xlmrSEP}
 }
 
-// embedBatch embeds one batch (len <= batchSize) into dst (same length). It
-// pads every row to the batch's longest sequence and lets attention_mask zero
-// the padding, so batching never changes a vector — only the throughput.
-func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
+// preparedBatch is a tokenised, padded batch ready for the GPU, plus where its
+// vectors belong in the caller's output slice (out[start : start+n]).
+type preparedBatch struct {
+	start    int     // output offset
+	n        int     // batch size (rows)
+	maxLen   int     // padded sequence length
+	flatIDs  []int64 // [n*maxLen] input_ids
+	flatMask []int64 // [n*maxLen] attention_mask
+}
+
+// prepareBatch is the CPU half of an embed: tokenise + truncate + pad one batch
+// (len <= batchSize) into flat input_ids / attention_mask tensors. No GPU, no
+// shared mutable state beyond the tokenizer — so it can run on the producer
+// goroutine while the GPU runs an earlier batch. start is the output offset.
+func (e *onnxEmbedder) prepareBatch(texts []string, start int) preparedBatch {
 	b := len(texts)
-	// 1. tokenise + truncate; track the longest row for padding.
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, t := range texts {
@@ -220,7 +278,6 @@ func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
 			maxLen = len(row)
 		}
 	}
-	// 2. pack into padded [b, maxLen] input_ids + attention_mask.
 	flatIDs := make([]int64, b*maxLen)
 	flatMask := make([]int64, b*maxLen)
 	for i, row := range rows {
@@ -230,22 +287,30 @@ func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
 				flatIDs[base+j] = row[j]
 				flatMask[base+j] = 1
 			} else {
-				flatIDs[base+j] = padID // masked out below
+				flatIDs[base+j] = padID // masked out by attention_mask
 			}
 		}
 	}
-	shape := ort.NewShape(int64(b), int64(maxLen))
-	idsT, err := ort.NewTensor(shape, flatIDs)
+	return preparedBatch{start: start, n: b, maxLen: maxLen, flatIDs: flatIDs, flatMask: flatMask}
+}
+
+// runPrepared is the GPU half: build the tensors, run BGE-M3 under e.mu (ORT
+// session.Run is not guaranteed concurrent-safe), L2-normalise, and write the
+// vectors to out[pb.start : pb.start+pb.n]. Padding is attention-masked, so a
+// padded row yields the same vector as if embedded alone (the A2 invariant).
+func (e *onnxEmbedder) runPrepared(pb preparedBatch, out [][]float32) error {
+	shape := ort.NewShape(int64(pb.n), int64(pb.maxLen))
+	idsT, err := ort.NewTensor(shape, pb.flatIDs)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = idsT.Destroy() }()
-	maskT, err := ort.NewTensor(shape, flatMask)
+	maskT, err := ort.NewTensor(shape, pb.flatMask)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = maskT.Destroy() }()
-	outT, err := ort.NewEmptyTensor[float32](ort.NewShape(int64(b), int64(Dim)))
+	outT, err := ort.NewEmptyTensor[float32](ort.NewShape(int64(pb.n), int64(Dim)))
 	if err != nil {
 		return err
 	}
@@ -257,13 +322,19 @@ func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
 	if err != nil {
 		return fmt.Errorf("onnx run: %w", err)
 	}
-	data := outT.GetData() // flat [b * Dim]
-	for i := 0; i < b; i++ {
+	data := outT.GetData() // flat [n * Dim]
+	for i := 0; i < pb.n; i++ {
 		vec := append([]float32(nil), data[i*Dim:(i+1)*Dim]...)
 		l2normalize(vec)
-		dst[i] = vec
+		out[pb.start+i] = vec
 	}
 	return nil
+}
+
+// embedBatch embeds one batch (len <= batchSize) into dst (same length) — the
+// serial prepare+run used by the non-pipelined path and the windowed path.
+func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
+	return e.runPrepared(e.prepareBatch(texts, 0), dst)
 }
 
 func l2normalize(v []float32) {
