@@ -48,6 +48,10 @@ on:
         description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen)."
         type: string
         default: "Rel-99"
+      include_legacy_gsm:
+        description: "Also index legacy GSM Phase 1/2 LEXICALLY under the honest 'GSM' bucket (§0; never vectorised). Pair with a legacy series in series_scope, e.g. '04 05 08'."
+        type: boolean
+        default: false
       publish_to_latest:
         description: "Publish the consolidated DB + index to the rolling 'latest' release (ONLY honoured on a whole-corpus run: no series_scope, not a PR)."
         type: boolean
@@ -535,6 +539,10 @@ jobs:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
+          # Opt-in (§0): index legacy GSM Phase 1/2 lexically under the honest "GSM"
+          # bucket. Pair with a legacy series in series_scope (e.g. "04 05 08"); these
+          # clauses are below every embed floor → never vectorised.
+          INCLUDE_LEGACY_GSM: ${{ github.event.inputs.include_legacy_gsm == 'true' && '1' || '0' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
       # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
       # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE
@@ -667,7 +675,7 @@ jobs:
         if: github.event.inputs.embed == 'true'
         env:
           EMBEDDER: bge-m3
-          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
+          EMBED_MODEL_DIR: ${{ github.workspace }}/data/models/bge-m3
           ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
           EMBED_WINDOWING: mean_pool
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
