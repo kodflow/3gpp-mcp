@@ -209,6 +209,18 @@ type errReason string
 
 func (e errReason) Error() string { return string(e) }
 
+// rrfKey is the LOGICAL identity of a clause for fusion. It must NOT be the
+// store's chunk_id: chunk_id is a per-DB counter (ingest.go restarts it at 1 in
+// every shard), so two distinct clauses from two sub-bases collide on the same
+// chunk_id. Keying RRF on chunk_id then silently drops one clause and
+// misattributes its rank mass to the other — a cite-or-silent hallucination
+// (finding rrf-chunkid-collision-across-shards). The 3GPP-canonical identity is
+// (spec_id, release, version, clause_path); that tuple is globally unique across
+// shards and is exactly the citation the server returns.
+func rrfKey(c model.Clause) string {
+	return c.SpecID + "\x00" + c.Release + "\x00" + c.Version + "\x00" + c.ClausePath
+}
+
 // RRF fuses ranked lists by Reciprocal Rank Fusion (CLAUDE.md §3, k=60).
 // score(doc) = Σ 1/(k + rank_i(doc)). Lists are ranked best-first. With a
 // single list it preserves order (monotonic in rank).
@@ -217,19 +229,20 @@ func RRF(k float64, lists ...[]model.SearchHit) []model.SearchHit {
 		hit   model.SearchHit
 		score float64
 	}
-	byID := map[uint64]*agg{}
+	byKey := map[string]*agg{}
 	for _, list := range lists {
 		for rank, h := range list {
-			a, ok := byID[h.Clause.ChunkID]
+			key := rrfKey(h.Clause)
+			a, ok := byKey[key]
 			if !ok {
 				a = &agg{hit: h}
-				byID[h.Clause.ChunkID] = a
+				byKey[key] = a
 			}
 			a.score += 1.0 / (k + float64(rank+1))
 		}
 	}
-	out := make([]model.SearchHit, 0, len(byID))
-	for _, a := range byID {
+	out := make([]model.SearchHit, 0, len(byKey))
+	for _, a := range byKey {
 		a.hit.Score = a.score
 		out = append(out, a.hit)
 	}

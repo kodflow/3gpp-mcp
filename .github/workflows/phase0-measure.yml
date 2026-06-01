@@ -178,7 +178,7 @@ jobs:
     env:
       CORPUS_DROP_ZIPS: "1"
       EMBEDDER: "bge-m3"
-      BGE_M3_DIR: data/models/bge-m3
+      EMBED_MODEL_DIR: data/models/bge-m3
       ONNXRUNTIME_SHARED_LIBRARY_PATH: data/models/onnxruntime/lib/libonnxruntime.so
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

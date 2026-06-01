@@ -12,6 +12,17 @@ import (
 // missing/stale. These methods add the CHECKPOINT fencing, verification, and
 // freeze markers around the raw BuildHNSW/EnableVSS already in store.go.
 
+// VectorMetaKeys is the complete set of schema_meta keys that describe vector
+// capability. BuildAndFreezeHNSW WRITES every one (except hnsw_state, which it
+// flips last as the gate) and a strip-to-lexical path must DELETE every one — so
+// the slim DB never advertises semantic capability it can no longer realise.
+// Sourcing both the write and the purge from this single slice is what stops the
+// two lists from drifting (the omission that left hnsw_metric behind:
+// hnsw-metric-omitted-from-strip-cleanup / strip-meta-test-tautological).
+var VectorMetaKeys = []string{
+	"hnsw_state", "hnsw_metric", "embedding_dim", "embedding_count", "embedding_model",
+}
+
 // OpenReadOnly opens the DuckDB file in read-only mode — the serve posture: no
 // writes ⇒ no WAL ⇒ the unsupported "custom index + WAL replay" path can't occur.
 func OpenReadOnly(path string) (*Store, error) {

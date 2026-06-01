@@ -166,7 +166,9 @@ func pointModelsAtCache() {
 			_ = os.Setenv("ONNXRUNTIME_SHARED_LIBRARY_PATH", lib)
 		}
 	}
-	setIfPresent("BGE_M3_DIR", models+"/bge-m3", "model.onnx")
+	// EMBED_MODEL_DIR points the active embed model (default bge-m3) at the cached
+	// copy, so serve finds it without the user exporting anything (registry seam).
+	setIfPresent("EMBED_MODEL_DIR", models+"/bge-m3", "model.onnx")
 	setIfPresent("BGE_RERANKER_DIR", models+"/bge-reranker-v2-m3", "model.onnx")
 }
 

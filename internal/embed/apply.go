@@ -4,16 +4,33 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+
+	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // ClauseHash is the per-clause embedding fingerprint: it changes iff the embedded
-// text (heading + body, exactly what EmbedText feeds the model) OR the model
+// text (heading + body, exactly what EmbedText feeds the model) OR the EmbedIdentity
 // changes. Stored next to the vector so the decoupled embed step can re-embed
 // ONLY clauses whose hash drifted — making repeat runs proportional to the clause
 // delta, not the spec or corpus. Keep this the single definition of "what text we
 // embed" so ingest and cmd/embed never disagree.
+//
+// The model component is the canonical model.EmbedIdentity (plan PR-3/PR-6), so
+// the re-embed gate keys on the SAME identity as DB meta and serve-time
+// compatibility checks. modelID is the embedder's ModelID(): for the production
+// BGE-M3 backend that is ALREADY the full EmbedIdentity digest (model family +
+// weight revision + tokenizer revision + dim + normalisation + precision — see
+// embed.bgeModelID), so a change in any of those components re-embeds every clause
+// WITHOUT re-ingesting. Wrapping it in EmbedParts.ModelID keeps a single
+// definition of the embed component and stays deterministic for the lexical
+// ("hash-local") and disabled ("") embedders too.
 func ClauseHash(heading, text, modelID string) string {
-	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + modelID))
+	embedID := model.EmbedIdentity(model.EmbedParts{ModelID: modelID})
+	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + embedID))
 	return hex.EncodeToString(h[:])[:16]
 }
 
@@ -34,65 +51,147 @@ type Item struct {
 // store.SetEmbeddingWithHash). Returning an error aborts the batch.
 type SetFunc func(ctx context.Context, chunkID uint64, vec []float32, hash string) error
 
+// BatchSetFunc persists a whole batch of (vector, hash) pairs in one shot (e.g.
+// store.SetEmbeddingsBatch, one transaction). ids/vecs/hashes are parallel slices.
+// Preferred over SetFunc at scale: one commit per batch instead of one per clause.
+type BatchSetFunc func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error
+
+// PerRow adapts a per-clause SetFunc into a BatchSetFunc by looping — so a caller
+// that only has a per-row writer (e.g. the inline ingest path) still satisfies the
+// batched Apply without changing its store call.
+func PerRow(set SetFunc) BatchSetFunc {
+	return func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+		for i := range ids {
+			if err := set(ctx, ids[i], vecs[i], hashes[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// applyBatch is the fixed batch size handed to the embedder (BGE-M3 reproducibility
+// contract; overridable on the GPU path via BGE_BATCH inside the onnx backend).
+const applyBatch = 32
+
+// defaultBucketWindow bounds how many needing-embed items are buffered before a
+// length-bucket + flush. A window large enough to span many batches lets us group
+// similar-length clauses together (tight padding) while staying a contiguous band
+// of the recent-first work-list, so coarse recency priority survives.
+const defaultBucketWindow = 4096
+
+// bucketWindow reads EMBED_BUCKET_WINDOW (default defaultBucketWindow). 0/1 (or any
+// value < applyBatch) disables length-bucketing and restores the legacy in-order,
+// streamed batching. Build-tag-free (apply.go is in the default build, so it cannot
+// borrow envInt from the onnx-only embed_onnx.go).
+func bucketWindow() int {
+	if v := os.Getenv("EMBED_BUCKET_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultBucketWindow
+}
+
+// embedLen is the cheap length proxy used to bucket clauses: byte length of the
+// embedded text. It correlates closely enough with token count for padding to be
+// the dominant cost, and avoids allocating a token/word split per item.
+func embedLen(it Item) int { return len(it.Heading) + len(it.Text) }
+
 // Apply embeds the items whose current hash differs from their StoredHash (or that
 // were never embedded) and persists each via set. Items already up to date are
-// skipped — this is the micro-granular re-embed. It batches in groups of 32
-// (the BGE-M3 reproducibility contract) and returns the number of clauses
+// skipped — this is the micro-granular re-embed. Returns the number of clauses
 // actually embedded. A disabled embedder embeds nothing (returns 0, nil).
 //
+// Throughput: needing-embed items are buffered into a bounded window and
+// LENGTH-BUCKETED before batching, so each fixed-size batch has near-uniform
+// sequence length and the padded tensor is tight. On 3GPP — where a 12-token
+// heading and a 512-token table can otherwise share a batch padded to 512 — this
+// is the single biggest GPU win and is identity-safe: padding is attention-masked
+// (a vector never depends on its batch-mates) and set() is keyed by chunk_id, so
+// the reordering changes nothing stored. Disable with EMBED_BUCKET_WINDOW<32.
+//
 // Shared by the inline ingest path and the standalone cmd/embed binary so the
-// batching, hashing, and skip logic live in exactly one place.
+// batching, hashing, and skip logic live in exactly one place. Apply uses a per-row
+// writer; ApplyBatched takes a batch writer for one commit per window at scale.
 func Apply(ctx context.Context, e Embedder, items []Item, set SetFunc) (int, error) {
+	return ApplyBatched(ctx, e, items, PerRow(set))
+}
+
+// ApplyBatched is Apply with a batch-native writer: each length-bucketed window is
+// embedded and then persisted in ONE batchSet call (e.g. store.SetEmbeddingsBatch's
+// single transaction), so the write cost is one commit per window, not per clause.
+func ApplyBatched(ctx context.Context, e Embedder, items []Item, batchSet BatchSetFunc) (int, error) {
 	if !e.Enabled() || len(items) == 0 {
 		return 0, nil
 	}
 	modelID := e.ModelID()
-	const batch = 32
 	embedded := 0
-	// Accumulate only the items that need embedding, then flush in fixed-size
-	// batches so the model always sees full batches regardless of how many were
-	// skipped.
-	pending := make([]Item, 0, batch)
-	hashes := make([]string, 0, batch)
 
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
+	// job pairs a needing-embed item with its already-computed target hash.
+	type job struct {
+		item Item
+		hash string
+	}
+
+	windowSize := bucketWindow()
+	sortWithin := windowSize > applyBatch
+	if windowSize < applyBatch {
+		windowSize = applyBatch // never emit short batches just because the window is tiny
+	}
+
+	// processWindow length-sorts (when enabled) then hands the whole window to the
+	// embedder in ONE call, so the backend can internally batch (by batchSize) and
+	// pipeline tokenisation against GPU inference across those batches. set() is
+	// then applied per clause (keyed by chunk_id), so output order is irrelevant.
+	processWindow := func(jobs []job) error {
+		if sortWithin {
+			sort.SliceStable(jobs, func(i, j int) bool {
+				return embedLen(jobs[i].item) < embedLen(jobs[j].item)
+			})
 		}
-		texts := make([]string, len(pending))
-		for i, it := range pending {
-			texts[i] = EmbedText(it.Heading, it.Text)
+		texts := make([]string, len(jobs))
+		for i, j := range jobs {
+			texts[i] = EmbedText(j.item.Heading, j.item.Text)
 		}
 		vecs, err := e.Embed(ctx, texts)
 		if err != nil {
 			return err
 		}
-		for i, v := range vecs {
-			if err := set(ctx, pending[i].ChunkID, v, hashes[i]); err != nil {
-				return err
-			}
-			embedded++
+		if len(vecs) != len(jobs) {
+			return fmt.Errorf("embedder returned %d vectors for %d texts", len(vecs), len(jobs))
 		}
-		pending = pending[:0]
-		hashes = hashes[:0]
+		ids := make([]uint64, len(jobs))
+		hashes := make([]string, len(jobs))
+		for i, j := range jobs {
+			ids[i] = j.item.ChunkID
+			hashes[i] = j.hash
+		}
+		if err := batchSet(ctx, ids, vecs, hashes); err != nil {
+			return err
+		}
+		embedded += len(jobs)
 		return nil
 	}
 
+	window := make([]job, 0, windowSize)
 	for _, it := range items {
 		want := ClauseHash(it.Heading, it.Text, modelID)
 		if it.StoredHash == want {
 			continue // already embedded with this exact text + model — skip.
 		}
-		pending = append(pending, it)
-		hashes = append(hashes, want)
-		if len(pending) == batch {
-			if err := flush(); err != nil {
+		window = append(window, job{item: it, hash: want})
+		if len(window) >= windowSize {
+			if err := processWindow(window); err != nil {
 				return embedded, err
 			}
+			window = window[:0]
 		}
 	}
-	if err := flush(); err != nil {
-		return embedded, err
+	if len(window) > 0 {
+		if err := processWindow(window); err != nil {
+			return embedded, err
+		}
 	}
 	return embedded, nil
 }

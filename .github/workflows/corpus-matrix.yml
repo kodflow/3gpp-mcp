@@ -48,6 +48,10 @@ on:
         description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen)."
         type: string
         default: "Rel-99"
+      include_legacy_gsm:
+        description: "Also index legacy GSM Phase 1/2 LEXICALLY under the honest 'GSM' bucket (§0; never vectorised). Pair with a legacy series in series_scope, e.g. '04 05 08'."
+        type: boolean
+        default: false
       publish_to_latest:
         description: "Publish the consolidated DB + index to the rolling 'latest' release (ONLY honoured on a whole-corpus run: no series_scope, not a PR)."
         type: boolean
@@ -64,6 +68,23 @@ on:
         description: "Per-shard timeout (max 360 on free hosted runners; lower to force the auto-resume chain quickly during testing — e.g. 10 to validate resume in ~30min)."
         type: string
         default: "360"
+  # AUTOMATIC on merge to main: a delta (append) lexical build — FULL the first time
+  # (no published index yet), then only the changed series on later merges. discover
+  # diffs the live 3GPP status + the build identities vs the published `latest`, so a
+  # no-op merge produces an empty matrix and costs ~1 min. Publishes to `latest` and
+  # includes Phase 1/2 (legacy GSM). Embedding is NOT done here — it is the separate,
+  # manual Kaggle job (corpus-embed-kaggle.yml).
+  push:
+    branches: [main]
+
+# One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
+# let the newest one supersede it: a delta build diffs against the published `latest`,
+# so the superseding run is a SUPERSET (it re-does anything the cancelled run dropped)
+# and ends by re-publishing `latest` — the final state is always the newest merge's.
+# This guarantees we never stack two identical corpus builds.
+concurrency:
+  group: corpus-build
+  cancel-in-progress: true
 
 permissions:
   contents: read # discover/build-shard read-only; merge elevates per-job
@@ -185,6 +206,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             scope="21 24"; floor="Rel-19"; full="false"
           fi
+          # AUTO (push to main): no dispatch inputs are present, so default the floor
+          # to Rel-99 (whole modern corpus). scope stays empty → delta-or-full discover;
+          # publish is enabled below; INCLUDE_LEGACY_GSM (Phase 1/2) is set on convert.
+          [ -n "$floor" ] || floor="Rel-99"
           if [ -n "$scope" ]; then
             matrix=$(printf '%s\n' $scope | jq -R . | jq -cs .)   # explicit series
           else
@@ -194,10 +219,21 @@ jobs:
             # the delta even when no norm moved (plan TROU #1).
             gh release download latest --repo "$GITHUB_REPOSITORY" -p corpus-index.json -D . 2>/dev/null || true
             gh release download latest --repo "$GITHUB_REPOSITORY" -p subject-index.json -D . 2>/dev/null || true
+            # build-index.json carries the three canonical identities; a drift in
+            # the embed identity (model weight/tokenizer/dim/precision bump) or the
+            # spec-ingest identity forces a full rebuild even when no spec version
+            # moved (plan PR-3/PR-6). --embed-model is the FAMILY discover resolves
+            # to the canonical EmbedIdentity; keep it in lockstep with EMBEDDER on
+            # the build-shard job (default lexical when embed=false).
+            gh release download latest --repo "$GITHUB_REPOSITORY" -p build-index.json -D . 2>/dev/null || true
+            embed_model=""
+            if [ "${{ github.event.inputs.embed }}" = "true" ]; then
+              embed_model="bge-m3"
+            fi
             if [ "$full" = "true" ]; then
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor")
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --floor "$floor")
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor")
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -211,9 +247,12 @@ jobs:
           # was passed. This is the guard that stops a "small test scenario" from
           # shrinking latest (e.g. the 3031→149 clobber that motivated it): latest
           # is written exclusively by the job that builds the entire corpus.
+          # A whole-corpus run publishes `latest` when EITHER publish_to_latest=true
+          # (manual dispatch) OR it's an automatic push-to-main build. Both still
+          # require an unscoped (whole-corpus) run — a scoped test never clobbers latest.
           publish=false
           if [ "${{ github.event_name }}" != "pull_request" ] \
-             && [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] \
+             && { [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; } \
              && [ -z "$scope" ]; then
             publish=true
           fi
@@ -485,12 +524,66 @@ jobs:
             rm -rf data/models/onnxruntime data/models/bge-m3 data/models/bge-reranker-v2-m3
             ./scripts/fetch-model.sh
           fi
+      # ── CONVERT/ORIGIN cache (PR-9 — perf only, NEVER correctness state) ──────
+      # The LibreOffice .doc→HTML conversion (data/sources/convert) is the single
+      # most expensive phase and the dominant reason a 6h-capped big series (e.g.
+      # 24) makes no forward progress on --resume: the shard cache + always-upload
+      # artifact persist ONLY dist/shard-*.duckdb, so a resumed run on a FRESH
+      # runner re-downloads + re-converts the WHOLE series from zero (corpus.sh
+      # skips a file only when its HTML/zip already sits on disk — wiped with the
+      # runner) before ingest can skip its 'done' specs. Restoring the converted
+      # HTML (and the origin zips) lets corpus.sh convert/download only the delta.
+      #
+      # This is a PURE optimisation, decoupled from the shard DB on purpose:
+      #   - separate cache namespace (`convert-v1-…`), separate from `shard-v2-…`,
+      #     so a convert-cache miss/eviction NEVER affects shard correctness and a
+      #     stale convert restore is harmless — corpus.sh re-converts anything
+      #     missing and ingest re-reads HTML from disk regardless.
+      #   - keyed on the per-shard tag (series OR series-release), so each entry is
+      #     bounded to ONE series/release slice → fits the 10 GiB repo cache budget
+      #     (a single series' convert+origin is well under it; the shard cache's
+      #     ~5 GiB and this share the same TTL-evicted pool).
+      #   - hash of the convert scripts only: a converter change (corpus.sh /
+      #     lib/convert.sh) busts the HTML cache so the new conversion is produced;
+      #     ingest/embed/model bumps do NOT bust it (they don't change the HTML).
+      #   - NO pipeline_version / embed_floor in the key: the converted HTML is
+      #     identical for lexical and embed runs, so both modes share it.
+      - name: Convert/origin cache (resume convert baseline — perf only)
+        id: convert_cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
+        with:
+          path: |
+            data/sources/convert
+            data/sources/origin
+          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
+          restore-keys: |
+            convert-v1-${{ steps.shard.outputs.tag }}-
       - name: Download + convert series ${{ steps.shard.outputs.tag }}
         env:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
+          # Index legacy GSM Phase 1/2 lexically under the honest "GSM" bucket. Enabled by
+          # ANY of: the repo variable vars.INCLUDE_LEGACY_GSM (case-tolerant true/TRUE/1 —
+          # a set-and-forget repo toggle), the per-dispatch include_legacy_gsm checkbox, or
+          # an automatic push build (whole corpus Phase 1 → Rel-20). These clauses are below
+          # every embed floor → indexed for BM25/LIKE but never vectorised.
+          INCLUDE_LEGACY_GSM: ${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '1' || '0' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
+      # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
+      # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE
+      # the "Free HTML before artifact upload" rm -rf below — capturing the HTML
+      # while it still exists on disk. Best-effort: skipped on an exact-key hit
+      # (nothing new to store) and never fails the job (perf-only state).
+      - name: Save convert/origin cache (perf only — feeds next --resume)
+        if: always() && steps.convert_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4
+        with:
+          path: |
+            data/sources/convert
+            data/sources/origin
+          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success
@@ -608,7 +701,7 @@ jobs:
         if: github.event.inputs.embed == 'true'
         env:
           EMBEDDER: bge-m3
-          BGE_M3_DIR: ${{ github.workspace }}/data/models/bge-m3
+          EMBED_MODEL_DIR: ${{ github.workspace }}/data/models/bge-m3
           ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
           EMBED_WINDOWING: mean_pool
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
@@ -627,12 +720,20 @@ jobs:
             # without a vector. We key on null_embeddings_at_floor, NOT the global
             # null_embeddings: with --embed-floor set, below-floor clauses are
             # LEFT NULL on purpose (lexical-only), so global null is never 0 and
-            # would fail every shard with older releases. _at_floor==0 means the
+            # would fail every shard with older releases. The gate ALSO requires
+            # .hnsw==true: a transient BuildAndFreezeHNSW failure leaves vectors
+            # present but the index unfrozen (rep.HNSW=false) and is otherwise
+            # non-fatal, so a shard could ship fully vectorised but UNINDEXED
+            # (serve degrades to O(N) exact scan, no alert). Failing the attempt
+            # makes the retry re-run the cheap build (0 re-embeds via
+            # embedding_hash) instead of publishing an unindexed sub-base
+            # (embed-gate-ignores-hnsw-false / hnsw-freeze-failure-not-gated).
+            # _at_floor==0 means the
             # shard is fully vectorised at/above the floor; a 6h-cap partial
             # leaves >0 and fails → the rerun resumes via embedding_hash.
             if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
                  --require-semantic --report json | tee "$RPT" \
-               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0' "$RPT"; then
+               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
               embed_ok=1
             fi
             echo "::endgroup::"
@@ -646,6 +747,27 @@ jobs:
           fi
       - name: Free HTML before artifact upload
         run: rm -rf data/sources/convert || true
+      # Stamp the EFFECTIVE per-shard timeout into a run artifact so the
+      # workflow_run-triggered autorerun can read the real value instead of
+      # hardcoding it (PR-1, timeout-min-drift-resurrects-operator-cancel).
+      # workflow_run events do NOT propagate the source dispatch inputs, but
+      # they CAN list/download the source run's artifacts — so this is the
+      # drift-proof channel. Every matrix slice writes the SAME value; a single
+      # overwrite-able artifact (last write wins, all identical) is enough.
+      - name: Stamp effective shard timeout (for autorerun)
+        if: always()
+        run: |
+          mkdir -p dist
+          printf '%s\n' "${{ fromJSON(github.event.inputs.shard_timeout_minutes || '360') }}" > dist/shard-timeout.txt
+      - name: Upload shard-timeout stamp (autorerun reads this)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: shard-timeout
+          path: dist/shard-timeout.txt
+          retention-days: 1
+          if-no-files-found: ignore
+          overwrite: true
       # Upload artifact ALWAYS (success or failure) so the next attempt of
       # this same job can --resume from the partial DB on disk. retention-days
       # is short (1d) — these are temp shards, not the published corpus.
@@ -701,11 +823,26 @@ jobs:
           mkdir -p data
           base_arg=""
           # Delta run: start from the existing DB and let each shard's series replace it.
+          #
+          # FAIL-CLOSED on a PUBLISHING delta run (PR-1,
+          # delta-publish-clobbers-latest-on-base-download-failure): if this run is
+          # authorised to clobber `latest` (publish=true) and is a delta (full=false),
+          # a missing/failed base download MUST abort — merging delta-only shards with
+          # no --base produces a fresh DB of just the changed series, and clobbering
+          # `latest` with it would shrink the published corpus to a handful of specs.
+          # The `2>/dev/null` that used to swallow the error is GONE so the failure is
+          # visible in the log. A NON-publishing delta run may still degrade to a fresh
+          # artifacts-only build (it never touches `latest`).
           if [ "${{ needs.discover.outputs.full }}" != "true" ]; then
-            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D . 2>/dev/null; then
+            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D .; then
               zstd -d 3gpp.duckdb.zst -o base.duckdb
               base_arg="--base base.duckdb"
               echo "incremental: using existing latest DB as base"
+            elif [ "${{ needs.discover.outputs.publish }}" = "true" ]; then
+              echo "::error::delta publish run could not fetch the 'latest' base DB — refusing to clobber latest with a delta-only rebuild"
+              exit 1
+            else
+              echo "::notice::no base available; non-publishing run proceeds as a fresh rebuild (artifacts only)"
             fi
           fi
           # When embed=true the shards carry FLOAT[1024] embeddings + a per-shard
@@ -718,7 +855,8 @@ jobs:
             strip_arg="--strip-embeddings"
           fi
           ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json \
-            --subject-index-out data/subject-index.json $base_arg $strip_arg shards/*.duckdb
+            --subject-index-out data/subject-index.json \
+            --build-index-out data/build-index.json $base_arg $strip_arg shards/*.duckdb
           ls -lh data/3gpp.duckdb
       - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
         run: |
@@ -751,7 +889,63 @@ jobs:
             data/3gpp.duckdb.sha256
             data/corpus-index.json
             data/subject-index.json
+            data/build-index.json
           retention-days: 7
+      # PRE-PUBLISH COUNT GUARD (PR-1, deterministic / fail-closed). Before
+      # clobbering `latest`, assert the about-to-publish DB does NOT have FEWER
+      # spec_versions or api_operations than the base it is replacing. A delta
+      # publish must only ADD or REPLACE rows; a DROP means the merge silently
+      # lost normative/API coverage (e.g. a base-download or enrich regression
+      # slipping past the fail-closed branch above). No vague "significantly
+      # smaller" threshold — ANY decrease blocks, unless this is a full rebuild
+      # (full=true, where shrink is intentional) or the operator explicitly
+      # acknowledges it via ALLOW_CORPUS_SHRINK / ALLOW_API_SHRINK. The counts are
+      # printed either way so a block is self-explanatory.
+      - name: Pre-publish count guard (no silent corpus/API shrink)
+        if: needs.discover.outputs.publish == 'true'
+        env:
+          ALLOW_CORPUS_SHRINK: ${{ vars.ALLOW_CORPUS_SHRINK }}
+          ALLOW_API_SHRINK: ${{ vars.ALLOW_API_SHRINK }}
+          FULL: ${{ needs.discover.outputs.full }}
+        run: |
+          set -eu
+          go build -trimpath -o bin/dbcount ./cmd/dbcount
+          # Parse "key=value" lines into shell vars (new_spec_versions, etc.).
+          eval "$(./bin/dbcount --db data/3gpp.duckdb | sed 's/^/new_/')"
+          echo "new: spec_versions=$new_spec_versions api_operations=$new_api_operations"
+          if [ "$FULL" = "true" ]; then
+            echo "::notice::full rebuild — count guard skipped (a full run may legitimately reshape the corpus)"
+            exit 0
+          fi
+          if [ ! -f base.duckdb ]; then
+            # A delta publish with no base would already have failed the fail-closed
+            # branch in the merge step; this is pure defence-in-depth.
+            echo "::error::delta publish run has no base.duckdb to compare against — refusing to publish"
+            exit 1
+          fi
+          eval "$(./bin/dbcount --db base.duckdb | sed 's/^/base_/')"
+          echo "base: spec_versions=$base_spec_versions api_operations=$base_api_operations"
+          block=0
+          if [ "$new_spec_versions" -lt "$base_spec_versions" ]; then
+            if [ "${ALLOW_CORPUS_SHRINK:-}" = "true" ]; then
+              echo "::warning::spec_versions shrank $base_spec_versions → $new_spec_versions but ALLOW_CORPUS_SHRINK=true — allowed"
+            else
+              echo "::error::spec_versions would SHRINK $base_spec_versions → $new_spec_versions on a delta publish — blocking (set repo variable ALLOW_CORPUS_SHRINK=true to override)"
+              block=1
+            fi
+          fi
+          if [ "$new_api_operations" -lt "$base_api_operations" ]; then
+            if [ "${ALLOW_API_SHRINK:-}" = "true" ]; then
+              echo "::warning::api_operations shrank $base_api_operations → $new_api_operations but ALLOW_API_SHRINK=true — allowed"
+            else
+              echo "::error::api_operations would SHRINK $base_api_operations → $new_api_operations on a delta publish — blocking (set repo variable ALLOW_API_SHRINK=true to override)"
+              block=1
+            fi
+          fi
+          if [ "$block" -ne 0 ]; then
+            exit 1
+          fi
+          echo "count guard PASSED: corpus/API coverage did not shrink"
       # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
       # publish_to_latest=true. A scoped/test run never reaches this step, so it
       # can't clobber latest no matter what inputs it was given.
@@ -763,7 +957,7 @@ jobs:
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
           gh release upload latest --repo "$GITHUB_REPOSITORY" \
             data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 \
-            data/corpus-index.json data/subject-index.json --clobber
+            data/corpus-index.json data/subject-index.json data/build-index.json --clobber
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
   # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,

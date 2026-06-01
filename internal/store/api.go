@@ -80,6 +80,29 @@ func (s *Store) ClearAPI(ctx context.Context) error {
 	return nil
 }
 
+// ClearAPIReleases deletes api_* rows for ONLY the given releases — the scoped
+// replace the OpenAPI ingest uses so re-ingesting one release never wipes the
+// others, and a degraded fetch (no releases) deletes nothing (PR-7,
+// openapi-clearapi-full-recompute-and-loss). An empty slice is a no-op.
+func (s *Store) ClearAPIReleases(ctx context.Context, releases []string) error {
+	if len(releases) == 0 {
+		return nil
+	}
+	place := make([]string, len(releases))
+	args := make([]any, len(releases))
+	for i, r := range releases {
+		place[i] = "?"
+		args[i] = r
+	}
+	in := `(` + strings.Join(place, ",") + `)`
+	for _, t := range []string{"api_operations", "api_schemas"} {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM `+t+` WHERE release IN `+in, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // HasAPI reports whether any API rows exist (optionally scoped to a release).
 func (s *Store) HasAPI(ctx context.Context, release string) bool {
 	q := `SELECT count(*) FROM api_operations`

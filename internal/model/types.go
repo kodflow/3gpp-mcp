@@ -62,6 +62,12 @@ type Acronym struct {
 	Domain       string `json:"domain"` // 5GC|EPC|IMS|RAN|""
 	FirstRelease string `json:"first_release"`
 	LastRelease  string `json:"last_release"`
+	// SourceSeries is the 2-digit 3GPP series of the spec that seeded this entry
+	// (e.g. "21" for the glossary subject's TS 21.905). It is provenance, not part
+	// of the (Term, Expansion, Domain) identity: the incremental merge uses it to
+	// scope-purge a changed subject's acronym rows before re-folding the shard, so
+	// a corrected/removed term actually replaces the stale base row (plan PR-4).
+	SourceSeries string `json:"source_series"`
 }
 
 // Evolution is an inter-entity evolution edge (table: evolutions), e.g.

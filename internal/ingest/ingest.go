@@ -90,7 +90,30 @@ type Stats struct {
 // suffix for multi-part specs (e.g. 36213-j30_s10-s13). 5-digit = 3GPP specs.
 // (GSM Phase 1/2 = 4-digit series 00-12, different numbering — out of scope.)
 // Junk inner docs from embedded media lack the prefix and are excluded.
-var reFile = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
+// 5-digit = modern 3GPP spec (23501); 4-digit = legacy GSM Phase-1/2 (0408).
+var reFile = regexp.MustCompile(`^([0-9]{4,5})-([0-9a-z]{3})(?:_.*)?$`)
+
+// classifyFile maps a converted spec filename stem (e.g. "23501-i60" or "0408-720")
+// to its (specID, num, release, version). Modern specs decode via the 3GPP version
+// code; legacy GSM Phase-1/2 (4-digit) get the honest "GSM" release bucket (§0) — the
+// modern code→release line is invalid for them — while keeping the literal code
+// version + exact spec_id. ok is false for non-matching names or undecodable codes.
+func classifyFile(base string) (specID, num, release, version string, ok bool) {
+	m := reFile.FindStringSubmatch(base)
+	if m == nil {
+		return "", "", "", "", false
+	}
+	num = m[1]
+	specID = num[:2] + "." + num[2:]
+	release, version, ok = model.DecodeVersionCode(m[2])
+	if !ok {
+		return "", "", "", "", false
+	}
+	if model.IsLegacyGSM(num) {
+		release = model.ReleaseGSM
+	}
+	return specID, num, release, version, true
+}
 
 // ingestJob is one (spec, version) tuple to process. Promoted to a named type
 // (was anonymous inside Run) so filterResumeJobs can take it as a parameter
@@ -124,13 +147,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	relSet, serSet, specSet := set(opt.Releases), set(opt.Series), set(opt.SpecIDs)
 	for _, p := range files {
 		base := strings.TrimSuffix(filepath.Base(p), ext)
-		m := reFile.FindStringSubmatch(base)
-		if m == nil {
-			continue
-		}
-		num := m[1]
-		specID := num[:2] + "." + num[2:]
-		release, version, ok := model.DecodeVersionCode(m[2])
+		specID, num, release, version, ok := classifyFile(base)
 		if !ok {
 			continue
 		}
@@ -191,8 +208,15 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	//   2. for each (spec, version) that's 'started' but not 'done', purge
 	//      its tables and the log row so the re-run is clean,
 	//   3. filter out (spec, version) tuples already 'done'.
-	pipelineVersion := model.PipelineVersion(opt.Embedder.ModelID())
-	jobs, skippedDone, err := filterResumeJobs(ctx, db, jobs, opt.Resume, pipelineVersion, logf)
+	// specIngestID gates the ingest_log ledger (plan PR-3): it folds the
+	// parser/chunking/schema + every subject footprint (incl. the ASN.1 scanner
+	// tag, via subjectmeta.Footprint), so a subject/scanner/parser change
+	// invalidates resume for the specs those subjects own — but a model bump does
+	// NOT (the embedding model is carried by EmbedIdentity / embedding_hash, not
+	// the ingest ledger). This replaces the legacy pipeline_version as the resume
+	// gate; pipeline_version is still stamped below as a read-compat alias.
+	specIngestID := specIngestIdentity()
+	jobs, skippedDone, err := filterResumeJobs(ctx, db, reg, jobs, opt.Resume, specIngestID, logf)
 	if err != nil {
 		return st, fmt.Errorf("resume filter: %w", err)
 	}
@@ -228,7 +252,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		// status='started' row; on resume we'll PurgeSpecScope + redo this
 		// (spec, version). Stamped with the current pipeline_version so an
 		// algorithm bump invalidates the log (see ResetIngestLog above).
-		if err := db.MarkIngestStarted(ctx, ps.Spec.SpecID, ps.Version.Version, pipelineVersion); err != nil {
+		if err := db.MarkIngestStarted(ctx, ps.Spec.SpecID, ps.Version.Version, specIngestID); err != nil {
 			return st, fmt.Errorf("mark ingest start %s %s: %w", ps.Spec.SpecID, ps.Version.Version, err)
 		}
 		if err := db.UpsertSpec(ps.Spec); err != nil {
@@ -264,7 +288,14 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 		// Domain subjects extend indexing on the specs they own (LI on 33.128,
 		// glossary on 21.905, …). The core stays generic: no hardcoded spec ids.
-		// Degrade-don't-block: a subject error is logged, never fatal.
+		// A subject WRITE error FAILS the (spec, version) scope: we return before
+		// MarkIngestDone so the ingest_log row stays 'started' and the next
+		// --resume run purges + redoes it cleanly. Otherwise a half-written
+		// subject (li_events without li_event_fields) would be marked done and
+		// skipped forever (invariant #3/#4 degenerates to never-recompute). The
+		// genuine degrade-don't-block case — a MISSING attachment — is handled
+		// INSIDE the subject (li.Ingest returns (0, nil)), so absent ASN.1 still
+		// never blocks; only a real write error becomes fatal here.
 		for _, s := range reg.Active(ps.Spec.SpecID) {
 			n, serr := s.Ingest(ctx, db, subject.IngestContext{
 				SpecID: ps.Spec.SpecID, Release: ps.Version.Release, Version: ps.Version.Version,
@@ -272,8 +303,7 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 				Clauses: ps.Clauses, IsLatest: latest[j.specID] == j.version,
 			})
 			if serr != nil {
-				logf("subject %s on %s: %v", s.Name(), ps.Spec.SpecID, serr)
-				continue
+				return st, fmt.Errorf("subject %s on %s %s: %w", s.Name(), ps.Spec.SpecID, ps.Version.Version, serr)
 			}
 			if n > 0 {
 				st.SubjectAdded[s.Name()] += n
@@ -315,9 +345,17 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 	if err := db.SetMeta("convert_dir", opt.ConvertDir); err != nil {
 		return st, err
 	}
-	// Stamp the indexing pipeline version so a delta merge can detect an
-	// incompatible base (different parser/chunking/schema/embedding model) and
-	// rebuild from scratch instead of mixing mechanics (plan §15 invariant #2).
+	// Stamp the canonical SpecIngestIdentity (plan PR-3): the gate the resume
+	// ledger and the merge base-gate compare. It folds parser/chunking/schema +
+	// subject footprints, so a subject/parser change invalidates the base for the
+	// owning specs, while a model bump (which only needs re-embed) does not.
+	if err := db.SetMeta("spec_ingest_identity", specIngestIdentity()); err != nil {
+		return st, err
+	}
+	// Stamp the legacy pipeline_version as a READ-COMPAT alias only (plan PR-3:
+	// "no durable hybrid"). New gates use spec_ingest_identity; pipeline_version is
+	// kept so a merge/discover built before this split can still read an identity
+	// off the DB. Do not gate on it where spec_ingest_identity is available.
 	if err := db.SetMeta("pipeline_version", model.PipelineVersion(opt.Embedder.ModelID())); err != nil {
 		return st, err
 	}
@@ -446,6 +484,24 @@ func max1(n int) int {
 	return n
 }
 
+// specIngestIdentity builds the canonical SpecIngestIdentity (plan PR-3) from the
+// CGO-free parser/chunking/schema tags and the current subject footprints
+// (subjectmeta, which already folds the ASN.1 scanner tag into the LI footprint).
+// This is the value stamped into ingest_log and compared on --resume, so a
+// subject/scanner/parser change re-ingests the owning specs while a model bump
+// does not. Centralised so MarkIngestStarted, ResetIngestLog and IsIngestDone all
+// gate on the identical value.
+func specIngestIdentity() string {
+	// Compose via the shared model.CurrentBuildIndex so ingest, merge and discover
+	// never drift on what SpecIngestIdentity means. The embed model id and global
+	// enrichers don't affect this identity (they gate re-embed / enricher refresh,
+	// not the ingest ledger), so we pass the zero values for them.
+	return model.CurrentBuildIndex(
+		subjectmeta.IngestFootprints(), subjectmeta.ASN1ScannerVersion, "",
+		model.GlobalEnrichmentParts{},
+	).SpecIngestIdentity
+}
+
 // filterResumeJobs implements the three-step resume orchestration:
 //  1. ResetIngestLog drops rows that don't belong to the CURRENT pipeline
 //     version (invariant #2: algorithm bump rebuilds from scratch).
@@ -456,17 +512,20 @@ func max1(n int) int {
 //
 // Returns the filtered job list + the count of skipped-because-done so the
 // progress line can report "+N resumed" alongside this-run progress.
-func filterResumeJobs(ctx context.Context, db *store.Store, jobs []ingestJob, resume bool, pipelineVersion string, logf func(string, ...any)) ([]ingestJob, int, error) {
+func filterResumeJobs(ctx context.Context, db *store.Store, reg *subject.Registry, jobs []ingestJob, resume bool, gate string, logf func(string, ...any)) ([]ingestJob, int, error) {
 	if !resume {
 		return jobs, 0, nil
 	}
-	if err := db.ResetIngestLog(ctx, pipelineVersion); err != nil {
+	// gate is the SpecIngestIdentity: rows stamped under a different identity (a
+	// changed subject/scanner/parser, or a legacy DB stamped only with the old
+	// pipeline_version) are wiped here, so the owning specs re-enter the job list.
+	if err := db.ResetIngestLog(ctx, gate); err != nil {
 		return jobs, 0, fmt.Errorf("reset stale ingest_log: %w", err)
 	}
 	out := jobs[:0]
 	skipped := 0
 	for _, j := range jobs {
-		done, err := db.IsIngestDone(ctx, j.specID, j.version, pipelineVersion)
+		done, err := db.IsIngestDone(ctx, j.specID, j.version, gate)
 		if err != nil {
 			return jobs, 0, fmt.Errorf("check ingest_log %s %s: %w", j.specID, j.version, err)
 		}
@@ -477,6 +536,14 @@ func filterResumeJobs(ctx context.Context, db *store.Store, jobs []ingestJob, re
 		// status='started' but not 'done' — half-ingested, purge then redo.
 		if err := db.PurgeSpecScope(ctx, j.specID, j.version); err != nil {
 			return jobs, 0, fmt.Errorf("purge half-ingested %s %s: %w", j.specID, j.version, err)
+		}
+		// PurgeSpecScope only knows the core tables; fan out to subject-owned
+		// tables so the redo is clean for derived rows too (li_events, asn1_types,
+		// …). Without this a corrected/removed subject row survives the redo.
+		for _, p := range reg.Purgers(j.specID) {
+			if err := p.Purge(ctx, db, j.specID, j.release, j.version); err != nil {
+				return jobs, 0, fmt.Errorf("purge subject rows for %s %s: %w", j.specID, j.version, err)
+			}
 		}
 		out = append(out, j)
 	}

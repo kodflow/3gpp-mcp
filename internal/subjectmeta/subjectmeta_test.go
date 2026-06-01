@@ -69,6 +69,49 @@ func TestFootprintChangesWithVersion(t *testing.T) {
 	}
 }
 
+// TestFootprintTracksSourceHash locks the pv-omits-asn1-scanner fix: the
+// content-derived SourceHash (e.g. the ASN.1 scanner tag) influences the
+// footprint independently of the Version string, so a scanner change is detected
+// even if the developer forgets to bump Version. Two Metas differing ONLY by
+// SourceHash must hash differently.
+func TestFootprintTracksSourceHash(t *testing.T) {
+	a := subjectmeta.Meta{Name: "li", Version: "li-v1", SourceHash: "asn1-vA", Series: []string{"33"}}
+	b := subjectmeta.Meta{Name: "li", Version: "li-v1", SourceHash: "asn1-vB", Series: []string{"33"}}
+	if subjectmeta.Footprint(a) == subjectmeta.Footprint(b) {
+		t.Fatal("footprint must change when SourceHash (ASN.1 scanner) changes, even with Version held constant")
+	}
+	// The shipped LI subject must carry the scanner tag in its SourceHash so a real
+	// scanner bump (ASN1ScannerVersion) flips the LI footprint.
+	var liSrc string
+	for _, m := range subjectmeta.All {
+		if m.Name == "li" {
+			liSrc = m.SourceHash
+		}
+	}
+	if liSrc != subjectmeta.ASN1ScannerVersion {
+		t.Fatalf("LI SourceHash = %q, want the ASN.1 scanner tag %q", liSrc, subjectmeta.ASN1ScannerVersion)
+	}
+}
+
+// TestIngestFootprintsSortedStable locks that IngestFootprints (folded into
+// model.SpecIngestIdentity) is sorted and deterministic, so the ingest gate does
+// not flip merely because subjects were declared in a different order.
+func TestIngestFootprintsSortedStable(t *testing.T) {
+	a := subjectmeta.IngestFootprints()
+	b := subjectmeta.IngestFootprints()
+	if len(a) != len(subjectmeta.All) {
+		t.Fatalf("IngestFootprints len=%d, want %d", len(a), len(subjectmeta.All))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatal("IngestFootprints must be deterministic")
+		}
+		if i > 0 && a[i-1] > a[i] {
+			t.Fatalf("IngestFootprints must be sorted, got %v", a)
+		}
+	}
+}
+
 // TestChangedSeries covers the three discover cases: unchanged (nil), one
 // subject bumped (only its series), and an empty published index (all series,
 // the once-only re-index after the feature ships).

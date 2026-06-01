@@ -70,6 +70,10 @@ func (*Subject) Ingest(ctx context.Context, db *store.Store, ic subject.IngestCo
 			if err := db.UpsertAcronym(model.Acronym{
 				Term: term, Expansion: exp,
 				FirstRelease: ic.Release, LastRelease: ic.Release,
+				// Provenance: the owning series (21 for TS 21.905) so the
+				// incremental merge can scope-purge this subject's acronym rows
+				// before re-folding a rebuilt shard (plan PR-4).
+				SourceSeries: specID[:2],
 			}); err != nil {
 				return n, err
 			}

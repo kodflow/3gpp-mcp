@@ -53,11 +53,18 @@ const DefaultORTVersion = "1.26.0"
 // under us, and the downloaded vectors stay reproducible. Bump the SHA
 // deliberately (and re-verify) when intentionally updating a model.
 const (
-	bgeCommit       = "5617a9f61b028005a4858fdac845db406aefb181" // BAAI/bge-m3
+	// BGECommit is the immutable BAAI/bge-m3 HuggingFace commit the embedder
+	// weights are pinned to. Exported as the SINGLE source of truth for "which
+	// BGE-M3 weights": embed.BGEModelRevision must equal its 7-hex prefix (the
+	// coupling is enforced by embed's TestBGEModelRevisionMatchesPinnedCommit so a
+	// future commit bump that forgets to update the embed-side identity fails CI —
+	// see finding model-commit-not-in-identity / plan PR-6).
+	BGECommit = "5617a9f61b028005a4858fdac845db406aefb181" // BAAI/bge-m3
+
 	rerankCommit    = "87449985a27bbd817f13ee2338df130bdb532bad" // celinehoang/bge-reranker-v2-m3-onnx
 	rerankTokCommit = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e" // BAAI/bge-reranker-v2-m3 (tokenizer)
 
-	bgeBase      = "https://huggingface.co/BAAI/bge-m3/resolve/" + bgeCommit
+	bgeBase      = "https://huggingface.co/BAAI/bge-m3/resolve/" + BGECommit
 	rerankBase   = "https://huggingface.co/celinehoang/bge-reranker-v2-m3-onnx/resolve/" + rerankCommit
 	rerankTokURL = "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/" + rerankTokCommit + "/tokenizer.json"
 )

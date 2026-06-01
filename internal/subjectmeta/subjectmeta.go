@@ -25,6 +25,14 @@ import (
 	"sort"
 )
 
+// ASN1ScannerVersion tags the TS 33.128 ASN.1 scanner (internal/subject/li/asn1).
+// It is folded into the LI subject's SourceHash so that an ASN.1 scanner change
+// shifts the LI footprint independently of the hand-bumped Version constant —
+// closing the `pv-omits-asn1-scanner` gap (a scanner improvement that forgets to
+// bump li Version would otherwise be invisible to discover AND to the resume
+// gate). BUMP this whenever the scanner's extraction output shape changes.
+const ASN1ScannerVersion = "asn1-v1"
+
 // Meta describes one domain subject for incremental-rebuild purposes.
 type Meta struct {
 	// Name is the stable subject id; MUST equal the subject's Subject.Name().
@@ -32,6 +40,13 @@ type Meta struct {
 	// Version is bumped whenever the subject's extraction logic changes, so its
 	// footprint shifts and the next CI run re-indexes its series.
 	Version string
+	// SourceHash is a content-derived discriminator for the subject's extraction
+	// machinery that is NOT captured by the hand-bumped Version — e.g. the ASN.1
+	// scanner tag for LI. Folding it into Footprint makes a scanner/extractor
+	// change self-invalidating instead of relying solely on a remembered string
+	// bump (see ASN1ScannerVersion). Empty for subjects with no such auxiliary
+	// machinery (their Version alone fully describes their extraction).
+	SourceHash string
 	// Series lists the 2-digit 3GPP series the subject owns (e.g. {"33"} for LI,
 	// which owns TS 33.128). Drives which matrix shards a subject change rebuilds.
 	Series []string
@@ -41,17 +56,32 @@ type Meta struct {
 // registry.Default() — TestSubjectMetaMatchesRegistry fails the build otherwise,
 // so a subject can never be added without its incremental metadata.
 var All = []Meta{
-	{Name: "li", Version: "li-v1", Series: []string{"33"}},
+	{Name: "li", Version: "li-v1", SourceHash: ASN1ScannerVersion, Series: []string{"33"}},
 	{Name: "glossary", Version: "glossary-v1", Series: []string{"21"}},
 }
 
 // Footprint is the per-subject digest compared base-vs-current to decide whether
-// the subject changed. Today it covers the version tag; widening it (e.g. seed
-// file content hashes) only means feeding more bytes here — the published
-// subject-index.json shape and the discover comparison stay identical.
+// the subject changed. It covers the version tag AND the content-derived
+// SourceHash (e.g. the ASN.1 scanner version), so a scanner change shifts the
+// footprint even without a Version bump. Widening it further (e.g. embedding the
+// subject's whole source tree) only means feeding more bytes into SourceHash —
+// the published subject-index.json shape and the discover comparison stay
+// identical.
 func Footprint(m Meta) string {
-	h := sha256.Sum256([]byte(m.Name + "|" + m.Version))
+	h := sha256.Sum256([]byte(m.Name + "|" + m.Version + "|" + m.SourceHash))
 	return hex.EncodeToString(h[:])[:12]
+}
+
+// IngestFootprints returns every subject's footprint, sorted, for folding into
+// model.SpecIngestIdentity. Sorting makes the result order-independent so the
+// ingest gate is stable regardless of the order subjects are declared in All.
+func IngestFootprints() []string {
+	out := make([]string, 0, len(All))
+	for _, m := range All {
+		out = append(out, Footprint(m))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Index returns name->footprint for every subject. Serialised to
