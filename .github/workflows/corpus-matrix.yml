@@ -563,11 +563,12 @@ jobs:
           # default-ON disk cleanup when embedding (the vectorized shard + model
           # crowd the 14 GB runner); harmless for the lexical path.
           CORPUS_DROP_ZIPS: ${{ github.event.inputs.embed == 'true' && '1' || '' }}
-          # Index legacy GSM Phase 1/2 lexically under the honest "GSM" bucket — ON for
-          # the automatic whole-corpus push build (Phase 1 → Rel-20) and for a manual
-          # dispatch with include_legacy_gsm=true. These clauses are below every embed
-          # floor → indexed for BM25/LIKE but never vectorised.
-          INCLUDE_LEGACY_GSM: ${{ (github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '1' || '0' }}
+          # Index legacy GSM Phase 1/2 lexically under the honest "GSM" bucket. Enabled by
+          # ANY of: the repo variable vars.INCLUDE_LEGACY_GSM (case-tolerant true/TRUE/1 —
+          # a set-and-forget repo toggle), the per-dispatch include_legacy_gsm checkbox, or
+          # an automatic push build (whole corpus Phase 1 → Rel-20). These clauses are below
+          # every embed floor → indexed for BM25/LIKE but never vectorised.
+          INCLUDE_LEGACY_GSM: ${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push') && '1' || '0' }}
         run: ./scripts/corpus.sh --set "${{ needs.discover.outputs.floor }}" --series "${{ steps.shard.outputs.series }}" --jobs 2
       # Save the converted HTML + zips for the NEXT run's --resume. Explicit save
       # (restore/save split, not the auto-save variant) so it runs HERE — BEFORE
