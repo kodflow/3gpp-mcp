@@ -155,12 +155,16 @@ run_one() {
     log "series $s: attempt $attempt/$((MAX_RETRIES+1)) — push"
     stage_kernel "$s" "$dir"
     # Capture push output so a failure surfaces its REASON (auth, invalid metadata,
-    # missing/unready dataset source). The CLI exits non-zero on failure — that is the
-    # control gate; the captured text only enriches the log (no fragile string-match
-    # that could mis-flag a successful push).
+    # missing/unready dataset source). MUST be done as the `if` condition: under
+    # `set -e`, a bare `v=$(cmd)` assignment whose substitution fails aborts the whole
+    # script *before* we can read $? — which is why earlier the driver vanished right
+    # after "attempt 1 — push" with no reason logged. As an `if` condition, set -e is
+    # suppressed and $? is the push's real exit code.
     local push_out push_rc
-    push_out="$(kaggle kernels push -p "$dir" 2>&1)"; push_rc=$?
-    if [ "$push_rc" -ne 0 ]; then
+    if push_out="$(kaggle kernels push -p "$dir" 2>&1)"; then
+      push_rc=0
+    else
+      push_rc=$?
       log "series $s: push failed (rc=$push_rc): $(printf '%s' "$push_out" | tr '\n' ' ' | tail -c 400)"
       sleep 15; continue
     fi
