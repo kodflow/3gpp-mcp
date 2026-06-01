@@ -85,6 +85,18 @@ func (s *Store) migrate() error {
 		`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
 		return fmt.Errorf("add embedding_hash column: %w", err)
 	}
+	// Additive upgrade (plan PR-4): provenance on the subject-owned global
+	// `acronyms` table. Without an owning-series column the incremental merge
+	// cannot scope-purge a changed/regressed glossary subject's rows (acronyms
+	// has no spec_id/release), so a corrected/removed term's stale row survives
+	// forever (ON CONFLICT DO NOTHING on the fold can't overwrite it). The column
+	// is metadata ABOUT provenance, not lexical content, so it deliberately does
+	// NOT bump schema_version. A pre-PR-4 DB gets the column added in place; its
+	// existing rows carry NULL source_series until the owning series is re-ingested.
+	if _, err := s.db.Exec(
+		`ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS source_series VARCHAR`); err != nil {
+		return fmt.Errorf("add acronyms source_series column: %w", err)
+	}
 	return nil
 }
 
@@ -101,8 +113,11 @@ func (s *Store) SetMeta(key, value string) error {
 // MarkIngestStarted is called BEFORE InsertClauses + SetEmbedding for a spec.
 // A row with status='started' survives a runner kill; on resume that spec is
 // PURGED + re-ingested (a half-written spec would otherwise poison vectors).
-// pipeline_version stamps the row so a later algorithm change invalidates
-// every row (the caller checks model.PipelineVersion at resume time).
+// The pipeline_version column stamps the row with the caller's resume gate —
+// since plan PR-3 that gate is model.SpecIngestIdentity (parser/chunking/schema +
+// subject footprints), so a subject/parser change invalidates the row while a
+// model bump does not. The column name is retained for read-compat; it carries
+// whatever identity the caller passes.
 func (s *Store) MarkIngestStarted(ctx context.Context, specID, version, pipelineVersion string) error {
 	// Timestamps are passed as bound parameters (time.Now()) rather than the
 	// SQL keyword CURRENT_TIMESTAMP because go-duckdb v1.x mis-parses the
@@ -145,8 +160,9 @@ func (s *Store) IngestProgress(ctx context.Context, pipelineVersion string) (don
 	return done, started, err
 }
 
-// IsIngestDone reports whether (spec, version) finished cleanly under the
-// SAME pipeline_version — the gate the resume loop uses to skip work.
+// IsIngestDone reports whether (spec, version) finished cleanly under the SAME
+// resume gate (SpecIngestIdentity since plan PR-3) — the gate the resume loop
+// uses to skip work. A row stamped under a different identity counts as not-done.
 func (s *Store) IsIngestDone(ctx context.Context, specID, version, pipelineVersion string) (bool, error) {
 	var status, pv string
 	err := s.db.QueryRowContext(ctx,
@@ -215,9 +231,11 @@ func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) e
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current
-// pipeline_version — invariant #2: when the chunker / embedder / schema
-// changes, the on-disk log is no longer comparable so the resume contract
-// must restart from scratch.
+// resume gate — invariant #2: when the parser / chunking / schema / subject
+// footprint changes (the SpecIngestIdentity since plan PR-3), the on-disk log is
+// no longer comparable so the resume contract must restart for those rows. A
+// legacy DB stamped only with the old pipeline_version necessarily mismatches the
+// SpecIngestIdentity and is wiped here — the "incompatible / migrate once" path.
 func (s *Store) ResetIngestLog(ctx context.Context, currentPipelineVersion string) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM ingest_log WHERE pipeline_version IS NULL OR pipeline_version <> ?`,
@@ -329,11 +347,12 @@ func (s *Store) InsertChanges(changes []model.Change) error {
 // UpsertAcronym inserts or updates a glossary entry.
 func (s *Store) UpsertAcronym(a model.Acronym) error {
 	_, err := s.db.Exec(
-		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
-		   first_release=excluded.first_release, last_release=excluded.last_release`,
-		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease)
+		   first_release=excluded.first_release, last_release=excluded.last_release,
+		   source_series=excluded.source_series`,
+		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease, a.SourceSeries)
 	return err
 }
 
@@ -509,6 +528,44 @@ func (s *Store) SetEmbeddingWithHash(ctx context.Context, chunkID uint64, vec []
 	return err
 }
 
+// SetEmbeddingsBatch writes a whole batch of (vector, hash) pairs in ONE
+// transaction instead of one autocommit per clause. On DuckDB every autocommit
+// UPDATE forces a WAL flush, so per-row writes dominate the embed wall-clock at
+// scale; folding a window's writes into a single BEGIN…COMMIT amortises that to
+// one flush per window. Each row's vector and hash still land in the same UPDATE,
+// so a mid-window crash either has both or neither for a given clause — the resume
+// marker is never torn from its vector. ids/vecs/hashes must be equal length; an
+// empty vector skips that row.
+func (s *Store) SetEmbeddingsBatch(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(vecs) != len(ids) || len(hashes) != len(ids) {
+		return fmt.Errorf("SetEmbeddingsBatch: ragged input ids=%d vecs=%d hashes=%d", len(ids), len(vecs), len(hashes))
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE clauses SET embedding = CAST(? AS FLOAT[1024]), embedding_hash = ? WHERE chunk_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for i := range ids {
+		if len(vecs[i]) == 0 {
+			continue
+		}
+		if _, err := stmt.ExecContext(ctx, vecLiteral(vecs[i]), hashes[i], ids[i]); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // EmbedCandidate is a clause the embed step may need to (re)embed: the text to
 // embed plus the hash currently stored against its vector ("" when never
 // embedded). The caller recomputes the expected hash and skips rows where it
@@ -521,19 +578,69 @@ type EmbedCandidate struct {
 	StoredHash string
 }
 
-// ClausesNeedingEmbedding streams the clauses that might need a vector: those with
-// no embedding yet, OR a stale/absent hash. A clause whose StoredHash already
-// equals the freshly-computed hash is returned but skipped by the caller — we
-// surface it rather than filtering in SQL so the hash function lives in one place
-// (Go), and so a model change (which the SQL can't know about) still re-embeds.
-// floorOrd > 0 restricts to clauses at/above that release ordinal (vectors are
-// recent-only; lexical coverage is unaffected). The rows() are streamed; the
-// caller must drain them.
-func (s *Store) ClausesNeedingEmbedding(ctx context.Context) (*sql.Rows, error) {
-	return s.db.QueryContext(ctx, `
-		SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '')
-		FROM clauses
-		ORDER BY chunk_id`)
+// EmbedScan parametrises the work-list query of ClausesNeedingEmbedding. Pushing
+// the floor / series / order / limit into SQL (rather than streaming the whole
+// table into a Go slice and filtering there) is what keeps the embed step flat on
+// a 10M-clause DB.
+type EmbedScan struct {
+	// FloorOrd > 0 restricts to clauses whose release recency >= FloorOrd (vectors
+	// are recent-only; lexical coverage is unaffected). 0 = all releases.
+	FloorOrd int
+	// SeriesPrefix != "" restricts to spec_ids in that 2-digit series ("23"), so a
+	// bounded Kaggle kernel can embed one series-shard at a time. "" = all series.
+	SeriesPrefix string
+	// Limit > 0 caps the work-list — a bounded session (Kaggle 12h cap) embeds the
+	// top-Limit rows of the order below, then resumes next run. 0 = no limit.
+	Limit int
+	// OldestFirst flips the order to chunk_id ASC. Default (false) is
+	// RECENT-RELEASE-FIRST (Rel-20 → … → Rel-99), so a session killed mid-run leaves
+	// the most-recent — and most-queried — releases embedded, not a random prefix.
+	OldestFirst bool
+	// ResumeOnly returns ONLY rows with no embedding_hash yet (NULL/empty) — the
+	// fast resume path for a fresh-model-per-run kernel. Default (false) streams all
+	// candidates so embed.Apply's Go hash-compare still re-embeds a clause whose
+	// text OR model changed (which SQL alone can't detect).
+	ResumeOnly bool
+}
+
+// ClausesNeedingEmbedding streams the clauses that might need a vector. By default
+// every clause is surfaced and the caller's hash-compare (embed.Apply) decides
+// what to (re)embed — we keep the hash logic in one place (Go) so a model change,
+// invisible to SQL, still re-embeds. ResumeOnly narrows to never-embedded rows for
+// a fast resume. Rows are streamed in RECENT-RELEASE-FIRST order (the user-facing
+// priority) unless OldestFirst is set. The caller must drain the rows.
+func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*sql.Rows, error) {
+	var b strings.Builder
+	b.WriteString(`SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '') FROM clauses`)
+	var (
+		conds []string
+		args  []any
+	)
+	if scan.ResumeOnly {
+		conds = append(conds, `(embedding_hash IS NULL OR embedding_hash = '')`)
+	}
+	if scan.SeriesPrefix != "" {
+		conds = append(conds, `substr(spec_id, 1, 2) = ?`)
+		args = append(args, scan.SeriesPrefix)
+	}
+	if scan.FloorOrd > 0 {
+		conds = append(conds, `(`+releaseRecencySQL("release")+`) >= ?`)
+		args = append(args, scan.FloorOrd)
+	}
+	if len(conds) > 0 {
+		b.WriteString(" WHERE " + strings.Join(conds, " AND "))
+	}
+	if scan.OldestFirst {
+		b.WriteString(" ORDER BY chunk_id ASC")
+	} else {
+		// Recency DESC then chunk_id ASC: a deterministic tiebreak so a --limit
+		// prefix is stable across resume runs.
+		b.WriteString(" ORDER BY (" + releaseRecencySQL("release") + ") DESC, chunk_id ASC")
+	}
+	if scan.Limit > 0 {
+		fmt.Fprintf(&b, " LIMIT %d", scan.Limit)
+	}
+	return s.db.QueryContext(ctx, b.String(), args...)
 }
 
 // Reset truncates all data tables (full deterministic rebuild).
@@ -699,11 +806,32 @@ func (s *Store) ClauseLineage(ctx context.Context, specID, prefix string) (map[s
 	return out, nil
 }
 
-// releasesOrdered returns a spec's releases oldest-first by major ordinal.
+// releaseRecencySQL builds a SQL expression yielding a release label's recency
+// ordinal, mirroring model.ReleaseOrdinal: 'Rel-99' -> 3 (the OLDEST 3GPP
+// release — Release 1999, version major 3), 'Rel-4'..'Rel-20' -> 4..20, and
+// everything else (drafts, GSM Phase-1/2, unparseable) -> -1 (sorted oldest).
+//
+// A bare regexp_extract(release,'[0-9]+') is WRONG here: 'Rel-99' carries the
+// digits 99 and would sort as the NEWEST release, when it is in fact the oldest.
+// That naive form previously sat in releasesOrdered + ListReleases; this is the
+// single correct definition. col must be a trusted column identifier (the caller
+// controls it — never interpolate user input here).
+func releaseRecencySQL(col string) string {
+	return `CASE
+		WHEN ` + col + ` = 'Rel-99' THEN 3
+		WHEN regexp_full_match(` + col + `, 'Rel-[0-9]+')
+		     AND CAST(regexp_extract(` + col + `, '[0-9]+') AS INTEGER) >= 4
+		  THEN CAST(regexp_extract(` + col + `, '[0-9]+') AS INTEGER)
+		ELSE -1
+	END`
+}
+
+// releasesOrdered returns a spec's releases oldest-first by release recency
+// (Rel-99 first, then Rel-4..Rel-20), via the shared releaseRecencySQL.
 func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT DISTINCT release FROM spec_versions WHERE spec_id = ?
-		 ORDER BY CAST(regexp_extract(release, '[0-9]+') AS INTEGER)`, specID)
+		 ORDER BY `+releaseRecencySQL("release"), specID)
 	if err != nil {
 		return nil, err
 	}
@@ -785,7 +913,7 @@ func (s *Store) ListReleases(ctx context.Context, specID string) ([]model.SpecVe
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT spec_id, release, version, freeze_date, docx_url
 		 FROM spec_versions WHERE spec_id = ?
-		 ORDER BY CAST(regexp_extract(release, '[0-9]+') AS INTEGER) DESC,
+		 ORDER BY `+releaseRecencySQL("release")+` DESC,
 		          version DESC, freeze_date DESC NULLS LAST`, specID)
 	if err != nil {
 		return nil, err
@@ -893,6 +1021,18 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 func (s *Store) CountSpecs(ctx context.Context) (int, error)   { return s.count(ctx, "specs") }
 func (s *Store) CountClauses(ctx context.Context) (int, error) { return s.count(ctx, "clauses") }
 
+// CountSpecVersions / CountAPIOperations expose the two corpus-coverage counters
+// the CI pre-publish guard reads (PR-1): a delta publish must never SHRINK either
+// vs the base it is replacing. They are the most direct "did we lose normative
+// rows" / "did we lose API rows" signals — spec_versions tracks every indexed
+// (spec, release, version); api_operations tracks every 5GC OpenAPI operation.
+func (s *Store) CountSpecVersions(ctx context.Context) (int, error) {
+	return s.count(ctx, "spec_versions")
+}
+func (s *Store) CountAPIOperations(ctx context.Context) (int, error) {
+	return s.count(ctx, "api_operations")
+}
+
 func (s *Store) count(ctx context.Context, table string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM `+table).Scan(&n)
@@ -905,6 +1045,38 @@ func (s *Store) count(ctx context.Context, table string) (int, error) {
 func (s *Store) CountNullEmbeddings(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NULL`).Scan(&n)
+	return n, err
+}
+
+// Checkpoint forces a DuckDB CHECKPOINT so in-progress embed writes are flushed
+// durably to the file. A bounded embed session killed by the Kaggle 12h cap then
+// resumes from the last checkpoint (the embedding_hash markers survive) instead of
+// losing everything written since the run began.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CHECKPOINT`)
+	return err
+}
+
+// CountNullAtFloor counts clauses that SHOULD carry a vector but do not: those at/
+// above the release floor and, when seriesPrefix != "", in that 2-digit series,
+// still NULL. floorOrd <= 0 means "all releases". This is the series-aware
+// completeness oracle the per-shard CI gate keys on — unlike the global
+// CountNullEmbeddings it never counts intentionally-skipped below-floor or
+// other-series clauses as a failure.
+func (s *Store) CountNullAtFloor(ctx context.Context, floorOrd int, seriesPrefix string) (int, error) {
+	var b strings.Builder
+	b.WriteString(`SELECT count(*) FROM clauses WHERE embedding IS NULL`)
+	var args []any
+	if seriesPrefix != "" {
+		b.WriteString(` AND substr(spec_id, 1, 2) = ?`)
+		args = append(args, seriesPrefix)
+	}
+	if floorOrd > 0 {
+		b.WriteString(` AND (` + releaseRecencySQL("release") + `) >= ?`)
+		args = append(args, floorOrd)
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, b.String(), args...).Scan(&n)
 	return n, err
 }
 

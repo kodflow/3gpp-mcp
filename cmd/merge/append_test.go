@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kodflow/3gpp-mcp/internal/enrichmeta"
+	"github.com/kodflow/3gpp-mcp/internal/evolseed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
@@ -61,7 +63,7 @@ func TestIncrementalAppendKeepsUntouchedSeries(t *testing.T) {
 		_ = st.SetMeta("pipeline_version", lexPV)
 	})
 
-	if err := run(ctx, out, []string{delta}, false, "", base, false, ""); err != nil {
+	if err := run(ctx, out, []string{delta}, false, "", base, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -98,6 +100,101 @@ func TestIncrementalAppendKeepsUntouchedSeries(t *testing.T) {
 	}
 }
 
+// TestIncrementalReseedsEvolutionsFromCurrentCode is the PR-7 lock for
+// evolutions-seed-edit-never-lands-in-delta-merge: on a delta the fold list is
+// [base, shard...], so a fold-from-first rule copies the BASE's (stale) seed and
+// a seed edit shipped in the shards never lands. The fix reseeds evolutions
+// authoritatively from the current code AFTER all folds, so the merged DB always
+// carries exactly evolseed.Seed() regardless of what the base/shard held.
+func TestIncrementalReseedsEvolutionsFromCurrentCode(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.duckdb")
+	shard := filepath.Join(dir, "shard-24.duckdb")
+	out := filepath.Join(dir, "out.duckdb")
+	biOut := filepath.Join(dir, "build-index.json")
+	lexPV := model.PipelineVersion("")
+
+	// Base carries a STALE, WRONG evolutions set: a single bogus edge that is NOT in
+	// the current seed, and it is MISSING every real edge. If merge folded the seed
+	// from the base (fold #0), this bogus set would survive into the output.
+	buildShard(t, base, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.0.0"})
+		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.0.0", "1")})
+		_ = st.ReplaceEvolutions(ctx, []model.Evolution{{
+			FromTerm: "BOGUS", ToTerm: "STALE", EvolutionType: "RENAME",
+			JustificationSpec: "00.000", JustificationClause: "0", Confidence: 0.1,
+		}})
+	})
+	// Delta shard rebuilds series 24; it carries the CURRENT seed (as a real ingest
+	// would via ReplaceEvolutions), but on a delta it is fold #1, not #0.
+	buildShard(t, shard, func(st *store.Store) {
+		_ = st.SetMeta("pipeline_version", lexPV)
+		_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+		_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.1.0"})
+		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.1.0", "1")})
+		_ = st.ReplaceEvolutions(ctx, evolseed.Seed())
+	})
+
+	if err := run(ctx, out, []string{shard}, false, "", base, false, "", biOut); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.OpenReadOnly(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	db := st.DB()
+
+	// 1. The bogus stale base edge must be GONE.
+	var bogus int
+	_ = db.QueryRowContext(ctx, `SELECT count(*) FROM evolutions WHERE from_term='BOGUS'`).Scan(&bogus)
+	if bogus != 0 {
+		t.Errorf("stale base evolution survived (%d rows) — reseed did not win over fold order", bogus)
+	}
+
+	// 2. The merged evolutions must equal the current code's seed exactly.
+	want := evolseed.Seed()
+	var got int
+	_ = db.QueryRowContext(ctx, `SELECT count(*) FROM evolutions`).Scan(&got)
+	if got != len(want) {
+		t.Fatalf("evolutions count = %d, want %d (current seed)", got, len(want))
+	}
+	// A representative current-code edge (MME->AMF) must be present, proving the
+	// fresh seed actually landed (not just that the count matched by luck).
+	var mmeAMF int
+	_ = db.QueryRowContext(ctx,
+		`SELECT count(*) FROM evolutions WHERE from_term='MME' AND to_term='AMF'`).Scan(&mmeAMF)
+	if mmeAMF != 1 {
+		t.Errorf("MME->AMF current-seed edge missing from merged DB (%d)", mmeAMF)
+	}
+
+	// 3. The published build index carries the evolutions seed hash via the global
+	//    enrichment identity, so discover can force the refresh on a seed drift.
+	b, err := os.ReadFile(biOut)
+	if err != nil {
+		t.Fatalf("build-index not written: %v", err)
+	}
+	var bi model.BuildIndex
+	if err := json.Unmarshal(b, &bi); err != nil {
+		t.Fatal(err)
+	}
+	wantGEI := model.GlobalEnrichmentIdentity(enrichmeta.Current())
+	if bi.GlobalEnrichmentIdentity != wantGEI {
+		t.Errorf("build-index global_enrichment_identity = %q, want %q (must fold evolutions_seed_hash)",
+			bi.GlobalEnrichmentIdentity, wantGEI)
+	}
+	// Sanity: a different seed yields a different identity (the hash is load-bearing).
+	other := enrichmeta.Current()
+	other.EvolutionsSeedHash = "different0000"
+	if model.GlobalEnrichmentIdentity(other) == wantGEI {
+		t.Error("global_enrichment_identity is blind to the evolutions seed hash")
+	}
+}
+
 // TestStripEmbeddingsStampsLexicalPipeline verifies that an embed-run merge,
 // which strips vectors to keep the lexical `latest` asset slim, stamps the
 // LEXICAL pipeline_version on the output (not the shard's bge-m3 one). Without
@@ -121,7 +218,7 @@ func TestStripEmbeddingsStampsLexicalPipeline(t *testing.T) {
 		_ = st.SetMeta("embedding_model", "bge-m3")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -162,7 +259,7 @@ func TestMergeEmitsSubjectIndex(t *testing.T) {
 		})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", false, subjIdx); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", false, subjIdx, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,7 +333,7 @@ func TestSubjectFootprintNotAdvancedWhenSeriesNotRebuilt(t *testing.T) {
 		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.1.0", "5")})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false, subjIdx); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, subjIdx, ""); err != nil {
 		t.Fatal(err)
 	}
 
