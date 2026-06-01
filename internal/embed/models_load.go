@@ -12,14 +12,6 @@ import (
 // the onnx tag because only the real backend (and its tests) touch the filesystem;
 // the default/CGO-free build computes identity from the spec without needing paths.
 
-// tokenizerDirOrModel returns the tokenizer dir, defaulting to the model dir.
-func (m ModelSpec) tokenizerDirOrModel() string {
-	if m.TokenizerDir != "" {
-		return m.TokenizerDir
-	}
-	return m.Dir
-}
-
 // resolveBase makes a (possibly relative) model dir portable across deployments:
 // an absolute dir is returned as-is; a relative one is joined onto EMBED_MODELS_BASE
 // when set (default: the process cwd). This is the DEPLOYMENT-path seam — kept in
@@ -42,4 +34,18 @@ func activeModelDir(spec ModelSpec) string {
 		return o
 	}
 	return resolveBase(spec.Dir)
+}
+
+// activeTokenizerDir is the on-disk dir holding tokenizer.json. An explicit
+// TokenizerDir (e.g. the fp16 variant pointing at the fp32 dir) always wins. With
+// no explicit dir the tokenizer lives ALONGSIDE the model, so it must follow the
+// SAME EMBED_MODEL_DIR override as activeModelDir — otherwise a single-model
+// deployment (Kaggle kernel, fetch-model.sh: all files in one dir) finds model.onnx
+// via the override but loses tokenizer.json to the registry's relative spec.Dir,
+// silently disabling the embedder.
+func activeTokenizerDir(spec ModelSpec) string {
+	if spec.TokenizerDir != "" {
+		return resolveBase(spec.TokenizerDir)
+	}
+	return activeModelDir(spec)
 }
