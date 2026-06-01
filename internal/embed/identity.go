@@ -1,8 +1,6 @@
 package embed
 
 import (
-	"strconv"
-
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
@@ -36,27 +34,26 @@ const (
 	// bgeNormalization records that the backend L2-normalises every vector
 	// (l2normalize in embed_onnx.go); a switch to raw/none must flip the identity.
 	bgeNormalization = "l2"
-	// bgePrecision is the numeric precision of the produced vectors. The CPU ONNX
-	// path runs fp32; a GPU fp16 run produces slightly different vectors (plan
-	// PR-11 fp16 caveat), so precision is an identity component — fp16-GPU and
-	// fp32-CPU vectors must never share one HNSW.
-	bgePrecision = "fp32"
 )
 
-// BGEEmbedParts is the canonical EmbedParts for the production BGE-M3 backend.
-// model.EmbedIdentity(BGEEmbedParts()) is the value stamped into DB meta
-// (embedding_model), folded into ClauseHash, and compared at serve time, so a
-// change in ANY component (weights, tokenizer, dim, normalisation, precision)
-// re-embeds and refuses a mismatched corpus instead of mixing model revisions.
+// PrecisionFP32 / PrecisionFP16 are the two supported numeric precisions of the
+// produced vectors. Precision is an EmbedIdentity component because fp16 vectors
+// differ slightly from fp32 — so an fp16 corpus and an fp32 query (or two shards of
+// different precision) must NEVER share one HNSW. The flip is what the serve guard
+// and the re-embed gate key on.
+const (
+	PrecisionFP32 = "fp32"
+	PrecisionFP16 = "fp16"
+)
+
+// BGEEmbedParts is the canonical EmbedParts for the ACTIVE model in the registry
+// (default: the pinned fp32 BGE-M3). model.EmbedIdentity(BGEEmbedParts()) is the
+// value stamped into DB meta (embedding_model), folded into ClauseHash, and compared
+// at serve time, so swapping the active model OR its precision (via the registry /
+// EMBED_MODEL) re-embeds and refuses a mismatched corpus instead of mixing models.
+// It reads the registry (CGO-free), so discover and the ONNX backend agree.
 func BGEEmbedParts() model.EmbedParts {
-	return model.EmbedParts{
-		ModelID:           bgeModelName,
-		ModelRevision:     BGEModelRevision,
-		TokenizerRevision: BGETokenizerRevision,
-		VectorDim:         strconv.Itoa(Dim),
-		NormalizationMode: bgeNormalization,
-		Precision:         bgePrecision,
-	}
+	return ActiveModel().embedParts()
 }
 
 // bgeModelID is the canonical identity STRING for the BGE-M3 backend: the digest
