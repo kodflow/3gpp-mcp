@@ -1,12 +1,16 @@
 # CI — fmt, vet, test. Linting is handled by ktn-linter (hooks), not golangci-lint.
 # CGO is required (DuckDB; optional ONNX behind -tags onnx). No cross-compile:
 # tests run natively per-OS. Default build stays lexical (no -tags onnx).
+#
+# Runs on PULL REQUESTS ONLY — the tests gate the merge there. Re-running the same
+# OS test matrix on the merge commit (push to main) is redundant (the merge is the
+# already-tested PR head), so push to main is intentionally NOT a trigger: a merge
+# leaves only "Release" (binaries, if code changed) and "Corpus · Build" (if a
+# pipeline file changed).
 
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
