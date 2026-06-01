@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/sugarme/tokenizer"
@@ -78,9 +79,24 @@ func newEmbedder() Embedder {
 	// model.onnx resolved via the override but tokenizer.json did not.
 	tokPath := filepath.Join(activeTokenizerDir(spec), "tokenizer.json")
 	if !fileExists(onnxrt.LibPath()) || !fileExists(modelPath) || !fileExists(tokPath) {
-		if spec.Precision == PrecisionFP16 {
-			log.Printf("embed: model %q (fp16) not present at %s — disabling vectors (refusing to run another model under an fp16 identity)", spec.Name, modelDir)
+		// Name the EXACT missing artifact(s) and their resolved paths. The generic
+		// "embedder disabled" cost a long investigation when only tokenizer.json was
+		// misplaced; this turns the next occurrence into a one-line diagnosis.
+		var missing []string
+		if !fileExists(onnxrt.LibPath()) {
+			missing = append(missing, "ort_lib="+onnxrt.LibPath())
 		}
+		if !fileExists(modelPath) {
+			missing = append(missing, "model="+modelPath)
+		}
+		if !fileExists(tokPath) {
+			missing = append(missing, "tokenizer="+tokPath)
+		}
+		fp16 := ""
+		if spec.Precision == PrecisionFP16 {
+			fp16 = " (refusing to run another model under an fp16 identity)"
+		}
+		log.Printf("embed: model %q disabled%s — missing %s", spec.Name, fp16, strings.Join(missing, " "))
 		return Disabled{}
 	}
 	tok, err := pretrained.FromFile(tokPath)
