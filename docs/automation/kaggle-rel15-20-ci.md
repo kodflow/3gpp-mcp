@@ -91,25 +91,33 @@ files on disk. NEVER commit the token or paste it into a kernel's code.
 
 ## 5. How to run it
 
+**Two decoupled CI jobs (the architecture you confirmed):**
+- **LEXICAL build** = `corpus-matrix.yml`. Runs AUTOMATICALLY on every merge to `main`
+  (`push`) — a delta/append build that publishes `latest`, includes Phase 1/2 (GSM),
+  and does NO embedding. `concurrency: cancel-in-progress` so back-to-back merges never
+  stack two builds (the newest supersedes). Also manual via dispatch.
+- **EMBED campaign** = `corpus-embed-kaggle.yml`. MANUAL only (Kaggle quota). Consumes
+  the published `latest`, embeds on Kaggle GPU, publishes vectors to GHCR `3gpp-vec`.
+
 ```bash
-# 0. one-time: set KAGGLE_USERNAME / KAGGLE_KEY repo secrets (§3).
+# 0. one-time: set KAGGLE_USERNAME (=makingcodes) + KAGGLE_KEY repo secrets (§3).
 
-# 1. WHOLE-CORPUS LEXICAL build (Phase1/2 not yet — see §7; Rel-99..Rel-20 today):
-#    dispatch corpus-matrix.yml with full=true, release_floor=Rel-99, publish_to_latest=true.
-#    (scripts/corpus.sh already defaults SET=Rel-99; cmd/discover --all --floor Rel-99
-#     covers series 21..38 — no code change, it's a dispatch input.)
+# 1. FIRST full lexical build (one-time, to seed `latest` with the whole corpus
+#    Phase 1 → Rel-20): Actions → "Corpus · Build" → Run workflow:
+#      full=true, release_floor=Rel-99, include_legacy_gsm=true, publish_to_latest=true, embed=false
+#    Thereafter EVERY merge to main auto-runs a DELTA build (only changed series).
 
-# 2. EMBED campaign — from GitHub:
-#    Actions → "Corpus · Embed (Kaggle GPU)" → Run workflow
-#      series_list = ""           (driver default, core-network first)
-#      embed_floor = Rel-15
-#      publish     = true         (push to GHCR 3gpp-vec when complete)
+# 2. EMBED campaign (Rel-17 → Rel-20 for this first run):
+#    Actions → "Corpus · Embed (Kaggle GPU)" → Run workflow:
+#      series_list = "33"   (one series first — shakedown), then "" (all 16)
+#      embed_floor = Rel-17
+#      publish     = true
+#    A later MR lowers embed_floor toward Rel-99 once this works.
 
 # 2'. …or locally (operator box with ~/.kaggle/kaggle.json):
-KAGGLE_USER=makingcodes scripts/kaggle-rel15-20.sh all       # every series, resumable
-KAGGLE_USER=makingcodes scripts/kaggle-rel15-20.sh one 33    # just series 33
+KAGGLE_USER=makingcodes EMBED_FLOOR=Rel-17 scripts/kaggle-rel15-20.sh one 33
 
-# 3. PROVE IT WORKS LOCALLY (no Kaggle, no GPU; uses real BGE-M3 on CPU if present):
+# 3. PROVE IT WORKS LOCALLY (no Kaggle, no GPU; real BGE-M3 on CPU if present):
 make embed-smoke
 ```
 

@@ -31,9 +31,9 @@ on:
         required: false
         default: ""
       embed_floor:
-        description: "Release floor to embed (vectors are recent-only; lexical unaffected)"
+        description: "Release floor to embed (vectors are recent-only; lexical unaffected). First campaign: Rel-17 (Rel-17..20); a later MR lowers it toward Rel-99."
         required: false
-        default: "Rel-15"
+        default: "Rel-17"
       max_retries:
         description: "Per-series ERROR retries before moving on"
         required: false
