@@ -1,0 +1,38 @@
+# Embedding model registry (built-in default).
+#
+# Swapping BGE-M3 ↔ another model, or fp32 ↔ fp16, is a CONFIG edit, not a code
+# change. Override or extend this by placing a models.yaml at $EMBED_MODELS_CONFIG
+# (or data/models/models.yaml): entries merge by `name`, the file's `active` (or the
+# $EMBED_MODEL env for a one-off run) picks which model the embedder loads.
+#
+# Identity: family / revision / tokenizer_revision / dim / normalization / precision
+# are folded into the EmbedIdentity — change any and the re-embed + serve-compat
+# gates fire, so an fp16 corpus and an fp32 query can never share one HNSW.
+#
+# Runtime tuning stays in env, NOT here (it doesn't change the vectors' identity):
+#   ORT_EP=cpu|cuda · EMBED_PIPELINE · EMBED_GRAPH_OPT · BGE_BATCH · EMBED_BUCKET_WINDOW
+active: bge-m3
+
+models:
+  - name: bge-m3            # the pinned fp32 BGE-M3 dense export (default)
+    family: bge-m3
+    dir: data/models/bge-m3
+    precision: fp32
+    dim: 1024
+    normalization: l2
+    revision: 5617a9f
+    tokenizer_revision: 5617a9f
+    inputs: [input_ids, attention_mask]
+    output: sentence_embedding
+
+  - name: bge-m3-fp16       # half-precision variant (T4 Tensor Cores). Provide a
+    family: bge-m3          # validated fp16 export at `dir` (WITH_FP16=1 make model),
+    dir: data/models/bge-m3-fp16  # then: EMBED_MODEL=bge-m3-fp16. Gated by the
+    precision: fp16         # cos(fp32,fp16)>=0.9995 acceptance test before any bulk run.
+    dim: 1024
+    normalization: l2
+    revision: 5617a9f
+    tokenizer_revision: 5617a9f
+    tokenizer_dir: data/models/bge-m3   # fp16 export often ships the model only
+    inputs: [input_ids, attention_mask]
+    output: sentence_embedding
