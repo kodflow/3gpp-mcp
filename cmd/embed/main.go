@@ -189,24 +189,26 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 		return rep, err
 	}
 
-	// --checkpoint-every wraps the per-clause writer to flush the DB durably every N
-	// embeds, so a session killed by the Kaggle 12h cap resumes from the last
-	// checkpoint instead of losing the whole run.
-	set := db.SetEmbeddingWithHash
+	// Batched writes: one transaction per length-bucketed window (store.SetEmbeddingsBatch)
+	// instead of one autocommit per clause — the write path that keeps a 10M embed flat.
+	// --checkpoint-every additionally flushes the DB durably every N embeds, so a session
+	// killed by the Kaggle 12h cap resumes from the last checkpoint, not the run start.
+	var batchSet embed.BatchSetFunc = db.SetEmbeddingsBatch
 	if cfg.checkpointEvery > 0 {
-		written := 0
-		set = func(ctx context.Context, chunkID uint64, vec []float32, hash string) error {
-			if err := db.SetEmbeddingWithHash(ctx, chunkID, vec, hash); err != nil {
+		sinceCkpt := 0
+		batchSet = func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
+			if err := db.SetEmbeddingsBatch(ctx, ids, vecs, hashes); err != nil {
 				return err
 			}
-			if written++; written%cfg.checkpointEvery == 0 {
+			if sinceCkpt += len(ids); sinceCkpt >= cfg.checkpointEvery {
+				sinceCkpt = 0
 				return db.Checkpoint(ctx)
 			}
 			return nil
 		}
 	}
 
-	embedded, err := embed.Apply(ctx, e, items, set)
+	embedded, err := embed.ApplyBatched(ctx, e, items, batchSet)
 	if err != nil {
 		return rep, fmt.Errorf("embed: %w", err)
 	}
