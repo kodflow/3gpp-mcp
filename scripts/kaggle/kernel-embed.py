@@ -200,16 +200,27 @@ if PRECISION == "fp16":
     with open(conv_py, "w") as cf:
         cf.write(
             "import onnx\n"
+            "from onnx import shape_inference\n"
             "from onnxconverter_common import float16\n"
+            # File-based shape inference FIRST: BGE-M3 is >2GB so in-memory shape\n"
+            # inference (what convert_float_to_float16 runs unless disabled) hits the\n"
+            # 2GB protobuf ceiling and is skipped — leaving the converter blind to\n"
+            # tensor types at fp16/fp32 boundaries, so it omits a Cast and ORT later\n"
+            # rejects the graph at a node like /model/Sub (type float16 vs float).\n"
+            # infer_shapes_path streams from disk (no 2GB limit) and writes the graph\n"
+            # next to the external-data files so refs still resolve; the populated\n"
+            # value_info then drives correct Cast placement under disable_shape_infer.\n"
+            "shape_inference.infer_shapes_path(%r, %r)\n"
             "m = onnx.load(%r)\n"
             "m16 = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=True)\n"
             "onnx.save(m16, %r, save_as_external_data=True, all_tensors_to_one_file=True, location='model.onnx_data')\n"
             "print('fp16_saved')\n"
-            % ("%s/model.onnx" % BGE, "%s/model.onnx" % BGE16)
+            % ("%s/model.onnx" % BGE, "%s/model.shp.onnx" % BGE,
+               "%s/model.shp.onnx" % BGE, "%s/model.onnx" % BGE16)
         )
     conv = sh('python3 "%s"' % conv_py)
     if conv.returncode != 0 or not os.path.isfile("%s/model.onnx" % BGE16):
-        fail("fp16_convert", ((conv.stderr or "") + (conv.stdout or "")).replace("\n", " ")[-200:])
+        fail("fp16_convert", ((conv.stderr or "") + (conv.stdout or "")).replace("\n", " ")[-1500:])
     shutil.copy("%s/tokenizer.json" % BGE, "%s/tokenizer.json" % BGE16)
     with open("%s/models.yaml" % WORK, "w") as mf:
         mf.write(
@@ -283,7 +294,7 @@ if rc == 124:
 elif rc != 0:
     err = ""
     try:
-        err = open("/tmp/embed.err").read().replace("\n", " ")[-200:]
+        err = open("/tmp/embed.err").read().replace("\n", " ")[-1500:]
     except Exception:
         pass
     say("embed_rc=%d err=%s" % (rc, err))
