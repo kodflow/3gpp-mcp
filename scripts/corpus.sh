@@ -75,6 +75,24 @@ done
 SET_MAJOR="$(printf '%s' "$SET" | grep -oE '[0-9]+' | head -1)"; SET_MAJOR="${SET_MAJOR:-3}"
 [[ "$SET" == "Rel-99" ]] && SET_MAJOR=3   # Rel-99 == version major 3 (not 99)
 
+# Whole MODERN corpus (Rel-99 + Rel-4..latest) is the DEFAULT (SET=Rel-99 above).
+#
+# GSM Phase 1/2 (4-digit specs / legacy series 00-13) stays OUT by design: those
+# filenames use a DIFFERENT, reverse-engineered version-code scheme (Phase2≈v4,
+# R96≈v5 … R99≈v8) that is "not in any 3GPP doc" and CANNOT be decoded to an exact
+# {release, version} — and "major ≤ 2" can't even distinguish a real GSM Phase 1/2
+# from an abandoned modern draft. Emitting approximate release labels would violate
+# the cite-exactly rule (CLAUDE.md §1). Enabling it is therefore an architectural
+# decision that needs explicit written sign-off (CLAUDE.md §0). This guard makes the
+# boundary explicit instead of silently mis-labelling legacy specs.
+if [[ "${INCLUDE_LEGACY_GSM:-0}" == "1" ]]; then
+  echo "ERROR: INCLUDE_LEGACY_GSM=1 — GSM Phase 1/2 ingestion is gated." >&2
+  echo "  The legacy version-code scheme is reverse-engineered + approximate, so it would" >&2
+  echo "  produce citations that violate CLAUDE.md §1 (cite exactly or stay silent)." >&2
+  echo "  Enabling it needs an authoritative legacy mapping + an explicit §0 arch sign-off." >&2
+  exit 2
+fi
+
 mkdir -p "$ORIGIN" "$CONVERT"
 
 LOCK="$ROOT/data/sources/.corpus.lock"
