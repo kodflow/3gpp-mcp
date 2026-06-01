@@ -1,0 +1,178 @@
+# =============================================================================
+#  Corpus · Embed (Kaggle GPU)      — PR-11b, DEDICATED semantic-vector campaign
+# =============================================================================
+#  WHAT it does    Drives the sharded BGE-M3 embed campaign on Kaggle's free GPU,
+#                  one kernel per SERIES, RESUMABLE across the 12h cap, then
+#                  publishes the per-series vectorized sub-bases to GHCR 3gpp-vec.
+#
+#  WHEN it runs    MANUAL ONLY (workflow_dispatch). Optionally on a cron to keep
+#                  nibbling the weekly Kaggle quota — DISABLED by default.
+#
+#  DECOUPLING      This NEVER builds or republishes the lexical DB. It CONSUMES the
+#                  immutable `latest` lexical Release (the resume baseline) and only
+#                  writes the GHCR 3gpp-vec semantic channel. Lexical = corpus-matrix.yml.
+#
+#  CREDENTIALS     KAGGLE_USERNAME / KAGGLE_KEY repository secrets
+#                  (Settings → Secrets and variables → Actions). The kaggle CLI reads
+#                  them from env; they are never written to disk or into a kernel.
+#
+#  ⚠ UNVALIDATED   A real run needs a phone-verified Kaggle account (GPU + Internet)
+#                  and the two secrets. The kernel runs up to ~12h on Kaggle, longer
+#                  than a GitHub runner's 6h cap, so each job is time-boxed and the
+#                  campaign resumes on the next dispatch (lossless via embedding_hash).
+# =============================================================================
+name: Corpus · Embed (Kaggle GPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      series_list:
+        description: "Space-separated series, priority order (empty = driver default, core-network first)"
+        required: false
+        default: ""
+      embed_floor:
+        description: "Release floor to embed (vectors are recent-only; lexical unaffected)"
+        required: false
+        default: "Rel-15"
+      max_retries:
+        description: "Per-series ERROR retries before moving on"
+        required: false
+        default: "3"
+      runner_minutes:
+        description: "Per-series GitHub-runner time box (< 360, the runner cap). Resume continues next dispatch."
+        required: false
+        default: "330"
+      publish:
+        description: "Push the pulled sub-bases to GHCR 3gpp-vec:latest when done"
+        required: false
+        default: "false"
+  # Keep nibbling the weekly Kaggle quota unattended. Disabled by default — uncomment
+  # and rely on Kaggle Secrets attached to the kernels for self-versioning.
+  # schedule:
+  #   - cron: "17 3 * * *"
+
+concurrency:
+  group: corpus-embed-kaggle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- plan: turn the series list into a matrix (recent-first is handled inside
+  # the kernel via --order recent; this is the per-series fan-out). --------------
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SERIES_LIST: ${{ github.event.inputs.series_list }}
+        run: |
+          list="${SERIES_LIST:-23 24 29 33 38 21 22 25 26 27 28 31 32 35 36 37}"
+          json="[]"
+          for s in $list; do json=$(printf '%s' "$json" | python3 -c "import json,sys;a=json.load(sys.stdin);a.append('$s');print(json.dumps(a))"); done
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "series matrix: $json"
+
+  # ---- embed: one job per series, ≤2 concurrent (Kaggle ~2 GPU sessions). Each
+  # drives kaggle-rel15-20.sh, time-boxed under the runner cap; a box-out leaves a
+  # resumable Dataset for the next dispatch. continue-on-error so one stuck series
+  # never sinks the matrix. --------------------------------------------------------
+  embed:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        series: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KAGGLE_USER: ${{ secrets.KAGGLE_USERNAME }}
+      EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
+      MAX_RETRIES: ${{ github.event.inputs.max_retries }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Guard — secrets present
+        run: |
+          if [ -z "${KAGGLE_USERNAME}" ] || [ -z "${KAGGLE_KEY}" ]; then
+            echo "::error::KAGGLE_USERNAME / KAGGLE_KEY secrets are not set — see the runbook (docs/automation/kaggle-rel15-20-ci.md)"
+            exit 1
+          fi
+      - name: Install kaggle CLI
+        run: pipx install kaggle || pip install --user kaggle
+      - name: Drive series ${{ matrix.series }} (time-boxed; resumes next dispatch)
+        run: |
+          mins="${{ github.event.inputs.runner_minutes }}"
+          timeout "${mins:-330}m" scripts/kaggle-rel15-20.sh one "${{ matrix.series }}" || \
+            echo "::notice::series ${{ matrix.series }} timed out / incomplete — resume on next dispatch (lossless)"
+      - name: Upload pulled sub-base (if any)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vec-s${{ matrix.series }}
+          path: .kaggle-campaign/out-${{ matrix.series }}/**/*.duckdb
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---- publish-vec: ORAS-push the pulled sub-bases to the rolling GHCR semantic
+  # channel (same contract corpus-matrix.yml uses). Gated on the publish input. ----
+  publish-vec:
+    needs: embed
+    if: github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    env:
+      ORAS_VERSION: "1.2.0"
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: shards
+          pattern: vec-s*
+          merge-multiple: true
+      - name: Install zstd + jq + ORAS (pinned)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd jq
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin oras
+          oras version
+      - name: Package sub-bases + vec-manifest
+        run: |
+          mkdir -p vec
+          subs="[]"
+          for f in shards/**/*.duckdb shards/*.duckdb; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f" .duckdb)
+            zstd -19 -T0 -f "$f" -o "vec/$b.duckdb.zst"
+            subs=$(printf '%s' "$subs" | jq --arg n "$b.duckdb" '. + [$n]')
+          done
+          printf '%s' "$subs" | jq \
+            --arg floor "${{ github.event.inputs.embed_floor }}" \
+            '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
+          cat vec/vec-manifest.json
+          test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no vectorized sub-bases pulled — nothing to publish"; exit 1; }
+      - name: Push sub-bases + manifest to GHCR (rolling 'latest')
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cd vec
+          args="vec-manifest.json:application/json"
+          for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
+          oras push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest" \
+            --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            $args
+      - name: Upload artifact (vectorized sub-bases)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: 3gpp-vec
+          path: vec/
+          retention-days: 7
