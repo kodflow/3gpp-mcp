@@ -64,7 +64,7 @@ func TestEmbedIsMicroGranular(t *testing.T) {
 	e := localEmbedder()
 
 	// 1. First embed: all 3 are candidates, all 3 embedded.
-	rep, err := run(ctx, dbPath, e, "", true)
+	rep, err := run(ctx, dbPath, e, embedConfig{buildHNSW: true})
 	if err != nil {
 		t.Fatalf("run1: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestEmbedIsMicroGranular(t *testing.T) {
 	}
 
 	// 2. Re-run, nothing changed: 0 embedded (every hash already current).
-	rep, err = run(ctx, dbPath, e, "", true)
+	rep, err = run(ctx, dbPath, e, embedConfig{buildHNSW: true})
 	if err != nil {
 		t.Fatalf("run2: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestEmbedIsMicroGranular(t *testing.T) {
 	}
 	_ = st.Close()
 
-	rep, err = run(ctx, dbPath, e, "", true)
+	rep, err = run(ctx, dbPath, e, embedConfig{buildHNSW: true})
 	if err != nil {
 		t.Fatalf("run3: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestEmbedFloorSkipsOldReleases(t *testing.T) {
 	seedClause(t, st, 2, "23.501", "Rel-19", "19.0.0", "5.2", "new release clause")
 	_ = st.Close()
 
-	rep, err := run(ctx, dbPath, localEmbedder(), "Rel-19", true)
+	rep, err := run(ctx, dbPath, localEmbedder(), embedConfig{floor: "Rel-19", buildHNSW: true})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
