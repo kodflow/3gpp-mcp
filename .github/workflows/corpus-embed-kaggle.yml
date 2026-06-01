@@ -150,35 +150,57 @@ jobs:
         with:
           path: shards
           pattern: vec-s*
-          merge-multiple: true
+          # NO merge-multiple: every shard's file is named 3gpp-embedded.duckdb, so
+          # merging would collide across series. Keep each artifact in its own dir
+          # (shards/vec-s<NN>/) and key the sub-base by the dir's series number.
       - name: Install zstd + jq + ORAS (pinned)
         run: |
           sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd jq
           curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin oras
           oras version
-      - name: Package sub-bases + vec-manifest
+      - name: Merge with the existing channel, then push (ADDITIVE — never clobber)
         run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          REF="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest"
           mkdir -p vec
-          subs="[]"
-          for f in shards/**/*.duckdb shards/*.duckdb; do
-            [ -e "$f" ] || continue
-            b=$(basename "$f" .duckdb)
-            zstd -19 -T0 -f "$f" -o "vec/$b.duckdb.zst"
-            subs=$(printf '%s' "$subs" | jq --arg n "$b.duckdb" '. + [$n]')
+          # 1) Seed vec/ from the EXISTING channel so OTHER series' sub-bases survive a
+          #    single-series re-publish (absent → first publish, start empty).
+          if oras pull "$REF" -o vec 2>/dev/null; then
+            echo "pulled existing channel:"; ls -1 vec || true
+          else
+            echo "no existing channel — first publish"
+          fi
+          existing='[]'
+          if [ -f vec/vec-manifest.json ]; then
+            # Drop the legacy collision-prone name; the new scheme is s<NN>.duckdb.
+            existing="$(jq -c '[(.sub_bases // [])[] | select(. != "3gpp-embedded.duckdb")]' vec/vec-manifest.json)"
+          fi
+          rm -f vec/3gpp-embedded.duckdb.zst vec/vec-manifest.json
+          # 2) Overlay THIS run's shards as s<series>.duckdb.zst (series from the dir name).
+          new='[]'
+          for d in shards/vec-s*/; do
+            [ -d "$d" ] || continue
+            s="$(basename "$d" | sed 's/^vec-s//')"
+            f="$(find "$d" -name '*.duckdb' | head -1)"; [ -n "$f" ] || continue
+            zstd -19 -T0 -f "$f" -o "vec/s$s.duckdb.zst"
+            new="$(printf '%s' "$new" | jq --arg n "s$s.duckdb" '. + [$n]')"
           done
+          # 3) Union existing ∪ new (new wins on dup), keeping only entries whose .zst exists.
+          subs="$(jq -cn --argjson e "$existing" --argjson n "$new" '($e + $n) | unique')"
+          present="$(cd vec && ls -1 ./*.duckdb.zst 2>/dev/null | sed 's#^\./##; s#\.zst$##' | jq -R . | jq -cs .)"
+          subs="$(jq -cn --argjson s "$subs" --argjson p "$present" '[ $s[] | select(. as $x | $p | any(. == $x)) ]')"
           printf '%s' "$subs" | jq \
             --arg floor "${{ github.event.inputs.embed_floor }}" \
             '{embedding_model:"bge-m3", embed_floor:$floor, sub_bases:.}' > vec/vec-manifest.json
           cat vec/vec-manifest.json
-          test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no vectorized sub-bases pulled — nothing to publish"; exit 1; }
-      - name: Push sub-bases + manifest to GHCR (rolling 'latest')
-        run: |
-          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no sub-bases to publish"; exit 1; }
+          # 4) Push the MERGED set (existing survivors + this run's series).
           cd vec
           args="vec-manifest.json:application/json"
           for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
-          oras push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest" \
+          oras push "$REF" \
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
