@@ -601,6 +601,14 @@ type EmbedScan struct {
 	// candidates so embed.Apply's Go hash-compare still re-embeds a clause whose
 	// text OR model changed (which SQL alone can't detect).
 	ResumeOnly bool
+	// ShardCount > 1 partitions the work-list across N processes by chunk_id: this
+	// scan returns only rows where chunk_id % ShardCount = ShardIndex. It is how the
+	// 2-process multi-GPU path splits a series — one single-GPU process per CUDA
+	// device (pinned via CUDA_VISIBLE_DEVICES, so each is the proven single-device
+	// path) embeds a disjoint clause set, and the kernel merges the results. 0 or 1
+	// = no sharding.
+	ShardCount int
+	ShardIndex int
 }
 
 // ClausesNeedingEmbedding streams the clauses that might need a vector. By default
@@ -618,6 +626,10 @@ func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*s
 	)
 	if scan.ResumeOnly {
 		conds = append(conds, `(embedding_hash IS NULL OR embedding_hash = '')`)
+	}
+	if scan.ShardCount > 1 {
+		conds = append(conds, `(chunk_id % ? = ?)`)
+		args = append(args, scan.ShardCount, scan.ShardIndex)
 	}
 	if scan.SeriesPrefix != "" {
 		conds = append(conds, `substr(spec_id, 1, 2) = ?`)

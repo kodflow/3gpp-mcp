@@ -48,6 +48,7 @@ func main() {
 		reqSem    = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1)")
 		report    = flag.String("report", "text", "end-of-run summary: text | json")
 		noHNSW    = flag.Bool("no-hnsw", false, "skip the HNSW build/freeze (e.g. when embedding a per-series shard that will be merged first)")
+		shard     = flag.String("shard", "", "embed only work-list shard i/n (e.g. 0/2): chunk_id mod n == i. For multi-GPU — one single-GPU process per device. Empty = whole work-list.")
 	)
 	flag.Parse()
 
@@ -74,6 +75,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	shardIdx, shardN := 0, 0
+	if *shard != "" {
+		if _, err := fmt.Sscanf(*shard, "%d/%d", &shardIdx, &shardN); err != nil || shardN < 1 || shardIdx < 0 || shardIdx >= shardN {
+			fmt.Fprintf(os.Stderr, "embed: invalid --shard %q (want i/n with 0<=i<n)\n", *shard)
+			os.Exit(1)
+		}
+	}
+
 	start := time.Now()
 	rep, err := run(context.Background(), *dbPath, e, embedConfig{
 		floor:           *embFlr,
@@ -84,6 +93,8 @@ func main() {
 		checkpointEvery: *ckptEvery,
 		progressEvery:   *progEvery,
 		buildHNSW:       !*noHNSW,
+		shardCount:      shardN,
+		shardIndex:      shardIdx,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "embed failed: %v\n", err)
@@ -126,6 +137,8 @@ type embedConfig struct {
 	checkpointEvery int    // --checkpoint-every N; 0 = checkpoint only at end
 	progressEvery   int    // --progress-every N; 0 = no live progress line
 	buildHNSW       bool   // !--no-hnsw
+	shardCount      int    // --shard i/n: n (0/1 = no sharding)
+	shardIndex      int    // --shard i/n: i
 }
 
 func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) (reportJSON, error) {
@@ -160,6 +173,8 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 		Limit:        cfg.limit,
 		OldestFirst:  oldestFirst,
 		ResumeOnly:   cfg.resume,
+		ShardCount:   cfg.shardCount,
+		ShardIndex:   cfg.shardIndex,
 	})
 	if err != nil {
 		return rep, fmt.Errorf("scan clauses: %w", err)
