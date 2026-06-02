@@ -127,6 +127,7 @@ func ApplyBatched(ctx context.Context, e Embedder, items []Item, batchSet BatchS
 	}
 	modelID := e.ModelID()
 	embedded := 0
+	degradedTotal := 0 // clauses left UNembedded this run (untokenisable even after sanitise)
 
 	// job pairs a needing-embed item with its already-computed target hash.
 	type job struct {
@@ -161,16 +162,29 @@ func ApplyBatched(ctx context.Context, e Embedder, items []Item, batchSet BatchS
 		if len(vecs) != len(jobs) {
 			return fmt.Errorf("embedder returned %d vectors for %d texts", len(vecs), len(jobs))
 		}
-		ids := make([]uint64, len(jobs))
-		hashes := make([]string, len(jobs))
+		// A nil vector marks a DEGRADED clause (untokenisable even after
+		// sanitisation): skip it so it is never persisted with a placeholder hash.
+		// It keeps embedding_hash NULL → re-tried next run and counted by the
+		// completeness gate (null_at_floor), instead of silently corrupting the
+		// corpus with a single-space vector marked "done".
+		ids := make([]uint64, 0, len(jobs))
+		keptVecs := make([][]float32, 0, len(jobs))
+		hashes := make([]string, 0, len(jobs))
 		for i, j := range jobs {
-			ids[i] = j.item.ChunkID
-			hashes[i] = j.hash
+			if vecs[i] == nil {
+				degradedTotal++
+				continue
+			}
+			ids = append(ids, j.item.ChunkID)
+			keptVecs = append(keptVecs, vecs[i])
+			hashes = append(hashes, j.hash)
 		}
-		if err := batchSet(ctx, ids, vecs, hashes); err != nil {
-			return err
+		if len(ids) > 0 {
+			if err := batchSet(ctx, ids, keptVecs, hashes); err != nil {
+				return err
+			}
 		}
-		embedded += len(jobs)
+		embedded += len(ids)
 		return nil
 	}
 
@@ -192,6 +206,12 @@ func ApplyBatched(ctx context.Context, e Embedder, items []Item, batchSet BatchS
 		if err := processWindow(window); err != nil {
 			return embedded, err
 		}
+	}
+	if degradedTotal > 0 {
+		// Surface the corpus-quality hole loudly: these clauses have NO vector and
+		// will be retried. A persistent non-zero here points at a tokenizer trigger
+		// sanitizeForTokenizer does not yet cover.
+		fmt.Fprintf(os.Stderr, "embed: %d clause(s) left UNembedded (untokenisable even after sanitise) — will retry next run\n", degradedTotal)
 	}
 	return embedded, nil
 }

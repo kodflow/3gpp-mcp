@@ -42,7 +42,19 @@ func meanPoolL2(vecs [][]float32, idx []int) []float32 {
 	case 1:
 		return vecs[idx[0]]
 	}
-	dim := len(vecs[idx[0]])
+	// Pool only the non-nil windows: a window whose clause could not be tokenised
+	// is left UNembedded (nil) rather than corrupted (see tokenizeSafe), so it must
+	// not drag the mean toward zero. dim comes from the first real window.
+	var dim, count int
+	for _, k := range idx {
+		if vecs[k] != nil {
+			dim = len(vecs[k])
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
 	acc := make([]float64, dim)
 	for _, k := range idx {
 		for j, x := range vecs[k] {
@@ -52,7 +64,7 @@ func meanPoolL2(vecs [][]float32, idx []int) []float32 {
 	out := make([]float32, dim)
 	var sum float64
 	for j := range acc {
-		v := acc[j] / float64(len(idx))
+		v := acc[j] / float64(count)
 		out[j] = float32(v)
 		sum += v * v
 	}
