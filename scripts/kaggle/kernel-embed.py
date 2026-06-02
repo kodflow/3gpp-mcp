@@ -79,7 +79,10 @@ say("step=start floor=%s series=%s precision=%s ort=%s branch=%s budget=%ds"
 g = sh("nvidia-smi -L")
 if g.returncode == 0 and g.stdout.strip():
     EP = "cuda"
-    say("gpu=present detail=%s ep=cuda" % g.stdout.splitlines()[0].strip())
+    # Kaggle's "T4" accelerator is 2×T4. The Go embedder auto-detects the GPU count
+    # (same `nvidia-smi -L`) and runs one ORT session per device, so both are used.
+    gpus = [l for l in g.stdout.splitlines() if l.strip().startswith("GPU ")]
+    say("gpu=present count=%d detail=%s ep=cuda" % (len(gpus), gpus[0].strip() if gpus else "?"))
 else:
     EP = "cpu"
     say("gpu=absent ep=cpu (CPU fallback — GPU not attached to this worker)")

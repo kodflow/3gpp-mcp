@@ -21,6 +21,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,11 +38,15 @@ import (
 // inference fast and covers virtually every 3GPP clause).
 const maxTokens = 512
 
-type onnxEmbedder struct {
-	tok       *tokenizer.Tokenizer
-	session   *ort.DynamicAdvancedSession
-	mu        sync.Mutex // ORT session Run is not guaranteed concurrent-safe
-	windowing string     // "" = truncate at maxTokens (default); "mean_pool" = window long clauses + mean-pool (EMBED_WINDOWING)
+// gpuSession is one ORT session pinned to one device (one CUDA GPU, or the single
+// CPU session). Each carries its OWN mutex + reusable output buffer, so N of them on
+// N devices run fully in parallel: the multi-GPU path (Kaggle's 2×T4) is just N
+// gpuSessions, one per CUDA device, fed from a shared work queue. With one device it
+// is byte-identical to the old single-session embedder.
+type gpuSession struct {
+	session *ort.DynamicAdvancedSession
+	mu      sync.Mutex // ORT session Run is not guaranteed concurrent-safe
+	device  int        // CUDA device id (0 for CPU / single-GPU)
 	// outBuf is a reusable host backing store for the output tensor (cap
 	// batchSize*Dim). ort.NewTensor ALIASES its Go slice (no copy — see the binding's
 	// CreateOrtTensorWithShape), so the output tensor can share this buffer across
@@ -50,6 +55,14 @@ type onnxEmbedder struct {
 	// (no device-tensor API), so true GPU-resident IO-binding / cudaGraph capture is
 	// unreachable here — buffer reuse is the achievable part.
 	outBuf []float32
+}
+
+type onnxEmbedder struct {
+	tok *tokenizer.Tokenizer
+	// sessions is one gpuSession per device: len==1 on CPU / a single GPU, len==N
+	// across N CUDA devices (auto-detected). Embed shards its batches across them.
+	sessions  []*gpuSession
+	windowing string // "" = truncate at maxTokens (default); "mean_pool" = window long clauses + mean-pool (EMBED_WINDOWING)
 }
 
 // newEmbedder (onnx build) returns the BGE-M3 embedder, or Disabled{} if the
@@ -106,33 +119,40 @@ func newEmbedder() Embedder {
 	if err := onnxrt.Init(); err != nil {
 		return Disabled{}
 	}
-	// Execution provider: CPU (default) needs no SessionOptions (nil). CUDA
-	// builds a SessionOptions and appends the CUDA EP; this compiles on any host
-	// but only succeeds at runtime on a GPU box with the CUDA-enabled ORT lib.
-	// On any failure (no GPU, CPU-only lib, EP error) we degrade to Disabled{} —
-	// the embedder seam never hard-fails (embed.go doctrine).
-	opts, err := sessionOptionsFor(ExecutionProvider())
-	if err != nil {
-		log.Printf("embed: execution-provider %q unavailable (%v) — disabling vectors", ExecutionProvider(), err)
+	// Build one ORT session per device. On the CUDA path we auto-detect the GPU
+	// count (Kaggle's "T4" accelerator is 2×T4) and pin one session to each device,
+	// so both GPUs run concurrently instead of device 0 doing everything while
+	// device 1 sits idle. CPU / single-GPU → exactly one session (unchanged).
+	ep := ExecutionProvider()
+	devices := deviceIDs(ep)
+	var sessions []*gpuSession
+	for _, dev := range devices {
+		gs, err := newGPUSession(modelPath, spec, ep, dev)
+		if err != nil {
+			// Device 0 must work — its failure is the original "disable vectors" path.
+			// A SECONDARY device failing (e.g. the box really has fewer GPUs than
+			// nvidia-smi reported) is non-fatal: keep the sessions already built and
+			// run on those (degrade to fewer GPUs, never block).
+			if dev == devices[0] {
+				log.Printf("embed: model %q session load failed on device %d (%v) — check inputs/output in the registry match the export", spec.Name, dev, err)
+				for _, s := range sessions {
+					_ = s.session.Destroy()
+				}
+				return Disabled{}
+			}
+			log.Printf("embed: secondary GPU device %d unavailable (%v) — continuing on %d device(s)", dev, err, len(sessions))
+			break
+		}
+		sessions = append(sessions, gs)
+	}
+	if len(sessions) == 0 {
 		return Disabled{}
 	}
-	if opts != nil {
-		defer func() { _ = opts.Destroy() }()
-	}
-	// I/O node names come from the model spec, so a different export (e.g. an fp16
-	// one whose nodes are named differently) is wired by config, not code. A wrong
-	// name simply fails NewDynamicAdvancedSession → Disabled (degrade).
-	sess, err := ort.NewDynamicAdvancedSession(modelPath,
-		[]string{spec.Inputs[0], spec.Inputs[1]}, []string{spec.Output}, opts)
-	if err != nil {
-		log.Printf("embed: model %q session load failed (%v) — check inputs/output in the registry match the export", spec.Name, err)
-		return Disabled{}
-	}
+	log.Printf("embed: ready with %d device session(s) (ep=%s)", len(sessions), ep)
 	return &onnxEmbedder{
 		tok:       tok,
-		session:   sess,
+		sessions:  sessions,
 		windowing: envOr("EMBED_WINDOWING", ""),
-		outBuf:    make([]float32, batchSize*Dim),
 	}
 }
 
@@ -166,11 +186,13 @@ func pipelineOn() bool { return envOr("EMBED_PIPELINE", "1") != "0" }
 // L2-normalised 1024-dim dense vectors (cosine/HNSW expect unit norm).
 //
 // With more than one batch and the pipeline enabled, a SINGLE tokeniser goroutine
-// prepares batch N+1 (pure CPU) while the caller goroutine runs batch N on the GPU
-// under e.mu — overlapping the otherwise-serial tokenise and inference. One
-// tokeniser goroutine (never a pool) means e.tok is still touched serially within
-// a call, so this introduces no new concurrency on the tokenizer; the output is
-// byte-identical to the serial path (same tokens, padding, runs, by-index writes).
+// packs batch N+1 (pure CPU) while ONE runner goroutine PER DEVICE runs batches on
+// its own GPU — overlapping tokenise with inference AND, when several GPUs are
+// present, running them in parallel. The tokenizer is touched only by the single
+// producer goroutine (never concurrently); batches are independent and write
+// disjoint out[] ranges, so cross-device completion order is irrelevant and the
+// result is byte-identical to the serial path. With one device this is exactly the
+// previous single-consumer pipeline.
 func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if e.windowing == "mean_pool" {
 		return e.embedWindowed(texts)
@@ -179,7 +201,7 @@ func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	if len(texts) == 0 {
 		return out, nil
 	}
-	// One batch (or pipeline disabled): nothing to overlap — run serially.
+	// One batch (or pipeline disabled): nothing to overlap — run serially on dev 0.
 	if !pipelineOn() || len(texts) <= batchSize {
 		for start := 0; start < len(texts); start += batchSize {
 			end := min(start+batchSize, len(texts))
@@ -190,16 +212,19 @@ func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 		return out, nil
 	}
 
-	// Producer: tokenise+pack each batch in order on its own goroutine, feeding a
-	// small buffered channel. A defer-recover converts any unexpected tokenizer
+	// Producer: tokenise+pack each batch in order, feeding a buffered channel sized
+	// to keep every device fed. A defer-recover converts any unexpected tokenizer
 	// panic into an error (degrade-never-block) instead of crashing the process.
-	prepCh := make(chan preparedBatch, 2)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	prepCh := make(chan preparedBatch, len(e.sessions)+1)
 	var tokErr error
 	go func() {
 		defer close(prepCh)
 		defer func() {
 			if r := recover(); r != nil {
 				tokErr = fmt.Errorf("tokenizer goroutine panicked: %v", r)
+				cancel()
 			}
 		}()
 		for start := 0; start < len(texts); start += batchSize {
@@ -214,12 +239,32 @@ func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 		}
 	}()
 
-	// Consumer (this goroutine): run each prepared batch on the GPU and write its
-	// vectors to their output positions. Serialised by e.mu inside runPrepared.
-	for pb := range prepCh {
-		if err := e.runPrepared(pb, out); err != nil {
-			return nil, err
-		}
+	// One runner per device: each pulls prepared batches and runs them on its own
+	// session/GPU, writing vectors to their output positions. The first run error
+	// cancels the producer + sibling runners.
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var runErr error
+	for _, s := range e.sessions {
+		wg.Add(1)
+		go func(s *gpuSession) {
+			defer wg.Done()
+			for pb := range prepCh {
+				if err := s.runPrepared(pb, out); err != nil {
+					errMu.Lock()
+					if runErr == nil {
+						runErr = err
+					}
+					errMu.Unlock()
+					cancel()
+					return
+				}
+			}
+		}(s)
+	}
+	wg.Wait()
+	if runErr != nil {
+		return nil, runErr
 	}
 	return out, tokErr
 }
@@ -350,11 +395,13 @@ func (e *onnxEmbedder) prepareBatch(texts []string, start int) preparedBatch {
 	return preparedBatch{start: start, n: b, maxLen: maxLen, flatIDs: flatIDs, flatMask: flatMask}
 }
 
-// runPrepared is the GPU half: build the tensors, run BGE-M3 under e.mu (ORT
+// runPrepared is the GPU half: build the tensors, run BGE-M3 under s.mu (ORT
 // session.Run is not guaranteed concurrent-safe), L2-normalise, and write the
 // vectors to out[pb.start : pb.start+pb.n]. Padding is attention-masked, so a
 // padded row yields the same vector as if embedded alone (the A2 invariant).
-func (e *onnxEmbedder) runPrepared(pb preparedBatch, out [][]float32) error {
+// It is a gpuSession method so each device runs concurrently under its OWN mutex
+// and output buffer — the only cross-device sharing is the disjoint out[] writes.
+func (s *gpuSession) runPrepared(pb preparedBatch, out [][]float32) error {
 	shape := ort.NewShape(int64(pb.n), int64(pb.maxLen))
 	idsT, err := ort.NewTensor(shape, pb.flatIDs)
 	if err != nil {
@@ -366,20 +413,20 @@ func (e *onnxEmbedder) runPrepared(pb preparedBatch, out [][]float32) error {
 		return err
 	}
 	defer func() { _ = maskT.Destroy() }()
-	// The output tensor aliases the reusable e.outBuf (cap batchSize*Dim). Because
+	// The output tensor aliases the reusable s.outBuf (cap batchSize*Dim). Because
 	// the tensor shares that buffer across calls, the lock must span NewTensor + Run
 	// + the copy-out, so concurrent Embed callers never read each other's results.
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	outT, err := ort.NewTensor(ort.NewShape(int64(pb.n), int64(Dim)), e.outBuf[:pb.n*Dim])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	outT, err := ort.NewTensor(ort.NewShape(int64(pb.n), int64(Dim)), s.outBuf[:pb.n*Dim])
 	if err != nil {
 		return err
 	}
 	defer func() { _ = outT.Destroy() }()
-	if err := e.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT}); err != nil {
+	if err := s.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT}); err != nil {
 		return fmt.Errorf("onnx run: %w", err)
 	}
-	data := outT.GetData() // flat [n * Dim], aliasing e.outBuf
+	data := outT.GetData() // flat [n * Dim], aliasing s.outBuf
 	for i := 0; i < pb.n; i++ {
 		vec := append([]float32(nil), data[i*Dim:(i+1)*Dim]...)
 		l2normalize(vec)
@@ -391,7 +438,7 @@ func (e *onnxEmbedder) runPrepared(pb preparedBatch, out [][]float32) error {
 // embedBatch embeds one batch (len <= batchSize) into dst (same length) — the
 // serial prepare+run used by the non-pipelined path and the windowed path.
 func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
-	return e.runPrepared(e.prepareBatch(texts, 0), dst)
+	return e.sessions[0].runPrepared(e.prepareBatch(texts, 0), dst)
 }
 
 func l2normalize(v []float32) {
@@ -445,13 +492,15 @@ func graphOptOn() bool {
 // SessionOptions (caller owns Destroy()) and, best-effort:
 //   - EMBED_GRAPH_OPT: ENABLE_ALL graph fusion + optional warm-start cache
 //     (EMBED_GRAPH_CACHE) so the fused graph is reused across cold starts.
-//   - CUDA: appends the CUDA EP (device 0) after tuning it for steady-state batch
-//     embedding (heuristic conv search, same-stream copies, stable arena;
+//   - CUDA: appends the CUDA EP pinned to `device` after tuning it for steady-state
+//     batch embedding (heuristic conv search, same-stream copies, stable arena;
 //     gpu_mem_limit only when EMBED_GPU_MEM is set so small GPUs aren't starved).
+//     `device` is the CUDA device id — one session is built per device so a 2-GPU
+//     box runs both in parallel.
 //
 // Every ORT call that can fail on a CUDA-less / older runtime tears down and
 // returns an error, so the embedder degrades to Disabled{} instead of crashing.
-func sessionOptionsFor(ep string) (*ort.SessionOptions, error) {
+func sessionOptionsFor(ep string, device int) (*ort.SessionOptions, error) {
 	graphOpt := graphOptOn()
 	if ep != EPCUDA && !graphOpt {
 		return nil, nil
@@ -481,9 +530,10 @@ func sessionOptionsFor(ep string) (*ort.SessionOptions, error) {
 		}
 		defer func() { _ = cuda.Destroy() }()
 		cudaOpts := map[string]string{
-			"cudnn_conv_algo_search":    "HEURISTIC",        // skip slow per-shape conv autotune across length buckets
-			"do_copy_in_default_stream": "1",                // serialise H2D/D2H on the compute stream
-			"arena_extend_strategy":     "kSameAsRequested", // steady-state allocations, less fragmentation
+			"device_id":                 strconv.Itoa(device), // pin this session to one GPU (multi-GPU: one session per device)
+			"cudnn_conv_algo_search":    "HEURISTIC",          // skip slow per-shape conv autotune across length buckets
+			"do_copy_in_default_stream": "1",                  // serialise H2D/D2H on the compute stream
+			"arena_extend_strategy":     "kSameAsRequested",   // steady-state allocations, less fragmentation
 		}
 		if lim := os.Getenv("EMBED_GPU_MEM"); lim != "" {
 			cudaOpts["gpu_mem_limit"] = lim
@@ -496,7 +546,74 @@ func sessionOptionsFor(ep string) (*ort.SessionOptions, error) {
 			_ = opts.Destroy()
 			return nil, err
 		}
-		log.Printf("embed: ONNX execution provider = cuda (device 0)")
+		log.Printf("embed: ONNX execution provider = cuda (device %d)", device)
 	}
 	return opts, nil
+}
+
+// deviceIDs returns the CUDA device ids to build a session on, AUTO-DETECTED:
+//   - non-CUDA ep → [0] (the single CPU session; device id is ignored there).
+//   - CUDA → one id per detected GPU (Kaggle's "T4" accelerator is 2×T4 → [0,1]).
+//
+// EMBED_GPUS overrides the count (e.g. "1" to force single-GPU, useful for an
+// A/B throughput comparison or to dodge a flaky second device). Detection reads
+// `nvidia-smi -L` (one line per GPU); on any failure it falls back to a single
+// device — degrade, never block.
+func deviceIDs(ep string) []int {
+	if ep != EPCUDA {
+		return []int{0}
+	}
+	n := gpuCount()
+	ids := make([]int, n)
+	for i := range ids {
+		ids[i] = i
+	}
+	return ids
+}
+
+// gpuCount is the detected (or EMBED_GPUS-overridden) CUDA device count, clamped to
+// [1, 8]. nvidia-smi is the detector because the onnxruntime_go binding exposes no
+// device-count API; a missing/erroring nvidia-smi yields 1 (the safe single-GPU path).
+func gpuCount() int {
+	if v := os.Getenv("EMBED_GPUS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return min(n, 8)
+		}
+	}
+	out, err := exec.Command("nvidia-smi", "-L").Output()
+	if err != nil {
+		return 1
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "GPU ") {
+			n++
+		}
+	}
+	if n < 1 {
+		return 1
+	}
+	return min(n, 8)
+}
+
+// newGPUSession builds one ORT session for the given device. Each session owns its
+// SessionOptions lifetime (created, used, Destroyed here) and its own reusable
+// output buffer so N sessions run concurrently with zero shared mutable state.
+func newGPUSession(modelPath string, spec ModelSpec, ep string, device int) (*gpuSession, error) {
+	opts, err := sessionOptionsFor(ep, device)
+	if err != nil {
+		return nil, err
+	}
+	if opts != nil {
+		defer func() { _ = opts.Destroy() }()
+	}
+	// I/O node names come from the model spec, so a different export (e.g. an fp16
+	// one whose nodes are named differently) is wired by config, not code. A wrong
+	// name simply fails NewDynamicAdvancedSession → caller degrades.
+	sess, err := ort.NewDynamicAdvancedSession(modelPath,
+		[]string{spec.Inputs[0], spec.Inputs[1]}, []string{spec.Output}, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &gpuSession{session: sess, device: device, outBuf: make([]float32, batchSize*Dim)}, nil
 }
