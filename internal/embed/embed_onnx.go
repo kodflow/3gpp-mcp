@@ -21,6 +21,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -38,23 +39,34 @@ import (
 // inference fast and covers virtually every 3GPP clause).
 const maxTokens = 512
 
-// gpuSession is one ORT session pinned to one device (one CUDA GPU, or the single
-// CPU session). Each carries its OWN mutex + reusable output buffer, so N of them on
-// N devices run fully in parallel: the multi-GPU path (Kaggle's 2×T4) is just N
-// gpuSessions, one per CUDA device, fed from a shared work queue. With one device it
-// is byte-identical to the old single-session embedder.
+// gpuSession is one ORT session pinned to one device. Each carries its OWN mutex
+// + a pool of output buffers. N sessions run fully in parallel: across N CUDA
+// devices, OR several on ONE device (EMBED_SESSIONS_PER_GPU) so their Run() calls
+// overlap on the GPU instead of one session idling the device between batches.
+// With one session it is byte-identical to the old single-session embedder.
 type gpuSession struct {
 	session *ort.DynamicAdvancedSession
-	mu      sync.Mutex // ORT session Run is not guaranteed concurrent-safe
+	mu      sync.Mutex // serialises THIS session's ort.Run; held ONLY around Run
 	device  int        // CUDA device id (0 for CPU / single-GPU)
-	// outBuf is a reusable host backing store for the output tensor (cap
-	// batchSize*Dim). ort.NewTensor ALIASES its Go slice (no copy — see the binding's
-	// CreateOrtTensorWithShape), so the output tensor can share this buffer across
-	// runs as long as every Run + copy-out happens under mu (serialised). This drops
-	// one tensor alloc+free per batch. NOTE: the binding's ortMemoryInfo is CPU-pinned
-	// (no device-tensor API), so true GPU-resident IO-binding / cudaGraph capture is
-	// unreachable here — buffer reuse is the achievable part.
-	outBuf []float32
+	// bufPool recycles host backing stores for the output tensor (each cap
+	// batchSize*Dim). ort.NewTensor ALIASES its Go slice, so giving every run its
+	// OWN pooled buffer (instead of one shared s.outBuf) lets the lock cover ONLY
+	// session.Run — the copy-out + L2-normalise then run lock-free, and sibling
+	// sessions on the same GPU overlap instead of serialising on a shared buffer.
+	// Pointer-like pooling avoids a ~1 MB alloc per batch without re-aliasing.
+	// NOTE: the binding's ortMemoryInfo is CPU-pinned (no device-tensor API), so
+	// true GPU-resident IO-binding / cudaGraph capture is unreachable here.
+	bufPool sync.Pool
+}
+
+// getOutBuf returns a pointer to a recycled output buffer of cap batchSize*Dim
+// (allocating on a cold pool). Recycle it with s.bufPool.Put.
+func (s *gpuSession) getOutBuf() *[]float32 {
+	if v := s.bufPool.Get(); v != nil {
+		return v.(*[]float32)
+	}
+	b := make([]float32, batchSize*Dim)
+	return &b
 }
 
 type onnxEmbedder struct {
@@ -143,31 +155,32 @@ func newEmbedder() Embedder {
 	// so both GPUs run concurrently instead of device 0 doing everything while
 	// device 1 sits idle. CPU / single-GPU → exactly one session (unchanged).
 	ep := ExecutionProvider()
+	batchSize = resolveBatchSize() // size the output buffers + Embed's batching for this device class
 	devices := deviceIDs(ep)
+	perGPU := sessionsPerGPU()
 	var sessions []*gpuSession
 	for _, dev := range devices {
-		gs, err := newGPUSession(modelPath, spec, ep, dev)
-		if err != nil {
-			// Device 0 must work — its failure is the original "disable vectors" path.
-			// A SECONDARY device failing (e.g. the box really has fewer GPUs than
-			// nvidia-smi reported) is non-fatal: keep the sessions already built and
-			// run on those (degrade to fewer GPUs, never block).
-			if dev == devices[0] {
-				log.Printf("embed: model %q session load failed on device %d (%v) — check inputs/output in the registry match the export", spec.Name, dev, err)
-				for _, s := range sessions {
-					_ = s.session.Destroy()
+		for k := 0; k < perGPU; k++ {
+			gs, err := newGPUSession(modelPath, spec, ep, dev)
+			if err != nil {
+				// The FIRST session must work — its failure is the original "disable
+				// vectors" path. Any later session failing (a flaky 2nd GPU, or VRAM
+				// exhausted at the Kth concurrent session on one GPU) is non-fatal:
+				// keep what we have and run on fewer (degrade, never block).
+				if len(sessions) == 0 {
+					log.Printf("embed: model %q session load failed on device %d (%v) — check inputs/output in the registry match the export", spec.Name, dev, err)
+					return Disabled{}
 				}
-				return Disabled{}
+				log.Printf("embed: session %d on device %d unavailable (%v) — continuing on %d session(s)", k, dev, err, len(sessions))
+				break
 			}
-			log.Printf("embed: secondary GPU device %d unavailable (%v) — continuing on %d device(s)", dev, err, len(sessions))
-			break
+			sessions = append(sessions, gs)
 		}
-		sessions = append(sessions, gs)
 	}
 	if len(sessions) == 0 {
 		return Disabled{}
 	}
-	log.Printf("embed: ready with %d device session(s), %d tokeniser(s) (ep=%s)", len(sessions), len(toks), ep)
+	log.Printf("embed: ready with %d session(s) across %d device(s), %d tokeniser(s), batch=%d (ep=%s)", len(sessions), len(devices), len(toks), batchSize, ep)
 	return &onnxEmbedder{
 		toks:      toks,
 		sessions:  sessions,
@@ -186,10 +199,76 @@ func (*onnxEmbedder) Dim() int      { return Dim }
 // silently scoring a fresh query vector against corpus vectors from another model.
 func (*onnxEmbedder) ModelID() string { return bgeModelID() }
 
-// batchSize bounds how many clauses go into one ONNX call. 32 (CLAUDE.md §2)
-// amortises the per-call overhead while keeping the padded tensor small.
-// Overridable via BGE_BATCH for tuning.
+// batchSize bounds how many clauses go into one ONNX call. The package default
+// (32, the CPU value) is REPLACED at embedder init by resolveBatchSize(), which
+// scales the batch to the device class (a T4 feeds on far bigger batches than a
+// CPU). BGE_BATCH overrides everything for tuning. It also sizes each session's
+// pooled output buffer (batchSize*Dim), so it must be set before sessions build.
 var batchSize = envInt("BGE_BATCH", 32)
+
+// resolveBatchSize picks the ONNX batch for the active device class. CPU stays
+// small (32) — a big batch there just bloats latency. On CUDA the batch scales
+// with VRAM (the dominant GPU-utilisation lever for a 560M model: more rows per
+// Run = fewer kernel launches and higher occupancy), capped so the activations
+// of a 512-token batch still fit. BGE_BATCH overrides everything.
+func resolveBatchSize() int {
+	if v := os.Getenv("BGE_BATCH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	if ExecutionProvider() != EPCUDA {
+		return 32
+	}
+	switch mb := gpuMemTotalMB(); {
+	case mb >= 70000: // A100/H200 80 GB+
+		return 384
+	case mb >= 38000: // A100 40 GB
+		return 256
+	case mb >= 22000: // L4 24 GB
+		return 128
+	case mb >= 14000: // T4 16 GB
+		return 96
+	default: // CUDA, unknown or small VRAM — modest but still GPU-sized
+		return 64
+	}
+}
+
+// gpuMemTotalMB returns device-0 total VRAM in MiB via nvidia-smi, or 0 if the
+// query fails (no driver, tool absent) — best-effort, never fatal.
+func gpuMemTotalMB() int {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0
+	}
+	line := strings.TrimSpace(string(out))
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i] // first GPU only
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// sessionsPerGPU is how many independent ORT sessions to run PER device. Default
+// 1 (behaviour unchanged). >1 runs K sessions on the SAME device so their Run()
+// calls overlap on the GPU (copy/compute concurrency) instead of the device
+// idling between one session's batches — a single-GPU saturation lever, distinct
+// from the multi-DEVICE path. Same-device multi-session does NOT hit the
+// cross-device cudaSetDevice bug (that is about >1 CUDA device in one process).
+// Each session holds its own model copy, so more sessions cost more VRAM; a Kth
+// session that fails to load degrades to fewer. Opt-in, capped [1,8];
+// EMBED_SESSIONS_PER_GPU overrides.
+func sessionsPerGPU() int {
+	if v := os.Getenv("EMBED_SESSIONS_PER_GPU"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return min(n, 8)
+		}
+	}
+	return 1
+}
 
 // padID is the XLM-RoBERTa padding token (<pad>). Padded positions carry
 // attention_mask=0, so the export's mask-aware pooling ignores them — a padded
@@ -461,20 +540,24 @@ func (s *gpuSession) runPrepared(pb preparedBatch, out [][]float32) error {
 		return err
 	}
 	defer func() { _ = maskT.Destroy() }()
-	// The output tensor aliases the reusable s.outBuf (cap batchSize*Dim). Because
-	// the tensor shares that buffer across calls, the lock must span NewTensor + Run
-	// + the copy-out, so concurrent Embed callers never read each other's results.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	outT, err := ort.NewTensor(ort.NewShape(int64(pb.n), int64(Dim)), s.outBuf[:pb.n*Dim])
+	// The output tensor aliases a PER-RUN pooled buffer (not a shared one), so the
+	// lock need only cover session.Run (ORT Run is not concurrent-safe for one
+	// session). Building the tensor and the copy-out + L2-normalise run lock-free,
+	// so sibling sessions on the same GPU overlap instead of serialising.
+	buf := s.getOutBuf()
+	defer s.bufPool.Put(buf)
+	outT, err := ort.NewTensor(ort.NewShape(int64(pb.n), int64(Dim)), (*buf)[:pb.n*Dim])
 	if err != nil {
 		return err
 	}
 	defer func() { _ = outT.Destroy() }()
-	if err := s.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT}); err != nil {
+	s.mu.Lock()
+	err = s.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT})
+	s.mu.Unlock()
+	if err != nil {
 		return fmt.Errorf("onnx run: %w", err)
 	}
-	data := outT.GetData() // flat [n * Dim], aliasing s.outBuf
+	data := outT.GetData() // flat [n * Dim], aliasing buf (this run's private buffer)
 	for i := 0; i < pb.n; i++ {
 		if pb.degraded != nil && pb.degraded[i] {
 			out[pb.start+i] = nil // untokenisable: leave NULL for retry + completeness count
@@ -677,5 +760,5 @@ func newGPUSession(modelPath string, spec ModelSpec, ep string, device int) (*gp
 	if err != nil {
 		return nil, err
 	}
-	return &gpuSession{session: sess, device: device, outBuf: make([]float32, batchSize*Dim)}, nil
+	return &gpuSession{session: sess, device: device}, nil
 }
