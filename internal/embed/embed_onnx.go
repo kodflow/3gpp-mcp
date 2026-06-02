@@ -333,10 +333,10 @@ func (e *onnxEmbedder) embedWindowed(texts []string) ([][]float32, error) {
 	return out, nil
 }
 
-// XLM-RoBERTa (BGE-M3) special tokens — used as a last-resort floor when even
-// the space fallback fails. [CLS]=0, [SEP]=2 produce a valid 2-token sequence
-// with a non-empty attention mask, so the ONNX session always sees a tensor it
-// can run instead of an all-padded row with an all-zero mask.
+// XLM-RoBERTa (BGE-M3) special tokens. [CLS]=0, [SEP]=2 form a valid 2-token
+// sequence with a non-empty attention mask — used as the row for a legitimately
+// empty clause and as the discarded placeholder for a degraded (untokenisable)
+// row, so the ONNX session never sees an all-padded row with an all-zero mask.
 const (
 	xlmrCLS = 0
 	xlmrSEP = 2
@@ -353,33 +353,37 @@ func (e *onnxEmbedder) encodeIDs(tok *tokenizer.Tokenizer, text string) ([]int, 
 	return enc.Ids, nil
 }
 
-// tokenizeSafe runs the BGE-M3 tokenizer with a three-tier degradation:
-//  1. Normal call. On panic (sugarme/tokenizer v0.3.0 Metaspace off-by-one) or
-//     error, fall back to ► 2.
-//  2. EncodeSingle(" "). Single space tokenizes cleanly across XLM-RoBERTa
-//     vocab. On panic/error, fall back to ► 3.
-//  3. Hardcoded {CLS, SEP}. Guarantees a non-empty token sequence so embedBatch
-//     never builds an all-padding row with an all-zero attention_mask.
+// tokenizeSafe tokenises one clause, returning (ids, degraded). It first
+// SANITISES the text (sanitizeForTokenizer: strip Private-Use-Area glyphs +
+// collapse whitespace runs), which removes the conversion artefacts that trip
+// sugarme/tokenizer v0.3.0's Metaspace pretokenizer into a "slice bounds out of
+// range [2n+1:2n]" panic AND keeps the model fed real text instead of layout
+// noise.
 //
-// On any fallback we log {len, sha256-prefix} of the input — never the input
-// itself, which can be a user search query (Qodo finding #3: privacy).
-func (e *onnxEmbedder) tokenizeSafe(tok *tokenizer.Tokenizer, text string) []int {
-	enc := func(s string) ([]int, error) { return e.encodeIDs(tok, s) }
-	ids, err := safeEncode(enc, text)
+//   - clean == "" (clause was pure layout/glyph noise): return {CLS,SEP},
+//     degraded=false — a stable minimal vector for genuinely empty content, NOT
+//     flagged for endless retry.
+//   - tokenises cleanly: return its ids, degraded=false.
+//   - STILL panics/errors after sanitising (a new/unknown trigger): return
+//     (nil, true). The caller leaves the clause UNembedded (NULL) so it is
+//     retried and counted by the completeness gate — never silently persisted
+//     with a placeholder vector (the old single-space fallback corrupted the
+//     corpus invisibly). Logged once with a stable hash, never the text itself
+//     (it can be a user query — Qodo finding #3: privacy).
+func (e *onnxEmbedder) tokenizeSafe(tok *tokenizer.Tokenizer, text string) ([]int, bool) {
+	clean := sanitizeForTokenizer(text)
+	if clean == "" {
+		return []int{xlmrCLS, xlmrSEP}, false
+	}
+	ids, err := safeEncode(func(s string) ([]int, error) { return e.encodeIDs(tok, s) }, clean)
 	if err == nil && len(ids) > 0 {
-		return ids
+		return ids, false
 	}
 	if err != nil {
-		log.Printf("embed: tokenize failed (len=%d, hash=%s): %v — fallback to single space",
+		log.Printf("embed: tokenize failed after sanitise (len=%d, hash=%s): %v — clause left unembedded for retry",
 			len(text), snippetHash(text), err)
 	}
-	ids, err = safeEncode(enc, " ")
-	if err == nil && len(ids) > 0 {
-		return ids
-	}
-	log.Printf("embed: space-fallback also failed (orig len=%d, hash=%s): %v — using hardcoded CLS+SEP",
-		len(text), snippetHash(text), err)
-	return []int{xlmrCLS, xlmrSEP}
+	return nil, true
 }
 
 // preparedBatch is a tokenised, padded batch ready for the GPU, plus where its
@@ -390,6 +394,7 @@ type preparedBatch struct {
 	maxLen   int     // padded sequence length
 	flatIDs  []int64 // [n*maxLen] input_ids
 	flatMask []int64 // [n*maxLen] attention_mask
+	degraded []bool  // [n] true where the clause could not be tokenised → output discarded (nil)
 }
 
 // prepareBatch is the CPU half of an embed: tokenise + truncate + pad one batch
@@ -399,9 +404,17 @@ type preparedBatch struct {
 func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, start int) preparedBatch {
 	b := len(texts)
 	rows := make([][]int64, b)
+	degraded := make([]bool, b)
 	maxLen := 1
 	for i, t := range texts {
-		ids := e.tokenizeSafe(tok, t)
+		ids, deg := e.tokenizeSafe(tok, t)
+		if deg {
+			// Untokenisable even after sanitising: keep a minimal valid row so the
+			// batch tensor is well-formed, but flag it so runPrepared discards the
+			// output (out[pos]=nil) and the clause stays NULL for retry.
+			degraded[i] = true
+			ids = []int{xlmrCLS, xlmrSEP}
+		}
 		if len(ids) > maxTokens {
 			ids = ids[:maxTokens]
 		}
@@ -427,7 +440,7 @@ func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, st
 			}
 		}
 	}
-	return preparedBatch{start: start, n: b, maxLen: maxLen, flatIDs: flatIDs, flatMask: flatMask}
+	return preparedBatch{start: start, n: b, maxLen: maxLen, flatIDs: flatIDs, flatMask: flatMask, degraded: degraded}
 }
 
 // runPrepared is the GPU half: build the tensors, run BGE-M3 under s.mu (ORT
@@ -463,6 +476,10 @@ func (s *gpuSession) runPrepared(pb preparedBatch, out [][]float32) error {
 	}
 	data := outT.GetData() // flat [n * Dim], aliasing s.outBuf
 	for i := 0; i < pb.n; i++ {
+		if pb.degraded != nil && pb.degraded[i] {
+			out[pb.start+i] = nil // untokenisable: leave NULL for retry + completeness count
+			continue
+		}
 		vec := append([]float32(nil), data[i*Dim:(i+1)*Dim]...)
 		l2normalize(vec)
 		out[pb.start+i] = vec
