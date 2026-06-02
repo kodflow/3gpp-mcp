@@ -255,153 +255,63 @@ if build.returncode != 0:
     fail("build", (build.stderr or "").replace("\n", " ")[-200:])
 say("build=ok")
 
-# ---- EMBED (recent-first, resumable, time-bounded; multi-GPU via 2-process) -
-# In-process multi-session ONNX CUDA is broken (CUDA failure 400 invalid resource
-# handle — the onnxruntime_go binding has no cudaSetDevice), so on an N-GPU box we
-# run ONE single-GPU process PER device: each pinned with CUDA_VISIBLE_DEVICES (so it
-# IS the proven single-device path) on a private DB copy, embedding a DISJOINT
-# chunk_id shard (--shard i/N). Their embeddings are then merged back into
-# EMBEDDED_DB. One GPU / CPU → the original single-process path (live streaming).
+# ---- EMBED (recent-first, resumable, time-bounded) -------------------------
 env["EMBED_MODEL_DIR"] = MODEL_DIR_ACTIVE
 env["ORT_EP"] = EP
 env["EMBED_GRAPH_OPT"] = "1"
 env.update(EMBED_ENV)  # fp16: EMBED_MODELS_CONFIG + EMBED_MODEL=bge-m3-fp16
 REPORT = "%s/embed-report.json" % WORK
-
-
-def embed_base(db, shard):
-    s = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" '
-         "--order recent --resume --checkpoint-every \"%s\" --no-hnsw "
-         "--require-semantic --report json"
-         % (WORK, db, FLOOR, SERIES, CHECKPOINT_EVERY))
-    return s + (" --shard %s" % shard if shard else "")
-
-
-NGPU = 1
-if EP == "cuda":
-    gl = sh("nvidia-smi -L")
-    if gl.returncode == 0:
-        n = len([x for x in gl.stdout.splitlines() if x.strip().startswith("GPU ")])
-        NGPU = n if n >= 1 else 1
-
+cmd = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" '
+       "--order recent --resume --checkpoint-every \"%s\" --no-hnsw "
+       "--require-semantic --report json"
+       % (WORK, EMBEDDED_DB, FLOOR, SERIES, CHECKPOINT_EVERY))
 start = time.time()
 rc = 0
-EMB = 0
-MODEL = "?"
-NUL = None
-
-if NGPU >= 2:
-    say("embed=multi-gpu gpus=%d (one single-GPU process per device, sharded + merged)" % NGPU)
-    copies, procs, reps, errs = [], [], [], []
-    for i in range(NGPU):
-        cdb = "%s/embed.%d.duckdb" % (WORK, i)
-        shutil.copy(EMBEDDED_DB, cdb)
-        copies.append(cdb)
-        penv = dict(env)
-        penv["CUDA_VISIBLE_DEVICES"] = str(i)  # this process sees ONLY GPU i (as device 0)
-        rf = open("%s/embed-report.%d.json" % (WORK, i), "w")
-        ef = open("/tmp/embed.%d.err" % i, "w")
-        reps.append(rf)
-        errs.append(ef)
-        procs.append(subprocess.Popen(embed_base(cdb, "%d/%d" % (i, NGPU)),
-                                      shell=True, env=penv, stdout=rf, stderr=ef, text=True))
-    killer = threading.Timer(TIME_BUDGET, lambda: [p.kill() for p in procs])
+# Stream the embedder's progress (stderr) LIVE to the Kaggle log so a long GPU run
+# shows `embed progress: N embedded (R cl/s)` instead of silence after build=ok. The
+# JSON report still goes to REPORT (stdout); stderr is BOTH echoed and saved to
+# /tmp/embed.err for the FAIL detail. A threading.Timer enforces the time budget even
+# if the process stops emitting (a blocking read would never see the deadline); a
+# timer-kill surfaces as a negative wait() status, mapped to the 124 timeout path.
+with open(REPORT, "w") as out, open("/tmp/embed.err", "w") as errf:
+    proc = subprocess.Popen(cmd, shell=True, env=env, stdout=out,
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
+    killer = threading.Timer(TIME_BUDGET, proc.kill)
     killer.start()
-    rcs = [p.wait() for p in procs]
-    killer.cancel()
-    for rf in reps:
-        rf.close()
-    for ef in errs:
-        ef.close()
-    # Any process killed by the budget timer → treat the whole run as a (resumable)
-    # timeout. All non-negative & zero → success. Otherwise a real failure: surface
-    # every shard's stderr tail and abort.
-    if any(c < 0 for c in rcs):
+    try:
+        for line in proc.stderr:
+            errf.write(line)
+            s = line.rstrip()
+            if s and ("progress" in s or "error" in s.lower() or "warn" in s.lower()):
+                sys.stdout.write("embed| %s\n" % s[-180:])
+                sys.stdout.flush()
+        rc = proc.wait()
+    finally:
+        killer.cancel()
+    if rc < 0:  # killed by the budget timer (-SIGKILL) → treat as time-budget hit
         rc = 124
-    elif all(c == 0 for c in rcs):
-        rc = 0
-    else:
-        rc = max(rcs)
-        tail = ""
-        for i in range(NGPU):
-            try:
-                tail += "[gpu%d] %s " % (i, open("/tmp/embed.%d.err" % i).read().replace("\n", " ")[-700:])
-            except Exception:
-                pass
-        say("embed_rc=%d err=%s" % (rc, tail[-1500:]))
-        fail("embed_run")
-    # MERGE each shard copy's embeddings back into EMBEDDED_DB (each clause from the
-    # one copy that owns its chunk_id shard). Runs on success AND timeout, so partial
-    # multi-GPU progress is preserved + resumable.
-    msql = ""
-    for i in range(NGPU):
-        msql += "ATTACH '%s' AS s%d (READ_ONLY);" % (copies[i], i)
-    for i in range(NGPU):
-        si = str(i)
-        msql += ("UPDATE clauses SET embedding=s" + si + "c.embedding, embedding_hash=s" + si + "c.embedding_hash "
-                 "FROM s" + si + ".clauses s" + si + "c WHERE clauses.chunk_id=s" + si + "c.chunk_id "
-                 "AND clauses.chunk_id % " + str(NGPU) + " = " + si + " AND s" + si + "c.embedding IS NOT NULL;")
-    mg = sh('duckdb "%s" "%s"' % (EMBEDDED_DB, msql))
-    if mg.returncode != 0:
-        say("embed_rc=1 err=merge failed: %s" % ((mg.stderr or "") + (mg.stdout or ""))[-400:])
-        fail("embed_run")
-    for i in range(NGPU):
-        try:
-            r = json.load(open("%s/embed-report.%d.json" % (WORK, i)))
-            EMB += int(r.get("embedded_clauses", 0) or 0)
-            MODEL = r.get("model", MODEL)
-        except Exception:
-            pass
-    # Completeness on the MERGED db (read-only probe; no embedder, no GPU).
-    cn = sh('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" --count-null-at-floor --report json'
-            % (WORK, EMBEDDED_DB, FLOOR, SERIES))
-    try:
-        NUL = json.loads(cn.stdout).get("null_embeddings_at_floor", None)
-    except Exception:
-        NUL = None
-else:
-    # Single-GPU / CPU: live-stream the embedder's progress (stderr) to the Kaggle log;
-    # the JSON report goes to REPORT (stdout). A threading.Timer enforces the budget; a
-    # timer-kill surfaces as a negative wait() status, mapped to the 124 timeout path.
-    with open(REPORT, "w") as out, open("/tmp/embed.err", "w") as errf:
-        proc = subprocess.Popen(embed_base(EMBEDDED_DB, ""), shell=True, env=env, stdout=out,
-                                stderr=subprocess.PIPE, text=True, bufsize=1)
-        killer = threading.Timer(TIME_BUDGET, proc.kill)
-        killer.start()
-        try:
-            for line in proc.stderr:
-                errf.write(line)
-                s = line.rstrip()
-                if s and ("progress" in s or "error" in s.lower() or "warn" in s.lower()):
-                    sys.stdout.write("embed| %s\n" % s[-180:])
-                    sys.stdout.flush()
-            rc = proc.wait()
-        finally:
-            killer.cancel()
-        if rc < 0:  # killed by the budget timer (-SIGKILL) → time-budget hit
-            rc = 124
-    if rc != 124 and rc != 0:
-        err = ""
-        try:
-            err = open("/tmp/embed.err").read().replace("\n", " ")[-1500:]
-        except Exception:
-            pass
-        say("embed_rc=%d err=%s" % (rc, err))
-        fail("embed_run")
-    rep = {}
-    try:
-        rep = json.load(open(REPORT))
-    except Exception:
-        pass
-    MODEL = rep.get("model", "?")
-    EMB = int(rep.get("embedded_clauses", 0) or 0)
-    NUL = rep.get("null_embeddings_at_floor", None)
-
 elapsed = int(time.time() - start)
 if rc == 124:
     say("embed=timeout elapsed=%ds (hit time budget — partial DB is resumable next run)" % elapsed)
-say("model=%s embedded=%d null_at_floor=%s elapsed=%ds ep=%s gpus=%d rc=%d"
-    % (MODEL, EMB, NUL if NUL is not None else "?", elapsed, EP, NGPU, rc))
+elif rc != 0:
+    err = ""
+    try:
+        err = open("/tmp/embed.err").read().replace("\n", " ")[-1500:]
+    except Exception:
+        pass
+    say("embed_rc=%d err=%s" % (rc, err))
+    fail("embed_run")
+
+rep = {}
+try:
+    rep = json.load(open(REPORT))
+except Exception:
+    pass
+MODEL = rep.get("model", "?")
+EMB = int(rep.get("embedded_clauses", 0) or 0)
+NUL = rep.get("null_embeddings_at_floor", None)
+say("model=%s embedded=%d null_at_floor=%s elapsed=%ds ep=%s rc=%d"
+    % (MODEL, EMB, NUL if NUL is not None else "?", elapsed, EP, rc))
 if elapsed > 0:
     say("throughput=%.2f clauses_per_s_%s" % (EMB / elapsed, EP))
 
