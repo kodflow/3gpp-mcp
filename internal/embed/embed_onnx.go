@@ -21,7 +21,6 @@ import (
 	"log"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -571,29 +570,22 @@ func deviceIDs(ep string) []int {
 	return ids
 }
 
-// gpuCount is the detected (or EMBED_GPUS-overridden) CUDA device count, clamped to
-// [1, 8]. nvidia-smi is the detector because the onnxruntime_go binding exposes no
-// device-count API; a missing/erroring nvidia-smi yields 1 (the safe single-GPU path).
+// gpuCount is how many ORT CUDA sessions to run. DEFAULT 1 — the proven single-GPU
+// path (s33 embedded fully this way). In-process multi-GPU is DISABLED by default:
+// running >1 ORT CUDA session concurrently in one process throws "CUDA failure 400:
+// invalid resource handle" at cudaEventRecord (verified on Kaggle 2×T4), because the
+// onnxruntime_go binding exposes no cudaSetDevice, so the two devices' CUDA streams/
+// events collide on whichever OS thread the goroutine lands on. EMBED_GPUS>1 force-
+// enables the multi-session path for experimentation only; the real 2-GPU speedup is
+// a separate 2-PROCESS design (one process per GPU via CUDA_VISIBLE_DEVICES — each is
+// then the single-device path that works — sharding the work-list and merging).
 func gpuCount() int {
 	if v := os.Getenv("EMBED_GPUS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 			return min(n, 8)
 		}
 	}
-	out, err := exec.Command("nvidia-smi", "-L").Output()
-	if err != nil {
-		return 1
-	}
-	n := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "GPU ") {
-			n++
-		}
-	}
-	if n < 1 {
-		return 1
-	}
-	return min(n, 8)
+	return 1
 }
 
 // newGPUSession builds one ORT session for the given device. Each session owns its
