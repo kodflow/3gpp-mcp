@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +58,10 @@ type gpuSession struct {
 }
 
 type onnxEmbedder struct {
-	tok *tokenizer.Tokenizer
+	// toks is the tokeniser POOL — one instance per producer goroutine, so batches
+	// tokenise in parallel (the CPU bottleneck) without sharing a non-concurrency-safe
+	// tokenizer. len>=1.
+	toks []*tokenizer.Tokenizer
 	// sessions is one gpuSession per device: len==1 on CPU / a single GPU, len==N
 	// across N CUDA devices (auto-detected). Embed shards its batches across them.
 	sessions  []*gpuSession
@@ -111,8 +115,24 @@ func newEmbedder() Embedder {
 		log.Printf("embed: model %q disabled%s — missing %s", spec.Name, fp16, strings.Join(missing, " "))
 		return Disabled{}
 	}
-	tok, err := pretrained.FromFile(tokPath)
-	if err != nil {
+	// Tokenisation is the embed bottleneck (sugarme/tokenizer is pure-Go ~18 clauses/s
+	// single-thread, vs the GPU doing far more), so load a POOL of tokenizer instances
+	// — one per producer goroutine — to tokenise batches in parallel and keep the GPU
+	// fed. The sugarme tokenizer is not concurrency-safe, hence one instance per
+	// goroutine rather than one shared. Count = EMBED_TOKENIZERS or NumCPU (capped).
+	nTok := tokenizerCount()
+	toks := make([]*tokenizer.Tokenizer, 0, nTok)
+	for i := 0; i < nTok; i++ {
+		t, err := pretrained.FromFile(tokPath)
+		if err != nil {
+			if i == 0 {
+				return Disabled{}
+			}
+			break // one tokenizer is enough to run (degrade to fewer producers)
+		}
+		toks = append(toks, t)
+	}
+	if len(toks) == 0 {
 		return Disabled{}
 	}
 	if err := onnxrt.Init(); err != nil {
@@ -147,9 +167,9 @@ func newEmbedder() Embedder {
 	if len(sessions) == 0 {
 		return Disabled{}
 	}
-	log.Printf("embed: ready with %d device session(s) (ep=%s)", len(sessions), ep)
+	log.Printf("embed: ready with %d device session(s), %d tokeniser(s) (ep=%s)", len(sessions), len(toks), ep)
 	return &onnxEmbedder{
-		tok:       tok,
+		toks:      toks,
 		sessions:  sessions,
 		windowing: envOr("EMBED_WINDOWING", ""),
 	}
@@ -184,14 +204,12 @@ func pipelineOn() bool { return envOr("EMBED_PIPELINE", "1") != "0" }
 // Embed tokenises and runs BGE-M3 in padded batches of batchSize, returning
 // L2-normalised 1024-dim dense vectors (cosine/HNSW expect unit norm).
 //
-// With more than one batch and the pipeline enabled, a SINGLE tokeniser goroutine
-// packs batch N+1 (pure CPU) while ONE runner goroutine PER DEVICE runs batches on
-// its own GPU — overlapping tokenise with inference AND, when several GPUs are
-// present, running them in parallel. The tokenizer is touched only by the single
-// producer goroutine (never concurrently); batches are independent and write
-// disjoint out[] ranges, so cross-device completion order is irrelevant and the
-// result is byte-identical to the serial path. With one device this is exactly the
-// previous single-consumer pipeline.
+// With more than one batch and the pipeline enabled, a POOL of tokeniser goroutines
+// (one per tokeniser instance) packs batches in parallel — tokenisation is the CPU
+// bottleneck — feeding a channel drained by one runner goroutine PER DEVICE. Each
+// producer owns its tokeniser (never shared), each batch writes a disjoint out[]
+// range, so completion order is irrelevant and the result is identical to the serial
+// path. With one tokeniser + one device this is the previous single-consumer pipeline.
 func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if e.windowing == "mean_pool" {
 		return e.embedWindowed(texts)
@@ -211,32 +229,49 @@ func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 		return out, nil
 	}
 
-	// Producer: tokenise+pack each batch in order, feeding a buffered channel sized
-	// to keep every device fed. A defer-recover converts any unexpected tokenizer
-	// panic into an error (degrade-never-block) instead of crashing the process.
+	// PRODUCERS: tokenisation is the bottleneck (pure-Go ~18 clauses/s/thread), so run
+	// one producer goroutine per tokeniser, each packing a ROUND-ROBIN slice of the
+	// batches in parallel — N producers ≈ N× tokenise throughput, enough to keep the
+	// GPU fed. Each owns its tokeniser (sugarme is not concurrency-safe). Batches are
+	// independent and write disjoint out[] ranges, so completion order is irrelevant
+	// and the result is identical to the serial path. prepCh closes once all are done.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	prepCh := make(chan preparedBatch, len(e.sessions)+1)
+	type batchRange struct{ start, end int }
+	var batches []batchRange
+	for start := 0; start < len(texts); start += batchSize {
+		batches = append(batches, batchRange{start, min(start+batchSize, len(texts))})
+	}
+	prepCh := make(chan preparedBatch, len(e.toks)+len(e.sessions))
+	var prodWg sync.WaitGroup
 	var tokErr error
-	go func() {
-		defer close(prepCh)
-		defer func() {
-			if r := recover(); r != nil {
-				tokErr = fmt.Errorf("tokenizer goroutine panicked: %v", r)
-				cancel()
+	var tokMu sync.Mutex
+	for ti := range e.toks {
+		prodWg.Add(1)
+		go func(ti int) {
+			defer prodWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					tokMu.Lock()
+					if tokErr == nil {
+						tokErr = fmt.Errorf("tokenizer goroutine panicked: %v", r)
+					}
+					tokMu.Unlock()
+					cancel()
+				}
+			}()
+			for bi := ti; bi < len(batches); bi += len(e.toks) {
+				br := batches[bi]
+				pb := e.prepareBatch(e.toks[ti], texts[br.start:br.end], br.start)
+				select {
+				case prepCh <- pb:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}()
-		for start := 0; start < len(texts); start += batchSize {
-			end := min(start+batchSize, len(texts))
-			pb := e.prepareBatch(texts[start:end], start)
-			select {
-			case prepCh <- pb:
-			case <-ctx.Done():
-				tokErr = ctx.Err()
-				return
-			}
-		}
-	}()
+		}(ti)
+	}
+	go func() { prodWg.Wait(); close(prepCh) }()
 
 	// One runner per device: each pulls prepared batches and runs them on its own
 	// session/GPU, writing vectors to their output positions. The first run error
@@ -310,8 +345,8 @@ const (
 // encodeIDs is the recoverable tokenize step (extracted so safeEncode in
 // embed_safe.go can host the panic-recovery contract and test it without a
 // real tokenizer).
-func (e *onnxEmbedder) encodeIDs(text string) ([]int, error) {
-	enc, err := e.tok.EncodeSingle(text, true)
+func (e *onnxEmbedder) encodeIDs(tok *tokenizer.Tokenizer, text string) ([]int, error) {
+	enc, err := tok.EncodeSingle(text, true)
 	if err != nil {
 		return nil, err
 	}
@@ -328,8 +363,9 @@ func (e *onnxEmbedder) encodeIDs(text string) ([]int, error) {
 //
 // On any fallback we log {len, sha256-prefix} of the input — never the input
 // itself, which can be a user search query (Qodo finding #3: privacy).
-func (e *onnxEmbedder) tokenizeSafe(text string) []int {
-	ids, err := safeEncode(e.encodeIDs, text)
+func (e *onnxEmbedder) tokenizeSafe(tok *tokenizer.Tokenizer, text string) []int {
+	enc := func(s string) ([]int, error) { return e.encodeIDs(tok, s) }
+	ids, err := safeEncode(enc, text)
 	if err == nil && len(ids) > 0 {
 		return ids
 	}
@@ -337,7 +373,7 @@ func (e *onnxEmbedder) tokenizeSafe(text string) []int {
 		log.Printf("embed: tokenize failed (len=%d, hash=%s): %v — fallback to single space",
 			len(text), snippetHash(text), err)
 	}
-	ids, err = safeEncode(e.encodeIDs, " ")
+	ids, err = safeEncode(enc, " ")
 	if err == nil && len(ids) > 0 {
 		return ids
 	}
@@ -360,12 +396,12 @@ type preparedBatch struct {
 // (len <= batchSize) into flat input_ids / attention_mask tensors. No GPU, no
 // shared mutable state beyond the tokenizer — so it can run on the producer
 // goroutine while the GPU runs an earlier batch. start is the output offset.
-func (e *onnxEmbedder) prepareBatch(texts []string, start int) preparedBatch {
+func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, start int) preparedBatch {
 	b := len(texts)
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, t := range texts {
-		ids := e.tokenizeSafe(t)
+		ids := e.tokenizeSafe(tok, t)
 		if len(ids) > maxTokens {
 			ids = ids[:maxTokens]
 		}
@@ -437,7 +473,7 @@ func (s *gpuSession) runPrepared(pb preparedBatch, out [][]float32) error {
 // embedBatch embeds one batch (len <= batchSize) into dst (same length) — the
 // serial prepare+run used by the non-pipelined path and the windowed path.
 func (e *onnxEmbedder) embedBatch(texts []string, dst [][]float32) error {
-	return e.sessions[0].runPrepared(e.prepareBatch(texts, 0), dst)
+	return e.sessions[0].runPrepared(e.prepareBatch(e.toks[0], texts, 0), dst)
 }
 
 func l2normalize(v []float32) {
@@ -584,6 +620,23 @@ func gpuCount() int {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 			return min(n, 8)
 		}
+	}
+	return 1
+}
+
+// tokenizerCount is the size of the tokeniser pool = number of parallel producer
+// goroutines. Tokenisation (pure-Go sugarme, ~18 clauses/s single-thread) is the
+// embed bottleneck, so this is the PRIMARY throughput lever: N tokenisers ≈ N×
+// throughput until the GPU saturates. Default = runtime.NumCPU(), capped to [1,16];
+// EMBED_TOKENIZERS overrides (e.g. to leave a core free, or to A/B).
+func tokenizerCount() int {
+	if v := os.Getenv("EMBED_TOKENIZERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return min(n, 16)
+		}
+	}
+	if n := runtime.NumCPU(); n >= 1 {
+		return min(n, 16)
 	}
 	return 1
 }
