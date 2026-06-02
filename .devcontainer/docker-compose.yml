@@ -127,7 +127,7 @@ services:
       - GPG_TTY=/dev/tty
       - GNUPGHOME=/home/vscode/.gnupg
       # PATH - Add all bin directories (user packages first, then system)
-      - PATH=/home/vscode/.local/share/npm-global/bin:/home/vscode/.local/bin:/usr/local/share/nvm/current/bin:/home/vscode/.cache/pyenv/bin:/home/vscode/.cache/rbenv/bin:/home/vscode/.cache/sdkman/bin:/home/vscode/.cache/composer/vendor/bin:/home/vscode/.cache/pub-cache/bin:/home/vscode/.cache/flutter/bin:/home/vscode/.cache/mix/escripts:/home/vscode/.cache/vcpkg:/home/vscode/.cache/carbon/bin:/home/vscode/.cache/go/bin:/home/vscode/.cache/cargo/bin:/home/vscode/.cache/gems/bin:/home/vscode/.cache/pnpm:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+      - PATH=/home/vscode/.venvs/embed-tools/bin:/home/vscode/.local/share/npm-global/bin:/home/vscode/.local/bin:/usr/local/share/nvm/current/bin:/home/vscode/.cache/pyenv/bin:/home/vscode/.cache/rbenv/bin:/home/vscode/.cache/sdkman/bin:/home/vscode/.cache/composer/vendor/bin:/home/vscode/.cache/pub-cache/bin:/home/vscode/.cache/flutter/bin:/home/vscode/.cache/mix/escripts:/home/vscode/.cache/vcpkg:/home/vscode/.cache/carbon/bin:/home/vscode/.cache/go/bin:/home/vscode/.cache/cargo/bin:/home/vscode/.cache/gems/bin:/home/vscode/.cache/pnpm:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
     # User
     user: vscode
 volumes:
