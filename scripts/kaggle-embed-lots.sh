@@ -202,7 +202,9 @@ stage_resume() { # $1=lot  $2=rels
     echo "os.environ.setdefault('RESUME_DB', '/kaggle/input/3gpp-resume-lot${lc}/3gpp-embedded.duckdb')"
     cat "$ROOT/scripts/kaggle/kernel-embed.py"
   } > "$dir/kernel.py"
-  printf '{\n "id": "%s",\n "title": "3gpp embed lot%s (resume)",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": ["%s"],\n "competition_sources": [],\n "kernel_sources": []\n}\n' \
+  # Title MUST slugify to the kernel id (Kaggle 409 otherwise); keep it identical to
+  # the fresh-push title (no "(resume)" suffix).
+  printf '{\n "id": "%s",\n "title": "3gpp embed lot%s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": ["%s"],\n "competition_sources": [],\n "kernel_sources": []\n}\n' \
     "$(kernel_slug "$lot")" "$lot" "$(resume_slug "$lot")" > "$dir/kernel-metadata.json"
 }
 
