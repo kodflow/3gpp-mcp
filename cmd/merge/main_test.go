@@ -105,7 +105,7 @@ func TestMergeSeriesReleaseScope(t *testing.T) {
 	})
 
 	// Incremental merge: base + shardA + shardB. FTS off (no extension under test).
-	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false, "", ""); err != nil {
+	if err := run(ctx, out, []string{shardA, shardB}, false, "", base, false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,7 +194,7 @@ func TestStripEmbeddings(t *testing.T) {
 		_ = st.SetMeta("hnsw_state", "frozen")
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, "", ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", true /* stripEmbeddings */, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -326,7 +326,7 @@ func TestMergeVectorizedNoStripBuildsHNSW(t *testing.T) {
 	})
 
 	// Full (no --base), NON-stripping merge of a vectorized shard.
-	if err := run(ctx, out, []string{shard}, false, "", "", false /* stripEmbeddings */, "", ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", false /* stripEmbeddings */, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -374,7 +374,7 @@ func TestMergeLexicalNoStripSkipsHNSW(t *testing.T) {
 		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-18", "18.0.0", "5.1")})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", "", false, "", ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", "", false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -431,7 +431,7 @@ func TestMergeChangesCumulativeAnnexIdempotent(t *testing.T) {
 		_ = st.InsertChanges(annex())
 	})
 
-	if err := run(ctx, out1, []string{shard}, false, "", base, false, "", ""); err != nil {
+	if err := run(ctx, out1, []string{shard}, false, "", base, false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	dupCount := func(path string) (dup, total int) {
@@ -455,7 +455,7 @@ func TestMergeChangesCumulativeAnnexIdempotent(t *testing.T) {
 	}
 
 	// Re-run the SAME delta against the freshly-published out1 as the new base.
-	if err := run(ctx, out2, []string{shard}, false, "", out1, false, "", ""); err != nil {
+	if err := run(ctx, out2, []string{shard}, false, "", out1, false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	dup2, total2 := dupCount(out2)
@@ -504,7 +504,7 @@ func TestMergeSiblingSpecNotLost(t *testing.T) {
 		_ = st.InsertChanges([]model.Change{{CRNumber: "C501", SpecID: "24.501", ToVersion: "19.3.0"}})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false, "", ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -563,7 +563,7 @@ func TestMergeAcronymReplacedOnSubjectChange(t *testing.T) {
 		_ = st.UpsertAcronym(model.Acronym{Term: "XYZ", Expansion: "Correct Thing", SourceSeries: "21"})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false, "", ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, "", "", false); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.OpenReadOnly(out)
@@ -617,7 +617,7 @@ func TestMergeDroppedBasePublishesEmptySubjectFootprint(t *testing.T) {
 		_ = st.InsertClauses([]model.Clause{cl(1, "24.501", "Rel-19", "19.2.0", "5.1")})
 	})
 
-	if err := run(ctx, out, []string{shard}, false, "", base, false, subjOut, ""); err != nil {
+	if err := run(ctx, out, []string{shard}, false, "", base, false, subjOut, "", false); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(subjOut)
