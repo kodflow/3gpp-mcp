@@ -192,6 +192,13 @@ else:
     say("sliced_clauses=%s" % sln)
     if not (sln.isdigit() and int(sln) >= 1):
         fail("empty_slice", "shard=%s full=%s" % (SHARD, fulln))
+    # DISK: full.duckdb (~1.7GB) is consumed — drop it so /kaggle/working doesn't carry
+    # it alongside the growing embedded DB + models (the disk-exhaustion crash root cause).
+    try:
+        os.remove("%s/full.duckdb" % WORK)
+        say("cleanup=full.duckdb_removed")
+    except OSError:
+        pass
 
 # ---- ONNX Runtime (GPU) + BGE-M3 -------------------------------------------
 if sh('curl -fsSL --retry 5 -o /tmp/ort.tgz '
@@ -280,6 +287,10 @@ if PRECISION == "fp16":
     MODEL_DIR_ACTIVE = BGE16
     EMBED_ENV = {"EMBED_MODELS_CONFIG": "%s/models.yaml" % WORK, "EMBED_MODEL": "bge-m3-fp16"}
     say("fp16=ready bytes=%d" % os.path.getsize("%s/model.onnx_data" % BGE16))
+    # DISK: the fp32 source model (~2.3GB) is no longer needed once fp16 is built — drop it
+    # so it doesn't sit next to the fp16 model + the growing embedded DB (crash root cause).
+    shutil.rmtree(BGE, ignore_errors=True)
+    say("cleanup=fp32_model_removed")
 
 # ---- build the onnx embed binary -------------------------------------------
 # fasttok = HuggingFace Rust tokenizer (daulet/tokenizers, CGO). The 2×T4 probe
