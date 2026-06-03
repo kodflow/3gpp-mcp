@@ -40,19 +40,21 @@ func main() {
 	base := flag.String("base", "", "existing DB to start from (incremental): each shard's (series,release) buckets REPLACE the base's")
 	stripEmbeddings := flag.Bool("strip-embeddings", false,
 		"after merge, DROP COLUMN embedding so the GitHub Release asset stays slim (vectors live in the GHCR per-series sub-bases)")
+	noHNSW := flag.Bool("no-hnsw", false,
+		"skip the HNSW index build on a vectorized merge (HNSW build is RAM-hungry; on a low-RAM box it OOMs). The merged DB keeps its vectors; serve degrades to EXACT-SCAN vector search (correct, slower); freeze HNSW later on a bigger machine. FTS is still rebuilt. Ignored with --strip-embeddings.")
 	flag.Parse()
 	inputs := flag.Args()
 	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "merge: no input DBs given")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut, *buildIndexOut); err != nil {
+	if err := run(context.Background(), *out, inputs, *fts, *indexOut, *base, *stripEmbeddings, *subjectIndexOut, *buildIndexOut, *noHNSW); err != nil {
 		fmt.Fprintln(os.Stderr, "merge:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut, buildIndexOut string) error {
+func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, base string, stripEmbeddings bool, subjectIndexOut, buildIndexOut string, noHNSW bool) error {
 	_ = os.Remove(out)
 	db, err := store.Open(out)
 	if err != nil {
@@ -178,6 +180,12 @@ func run(ctx context.Context, out string, inputs []string, fts bool, indexOut, b
 			return fmt.Errorf("checkpoint after strip: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "[merge] stripped embeddings + vector meta (lexical-only output)")
+	} else if noHNSW {
+		// Low-RAM escape hatch: keep the vectors but skip the HNSW build (it OOMs on a
+		// small box). serve's LoadVSS then degrades to an exact full-scan — correct, just
+		// slower. Freeze HNSW later on a bigger machine (re-merge without --no-hnsw, or a
+		// dedicated build). FTS below is still rebuilt.
+		fmt.Fprintln(os.Stderr, "[merge] --no-hnsw: vectors kept, HNSW NOT built (serve = exact-scan; build it later on more RAM)")
 	} else if err := rebuildHNSWIfVectorized(ctx, db, sqldb); err != nil {
 		// NOT stripping: if any folded clause carries a vector, the merged DB must
 		// ship with a usable, frozen HNSW. foldTable concatenates only ROWS, never
