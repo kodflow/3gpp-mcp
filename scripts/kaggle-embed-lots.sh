@@ -210,12 +210,18 @@ cmd_resume() {
   require_cli
   # Phase 1: upload BOTH partials first, so each dataset is fully processed before its
   # kernel mounts it (a not-yet-ready dataset would silently fresh-slice = re-embed all).
-  for pair in "A:$LOT_A" "B:$LOT_B"; do
-    lot="${pair%%:*}"
-    db="$STAGE/out-$lot/3gpp-embedded.duckdb"
-    [ -f "$db" ] || die "lot $lot: missing partial $db (run collect / place the file first)"
-    publish_resume "$lot" "$db"
-  done
+  # RESUME_SKIP_UPLOAD=1 re-pushes the kernels against ALREADY-uploaded resume datasets
+  # (e.g. after a code-only fix), avoiding a needless ~18GB re-upload.
+  if [ "${RESUME_SKIP_UPLOAD:-0}" = 1 ]; then
+    log "RESUME_SKIP_UPLOAD=1 — reusing existing resume datasets, no upload"
+  else
+    for pair in "A:$LOT_A" "B:$LOT_B"; do
+      lot="${pair%%:*}"
+      db="$STAGE/out-$lot/3gpp-embedded.duckdb"
+      [ -f "$db" ] || die "lot $lot: missing partial $db (run collect / place the file first)"
+      publish_resume "$lot" "$db"
+    done
+  fi
   # Phase 2: push both resume kernels (2 concurrent slots).
   for pair in "A:$LOT_A" "B:$LOT_B"; do
     lot="${pair%%:*}"; rels="${pair#*:}"
