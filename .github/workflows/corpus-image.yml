@@ -1,15 +1,13 @@
 name: Corpus Image
 
-# Reconstitute the full corpus DB from the per-release GitHub Releases, then bake it
-# into the 3gpp-mcp server image and push to GHCR. The `latest` release stays
-# binary-only; each 3GPP release (phase1, phase2, rel-99, rel-4 … rel-20) is its own
-# Release carrying ONLY its DB asset (3gpp-<release>.duckdb.zst). This job pulls them
-# all, `cmd/merge` re-fuses them (rebuilding FTS + HNSW on the union), and the image
-# bakes the result so `serve` boots offline.
+# Bake the VALIDATED global corpus DB into the 3gpp-mcp server image and push to GHCR.
+# Per the locked design (plan §3, §6.1, §9): the image CI does **bake only — ZERO merge**.
+# The single source of truth is the OCI artifact ghcr.io/<owner>/3gpp-corpus:latest, which
+# is produced + validated by the corpus pipeline (manual bootstrap, then Corpus Maintenance).
 #
-# Trigger manually, or after a per-release publish. The image is PRIVATE by default
-# (it embeds verbatim 3GPP clause text — see .claude/plans/embed-release-docker-mcp.md
-# §1.A); flip the package to public only if the IPR review allows it.
+# GATED: this only runs on manual dispatch and FAILS FAST with a clear message if the
+# corpus artifact does not exist yet (true until the first private publish). The image is
+# PRIVATE by default — it embeds verbatim 3GPP text (plan §2). Keep the GHCR package private.
 
 on:
   workflow_dispatch:
@@ -18,6 +16,10 @@ on:
         description: "Go build tags (empty = lexical; 'onnx' = semantic query path)"
         type: string
         default: ""
+      corpus_ref:
+        description: "OCI corpus artifact to bake (validated global)"
+        type: string
+        default: "ghcr.io/kodflow/3gpp-corpus:latest"
       push:
         description: "Push the image to GHCR"
         type: boolean
@@ -27,81 +29,69 @@ permissions:
   contents: read
 
 concurrency:
-  group: corpus-image-${{ github.ref }}
+  group: docker-image
   cancel-in-progress: true
 
 jobs:
-  reconstitute-and-build:
+  bake-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     permissions:
-      contents: read # read the per-release Release assets
-      packages: write # push to ghcr.io
+      contents: read
+      packages: write # pull the private corpus artifact + push the image
       id-token: write # SLSA provenance attestation
       attestations: write
-
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+
+      - name: Install ORAS
+        run: |
+          set -euo pipefail
+          VER=1.2.0
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${VER}/oras_${VER}_linux_amd64.tar.gz" -o /tmp/oras.tgz
+          tar -C /tmp -xzf /tmp/oras.tgz oras && sudo mv /tmp/oras /usr/local/bin/
+
+      - name: Login GHCR (oras + docker)
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull the VALIDATED global corpus → image-data/ (bake-only, no merge)
+        run: |
+          set -euo pipefail
+          mkdir -p image-data
+          if ! oras manifest fetch "${{ github.event.inputs.corpus_ref }}" >/dev/null 2>&1; then
+            echo "::error::corpus artifact ${{ github.event.inputs.corpus_ref }} not found." \
+                 "Publish a validated global corpus first (bootstrap §4 / Corpus Maintenance §6)." >&2
+            exit 1
+          fi
+          oras pull "${{ github.event.inputs.corpus_ref }}" -o image-data/
+          # Accept either a raw or zstd-compressed DB; decompress if needed.
+          if [ -f image-data/3gpp.duckdb.zst ]; then
+            sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
+            zstd -d --long=27 -f image-data/3gpp.duckdb.zst -o image-data/3gpp.duckdb
+            rm -f image-data/3gpp.duckdb.zst
+          fi
+          test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb in artifact" >&2; exit 1; }
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Install zstd
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
-
-      - name: Pull every per-release DB and re-merge into the full corpus
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Validate the baked DB before building (gate — plan §5)
         run: |
           set -euo pipefail
-          mkdir -p shards image-data
-          # Every Release EXCEPT `latest` (binary-only) is a per-3GPP-release DB.
-          tags=$(gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -v '^latest$' || true)
-          if [ -z "$tags" ]; then echo "no per-release Releases found — nothing to reconstitute" >&2; exit 1; fi
-          n=0
-          echo "$tags" | while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            echo "::group::download $tag"
-            gh release download "$tag" --dir shards --pattern '*.duckdb.zst' --clobber || { echo "no DB asset on $tag, skipping"; echo "::endgroup::"; continue; }
-            echo "::endgroup::"
-          done
-          # Decompress all shards.
-          for z in shards/*.duckdb.zst; do
-            [ -e "$z" ] || { echo "no shards downloaded" >&2; exit 1; }
-            zstd -d --long=27 -f "$z" -o "${z%.zst}"
-            n=$((n+1))
-          done
-          echo "decompressed $n shard(s)"
-          # Merge (vectors preserved, FTS + HNSW rebuilt on the union, manifests emitted).
-          CGO_ENABLED=1 go run ./cmd/merge --out image-data/3gpp.duckdb \
-            --index-out image-data/corpus-index.json \
-            --subject-index-out image-data/subject-index.json \
-            --build-index-out image-data/build-index.json \
-            shards/*.duckdb
-          rm -rf shards
-          ls -lah image-data/
-
-      - name: Validate completeness (no clause left unembedded across the union)
-        run: |
-          set -euo pipefail
-          CGO_ENABLED=1 go run ./cmd/embed --db image-data/3gpp.duckdb \
-            --count-null-at-floor --embed-floor Rel-99 --report json | tee probe.json
-          # Fail closed if any at/above-floor clause is still NULL.
-          python3 -c "import json,sys; d=json.load(open('probe.json')); sys.exit(0 if d.get('null_embeddings_at_floor',1)==0 else 1)" \
-            || { echo 'incomplete embeddings in merged DB' >&2; exit 1; }
+          CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
+            --require-fts --min-clauses 1
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
@@ -111,9 +101,7 @@ jobs:
             type=sha,prefix=,format=short
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in
-            org.opencontainers.image.licenses=MIT
-
+            org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in (PRIVATE)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
         with:
@@ -130,7 +118,6 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
-
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         if: ${{ github.event.inputs.push != 'false' && steps.build.outputs.digest != '' }}
         with:
