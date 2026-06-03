@@ -1,0 +1,21 @@
+# Keep the build context tiny: the corpus, caches, the compiled embed binary and
+# the local kaggle staging are huge and never needed to build the server image.
+# image-data/ is the ONLY data dir intentionally shipped (the CI puts the merged
+# DB there to bake into the image); everything else under data/ is excluded.
+.git
+data/
+!image-data/
+embed
+.kaggle-campaign/
+.kaggle-lots/
+dist/
+*.duckdb
+*.duckdb.zst
+*.zst
+.devcontainer/
+.claude/
+docs/
+tests/
+**/*_test.go
+node_modules/
+*.log
