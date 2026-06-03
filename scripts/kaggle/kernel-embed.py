@@ -155,6 +155,14 @@ else:
         fail("decompress")
     fulln = duckdb_scalar("%s/full.duckdb" % WORK, "SELECT count(*) FROM clauses;")
     say("full_clauses=%s" % fulln)
+    # Emit the WHOLE-corpus per-release clause counts once (we have full.duckdb here,
+    # on Kaggle's fast network). The local dashboard reads this as its denominator,
+    # so it never has to download the 7GB corpus on a flaky laptop link.
+    rt = sh('duckdb "%s/full.duckdb" -noheader -list '
+            '"SELECT release || \'=\' || count(*) FROM clauses GROUP BY release;"' % WORK)
+    if rt.returncode == 0 and rt.stdout.strip():
+        pairs = ",".join(l.strip() for l in rt.stdout.splitlines() if l.strip())
+        say("release_totals=%s" % pairs)
     slice_sql = ("ATTACH '%s/full.duckdb' AS s (READ_ONLY); "
                  "CREATE TABLE clauses AS SELECT * FROM s.clauses "
                  "WHERE substr(spec_id,1,2)='%s';" % (WORK, SERIES))
