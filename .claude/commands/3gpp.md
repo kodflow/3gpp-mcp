@@ -53,7 +53,10 @@ Acronymes ▸ AMF = Access & Mobility Management Function · AUSF = Authenticati
 - Les **12 champs MÉTA** : Releases · Domaine · Stack · NF/NE · Interfaces · Procédure ·
   Specs · WG · Type · Évolution · Récupération+confiance · (Acronymes = ligne dédiée
   sous les Sources). **Un champ non pertinent est OMIS** (ligne retirée), jamais inventé.
-- **Sources cliquables** = les `url` DOCX 3GPP renvoyées par le MCP, une par citation.
+- **Sources cliquables** : en mode HTTP, chaque source pointe vers
+  `http://<host>/spec/<spec_id>/<release>/<clause>` — la page locale qui ouvre le texte EXACT
+  (verbatim) de la clause indexée + le DOCX officiel 3GPP. Si l'hôte est inconnu (mode stdio),
+  retombe sur l'`url` officielle 3GPP renvoyée par le MCP.
 - **Récup./confiance** reflète honnêtement le retrieval : `PARTIELLE` si le MCP n'a couvert
   qu'une partie de la question (et dis ce qui manque).
 
