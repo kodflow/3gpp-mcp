@@ -246,14 +246,47 @@ if PRECISION == "fp16":
     say("fp16=ready bytes=%d" % os.path.getsize("%s/model.onnx_data" % BGE16))
 
 # ---- build the onnx embed binary -------------------------------------------
+# fasttok = HuggingFace Rust tokenizer (daulet/tokenizers, CGO). The 2×T4 probe
+# proved it: the pure-Go sugarme path leaves the GPU starved (util 3-5%, ~6 cl/s,
+# TOKENIZE-bound); daulet drops tokenise prep from ~65s to ~1s and lifts throughput
+# ~7× (≈43-56 cl/s, now GPU/RUN-bound). So we fetch the prebuilt static lib and build
+# -tags "onnx fasttok" by default; if the lib is unavailable we degrade to the pure-Go
+# build (slower but still correct — never block).
 env = dict(os.environ)
 env["CGO_ENABLED"] = "1"
 env["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
 env["LD_LIBRARY_PATH"] = ORT_DIR + ":" + env.get("LD_LIBRARY_PATH", "")
-build = sh('go build -tags onnx -o "%s/embed" ./cmd/embed' % WORK, env=env)
+BUILD_TAGS = "onnx"
+DAULET_VER = os.environ.get("DAULET_VERSION", "v1.27.0")
+FASTTOK = os.environ.get("EMBED_FASTTOK", "1") != "0"
+if FASTTOK:
+    libdir = "%s/libtok" % WORK
+    os.makedirs(libdir, exist_ok=True)
+    got = False
+    for asset in ("libtokenizers.linux-amd64.tar.gz", "libtokenizers.linux-x86_64.tar.gz"):
+        u = "https://github.com/daulet/tokenizers/releases/download/%s/%s" % (DAULET_VER, asset)
+        if sh('curl -fsSL --retry 5 "%s" -o "%s/lib.tgz"' % (u, libdir)).returncode == 0:
+            sh('tar -C "%s" -xzf "%s/lib.tgz"' % (libdir, libdir))
+            hits = glob.glob("%s/**/libtokenizers.a" % libdir, recursive=True) + ["%s/libtokenizers.a" % libdir]
+            hits = [h for h in hits if os.path.isfile(h)]
+            if hits:
+                env["CGO_LDFLAGS"] = "-L%s" % os.path.dirname(hits[0])
+                BUILD_TAGS = "onnx fasttok"
+                got = True
+                break
+    say("fasttok=%s ver=%s" % ("on" if got else "off_no_lib", DAULET_VER))
+build = sh('go build -tags "%s" -o "%s/embed" ./cmd/embed' % (BUILD_TAGS, WORK), env=env)
 if build.returncode != 0:
-    fail("build", (build.stderr or "").replace("\n", " ")[-200:])
-say("build=ok")
+    # If the fasttok link failed, fall back to the pure-Go build so the run still
+    # completes (correct, just slower) instead of failing the whole kernel.
+    if "fasttok" in BUILD_TAGS:
+        say("build=retry detail=fasttok_link_failed → pure-go")
+        env.pop("CGO_LDFLAGS", None)
+        build = sh('go build -tags onnx -o "%s/embed" ./cmd/embed' % WORK, env=env)
+        BUILD_TAGS = "onnx"
+    if build.returncode != 0:
+        fail("build", (build.stderr or "").replace("\n", " ")[-200:])
+say("build=ok tags=%s" % BUILD_TAGS)
 
 # ---- EMBED (recent-first, resumable, time-bounded) -------------------------
 env["EMBED_MODEL_DIR"] = MODEL_DIR_ACTIVE
