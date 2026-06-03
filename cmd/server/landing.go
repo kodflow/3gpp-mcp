@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/store"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
@@ -58,6 +59,8 @@ RULES:
 2. Quote the returned text and reproduce its citation block verbatim. Default to TS over TR.
 3. If a tool returns nothing, say so — never invent an IE, clause, or release.
 4. Releases are non-monotonic: always carry (release, version, freeze_date) when ordering.
+5. In HTTP mode, render each source as a clickable link to http://{{HOST}}/spec/<spec_id>/<release>/<clause>
+   (the local page showing that clause's EXACT indexed text); otherwise fall back to the official 3GPP url from the MCP.
 
 INSTALL & CONFIGURE (detect your environment, then use the matching method):
 - Claude Code / Claude Desktop: ` + "`claude mcp add --transport http 3gpp http://{{HOST}}/mcp`" + ` (or stdio:
@@ -87,10 +90,14 @@ func imageRef() string {
 // serveHTTP mounts the MCP Streamable HTTP transport + the landing routes on one
 // mux and blocks. Diagnostics already went to stderr in serve(); request logging
 // here is intentionally minimal.
-func serveHTTP(srv *mcpserver.MCPServer, addr string) error {
+func serveHTTP(srv *mcpserver.MCPServer, st *store.Store, addr string) error {
 	stream := mcpserver.NewStreamableHTTPServer(srv, mcpserver.WithEndpointPath(mcpEndpointPath))
 	mux := http.NewServeMux()
 	mux.Handle(mcpEndpointPath, stream)
+	// /spec/{spec_id}/{release}/{clause} (+ query-string fallback) renders the
+	// exact indexed clause text so a citation in an HTTP-mode answer is clickable.
+	mux.HandleFunc("/spec/", specDocHandler(st))
+	mux.HandleFunc("/spec", specDocHandler(st))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
