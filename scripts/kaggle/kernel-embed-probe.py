@@ -51,7 +51,7 @@ REPO = "https://github.com/kodflow/3gpp-mcp"
 BRANCH = os.environ.get("BRANCH", "feat/embed-pipeline-rebuild")
 SERIES = os.environ.get("SERIES", "21")
 FLOOR = os.environ.get("EMBED_FLOOR", "Rel-17")
-LIMIT = os.environ.get("PROBE_LIMIT", "1000")
+LIMIT = os.environ.get("PROBE_LIMIT", "3000")
 BGE_COMMIT = "5617a9f61b028005a4858fdac845db406aefb181"
 PRECISION = os.environ.get("EMBED_PRECISION", "fp16").lower()
 ORT_VERSION = os.environ.get("ORT_VERSION", "1.26.0")
@@ -276,20 +276,19 @@ def run_config(name, binary, extra_env, sessions_per_gpu="1"):
             "util_mean": util_mean, "util_max": util_max, "rc": rc}
 
 
-# ---- A/B: the tokenizer is the variable; batching levers default-on in both ----
-# The 2×T4 probe pinned the wall at CPU tokenisation (GPU util 3-5%). So the decisive
-# comparison is sugarme (pure-Go) vs daulet (HF Rust), same engine otherwise.
+# ---- A/B: daulet confirmed the fix (7×, GPU-bound). Now isolate the batching +
+# warmup levers IN the GPU-bound regime, where they should finally matter. ----
 results = []
-# A: sugarme, batching OFF — reproduces the ~6 cl/s baseline.
+# Reference: pure-Go baseline (~6 cl/s, GPU starved).
 results.append(run_config("sugarme_base", EMBED_SUGARME, {"EMBED_SHAPE_LADDER": "0", "EMBED_TOKEN_BUDGET_BATCHING": "0"}))
-# B: sugarme, ladder+budget ON — isolates the batching levers under the CPU wall.
-results.append(run_config("sugarme_levers", EMBED_SUGARME, {}))
-# C: daulet (HF Rust) + ladder+budget — the candidate fix; expect the GPU to stop
-# starving (util up, cl/s up). Skipped if the static lib was unavailable.
 if EMBED_DAULET:
-    results.append(run_config("daulet_levers", EMBED_DAULET, {}))
-    # D: daulet + 2 overlapping sessions — single-GPU saturation once the GPU is fed.
-    results.append(run_config("daulet_levers_s2", EMBED_DAULET, {}, sessions_per_gpu="2"))
+    # daulet, all GPU levers OFF — the raw tokenizer win alone.
+    results.append(run_config("daulet_plain", EMBED_DAULET,
+                              {"EMBED_SHAPE_LADDER": "0", "EMBED_TOKEN_BUDGET_BATCHING": "0", "EMBED_WARMUP": "0"}))
+    # daulet + ladder + token-budget (no warmup).
+    results.append(run_config("daulet_levers", EMBED_DAULET, {"EMBED_WARMUP": "0"}))
+    # daulet + ladder + token-budget + shape warmup (the full engine).
+    results.append(run_config("daulet_full", EMBED_DAULET, {}))
 
 base = results[0]["cl_s"] or 1e-9
 for r in results:
