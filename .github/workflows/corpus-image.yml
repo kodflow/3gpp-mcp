@@ -1,0 +1,139 @@
+name: Corpus Image
+
+# Reconstitute the full corpus DB from the per-release GitHub Releases, then bake it
+# into the 3gpp-mcp server image and push to GHCR. The `latest` release stays
+# binary-only; each 3GPP release (phase1, phase2, rel-99, rel-4 … rel-20) is its own
+# Release carrying ONLY its DB asset (3gpp-<release>.duckdb.zst). This job pulls them
+# all, `cmd/merge` re-fuses them (rebuilding FTS + HNSW on the union), and the image
+# bakes the result so `serve` boots offline.
+#
+# Trigger manually, or after a per-release publish. The image is PRIVATE by default
+# (it embeds verbatim 3GPP clause text — see .claude/plans/embed-release-docker-mcp.md
+# §1.A); flip the package to public only if the IPR review allows it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tags:
+        description: "Go build tags (empty = lexical; 'onnx' = semantic query path)"
+        type: string
+        default: ""
+      push:
+        description: "Push the image to GHCR"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reconstitute-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read # read the per-release Release assets
+      packages: write # push to ghcr.io
+      id-token: write # SLSA provenance attestation
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
+
+      - name: Pull every per-release DB and re-merge into the full corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p shards image-data
+          # Every Release EXCEPT `latest` (binary-only) is a per-3GPP-release DB.
+          tags=$(gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -v '^latest$' || true)
+          if [ -z "$tags" ]; then echo "no per-release Releases found — nothing to reconstitute" >&2; exit 1; fi
+          n=0
+          echo "$tags" | while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "::group::download $tag"
+            gh release download "$tag" --dir shards --pattern '*.duckdb.zst' --clobber || { echo "no DB asset on $tag, skipping"; echo "::endgroup::"; continue; }
+            echo "::endgroup::"
+          done
+          # Decompress all shards.
+          for z in shards/*.duckdb.zst; do
+            [ -e "$z" ] || { echo "no shards downloaded" >&2; exit 1; }
+            zstd -d --long=27 -f "$z" -o "${z%.zst}"
+            n=$((n+1))
+          done
+          echo "decompressed $n shard(s)"
+          # Merge (vectors preserved, FTS + HNSW rebuilt on the union, manifests emitted).
+          CGO_ENABLED=1 go run ./cmd/merge --out image-data/3gpp.duckdb \
+            --index-out image-data/corpus-index.json \
+            --subject-index-out image-data/subject-index.json \
+            --build-index-out image-data/build-index.json \
+            shards/*.duckdb
+          rm -rf shards
+          ls -lah image-data/
+
+      - name: Validate completeness (no clause left unembedded across the union)
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go run ./cmd/embed --db image-data/3gpp.duckdb \
+            --count-null-at-floor --embed-floor Rel-99 --report json | tee probe.json
+          # Fail closed if any at/above-floor clause is still NULL.
+          python3 -c "import json,sys; d=json.load(open('probe.json')); sys.exit(0 if d.get('null_embeddings_at_floor',1)==0 else 1)" \
+            || { echo 'incomplete embeddings in merged DB' >&2; exit 1; }
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in
+            org.opencontainers.image.licenses=MIT
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event.inputs.push != 'false' }}
+          build-args: |
+            BUILD_TAGS=${{ github.event.inputs.build_tags }}
+            VERSION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        if: ${{ github.event.inputs.push != 'false' && steps.build.outputs.digest != '' }}
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
