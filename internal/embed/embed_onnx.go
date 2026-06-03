@@ -176,11 +176,83 @@ func newEmbedder() Embedder {
 		return Disabled{}
 	}
 	log.Printf("embed: ready with %d session(s) across %d device(s), %d %s tokeniser(s), batch=%d (ep=%s)", len(sessions), len(devices), len(toks), tokenizerImpl(), batchSize, ep)
-	return &onnxEmbedder{
+	e := &onnxEmbedder{
 		toks:      toks,
 		sessions:  sessions,
 		windowing: envOr("EMBED_WINDOWING", ""),
 	}
+	e.warmup(ep)
+	return e
+}
+
+// warmupOn reports whether shape warmup runs (CUDA only, EMBED_WARMUP != "0",
+// default ON). It is pointless on CPU (no per-shape cuDNN/cuBLAS plan to cache).
+func warmupOn(ep string) bool { return ep == EPCUDA && envOr("EMBED_WARMUP", "1") != "0" }
+
+// warmup runs ONE dummy batch per ladder rung on each session BEFORE real work, so
+// the CUDA EP builds and caches its per-shape execution plan / cuDNN-cuBLAS algorithm
+// choices up front. This matters now that the fast tokenizer makes the run GPU-bound:
+// the first batch of each new shape otherwise pays a one-off replanning stall (the
+// "cold window" the post-mortem measured at CPU speed). With the fixed ladder there
+// are only len(shapeLadder) shapes, so a handful of throwaway runs warm them all.
+// Best-effort: any failure is skipped (warmup never blocks readiness). It calls
+// session.Run directly (not runPrepared) so it does not pollute the profiler.
+func (e *onnxEmbedder) warmup(ep string) {
+	if !warmupOn(ep) {
+		return
+	}
+	for _, s := range e.sessions {
+		for _, rung := range shapeLadder {
+			// Match the row count token-budget batching will actually use for this
+			// rung, so the warmed shape is the one that occurs.
+			rows := tokenBudget() / rung
+			if rows < 1 {
+				rows = 1
+			}
+			if rows > maxBatchRows() {
+				rows = maxBatchRows()
+			}
+			ids := make([]int64, rows*rung)
+			mask := make([]int64, rows*rung)
+			for i := 0; i < rows; i++ {
+				base := i * rung
+				ids[base], mask[base] = xlmrCLS, 1
+				if rung > 1 {
+					ids[base+1], mask[base+1] = xlmrSEP, 1
+				}
+				for j := 2; j < rung; j++ {
+					ids[base+j] = padID
+				}
+			}
+			e.warmupRun(s, rows, rung, ids, mask)
+		}
+	}
+	log.Printf("embed: warmed %d shape(s) × %d session(s)", len(shapeLadder), len(e.sessions))
+}
+
+// warmupRun executes one throwaway batch and destroys its tensors. Isolated so the
+// tensor lifetimes are scoped (defer) and any error is contained per shape.
+func (e *onnxEmbedder) warmupRun(s *gpuSession, rows, seq int, ids, mask []int64) {
+	shape := ort.NewShape(int64(rows), int64(seq))
+	idsT, err := ort.NewTensor(shape, ids)
+	if err != nil {
+		return
+	}
+	defer func() { _ = idsT.Destroy() }()
+	maskT, err := ort.NewTensor(shape, mask)
+	if err != nil {
+		return
+	}
+	defer func() { _ = maskT.Destroy() }()
+	buf := make([]float32, rows*Dim)
+	outT, err := ort.NewTensor(ort.NewShape(int64(rows), int64(Dim)), buf)
+	if err != nil {
+		return
+	}
+	defer func() { _ = outT.Destroy() }()
+	s.mu.Lock()
+	_ = s.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT})
+	s.mu.Unlock()
 }
 
 func (*onnxEmbedder) Enabled() bool { return true }
