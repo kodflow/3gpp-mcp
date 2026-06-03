@@ -1,0 +1,28 @@
+3gpp-mcp
+Copyright (c) 2026 kodflow. All rights reserved (see LICENSE).
+
+This product includes third-party software and models, each under its own license.
+The list below is informational; refer to each project's upstream LICENSE for the
+authoritative terms.
+
+Models
+------
+- BGE-M3 (BAAI/bge-m3) — embedding model. License: MIT.
+  https://huggingface.co/BAAI/bge-m3
+- BGE-reranker-v2-m3 (BAAI, optional) — License: Apache-2.0.
+  https://huggingface.co/BAAI/bge-reranker-v2-m3
+
+Runtime / libraries
+-------------------
+- ONNX Runtime (microsoft/onnxruntime) — License: MIT.
+- DuckDB and go-duckdb (marcboeker/go-duckdb, duckdb/duckdb-go-bindings) — License: MIT.
+- mcp-go (mark3labs/mcp-go) — License: MIT.
+- tokenizers (daulet/tokenizers; wraps HuggingFace tokenizers) — License: Apache-2.0.
+- Go standard library — BSD-3-Clause.
+
+3GPP material
+-------------
+This product indexes and quotes 3GPP technical specifications (TS/TR) for retrieval.
+3GPP specifications are © 3GPP Organizational Partners (ARIB, ATIS, CCSA, ETSI, TSDSI,
+TTA, TTC). 3GPP / ETSI retain all rights to that content. This repository does NOT
+license, sublicense, or authorize redistribution of 3GPP text. See DATA_NOTICE.md.

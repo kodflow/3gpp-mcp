@@ -1,0 +1,278 @@
+// Command validate is the single promotion gate for the corpus pipeline: it asserts
+// that a DuckDB snapshot is complete, coherent, and SAFE to publish before `latest`
+// is ever moved to it (plan §5). Every publication path — manual collect, CI collect,
+// CI corpus, CI image — runs it; the image never consumes an unvalidated DB.
+//
+//	validate --db data/3gpp.duckdb --pending-zero --require-fts --require-hnsw \
+//	         --expected-releases "Rel-99,Rel-4,...,Rel-20" --min-clauses 2000000 \
+//	         --embedding-dim 1024 --expected-embed-identity <digest> \
+//	         --zst data/3gpp.duckdb.zst --sha data/3gpp.duckdb.sha256 \
+//	         --repo-visibility public --forbid-fulltext-artifacts
+//
+// Any failed check is collected and reported; the process exits non-zero if ANY
+// invariant is violated (fail-closed). The anti-leak guard inspects DB CONTENT
+// (clauses.text), never a filename (plan §5.2): a public channel must never carry
+// verbatim 3GPP text.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/kodflow/3gpp-mcp/internal/store"
+)
+
+var Version = "dev"
+
+func main() {
+	var (
+		dbPath       = flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot to validate")
+		pendingZero  = flag.Bool("pending-zero", false, "fail unless EVERY clause has an embedding (null_embeddings==0)")
+		requireFTS   = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
+		requireHNSW  = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
+		embeddingDim = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
+		minClauses   = flag.Int("min-clauses", 0, "if >0, fail unless clause count >= this (anti-shrink guard)")
+		expRels      = flag.String("expected-releases", "", "comma-separated set; fail unless the DB's releases == this set exactly")
+		expIdentity  = flag.String("expected-embed-identity", "", "fail unless schema_meta embedding_model == this (EmbedIdentity)")
+		zstPath      = flag.String("zst", "", "compressed artifact whose sha256 is checked against --sha")
+		shaPath      = flag.String("sha", "", "sha256 sidecar for --zst (format: '<hex>  <name>')")
+		repoVis      = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
+		forbidFull   = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
+		report       = flag.String("report", "text", "text | json")
+	)
+	flag.Parse()
+
+	res := runChecks(context.Background(), checkCfg{
+		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW,
+		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
+		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
+		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
+	})
+
+	if *report == "json" {
+		b, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		for _, c := range res.Checks {
+			mark := "ok"
+			if !c.Pass {
+				mark = "FAIL"
+			}
+			fmt.Printf("[%-4s] %s: %s\n", mark, c.Name, c.Detail)
+		}
+	}
+	if !res.OK {
+		os.Exit(1)
+	}
+}
+
+type checkCfg struct {
+	db                                         string
+	pendingZero, requireFTS, requireHNSW       bool
+	embeddingDim, minClauses                   int
+	expectedReleases                           []string
+	expectedIdentity, zst, sha, repoVisibility string
+	forbidFulltext                             bool
+}
+
+type check struct {
+	Name   string `json:"name"`
+	Pass   bool   `json:"pass"`
+	Detail string `json:"detail"`
+}
+
+type result struct {
+	OK     bool    `json:"ok"`
+	Checks []check `json:"checks"`
+}
+
+func (r *result) add(name string, pass bool, format string, a ...any) {
+	r.Checks = append(r.Checks, check{Name: name, Pass: pass, Detail: fmt.Sprintf(format, a...)})
+	if !pass {
+		r.OK = false
+	}
+}
+
+func runChecks(ctx context.Context, cfg checkCfg) result {
+	res := result{OK: true}
+
+	// Checksum is file-level and independent of opening the DB — do it first.
+	if cfg.zst != "" && cfg.sha != "" {
+		if got, want, err := checksum(cfg.zst, cfg.sha); err != nil {
+			res.add("checksum", false, "%v", err)
+		} else {
+			res.add("checksum", got == want, "zst=%s sha256=%s (sidecar=%s)", cfg.zst, short(got), short(want))
+		}
+	}
+
+	db, err := store.OpenReadOnly(cfg.db)
+	if err != nil {
+		res.add("db-openable", false, "open %s: %v", cfg.db, err)
+		return res // nothing else is checkable
+	}
+	defer func() { _ = db.Close() }()
+	res.add("db-openable", true, "%s", cfg.db)
+	sqldb := db.DB()
+
+	// clause count + min-clauses
+	var clauses int
+	if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&clauses); err != nil {
+		res.add("clauses", false, "count clauses: %v", err)
+	} else if cfg.minClauses > 0 {
+		res.add("min-clauses", clauses >= cfg.minClauses, "clauses=%d (min=%d)", clauses, cfg.minClauses)
+	} else {
+		res.add("clauses", clauses > 0, "clauses=%d", clauses)
+	}
+
+	// expected-releases (exact set)
+	if len(cfg.expectedReleases) > 0 {
+		got, err := distinctReleases(ctx, sqldb)
+		if err != nil {
+			res.add("expected-releases", false, "%v", err)
+		} else {
+			missing, extra := diffSets(cfg.expectedReleases, got)
+			pass := len(missing) == 0 && len(extra) == 0
+			res.add("expected-releases", pass, "got=%d missing=%v extra=%v", len(got), missing, extra)
+		}
+	}
+
+	// pending-zero (every clause embedded)
+	if cfg.pendingZero {
+		if n, err := db.CountNullEmbeddings(ctx); err != nil {
+			res.add("pending-zero", false, "count null embeddings: %v", err)
+		} else {
+			res.add("pending-zero", n == 0, "null_embeddings=%d", n)
+		}
+	}
+
+	// embedding-dim (schema_meta)
+	if cfg.embeddingDim > 0 {
+		got := db.GetMeta(ctx, "embedding_dim")
+		res.add("embedding-dim", got == fmt.Sprintf("%d", cfg.embeddingDim), "schema_meta.embedding_dim=%q want=%d", got, cfg.embeddingDim)
+	}
+
+	// expected-embed-identity (schema_meta embedding_model == EmbedIdentity digest)
+	if cfg.expectedIdentity != "" {
+		got := db.GetMeta(ctx, "embedding_model")
+		res.add("embed-identity", got == cfg.expectedIdentity, "schema_meta.embedding_model=%q want=%q", got, cfg.expectedIdentity)
+	}
+
+	// require-hnsw (frozen) — only meaningful when vectorized
+	if cfg.requireHNSW {
+		st := db.GetMeta(ctx, "hnsw_state")
+		res.add("require-hnsw", st == "frozen", "hnsw_state=%q", st)
+	}
+
+	// require-fts — LOAD (never build) then probe availability
+	if cfg.requireFTS {
+		_ = db.LoadFTS(ctx)
+		res.add("require-fts", db.FTSAvailable(), "fts_available=%v", db.FTSAvailable())
+	}
+
+	// anti-leak: a public channel must never carry verbatim clause text (content-based)
+	if cfg.repoVisibility == "public" && cfg.forbidFulltext {
+		var withText int
+		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE text IS NOT NULL AND text <> ''`).Scan(&withText); err != nil {
+			res.add("anti-leak", false, "inspect clauses.text: %v", err)
+		} else {
+			// PASS = no full text present (safe to publish on a public channel).
+			res.add("anti-leak", withText == 0, "clauses_with_text=%d on a PUBLIC channel (must be 0)", withText)
+		}
+	}
+
+	return res
+}
+
+// distinctReleases returns the release labels present in clauses.
+func distinctReleases(ctx context.Context, sqldb *sql.DB) ([]string, error) {
+	rows, err := sqldb.QueryContext(ctx, `SELECT DISTINCT release FROM clauses WHERE release IS NOT NULL AND release <> '' ORDER BY release`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// splitCSV parses a comma-separated flag into a trimmed, empty-dropped slice.
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// diffSets returns (missing = want\got, extra = got\want), order-independent.
+func diffSets(want, got []string) (missing, extra []string) {
+	w, g := map[string]bool{}, map[string]bool{}
+	for _, x := range want {
+		w[x] = true
+	}
+	for _, x := range got {
+		g[x] = true
+	}
+	for x := range w {
+		if !g[x] {
+			missing = append(missing, x)
+		}
+	}
+	for x := range g {
+		if !w[x] {
+			extra = append(extra, x)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra
+}
+
+// checksum returns (computed, expected) sha256 hex for a file vs its sidecar.
+// The sidecar format is "<hex>  <name>" (sha256sum output); only the hex matters.
+func checksum(path, sidecar string) (got, want string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", "", err
+	}
+	got = hex.EncodeToString(h.Sum(nil))
+	b, err := os.ReadFile(sidecar)
+	if err != nil {
+		return "", "", err
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) == 0 {
+		return "", "", fmt.Errorf("empty sha256 sidecar %s", sidecar)
+	}
+	want = fields[0]
+	return got, want, nil
+}
+
+func short(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}

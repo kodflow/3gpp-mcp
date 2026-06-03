@@ -1,0 +1,15 @@
+Copyright (c) 2026 kodflow. All rights reserved.
+
+This software (the "3gpp-mcp" source code in this repository) is proprietary.
+No license, express or implied, is granted to copy, modify, distribute, sublicense,
+or use this software except with the prior written permission of the copyright
+holder. Public visibility of this repository does NOT grant any such rights.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF
+OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Third-party components are licensed under their own terms; see NOTICE.
+The 3GPP corpus and any data artifacts are NOT covered by this license; see DATA_NOTICE.md.
