@@ -103,6 +103,30 @@ func TestClausesNeedingEmbeddingScan(t *testing.T) {
 	}
 }
 
+// TestResumeKeysOnVectorNotHash pins the disk-crash-recovery fix: resume keys on the
+// embedding VECTOR, never on embedding_hash. A clause with a vector but an EMPTY hash
+// (the exact state a partial DB surfaced after a Kaggle resume-dataset round-trip)
+// must be treated as DONE and SKIPPED — a hash-keyed resume re-embedded everything.
+func TestResumeKeysOnVectorNotHash(t *testing.T) {
+	ctx := context.Background()
+	s := newMem(t)
+	if err := s.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "1", Heading: "h", Text: "t"},
+		{ChunkID: 2, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "2", Heading: "h", Text: "t"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// chunk 1: vector present but hash EMPTY (the partial-DB / round-trip scenario).
+	if err := s.SetEmbeddingsBatch(ctx, []uint64{1}, [][]float32{make([]float32, 1024)}, []string{""}); err != nil {
+		t.Fatal(err)
+	}
+	// chunk 2: no vector → genuinely needs embedding.
+	ids, _ := drainScan(t, s, EmbedScan{ResumeOnly: true})
+	if len(ids) != 1 || ids[0] != 2 {
+		t.Errorf("resume work-list = %v, want only [2] (chunk 1 has a vector → done, despite empty hash)", ids)
+	}
+}
+
 // TestClausesNeedingEmbeddingReleaseSet pins the per-RELEASE-lot selector: an exact
 // label set restricts the work-list to those releases only (the balanced-lot Kaggle
 // shards rely on it), stays recent-first ordered, AND-combines with --series, and an

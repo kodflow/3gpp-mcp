@@ -602,10 +602,14 @@ type EmbedScan struct {
 	// RECENT-RELEASE-FIRST (Rel-20 → … → Rel-99), so a session killed mid-run leaves
 	// the most-recent — and most-queried — releases embedded, not a random prefix.
 	OldestFirst bool
-	// ResumeOnly returns ONLY rows with no embedding_hash yet (NULL/empty) — the
-	// fast resume path for a fresh-model-per-run kernel. Default (false) streams all
-	// candidates so embed.Apply's Go hash-compare still re-embeds a clause whose
-	// text OR model changed (which SQL alone can't detect).
+	// ResumeOnly returns ONLY rows with no VECTOR yet (embedding IS NULL) — the fast
+	// resume path that fills gaps in a partial run. We key on the embedding column,
+	// NOT embedding_hash: the vector is the ground truth for "embedded", and a partial
+	// DB round-tripped through an external store (e.g. a Kaggle resume dataset) can
+	// surface a stale/empty hash even when the vector is present — which would make a
+	// hash-keyed resume re-embed everything. Default (false) streams all candidates so
+	// embed.Apply's Go hash-compare still re-embeds a clause whose text OR model changed
+	// (which SQL alone can't detect); that change-detection path is unaffected.
 	ResumeOnly bool
 }
 
@@ -623,7 +627,7 @@ func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*s
 		args  []any
 	)
 	if scan.ResumeOnly {
-		conds = append(conds, `(embedding_hash IS NULL OR embedding_hash = '')`)
+		conds = append(conds, `embedding IS NULL`)
 	}
 	if scan.SeriesPrefix != "" {
 		conds = append(conds, `substr(spec_id, 1, 2) = ?`)
