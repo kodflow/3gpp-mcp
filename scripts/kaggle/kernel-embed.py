@@ -21,6 +21,14 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
+
+# Silence Python 3.12 SyntaxWarnings emitted by Kaggle's notebook→HTML conversion
+# (mistune / nbconvert escape-sequence deprecations like '\|' and '\_'). They are
+# pure platform noise — unrelated to the embed — but they alarm a log reader. Best
+# effort: set it both via the filter and the env so a child interpreter inherits it.
+warnings.filterwarnings("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
 WORK = "/kaggle/working"
 R = os.path.join(WORK, "RESULT.txt")
@@ -374,6 +382,27 @@ if KU and KK and EMB >= 1:
         say("version=skip detail=no_kaggle_cli")
 else:
     say("version=skip detail=no_creds_or_nothing_embedded embedded=%d" % EMB)
+
+# ---- shrink the kernel output so the driver's `kernels output` pull is FAST -----
+# Kaggle auto-saves ALL of /kaggle/working as the kernel output, and the driver
+# downloads it to publish the resume dataset. Without this, every pull drags the
+# multi-GB scratch (the 2GB BGE model, the ~7GB sliced corpus, ORT, the build tree)
+# and hangs for many minutes. The driver only needs 3gpp-embedded.duckdb (+ the
+# RESULT/report markers), so delete the scratch and keep just those.
+KEEP = {"3gpp-embedded.duckdb", "RESULT.txt", "embed-report.json"}
+try:
+    os.chdir(WORK)  # never sit inside a dir we are about to remove
+    for name in os.listdir(WORK):
+        if name in KEEP:
+            continue
+        p = os.path.join(WORK, name)
+        try:
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+        except Exception:
+            pass
+    say("cleanup=ok kept=%s" % ",".join(sorted(KEEP)))
+except Exception as e:
+    say("cleanup=skip detail=%s" % str(e)[:80])
 
 # A complete series ends with null_at_floor==0 AND no timeout. A timeout/partial is a
 # SUCCESSFUL increment — the driver re-launches to continue.
