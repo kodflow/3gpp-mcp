@@ -185,9 +185,13 @@ func newEmbedder() Embedder {
 	return e
 }
 
-// warmupOn reports whether shape warmup runs (CUDA only, EMBED_WARMUP != "0",
-// default ON). It is pointless on CPU (no per-shape cuDNN/cuBLAS plan to cache).
-func warmupOn(ep string) bool { return ep == EPCUDA && envOr("EMBED_WARMUP", "1") != "0" }
+// warmupOn reports whether shape warmup runs (CUDA only, EMBED_WARMUP == "1").
+// Default OFF: the probe showed warmup raised steady GPU util a little (30→37%) but
+// its init cost (dummy runs over every ladder rung) cut the AVERAGE throughput on a
+// real-sized run, and steady-state did not beat the no-warmup path. Pointless on CPU
+// (no per-shape cuDNN/cuBLAS plan to cache). Opt-in for a replanning-dominated regime
+// (pair with EMBED_SHAPE_LADDER=1).
+func warmupOn(ep string) bool { return ep == EPCUDA && os.Getenv("EMBED_WARMUP") == "1" }
 
 // warmup runs ONE dummy batch per ladder rung on each session BEFORE real work, so
 // the CUDA EP builds and caches its per-shape execution plan / cuDNN-cuBLAS algorithm
@@ -309,11 +313,14 @@ func resolveBatchSize() int {
 func maxBatchRows() int { return 8 * batchSize }
 
 // tokenBudgetBatchingOn reports whether variable-size, token-budget batches are
-// used on the pipelined path (EMBED_TOKEN_BUDGET_BATCHING != "0", default ON). Off
-// restores fixed batchSize-row batches. It is a strict generalisation: at full
-// clause length the budget yields exactly batchSize rows, so the default-on path
-// matches the old behaviour for a max-length corpus and only HELPS shorter ones.
-func tokenBudgetBatchingOn() bool { return envOr("EMBED_TOKEN_BUDGET_BATCHING", "1") != "0" }
+// used on the pipelined path (EMBED_TOKEN_BUDGET_BATCHING == "1"). Default OFF:
+// once the HF Rust tokenizer made the run GPU-bound, the 2×T4 probe showed this
+// REGRESSED throughput (~59→53 cl/s on series 21) — the byte→token estimate
+// oversizes batches for short-clause series, and the GPU ceiling is memory-transfer
+// (not occupancy) bound through this binding, so bigger batches don't help. Kept as
+// an opt-in tunable (may help a long-clause corpus or a stronger GPU); the default
+// fixed batchSize-row path is the validated best.
+func tokenBudgetBatchingOn() bool { return os.Getenv("EMBED_TOKEN_BUDGET_BATCHING") == "1" }
 
 // tokenBudget is the target padded-token count (rows × rung) per ONNX Run. Sizing
 // batches to a constant TOKEN budget instead of a constant ROW count keeps the GPU's
@@ -452,9 +459,12 @@ func ladderCeil(n int) int {
 }
 
 // shapeLadderOn reports whether fixed-shape padding is enabled (EMBED_SHAPE_LADDER
-// != "0", default ON). Off restores the legacy batch-local-max padding (a distinct
-// shape per batch) — kept as an A/B escape hatch, not a recommended mode.
-func shapeLadderOn() bool { return envOr("EMBED_SHAPE_LADDER", "1") != "0" }
+// == "1"). Default OFF: the dynamic-shape replanning it targets turned out NOT to be
+// the bottleneck (the 2×T4 probe was CPU-tokenise bound, then memory-transfer bound
+// once the fast tokenizer landed — daulet "plain" with per-batch dynamic shapes was
+// the fastest config). Kept as an opt-in tunable for a regime where per-shape
+// replanning actually dominates.
+func shapeLadderOn() bool { return os.Getenv("EMBED_SHAPE_LADDER") == "1" }
 
 // pipelineOn reports whether the 2-stage tokenise/run pipeline is enabled
 // (EMBED_PIPELINE != "0", default on). When off, Embed runs the legacy serial
