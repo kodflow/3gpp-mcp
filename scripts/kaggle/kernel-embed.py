@@ -151,6 +151,15 @@ os.chdir(src)
 EMBEDDED_DB = os.path.join(WORK, "3gpp-embedded.duckdb")
 RESUME_DB = os.environ.get(
     "RESUME_DB", "/kaggle/input/3gpp-embedded-%s/3gpp-embedded.duckdb" % SHARD)
+# Kaggle's exact dataset mount dir is brittle (slug/case/version), so an explicit
+# RESUME_DB path can miss a dataset that IS attached → silent fresh-slice (re-embeds
+# everything). If the explicit path isn't a file, GLOB for the resume DB anywhere under
+# /kaggle/input/ and use it — robust to whatever dir Kaggle actually mounted it at.
+if not os.path.isfile(RESUME_DB):
+    _hits = sorted(glob.glob("/kaggle/input/**/3gpp-embedded.duckdb", recursive=True))
+    if _hits:
+        say("resume=glob_found path=%s (env RESUME_DB=%s missed)" % (_hits[0], RESUME_DB))
+        RESUME_DB = _hits[0]
 if os.path.isfile(RESUME_DB):
     shutil.copy(RESUME_DB, EMBEDDED_DB)
     prior = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
