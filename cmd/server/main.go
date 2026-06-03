@@ -84,6 +84,7 @@ func serve(args []string) error {
 	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
 	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
 	vecGHCR := fs.String("vec-ghcr", "", "Option B: pull vector sub-bases from ghcr.io/<owner>/3gpp-vec:latest into the cache and serve them (empty = off)")
+	httpAddr := fs.String("http", "", "serve MCP over Streamable HTTP on this addr (e.g. 127.0.0.1:8765) + a landing page at /; empty = stdio (the default, unchanged). A non-loopback bind exposes the corpus — gate it.")
 	_ = fs.Parse(args)
 
 	// Let the (onnx) embedder/reranker transparently use cache-bootstrapped
@@ -190,6 +191,14 @@ func serve(args []string) error {
 	scope := *release
 	if scope == "" {
 		scope = "latest"
+	}
+	// stdio (default) is byte-identical to the historical behaviour. --http mounts
+	// the SAME *MCPServer on Streamable HTTP plus a copy-paste landing page; the
+	// engine is transport-agnostic, so nothing about retrieval changes.
+	if *httpAddr != "" {
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP over Streamable HTTP on %s (endpoint /mcp, landing /, db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
+			*httpAddr, effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
+		return serveHTTP(srv, *httpAddr)
 	}
 	fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP on stdio (db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
 		effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
