@@ -169,14 +169,45 @@ if PRECISION == "fp16":
     EMBED_ENV = {"EMBED_MODELS_CONFIG": "%s/models.yaml" % WORK, "EMBED_MODEL": "bge-m3-fp16"}
     say("fp16=ready")
 
-# ---- build the new embed binary -------------------------------------------
+# ---- build the embed binaries (sugarme + optional daulet/fasttok) ----------
 env = dict(os.environ)
 env["CGO_ENABLED"] = "1"
 env["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
 env["LD_LIBRARY_PATH"] = ORT_DIR + ":" + env.get("LD_LIBRARY_PATH", "")
-if sh('go build -tags onnx -o "%s/embed" ./cmd/embed' % WORK, env=env).returncode != 0:
-    fail("build")
-say("build=ok")
+EMBED_SUGARME = "%s/embed-sugarme" % WORK
+if sh('go build -tags onnx -o "%s" ./cmd/embed' % EMBED_SUGARME, env=env).returncode != 0:
+    fail("build_sugarme")
+say("build=ok bin=sugarme")
+
+# fasttok = HuggingFace Rust tokenizer via daulet/tokenizers (CGO). Fetch the
+# prebuilt static lib for this daulet version and link it. This is the candidate
+# fix for the CPU-tokenise starvation; the A/B below measures its real uplift.
+EMBED_DAULET = ""
+DAULET_VER = os.environ.get("DAULET_VERSION", "v1.27.0")
+libdir = "%s/libtok" % WORK
+os.makedirs(libdir, exist_ok=True)
+got_lib = False
+for asset in ("libtokenizers.linux-amd64.tar.gz", "libtokenizers.linux-x86_64.tar.gz"):
+    u = "https://github.com/daulet/tokenizers/releases/download/%s/%s" % (DAULET_VER, asset)
+    if sh('curl -fsSL --retry 5 "%s" -o "%s/lib.tgz"' % (u, libdir)).returncode == 0:
+        sh('tar -C "%s" -xzf "%s/lib.tgz"' % (libdir, libdir))
+        if glob.glob("%s/**/libtokenizers.a" % libdir, recursive=True) or os.path.isfile("%s/libtokenizers.a" % libdir):
+            got_lib = True
+            break
+if got_lib:
+    libpath = (glob.glob("%s/**/libtokenizers.a" % libdir, recursive=True) + ["%s/libtokenizers.a" % libdir])[0]
+    libloc = os.path.dirname(libpath)
+    fenv = dict(env)
+    fenv["CGO_LDFLAGS"] = "-L%s" % libloc
+    EMBED_DAULET = "%s/embed-daulet" % WORK
+    b = sh('go build -tags "onnx fasttok" -o "%s" ./cmd/embed' % EMBED_DAULET, env=fenv)
+    if b.returncode != 0:
+        say("build=fail bin=daulet detail=%s" % ((b.stderr or "")[-200:]).replace("\n", " "))
+        EMBED_DAULET = ""
+    else:
+        say("build=ok bin=daulet ver=%s" % DAULET_VER)
+else:
+    say("daulet=skip detail=no_libtokenizers_asset")
 
 
 def gpu_sampler(stop_evt, out):
@@ -190,7 +221,7 @@ def gpu_sampler(stop_evt, out):
         stop_evt.wait(0.5)
 
 
-def run_config(name, extra_env, sessions_per_gpu="1"):
+def run_config(name, binary, extra_env, sessions_per_gpu="1"):
     """Embed a FRESH copy of the base slice under one engine config; return metrics."""
     db = "%s/run-%s.duckdb" % (WORK, name)
     shutil.copy(BASE_DB, db)
@@ -199,14 +230,14 @@ def run_config(name, extra_env, sessions_per_gpu="1"):
     e["ORT_EP"] = EP
     e["EMBED_GRAPH_OPT"] = "1"
     e["EMBED_PROFILE"] = "1"
-    e["EMBED_PROFILE_EVERY"] = "16"
+    e["EMBED_PROFILE_EVERY"] = "4"
     e["EMBED_SESSIONS_PER_GPU"] = sessions_per_gpu
     e.update(EMBED_ENV)
     e.update(extra_env)
     report = "%s/report-%s.json" % (WORK, name)
-    cmd = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" --order recent --resume '
+    cmd = ('"%s" --db "%s" --embed-floor "%s" --series "%s" --order recent --resume '
            '--limit "%s" --no-hnsw --require-semantic --report json --progress-every 200'
-           % (WORK, db, FLOOR, SERIES, LIMIT))
+           % (binary, db, FLOOR, SERIES, LIMIT))
     stop = threading.Event()
     util = {"samples": []}
     sampler = threading.Thread(target=gpu_sampler, args=(stop, util), daemon=True)
@@ -245,17 +276,23 @@ def run_config(name, extra_env, sessions_per_gpu="1"):
             "util_mean": util_mean, "util_max": util_max, "rc": rc}
 
 
-# ---- A/B/C -----------------------------------------------------------------
+# ---- A/B: the tokenizer is the variable; batching levers default-on in both ----
+# The 2×T4 probe pinned the wall at CPU tokenisation (GPU util 3-5%). So the decisive
+# comparison is sugarme (pure-Go) vs daulet (HF Rust), same engine otherwise.
 results = []
-# A: baseline (old fixed-batch, no ladder) — reproduces the ~1.79 cl/s post-mortem.
-results.append(run_config("baseline", {"EMBED_SHAPE_LADDER": "0", "EMBED_TOKEN_BUDGET_BATCHING": "0"}))
-# B: new engine (ladder + token-budget batching, both default-on).
-results.append(run_config("ladder_budget", {}))
-# C: new engine + 2 overlapping sessions on each GPU (single-GPU saturation lever).
-results.append(run_config("ladder_budget_s2", {}, sessions_per_gpu="2"))
+# A: sugarme, batching OFF — reproduces the ~6 cl/s baseline.
+results.append(run_config("sugarme_base", EMBED_SUGARME, {"EMBED_SHAPE_LADDER": "0", "EMBED_TOKEN_BUDGET_BATCHING": "0"}))
+# B: sugarme, ladder+budget ON — isolates the batching levers under the CPU wall.
+results.append(run_config("sugarme_levers", EMBED_SUGARME, {}))
+# C: daulet (HF Rust) + ladder+budget — the candidate fix; expect the GPU to stop
+# starving (util up, cl/s up). Skipped if the static lib was unavailable.
+if EMBED_DAULET:
+    results.append(run_config("daulet_levers", EMBED_DAULET, {}))
+    # D: daulet + 2 overlapping sessions — single-GPU saturation once the GPU is fed.
+    results.append(run_config("daulet_levers_s2", EMBED_DAULET, {}, sessions_per_gpu="2"))
 
 base = results[0]["cl_s"] or 1e-9
 for r in results:
-    say("SUMMARY cfg=%-18s cl_s=%6.2f speedup=%4.2fx util_mean=%3.0f%% util_max=%d%%"
+    say("SUMMARY cfg=%-18s cl_s=%7.2f speedup=%5.2fx util_mean=%3.0f%% util_max=%d%%"
         % (r["name"], r["cl_s"], r["cl_s"] / base, r["util_mean"], r["util_max"]))
 say("step=OK complete=1")
