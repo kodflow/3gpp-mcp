@@ -29,8 +29,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sugarme/tokenizer"
-	"github.com/sugarme/tokenizer/pretrained"
 	ort "github.com/yalue/onnxruntime_go"
 
 	"github.com/kodflow/3gpp-mcp/internal/onnxrt"
@@ -75,8 +73,9 @@ func (s *gpuSession) getOutBuf() *[]float32 {
 type onnxEmbedder struct {
 	// toks is the tokeniser POOL — one instance per producer goroutine, so batches
 	// tokenise in parallel (the CPU bottleneck) without sharing a non-concurrency-safe
-	// tokenizer. len>=1.
-	toks []*tokenizer.Tokenizer
+	// tokenizer. The concrete type is chosen by build tag (sugarme vs HF Rust); see
+	// the clauseTokenizer seam. len>=1.
+	toks []clauseTokenizer
 	// sessions is one gpuSession per device: len==1 on CPU / a single GPU, len==N
 	// across N CUDA devices (auto-detected). Embed shards its batches across them.
 	sessions  []*gpuSession
@@ -130,24 +129,17 @@ func newEmbedder() Embedder {
 		log.Printf("embed: model %q disabled%s — missing %s", spec.Name, fp16, strings.Join(missing, " "))
 		return Disabled{}
 	}
-	// Tokenisation is the embed bottleneck (sugarme/tokenizer is pure-Go ~18 clauses/s
-	// single-thread, vs the GPU doing far more), so load a POOL of tokenizer instances
-	// — one per producer goroutine — to tokenise batches in parallel and keep the GPU
-	// fed. The sugarme tokenizer is not concurrency-safe, hence one instance per
-	// goroutine rather than one shared. Count = EMBED_TOKENIZERS or NumCPU (capped).
+	// Tokenisation is the embed bottleneck (the 2×T4 probe measured GPU util at 3-5%
+	// — starved by the CPU), so load a POOL of tokenizer instances — one per producer
+	// goroutine — to tokenise batches in parallel and keep the GPU fed. The concrete
+	// tokenizer is chosen by build tag via the clauseTokenizer seam: pure-Go sugarme
+	// by default, HF Rust (orders of magnitude faster) under -tags fasttok. Neither is
+	// assumed concurrency-safe, hence one instance per goroutine. Count =
+	// EMBED_TOKENIZERS or NumCPU (capped).
 	nTok := tokenizerCount()
-	toks := make([]*tokenizer.Tokenizer, 0, nTok)
-	for i := 0; i < nTok; i++ {
-		t, err := pretrained.FromFile(tokPath)
-		if err != nil {
-			if i == 0 {
-				return Disabled{}
-			}
-			break // one tokenizer is enough to run (degrade to fewer producers)
-		}
-		toks = append(toks, t)
-	}
-	if len(toks) == 0 {
+	toks, err := newClauseTokenizers(tokPath, nTok)
+	if err != nil {
+		log.Printf("embed: tokenizer load failed (%v) — disabling", err)
 		return Disabled{}
 	}
 	if err := onnxrt.Init(); err != nil {
@@ -183,7 +175,7 @@ func newEmbedder() Embedder {
 	if len(sessions) == 0 {
 		return Disabled{}
 	}
-	log.Printf("embed: ready with %d session(s) across %d device(s), %d tokeniser(s), batch=%d (ep=%s)", len(sessions), len(devices), len(toks), batchSize, ep)
+	log.Printf("embed: ready with %d session(s) across %d device(s), %d %s tokeniser(s), batch=%d (ep=%s)", len(sessions), len(devices), len(toks), tokenizerImpl(), batchSize, ep)
 	return &onnxEmbedder{
 		toks:      toks,
 		sessions:  sessions,
@@ -550,12 +542,8 @@ const (
 // encodeIDs is the recoverable tokenize step (extracted so safeEncode in
 // embed_safe.go can host the panic-recovery contract and test it without a
 // real tokenizer).
-func (e *onnxEmbedder) encodeIDs(tok *tokenizer.Tokenizer, text string) ([]int, error) {
-	enc, err := tok.EncodeSingle(text, true)
-	if err != nil {
-		return nil, err
-	}
-	return enc.Ids, nil
+func (e *onnxEmbedder) encodeIDs(tok clauseTokenizer, text string) ([]int, error) {
+	return tok.EncodeIDs(text)
 }
 
 // tokenizeSafe tokenises one clause, returning (ids, degraded). It first
@@ -575,7 +563,7 @@ func (e *onnxEmbedder) encodeIDs(tok *tokenizer.Tokenizer, text string) ([]int, 
 //     with a placeholder vector (the old single-space fallback corrupted the
 //     corpus invisibly). Logged once with a stable hash, never the text itself
 //     (it can be a user query — Qodo finding #3: privacy).
-func (e *onnxEmbedder) tokenizeSafe(tok *tokenizer.Tokenizer, text string) ([]int, bool) {
+func (e *onnxEmbedder) tokenizeSafe(tok clauseTokenizer, text string) ([]int, bool) {
 	clean := sanitizeForTokenizer(text)
 	if clean == "" {
 		return []int{xlmrCLS, xlmrSEP}, false
@@ -606,7 +594,7 @@ type preparedBatch struct {
 // (len <= batchSize) into flat input_ids / attention_mask tensors. No GPU, no
 // shared mutable state beyond the tokenizer — so it can run on the producer
 // goroutine while the GPU runs an earlier batch. start is the output offset.
-func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, start int) preparedBatch {
+func (e *onnxEmbedder) prepareBatch(tok clauseTokenizer, texts []string, start int) preparedBatch {
 	tStart := time.Now()
 	b := len(texts)
 	rows := make([][]int64, b)

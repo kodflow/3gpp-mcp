@@ -14,6 +14,7 @@ require (
 
 require (
 	github.com/apache/arrow-go/v18 v18.6.0 // indirect
+	github.com/daulet/tokenizers v1.27.0 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.10503.0 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-amd64 v0.1.24 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-arm64 v0.1.24 // indirect
