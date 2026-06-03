@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/pretrained"
@@ -59,13 +60,15 @@ type gpuSession struct {
 	bufPool sync.Pool
 }
 
-// getOutBuf returns a pointer to a recycled output buffer of cap batchSize*Dim
-// (allocating on a cold pool). Recycle it with s.bufPool.Put.
+// getOutBuf returns a pointer to a recycled output buffer of cap maxBatchRows*Dim
+// (allocating on a cold pool). Recycle it with s.bufPool.Put. It is sized for the
+// LARGEST possible batch (token-budget batching makes a short-clause batch hold many
+// more than batchSize rows), so runPrepared's (*buf)[:pb.n*Dim] never overruns.
 func (s *gpuSession) getOutBuf() *[]float32 {
 	if v := s.bufPool.Get(); v != nil {
 		return v.(*[]float32)
 	}
-	b := make([]float32, batchSize*Dim)
+	b := make([]float32, maxBatchRows()*Dim)
 	return &b
 }
 
@@ -234,6 +237,86 @@ func resolveBatchSize() int {
 	}
 }
 
+// maxBatchRows bounds the row count of any one batch (and hence the pooled output
+// buffer). Token-budget batching packs short clauses into batches far larger than
+// batchSize; this cap keeps tensor allocation and the per-batch copy-out bounded
+// while still giving the GPU ample parallelism (8× the full-length batch). It is the
+// ceiling tokenBudgetBatches must not exceed.
+func maxBatchRows() int { return 8 * batchSize }
+
+// tokenBudgetBatchingOn reports whether variable-size, token-budget batches are
+// used on the pipelined path (EMBED_TOKEN_BUDGET_BATCHING != "0", default ON). Off
+// restores fixed batchSize-row batches. It is a strict generalisation: at full
+// clause length the budget yields exactly batchSize rows, so the default-on path
+// matches the old behaviour for a max-length corpus and only HELPS shorter ones.
+func tokenBudgetBatchingOn() bool { return envOr("EMBED_TOKEN_BUDGET_BATCHING", "1") != "0" }
+
+// tokenBudget is the target padded-token count (rows × rung) per ONNX Run. Sizing
+// batches to a constant TOKEN budget instead of a constant ROW count keeps the GPU's
+// work-per-Run uniform across length buckets — the saturation lever for a corpus
+// whose clauses span 10 to 512 tokens: short clauses pack into big batches (high
+// occupancy, fewer kernel launches), long clauses fall back to small ones (bounded
+// VRAM). Default = batchSize×maxTokens, i.e. the VRAM-sized full-length batch the
+// device class already proved it can hold; EMBED_TOKEN_BUDGET overrides for tuning.
+func tokenBudget() int {
+	if v := os.Getenv("EMBED_TOKEN_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return batchSize * maxTokens
+}
+
+// bytesPerToken converts a clause's byte length to an APPROXIMATE token count, used
+// only to SIZE its batch (never to pad it — prepareBatch pads to the real tokenised
+// rung, so a wrong estimate costs a little occupancy, never correctness). 3GPP
+// technical prose runs denser than plain English; ~3 bytes/token is conservative.
+const bytesPerToken = 3
+
+// estTokens approximates text's token count from its byte length, clamped to
+// [1, maxTokens]. Cheap (no tokenise) so batch formation stays off the hot path.
+func estTokens(text string) int {
+	n := len(text) / bytesPerToken
+	if n < 1 {
+		return 1
+	}
+	if n > maxTokens {
+		return maxTokens
+	}
+	return n
+}
+
+// tokenBudgetBatches splits a LENGTH-SORTED slice (apply.go sorts the window
+// ascending by byte length) into variable-size [start,end) ranges, each carrying
+// ~budget padded tokens. Because the input is sorted, a batch's rung (ladderCeil of
+// its longest est-length) is non-decreasing as rows are added, so padding stays
+// tight. Row count is capped at maxBatchRows so a batch of tiny clauses cannot
+// allocate an unbounded tensor. Always emits at least one row per batch.
+func tokenBudgetBatches(texts []string, budget int) [][2]int {
+	var batches [][2]int
+	cap := maxBatchRows()
+	i, n := 0, len(texts)
+	for i < n {
+		start := i
+		rung := ladderCeil(estTokens(texts[i]))
+		i++ // the first row is always included
+		for i < n {
+			// Candidate batch rung if this row joins. Sorted ascending ⇒ usually
+			// >= rung; the max() is defensive since a byte-sort isn't a perfect
+			// token-sort (a longer-byte clause can tokenise shorter).
+			r := max(rung, ladderCeil(estTokens(texts[i])))
+			rows := i - start
+			if rows >= cap || (rows+1)*r > budget {
+				break
+			}
+			rung = r
+			i++
+		}
+		batches = append(batches, [2]int{start, i})
+	}
+	return batches
+}
+
 // gpuMemTotalMB returns device-0 total VRAM in MiB via nvidia-smi, or 0 if the
 // query fails (no driver, tool absent) — best-effort, never fatal.
 func gpuMemTotalMB() int {
@@ -274,6 +357,40 @@ func sessionsPerGPU() int {
 // attention_mask=0, so the export's mask-aware pooling ignores them — a padded
 // batch yields the same vectors as one-at-a-time (asserted in the A2 test).
 const padID int64 = 1
+
+// shapeLadder is the fixed set of padded sequence lengths a batch may take. Every
+// batch's padded length is rounded UP to the next rung, so the ONNX session ever
+// sees only len(shapeLadder) distinct (batch, seq) shapes instead of one per
+// distinct clause length. This is the dominant GPU-throughput lever: the CUDA EP
+// re-plans memory and re-selects cuDNN/cuBLAS algorithms on every NEW input shape,
+// and apply.go's ascending length-sort otherwise feeds a DIFFERENT length to almost
+// every batch — maximising replanning (measured: the cold window ran at CPU speed,
+// ~300 tok/s, while warm shapes ran ~5× faster). Snapping to a small ladder lets
+// ORT cache and reuse those plans. It is IDENTITY-SAFE: the extra pad positions
+// carry attention_mask=0 and the export's pooling is mask-aware, so a vector is
+// byte-identical regardless of how far its row was padded (the A2 invariant). The
+// ladder is denser below the corpus median (~150 tok) where most clauses live, so
+// padding waste stays small. Capped at maxTokens.
+var shapeLadder = []int{16, 32, 64, 96, 128, 192, 256, 384, maxTokens}
+
+// ladderCeil rounds n UP to the next shapeLadder rung (never below n, never above
+// maxTokens). A batch whose longest row is n is padded to ladderCeil(n).
+func ladderCeil(n int) int {
+	if n >= maxTokens {
+		return maxTokens
+	}
+	for _, r := range shapeLadder {
+		if r >= n {
+			return r
+		}
+	}
+	return maxTokens
+}
+
+// shapeLadderOn reports whether fixed-shape padding is enabled (EMBED_SHAPE_LADDER
+// != "0", default ON). Off restores the legacy batch-local-max padding (a distinct
+// shape per batch) — kept as an A/B escape hatch, not a recommended mode.
+func shapeLadderOn() bool { return envOr("EMBED_SHAPE_LADDER", "1") != "0" }
 
 // pipelineOn reports whether the 2-stage tokenise/run pipeline is enabled
 // (EMBED_PIPELINE != "0", default on). When off, Embed runs the legacy serial
@@ -318,8 +435,17 @@ func (e *onnxEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	defer cancel()
 	type batchRange struct{ start, end int }
 	var batches []batchRange
-	for start := 0; start < len(texts); start += batchSize {
-		batches = append(batches, batchRange{start, min(start+batchSize, len(texts))})
+	if tokenBudgetBatchingOn() {
+		// Variable-size batches at a constant token budget: short clauses pack into
+		// big batches (occupancy), long ones into small (bounded VRAM). texts arrive
+		// length-sorted (apply.go) so each batch's rung stays tight.
+		for _, r := range tokenBudgetBatches(texts, tokenBudget()) {
+			batches = append(batches, batchRange{r[0], r[1]})
+		}
+	} else {
+		for start := 0; start < len(texts); start += batchSize {
+			batches = append(batches, batchRange{start, min(start+batchSize, len(texts))})
+		}
 	}
 	prepCh := make(chan preparedBatch, len(e.toks)+len(e.sessions))
 	var prodWg sync.WaitGroup
@@ -481,6 +607,7 @@ type preparedBatch struct {
 // shared mutable state beyond the tokenizer — so it can run on the producer
 // goroutine while the GPU runs an earlier batch. start is the output offset.
 func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, start int) preparedBatch {
+	tStart := time.Now()
 	b := len(texts)
 	rows := make([][]int64, b)
 	degraded := make([]bool, b)
@@ -506,6 +633,13 @@ func (e *onnxEmbedder) prepareBatch(tok *tokenizer.Tokenizer, texts []string, st
 			maxLen = len(row)
 		}
 	}
+	// Snap the padded length to the fixed ladder so the ONNX session sees a handful
+	// of shapes (plans cached) instead of one per distinct length (replan storm).
+	// Mask-aware pooling makes the extra padding identity-neutral (A2 invariant).
+	if shapeLadderOn() {
+		maxLen = ladderCeil(maxLen)
+	}
+	defer func() { prof.addTokenize(time.Since(tStart)) }()
 	flatIDs := make([]int64, b*maxLen)
 	flatMask := make([]int64, b*maxLen)
 	for i, row := range rows {
@@ -552,11 +686,14 @@ func (s *gpuSession) runPrepared(pb preparedBatch, out [][]float32) error {
 	}
 	defer func() { _ = outT.Destroy() }()
 	s.mu.Lock()
+	runStart := time.Now()
 	err = s.session.Run([]ort.Value{idsT, maskT}, []ort.Value{outT})
+	runEnd := time.Now()
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("onnx run: %w", err)
 	}
+	prof.addRun(runEnd.Sub(runStart), pb.n, pb.maxLen)
 	data := outT.GetData() // flat [n * Dim], aliasing buf (this run's private buffer)
 	for i := 0; i < pb.n; i++ {
 		if pb.degraded != nil && pb.degraded[i] {
