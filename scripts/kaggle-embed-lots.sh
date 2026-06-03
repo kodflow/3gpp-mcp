@@ -44,6 +44,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${STAGE:-$ROOT/.kaggle-lots}"
 PRECISION="${EMBED_PRECISION:-fp16}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-2000}"
+# GPU accelerator: Kaggle's "NvidiaTeslaT4" is the 2×T4 Tensor-Core box the fp16 path
+# was tuned for (~60 cl/s). WITHOUT this flag, `kaggle kernels push` defaults to a
+# single P100 (no Tensor Cores, fp16 ≈ fp32, ~34 cl/s) — so we pass it explicitly,
+# exactly like kaggle-embed-campaign.sh does.
+ACCELERATOR="${KAGGLE_ACCELERATOR:-NvidiaTeslaT4}"
 BRANCH="${BRANCH:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}"
 
 # Balanced per-RELEASE lots (greedy LPT on the kernel's whole-corpus release_totals):
@@ -98,12 +103,16 @@ stage_kernel() {
 push_one() {
   local lot="$1" rels="$2"; local dir="$STAGE/kernel-$lot"
   stage_kernel "$lot" "$rels" "$dir"
-  log "lot $lot: push  releases=$rels  precision=$PRECISION  branch=$BRANCH"
+  log "lot $lot: push  releases=$rels  precision=$PRECISION  accel=$ACCELERATOR  branch=$BRANCH"
   local out
-  if out="$(kaggle kernels push -p "$dir" 2>&1)"; then
+  out="$(kaggle kernels push -p "$dir" --accelerator "$ACCELERATOR" 2>&1)"
+  # The CLI exits 0 even when the server rejects the push (e.g. "Maximum batch GPU
+  # session count of 2 reached" when both concurrent slots are busy), so parse the
+  # message rather than trust $?. "successfully pushed" is the only success marker.
+  if printf '%s' "$out" | grep -qi 'successfully pushed'; then
     log "lot $lot: pushed -> $(kernel_slug "$lot")  ($out)"
   else
-    die "lot $lot: push failed: $out"
+    die "lot $lot: push REJECTED: $out"
   fi
 }
 
