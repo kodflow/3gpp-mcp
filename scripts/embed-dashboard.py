@@ -33,10 +33,26 @@ def rel_ordinal(rel):
 
 
 def load_totals():
+    # Preferred: the kernel emits `release_totals=Rel-99=NNN,Rel-4=NNN,…` on its
+    # fresh-slice (computed on Kaggle's fast network) — robust to a flaky laptop link.
+    for rf in sorted(glob.glob(os.path.join(ROOT, "out-*", "RESULT.txt"))):
+        for line in open(rf, errors="ignore"):
+            if line.startswith("RESULT release_totals="):
+                per = {}
+                for kv in line.split("release_totals=", 1)[1].strip().split(","):
+                    if "=" in kv:
+                        k, v = kv.rsplit("=", 1)
+                        try:
+                            per[k] = int(v)
+                        except ValueError:
+                            pass
+                if per:
+                    return {"total": sum(per.values()), "per_release": per}
+    # Fallback: a locally-cached release-totals.json (if the laptop download succeeded).
     p = os.path.join(ROOT, "release-totals.json")
-    if not os.path.isfile(p):
-        return None
-    return json.load(open(p))
+    if os.path.isfile(p):
+        return json.load(open(p))
+    return None
 
 
 def embedded_per_release():
@@ -125,16 +141,22 @@ def main():
     rels = sorted(per.keys(), key=rel_ordinal)
     grand_emb = sum(emb.get(r, 0) for r in per)
 
-    print(f"│ {'Rel':7s} {'clauses':>9s} {'embedded':>9s}  {'progress':24s} {'%':>5s}")
-    print("│ " + "─" * 64)
+    # cl/s per row = the GLOBAL real GPU rate (per-release timing is not separable —
+    # all releases of a series embed interleaved — so this column repeats the global
+    # measured rate on every row; only meaningful once a series has finished).
+    clstr = f"{cls:.1f}" if cls else "—"
+    print(f"│ {'Rel':7s} {'clauses':>9s} {'embedded':>9s}  {'progress':24s} {'%':>5s} {'cl/s*':>6s}")
+    print("│ " + "─" * 72)
     for rel in rels:
         tot = per[rel]
         e = emb.get(rel, 0)
         frac = (e / tot) if tot else 0.0
-        print(f"│ {rel:7s} {human(tot):>9s} {human(e):>9s}  {bar(frac)} {frac*100:4.0f}%")
-    print("│ " + "─" * 64)
+        # show the rate only on rows that actually have embedded clauses
+        rowcls = clstr if e > 0 else "—"
+        print(f"│ {rel:7s} {human(tot):>9s} {human(e):>9s}  {bar(frac)} {frac*100:4.0f}% {rowcls:>6s}")
+    print("│ " + "─" * 72)
     gfrac = (grand_emb / grand_total) if grand_total else 0.0
-    print(f"│ {'TOTAL':7s} {human(grand_total):>9s} {human(grand_emb):>9s}  {bar(gfrac)} {gfrac*100:4.0f}%")
+    print(f"│ {'TOTAL':7s} {human(grand_total):>9s} {human(grand_emb):>9s}  {bar(gfrac)} {gfrac*100:4.0f}% {clstr:>6s}")
 
     remaining = grand_total - grand_emb
     eta = (remaining / cls) if cls else 0
@@ -143,6 +165,8 @@ def main():
           f"   │   ETA GPU pseudo: {fmt_eta(eta)}")
     print(f"│  (réel = {human(run_emb)} clauses en {run_el}s de GPU cumulé sur séries finies;"
           f" ETA = restant ÷ cl/s, hors build/pull/quota)")
+    print("│  * cl/s par-Rel = débit GPU GLOBAL (uniforme, tokens/s-borné) — le temps")
+    print("│    n'est pas séparable par release (embed entrelacé recent-first dans une série).")
     print("└" + "─" * 70)
 
 
