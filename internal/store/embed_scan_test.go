@@ -102,3 +102,49 @@ func TestClausesNeedingEmbeddingScan(t *testing.T) {
 		t.Errorf("ResumeOnly = %v, want 3 still-NULL rows", ids)
 	}
 }
+
+// TestClausesNeedingEmbeddingReleaseSet pins the per-RELEASE-lot selector: an exact
+// label set restricts the work-list to those releases only (the balanced-lot Kaggle
+// shards rely on it), stays recent-first ordered, AND-combines with --series, and an
+// empty set is a no-op (all releases). Non-contiguous sets — which a floor cannot
+// express — are the whole point, so the assertions use one.
+func TestClausesNeedingEmbeddingReleaseSet(t *testing.T) {
+	s := newMem(t)
+	if err := s.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-99", Version: "3.1.0", ClausePath: "1", Heading: "h", Text: "t"},
+		{ChunkID: 2, SpecID: "23.501", Release: "Rel-20", Version: "20.0.0", ClausePath: "2", Heading: "h", Text: "t"},
+		{ChunkID: 3, SpecID: "33.128", Release: "Rel-18", Version: "18.5.0", ClausePath: "3", Heading: "h", Text: "t"},
+		{ChunkID: 4, SpecID: "23.502", Release: "Rel-19", Version: "19.6.0", ClausePath: "4", Heading: "h", Text: "t"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-contiguous lot {Rel-20, Rel-18, Rel-99}: exactly those three, recent-first.
+	_, rels := drainScan(t, s, EmbedScan{Releases: []string{"Rel-20", "Rel-18", "Rel-99"}})
+	want := []string{"Rel-20", "Rel-18", "Rel-99"}
+	if len(rels) != len(want) {
+		t.Fatalf("release set = %v, want %v", rels, want)
+	}
+	for i, w := range want {
+		if rels[i] != w {
+			t.Errorf("release set order[%d]=%q want %q", i, rels[i], w)
+		}
+	}
+
+	// AND-combined with series 23: Rel-18 lives only on 33.128, so it drops out.
+	ids, _ := drainScan(t, s, EmbedScan{SeriesPrefix: "23", Releases: []string{"Rel-20", "Rel-18", "Rel-99"}})
+	for _, id := range ids {
+		if id == 3 {
+			t.Errorf("series 23 ∩ release set wrongly kept 33.128 chunk 3: %v", ids)
+		}
+	}
+	if len(ids) != 2 { // chunks 1 (Rel-99) + 2 (Rel-20), both on 23.501
+		t.Errorf("series 23 ∩ {Rel-20,Rel-18,Rel-99} = %v, want 2 rows", ids)
+	}
+
+	// Empty set is a no-op: all four clauses surface.
+	ids, _ = drainScan(t, s, EmbedScan{Releases: nil})
+	if len(ids) != 4 {
+		t.Errorf("empty release set = %v, want all 4 rows", ids)
+	}
+}

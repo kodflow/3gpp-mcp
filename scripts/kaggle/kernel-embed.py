@@ -76,11 +76,20 @@ ORT_VERSION = os.environ.get("ORT_VERSION", "1.26.0")
 CHECKPOINT_EVERY = os.environ.get("CHECKPOINT_EVERY", "2000")
 # Stop ~10.8h in so the version/validate tail always runs before Kaggle's 12h kill.
 TIME_BUDGET = int(os.environ.get("EMBED_TIME_BUDGET", "39000"))
+# Per-RELEASE-lot mode (kaggle-embed-lots.sh): when EMBED_RELEASES is a non-empty
+# comma-separated label set, this kernel shards by an explicit RELEASE SET instead of
+# by SERIES, so two balanced lots can embed concurrently in two sessions. LOT names
+# the shard ("A"/"B") for the resume Dataset + RESULT markers. The slice, the embed
+# selector, and the resume/state slug all key on SHARD, which is "lot<LOT>" in lot mode
+# and "s<SERIES>" otherwise — the proven per-series path is byte-for-byte unchanged.
+RELEASES = os.environ.get("EMBED_RELEASES", "").strip()
+LOT = os.environ.get("LOT", "").strip()
+SHARD = ("lot%s" % LOT) if RELEASES else ("s%s" % SERIES)
 os.chdir(WORK)
 os.environ.pop("EMBEDDER", None)  # force the real onnx/CUDA backend (never Local)
 
-say("step=start floor=%s series=%s precision=%s ort=%s branch=%s budget=%ds"
-    % (FLOOR, SERIES, PRECISION, ORT_VERSION, BRANCH, TIME_BUDGET))
+say("step=start floor=%s shard=%s series=%s releases=%s precision=%s ort=%s branch=%s budget=%ds"
+    % (FLOOR, SHARD, SERIES, (RELEASES or "-"), PRECISION, ORT_VERSION, BRANCH, TIME_BUDGET))
 
 # GPU-optional: CUDA when a GPU is attached (T4 Tensor-Core fp16 path), else CPU so
 # the pipeline + download path are still exercised end-to-end.
@@ -141,7 +150,7 @@ os.chdir(src)
 # ---- RESUME or fresh SLICE -------------------------------------------------
 EMBEDDED_DB = os.path.join(WORK, "3gpp-embedded.duckdb")
 RESUME_DB = os.environ.get(
-    "RESUME_DB", "/kaggle/input/3gpp-embedded-s%s/3gpp-embedded.duckdb" % SERIES)
+    "RESUME_DB", "/kaggle/input/3gpp-embedded-%s/3gpp-embedded.duckdb" % SHARD)
 if os.path.isfile(RESUME_DB):
     shutil.copy(RESUME_DB, EMBEDDED_DB)
     prior = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
@@ -163,15 +172,26 @@ else:
     if rt.returncode == 0 and rt.stdout.strip():
         pairs = ",".join(l.strip() for l in rt.stdout.splitlines() if l.strip())
         say("release_totals=%s" % pairs)
+    # Lot mode slices by an explicit RELEASE SET; series mode by the 2-digit series.
+    # The release labels are validated against the safe Rel-NN / phase grammar before
+    # interpolation (they originate from the operator's lot definition, never the DB).
+    if RELEASES:
+        rels = [r.strip() for r in RELEASES.split(",") if r.strip()]
+        for r in rels:
+            if not re.match(r"^[A-Za-z0-9._-]+$", r):
+                fail("bad_release", "release=%s" % r)
+        where = "release IN (%s)" % ",".join("'%s'" % r for r in rels)
+    else:
+        where = "substr(spec_id,1,2)='%s'" % SERIES
     slice_sql = ("ATTACH '%s/full.duckdb' AS s (READ_ONLY); "
                  "CREATE TABLE clauses AS SELECT * FROM s.clauses "
-                 "WHERE substr(spec_id,1,2)='%s';" % (WORK, SERIES))
+                 "WHERE %s;" % (WORK, where))
     if sh('duckdb "%s" "%s"' % (EMBEDDED_DB, slice_sql)).returncode != 0:
         fail("slice")
     sln = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses;")
     say("sliced_clauses=%s" % sln)
     if not (sln.isdigit() and int(sln) >= 1):
-        fail("empty_slice", "series=%s full=%s" % (SERIES, fulln))
+        fail("empty_slice", "shard=%s full=%s" % (SHARD, fulln))
 
 # ---- ONNX Runtime (GPU) + BGE-M3 -------------------------------------------
 if sh('curl -fsSL --retry 5 -o /tmp/ort.tgz '
@@ -310,10 +330,15 @@ env["ORT_EP"] = EP
 env["EMBED_GRAPH_OPT"] = "1"
 env.update(EMBED_ENV)  # fp16: EMBED_MODELS_CONFIG + EMBED_MODEL=bge-m3-fp16
 REPORT = "%s/embed-report.json" % WORK
-cmd = ('"%s/embed" --db "%s" --embed-floor "%s" --series "%s" '
+# Lot mode selects the work-list by the SAME release SET that sliced the DB (belt &
+# braces: the slice already restricts the table, --embed-releases re-asserts it on the
+# work-list query); series mode keeps the per-series selector. Selection-only — neither
+# changes EmbedIdentity, so fp16 vectors are bit-for-bit what the per-series path makes.
+selector = ('--embed-releases "%s"' % RELEASES) if RELEASES else ('--series "%s"' % SERIES)
+cmd = ('"%s/embed" --db "%s" --embed-floor "%s" %s '
        "--order recent --resume --checkpoint-every \"%s\" --no-hnsw "
        "--require-semantic --report json"
-       % (WORK, EMBEDDED_DB, FLOOR, SERIES, CHECKPOINT_EVERY))
+       % (WORK, EMBEDDED_DB, FLOOR, selector, CHECKPOINT_EVERY))
 start = time.time()
 rc = 0
 # Stream the embedder's progress (stderr) LIVE to the Kaggle log so a long GPU run
@@ -370,17 +395,17 @@ if elapsed > 0:
 # the laptop (creds-never-leave-laptop posture); this tail is the unattended opt-in.
 KU = os.environ.get("KAGGLE_USERNAME", "")
 KK = os.environ.get("KAGGLE_KEY", "")
-EMBED_STATE_DS = os.environ.get("EMBED_STATE_DS") or (("%s/3gpp-embedded-s%s" % (KU, SERIES)) if KU else "")
+EMBED_STATE_DS = os.environ.get("EMBED_STATE_DS") or (("%s/3gpp-embedded-%s" % (KU, SHARD)) if KU else "")
 if KU and KK and EMB >= 1:
     if have("kaggle") or sh("pip install --quiet kaggle").returncode == 0:
         out = "%s/state" % WORK
         os.makedirs(out, exist_ok=True)
         shutil.copy(EMBEDDED_DB, "%s/3gpp-embedded.duckdb" % out)
-        json.dump({"title": "3gpp-embedded-s%s" % SERIES, "id": EMBED_STATE_DS,
+        json.dump({"title": "3gpp-embedded-%s" % SHARD, "id": EMBED_STATE_DS,
                    "licenses": [{"name": "CC0-1.0"}]},
                   open("%s/dataset-metadata.json" % out, "w"))
-        if sh('kaggle datasets version -p "%s" -m "series=%s embedded=%d" --dir-mode zip'
-              % (out, SERIES, EMB)).returncode == 0:
+        if sh('kaggle datasets version -p "%s" -m "shard=%s embedded=%d" --dir-mode zip'
+              % (out, SHARD, EMB)).returncode == 0:
             say("versioned=%s" % EMBED_STATE_DS)
         elif sh('kaggle datasets create -p "%s" --dir-mode zip' % out).returncode == 0:
             say("created=%s" % EMBED_STATE_DS)

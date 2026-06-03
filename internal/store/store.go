@@ -589,6 +589,12 @@ type EmbedScan struct {
 	// SeriesPrefix != "" restricts to spec_ids in that 2-digit series ("23"), so a
 	// bounded Kaggle kernel can embed one series-shard at a time. "" = all series.
 	SeriesPrefix string
+	// Releases, when non-empty, restricts to clauses whose release label is in this
+	// exact set ("Rel-19","Rel-16",…), so a balanced per-RELEASE-lot Kaggle kernel can
+	// embed an arbitrary subset of releases concurrently with its sibling lot. Matched
+	// verbatim against clauses.release (NOT a recency range), AND-combined with the
+	// other predicates. nil/empty = all releases.
+	Releases []string
 	// Limit > 0 caps the work-list — a bounded session (Kaggle 12h cap) embeds the
 	// top-Limit rows of the order below, then resumes next run. 0 = no limit.
 	Limit int
@@ -622,6 +628,14 @@ func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*s
 	if scan.SeriesPrefix != "" {
 		conds = append(conds, `substr(spec_id, 1, 2) = ?`)
 		args = append(args, scan.SeriesPrefix)
+	}
+	if len(scan.Releases) > 0 {
+		ph := make([]string, len(scan.Releases))
+		for i, r := range scan.Releases {
+			ph[i] = "?"
+			args = append(args, r)
+		}
+		conds = append(conds, `release IN (`+strings.Join(ph, ", ")+`)`)
 	}
 	if scan.FloorOrd > 0 {
 		conds = append(conds, `(`+releaseRecencySQL("release")+`) >= ?`)

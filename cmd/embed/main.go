@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
@@ -40,6 +41,7 @@ func main() {
 		dbPath    = flag.String("db", "data/3gpp.duckdb", "existing DuckDB snapshot to embed in place")
 		embFlr    = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-19); empty = all. Lexical coverage is unaffected.")
 		series    = flag.String("series", "", "embed ONLY this 2-digit series (e.g. 23); empty = all. For per-series Kaggle shards.")
+		embRels   = flag.String("embed-releases", "", "embed ONLY clauses in this comma-separated SET of exact release labels (e.g. \"Rel-19,Rel-16,Rel-15\"); empty = all. For balanced per-RELEASE-lot Kaggle shards. AND-combined with --series/--embed-floor; selection-only (does NOT change EmbedIdentity).")
 		limit     = flag.Int("limit", 0, "cap the work-list to N clauses (bounded session; resumes next run). 0 = no limit.")
 		order     = flag.String("order", "recent", "work-list order: recent (newest release first) | chunk (chunk_id order)")
 		resume    = flag.Bool("resume", false, "fast resume: embed ONLY never-embedded clauses (skip the Go hash re-check). Pair with --limit for bounded sessions.")
@@ -59,6 +61,8 @@ func main() {
 	if *countNull {
 		os.Exit(runCountNull(*dbPath, *embFlr, *series, *report))
 	}
+
+	releases := splitReleases(*embRels)
 
 	e := embed.New()
 	if (*reqSem || os.Getenv("SEMANTIC_REQUIRED") == "1") && !e.Enabled() {
@@ -80,6 +84,7 @@ func main() {
 	rep, err := run(context.Background(), *dbPath, e, embedConfig{
 		floor:           *embFlr,
 		series:          *series,
+		releases:        releases,
 		limit:           *limit,
 		order:           *order,
 		resume:          *resume,
@@ -121,15 +126,16 @@ type reportJSON struct {
 // embedConfig is the resolved cmd/embed invocation: which clauses to embed (floor,
 // series, limit, order, resume) and the durability/finalisation knobs.
 type embedConfig struct {
-	floor           string // --embed-floor (e.g. "Rel-19"); "" = all releases
-	series          string // --series 2-digit prefix; "" = all series
-	limit           int    // --limit work-list cap; 0 = no limit
-	order           string // --order: "recent" (default) | "chunk"
-	resume          bool   // --resume: only never-embedded rows
-	checkpointEvery int    // --checkpoint-every N; 0 = checkpoint only at end
-	progressEvery   int    // --progress-every N; 0 = no live progress line
-	logFile         string // --log-file; "" = stderr only
-	buildHNSW       bool   // !--no-hnsw
+	floor           string   // --embed-floor (e.g. "Rel-19"); "" = all releases
+	series          string   // --series 2-digit prefix; "" = all series
+	releases        []string // --embed-releases exact-label set; nil/empty = all releases
+	limit           int      // --limit work-list cap; 0 = no limit
+	order           string   // --order: "recent" (default) | "chunk"
+	resume          bool     // --resume: only never-embedded rows
+	checkpointEvery int      // --checkpoint-every N; 0 = checkpoint only at end
+	progressEvery   int      // --progress-every N; 0 = no live progress line
+	logFile         string   // --log-file; "" = stderr only
+	buildHNSW       bool     // !--no-hnsw
 }
 
 func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) (reportJSON, error) {
@@ -161,6 +167,7 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 	rows, err := db.ClausesNeedingEmbedding(ctx, store.EmbedScan{
 		FloorOrd:     floorOrd,
 		SeriesPrefix: cfg.series,
+		Releases:     cfg.releases,
 		Limit:        cfg.limit,
 		OldestFirst:  oldestFirst,
 		ResumeOnly:   cfg.resume,
@@ -337,4 +344,19 @@ func runCountNull(dbPath, floor, series, report string) int {
 		fmt.Printf("null_at_floor=%d null_after=%d floor=%q series=%q\n", atFloor, global, floor, series)
 	}
 	return 0
+}
+
+// splitReleases parses the comma-separated --embed-releases value into a trimmed,
+// empty-dropped list of exact release labels. "" / whitespace yields nil (all
+// releases), so the SQL predicate is skipped entirely. The values are matched
+// verbatim against the clauses.release column (e.g. "Rel-19"), never re-derived
+// from a recency ordinal — a lot is an explicit label set, not a range.
+func splitReleases(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if r := strings.TrimSpace(part); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
 }
