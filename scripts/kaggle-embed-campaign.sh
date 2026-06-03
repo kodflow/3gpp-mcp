@@ -182,7 +182,7 @@ version_state() {
 recover_orphan() {
   local s="$1"
   mkdir -p "$STAGE/out-$s"
-  kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
+  timeout 300 kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
   version_state "$s"   # no-op when there is no prior output; promotes a partial otherwise
 }
 
@@ -213,7 +213,7 @@ run_one() {
     fi
     local state; state="$(poll_kernel "$s")"
     mkdir -p "$STAGE/out-$s"
-    kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
+    timeout 300 kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
     version_state "$s"
     if series_complete "$s"; then
       log "series $s: COMPLETE (null_at_floor=0)"; return 0
