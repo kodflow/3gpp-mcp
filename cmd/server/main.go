@@ -198,7 +198,7 @@ func serve(args []string) error {
 	if *httpAddr != "" {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP over Streamable HTTP on %s (endpoint /mcp, landing /, db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
 			*httpAddr, effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
-		return serveHTTP(srv, *httpAddr)
+		return serveHTTP(srv, st, *httpAddr)
 	}
 	fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP on stdio (db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
 		effDB, st.FTSAvailable(), st.VSSAvailable(), scope)

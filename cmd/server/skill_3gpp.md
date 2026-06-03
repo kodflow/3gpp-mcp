@@ -46,6 +46,11 @@ Acronymes ▸ AMF = … · AUSF = …   (only acronyms actually used; via resolv
      evidence. Never estimate without the workflow.
    - "Anything else?"
 
+**Source links:** in HTTP mode, render each source as a clickable link to
+`http://<host>/spec/<spec_id>/<release>/<clause>` — the local page that opens that clause's
+EXACT indexed text (verbatim) plus the official 3GPP DOCX. If the host is unknown (stdio),
+fall back to the official 3GPP `url` the MCP returned.
+
 Guardrails: TS by default; carry `(release, version)` when ordering (3GPP versions are
 non-monotonic); if `server_info` says semantic is off, say search is lexical; all
 reasoning is yours, the MCP only does cited retrieval.
