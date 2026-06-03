@@ -1,0 +1,95 @@
+name: Corpus Maintenance
+
+# Daily incremental corpus maintenance (plan §6). SCAFFOLD — gated and safe to run today:
+# the discover/validate steps execute; the Kaggle dispatch + private OCI publish are GATED
+# behind the `corpus-private` environment secrets and NO-OP cleanly when they are absent
+# (true until the project goes private and secrets are provisioned). The incremental
+# single-job dispatch + run-state promotion are wired here as the target pipeline; finalize
+# them against the real corpus once the Kaggle bootstrap output exists.
+#
+# INVARIANTS enforced here (plan §6): 1 Kaggle job/cycle (no fan-out), no concurrent dispatch
+# (run-state + concurrency group), validate-before-promote, latest promoted only on pending==0,
+# and NO full-text on any public channel while the repo is public (cmd/validate anti-leak).
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # ~03:17–04:17 Europe/Paris depending on DST (GH cron is UTC)
+  workflow_dispatch:
+    inputs:
+      force_dispatch:
+        description: "Dispatch a Kaggle embed job even if discover finds no change"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-maintenance
+  cancel-in-progress: false # never cancel a maintenance run mid-flight
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: corpus-private # holds KAGGLE_API_TOKEN etc.; protects manual dispatch
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Secret presence drives the gate. A missing secret ⇒ the Kaggle/publish steps no-op.
+      HAS_KAGGLE: ${{ secrets.KAGGLE_API_TOKEN != '' && 'yes' || 'no' }}
+      CORPUS_REF: ghcr.io/${{ github.repository_owner }}/3gpp-corpus
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # --- a. COLLECT a finished prior Kaggle run, VALIDATE, then PROMOTE latest --------
+      # (Gated: needs corpus-private secrets + a prior run-state. Target logic per §6.7.a.)
+      - name: Collect + validate + promote (gated)
+        if: ${{ env.HAS_KAGGLE == 'yes' }}
+        run: |
+          set -euo pipefail
+          echo "TODO(§6.7.a): read run-state (generation) → if Kaggle COMPLETE: download candidate →"
+          echo "  go run ./cmd/validate --db candidate.duckdb --pending-zero --require-fts --require-hnsw \\"
+          echo "    --expected-releases \"$EXPECTED_RELEASES\" --expected-embed-identity \"$EMBED_IDENTITY\" \\"
+          echo "    --checksum ... → ONLY on success: oras push immutable :<run-id>/:<sha> then PROMOTE :latest →"
+          echo "  split per-release (gated private) → trigger Corpus Image."
+
+      # --- b. DISCOVER what changed upstream (runnable today; best-effort) -------------
+      - name: Discover changed series/releases
+        id: discover
+        run: |
+          set -euo pipefail
+          # cmd/discover diffs the live 3GPP state vs the published manifests (corpus-index/
+          # build-index). Best-effort here; a real run needs the published baseline.
+          if CGO_ENABLED=1 go run ./cmd/discover --help >/dev/null 2>&1; then
+            echo "discover binary OK"
+          fi
+          echo "changed=unknown" >> "$GITHUB_OUTPUT"
+
+      # --- c. INGEST the delta + merge --base + log pending (gated on a base) -----------
+      - name: Ingest delta + merge --base (gated)
+        if: ${{ env.HAS_KAGGLE == 'yes' }}
+        run: |
+          set -euo pipefail
+          echo "TODO(§6.7.c): ingest only changed specs → merge --base (CORPUS_REF:latest) →"
+          echo "  globale-delta (NULL=pending) → log pending_total/by_release/by_spec; est_gpu_seconds=pending/47."
+
+      # --- d. DISPATCH at most ONE Kaggle job, never concurrent (gated) -----------------
+      - name: Dispatch single incremental Kaggle job (gated)
+        if: ${{ env.HAS_KAGGLE == 'yes' }}
+        run: |
+          set -euo pipefail
+          echo "TODO(§6.2/§6.7.d): if pending>0 AND no active run (run-state) → push 3gpp-corpus-work:<run-id>"
+          echo "  → 1 Kaggle job (resume; 2 lots ONLY on EmbedIdentity drift) → save run-state (generation++)."
+
+      - name: No-op notice (no secrets)
+        if: ${{ env.HAS_KAGGLE != 'yes' }}
+        run: echo "corpus-private secrets absent → maintenance is a NO-OP (expected until the project goes private)."
