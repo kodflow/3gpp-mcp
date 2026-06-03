@@ -220,6 +220,7 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 
 	embStart := time.Now()
 	done, sinceCkpt, sinceLog := 0, 0, 0
+	total := rep.Candidates // work-list size (scanned); denominator for the progress %
 	batchSet := func(ctx context.Context, ids []uint64, vecs [][]float32, hashes []string) error {
 		if err := db.SetEmbeddingsBatch(ctx, ids, vecs, hashes); err != nil {
 			return err
@@ -241,7 +242,20 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 				if el > 0 {
 					rate = float64(done) / el
 				}
-				_, _ = fmt.Fprintf(progressW, "embed progress: %d embedded (%.1f cl/s, %.0fs elapsed)\n", done, rate, el)
+				// done/total + % + a pseudo ETA for the remaining work-list, so a
+				// remote log shows HOW FAR ALONG the run is, not just a running count.
+				// total is the scanned work-list (rep.Candidates); with --resume that
+				// is exactly the clauses left to embed, so done/total is the true ratio.
+				pct, eta := 0.0, 0.0
+				if total > 0 {
+					pct = 100 * float64(done) / float64(total)
+				}
+				if rate > 0 && total > done {
+					eta = float64(total-done) / rate
+				}
+				_, _ = fmt.Fprintf(progressW,
+					"embed progress: %d/%d embedded (%.1f%%, %.1f cl/s, %.0fs elapsed, ETA %.0fs)\n",
+					done, total, pct, rate, el, eta)
 			}
 		}
 		return nil
