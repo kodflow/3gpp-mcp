@@ -260,6 +260,11 @@ jobs:
             # to the canonical EmbedIdentity; keep it in lockstep with EMBEDDER on
             # the build-shard job (default lexical when embed=false).
             gh release download latest --repo "$GITHUB_REPOSITORY" -p build-index.json -D . 2>/dev/null || true
+            # absent-index.json (from Corpus · Coverage): the (spec,release) 3GPP
+            # lists but never published as a file. Subtracting it stops the genuine
+            # residue re-flagging every run, so actionable drift converges to 0.
+            gh release download latest --repo "$GITHUB_REPOSITORY" -p absent-index.json -D . 2>/dev/null || true
+            absent=""; [ -f absent-index.json ] && absent="--absent-index absent-index.json"
             embed_model=""
             if [ "${{ github.event.inputs.embed }}" = "true" ]; then
               embed_model="bge-m3"
@@ -272,7 +277,7 @@ jobs:
             if [ "$full" = "true" ]; then
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy)
+              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy $absent)
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
