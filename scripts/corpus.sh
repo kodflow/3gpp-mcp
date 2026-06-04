@@ -178,15 +178,25 @@ download_zip() {
       *) break;;
     esac
   done
-  # FALLBACK — highest version actually in the archive dir (>= floor).
+  # FALLBACK — highest version of the SAME RELEASE actually present in the spec's
+  # archive dir. Matching the release-major (not just the floor) keeps attribution
+  # correct: a Rel-6 miss falls back to the highest Rel-6 file (…-6xx), NEVER a
+  # higher release's version that would then be mis-filed under Rel-6. In 3GPP's
+  # encoding the version-major IS the release ordinal (Rel-99 = major 3).
   dir="${url%/*}/"; prefix="${name%.zip}"; prefix="${prefix%-*}"
+  case "$rel" in
+    Rel-99) relmaj=3 ;;
+    Rel-*)  relmaj="${rel#Rel-}" ;;
+    *)      relmaj=0 ;;   # GSM/legacy: version-major is not the release → take highest
+  esac
   html="$(fetch "$dir" 2>/dev/null || true)"
   if [[ -n "$html" ]]; then
     bestkey=-1; best=""
     while IFS= read -r f; do
       [[ -z "$f" ]] && continue
       c3="${f##*-}"; c3="${c3%.zip}"
-      m="$(decode_char "${c3:0:1}")"; (( m == 999 || m < SET_MAJOR )) && continue
+      m="$(decode_char "${c3:0:1}")"; (( m == 999 )) && continue
+      if (( relmaj > 0 )); then (( m != relmaj )) && continue; else (( m < SET_MAJOR )) && continue; fi
       v2="$(decode_char "${c3:1:1}")"; v3="$(decode_char "${c3:2:1}")"
       (( v2 == 999 )) && v2=0; (( v3 == 999 )) && v3=0
       key=$(( m*10000 + v2*100 + v3 ))
