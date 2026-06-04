@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# build-absent-index.sh — turn verify-coverage.sh's "absent" rows into the
+# absent-index.json ledger that `discover --absent-index` consumes: a JSON object
+# "<spec_id>|<Rel-NN>" -> "<X.Y.Z>" of the (spec,release) 3GPP lists but never
+# published as a downloadable file (no same-release version in the archive).
+#
+#   scripts/build-absent-index.sh /tmp/coverage/results.tsv data/absent-index.json
+#
+# The version is decoded from the archive file code (3-char base36, or the 6-digit
+# decimal form for high components) so it matches the status-report version discover
+# compares against — a key reappears in the worklist only when 3GPP bumps it.
+set -uo pipefail
+
+RES="${1:?usage: build-absent-index.sh <results.tsv> <out.json>}"
+OUT="${2:?usage: build-absent-index.sh <results.tsv> <out.json>}"
+
+decode_char() { local c="$1"; case "$c" in [0-9]) printf '%d' "$c";; [a-z]) printf '%d' "$(( 10 + $(printf '%d' "'$c") - 97 ))";; *) printf '%d' 0;; esac; }
+
+ver_from_code() {  # <code> -> X.Y.Z
+  local c="$1"
+  if [[ "$c" =~ ^[0-9]{6}$ ]]; then
+    printf '%d.%d.%d' "$((10#${c:0:2}))" "$((10#${c:2:2}))" "$((10#${c:4:2}))"
+  else
+    printf '%d.%d.%d' "$(decode_char "${c:0:1}")" "$(decode_char "${c:1:1}")" "$(decode_char "${c:2:1}")"
+  fi
+}
+
+tmp="$(mktemp)"
+printf '{\n' > "$tmp"
+first=1
+# absent rows: "absent<TAB><rel><TAB><url>"
+while IFS=$'\t' read -r state rel url; do
+  [[ "$state" == "absent" ]] || continue
+  spec="$(printf '%s' "$url" | grep -oE '[0-9]{2}\.[0-9]{3}(-[0-9]+)?' | head -1)"
+  name="${url##*/}"; code="${name%.zip}"; code="${code##*-}"
+  ver="$(ver_from_code "$code")"
+  [[ -n "$spec" && -n "$rel" ]] || continue
+  [[ $first -eq 1 ]] && first=0 || printf ',\n' >> "$tmp"
+  printf '  "%s|%s": "%s"' "$spec" "$rel" "$ver" >> "$tmp"
+done < "$RES"
+printf '\n}\n' >> "$tmp"
+mv -f "$tmp" "$OUT"
+n=$(grep -c '": "' "$OUT" || true)
+echo "absent-index: $n entries -> $OUT"
