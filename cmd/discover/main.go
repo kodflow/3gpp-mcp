@@ -321,6 +321,12 @@ func emitWorklist(site map[string]string, floorMajor int, seriesFilter string) {
 		}
 		code, ok := encodeVerCode(site[key])
 		if !ok {
+			// A version component > 35 has no single-char code in the 3GPP 3-char
+			// scheme — 3GPP names these files with an irregular code, so we cannot
+			// reconstruct the URL. Logged (never silently dropped) so the residual
+			// is auditable; the build's archive-dir fallback still picks them up by
+			// listing (they exist, just not at a code we can compute).
+			fmt.Fprintf(os.Stderr, "emit-worklist SKIP-unencodable %s %s\n", key, site[key])
 			skipped++
 			continue
 		}
@@ -339,26 +345,36 @@ func emitWorklist(site map[string]string, floorMajor int, seriesFilter string) {
 // not a number or exceeds 35 (outside the single-char encoding).
 func encodeVerCode(ver string) (string, bool) {
 	parts := strings.SplitN(ver, ".", 3)
-	var code [3]byte
+	var n [3]int
 	for i := 0; i < 3; i++ {
-		n := 0
 		if i < len(parts) && parts[i] != "" {
 			v, err := strconv.Atoi(parts[i])
-			if err != nil {
+			if err != nil || v < 0 {
 				return "", false
 			}
-			n = v
-		}
-		if n < 0 || n > 35 {
-			return "", false
-		}
-		if n < 10 {
-			code[i] = byte('0' + n)
-		} else {
-			code[i] = byte('a' + n - 10)
+			n[i] = v
 		}
 	}
-	return string(code[:]), true
+	// 3GPP uses the compact 3-char base36 code (one char per component, 0..35)
+	// when EVERY component fits; otherwise the 6-DIGIT zero-padded decimal form,
+	// two digits per component (8.37.0 → "083700", 1.62.0 → "016200"). The latter
+	// is what high-minor maintenance versions use — we must emit it or those specs
+	// (24.229, 30.531, …) are never fetched.
+	if n[0] <= 35 && n[1] <= 35 && n[2] <= 35 {
+		var code [3]byte
+		for i, v := range n {
+			if v < 10 {
+				code[i] = byte('0' + v)
+			} else {
+				code[i] = byte('a' + v - 10)
+			}
+		}
+		return string(code[:]), true
+	}
+	if n[0] <= 99 && n[1] <= 99 && n[2] <= 99 {
+		return fmt.Sprintf("%02d%02d%02d", n[0], n[1], n[2]), true
+	}
+	return "", false // a component ≥ 100 — outside even the 6-digit scheme (vanishingly rare)
 }
 
 // seriesSet parses a "23 33" / "23,33" / "24|Rel-19" filter into a set of 2-digit

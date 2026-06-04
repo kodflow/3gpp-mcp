@@ -195,13 +195,19 @@ download_zip() {
     while IFS= read -r f; do
       [[ -z "$f" ]] && continue
       c3="${f##*-}"; c3="${c3%.zip}"
-      m="$(decode_char "${c3:0:1}")"; (( m == 999 )) && continue
+      # Two archive code forms: 3-char base36 (one char/component, 0..35) and the
+      # 6-digit decimal form for high components (08 37 00 = 8.37.0). Decode both.
+      if [[ "$c3" =~ ^[0-9]{6}$ ]]; then
+        m=$((10#${c3:0:2})); v2=$((10#${c3:2:2})); v3=$((10#${c3:4:2}))
+      else
+        m="$(decode_char "${c3:0:1}")"; (( m == 999 )) && continue
+        v2="$(decode_char "${c3:1:1}")"; v3="$(decode_char "${c3:2:1}")"
+        (( v2 == 999 )) && v2=0; (( v3 == 999 )) && v3=0
+      fi
       if (( relmaj > 0 )); then (( m != relmaj )) && continue; else (( m < SET_MAJOR )) && continue; fi
-      v2="$(decode_char "${c3:1:1}")"; v3="$(decode_char "${c3:2:1}")"
-      (( v2 == 999 )) && v2=0; (( v3 == 999 )) && v3=0
       key=$(( m*10000 + v2*100 + v3 ))
       (( key > bestkey )) && { bestkey=$key; best="$f"; }
-    done < <(printf '%s' "$html" | grep -oE "${prefix}-[0-9a-z]{3}\.zip" | sort -u)
+    done < <(printf '%s' "$html" | grep -oE "${prefix}-([0-9a-z]{3}|[0-9]{6})\.zip" | sort -u)
     if [[ -n "$best" ]]; then
       if fetch -o "$ORIGIN/$rel/$best.part" "${dir}${best}"; then
         mv -f "$ORIGIN/$rel/$best.part" "$ORIGIN/$rel/$best"
