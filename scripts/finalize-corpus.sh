@@ -41,17 +41,22 @@ fi
 [ -s "$a" ] && [ -s "$b" ] || { echo "missing lot DBs ($a / $b)"; exit 1; }
 
 # 2. assemble the full DB: the lot outputs are CLAUSES-ONLY (vectors, no catalogue), so
-# we OVERLAY their vectors onto the full lexical `latest` base (catalogue + clauses, no
-# vectors) keyed by chunk_id. NOT `merge` (merging the clauses-only lots loses the
-# specs/spec_versions/acronyms/changes/api/li catalogue). HNSW is not built (RAM); serve
-# does exact-scan vector search (build HNSW later on a big-RAM box).
+# the lot outputs are CLAUSES-ONLY but carry the FULL clauses (text + 100% vectors).
+# So: (1) MERGE the lots → all 2.45M clauses + vectors (their own consistent chunk_ids),
+# then (2) copy the CATALOGUE (specs/spec_versions/acronyms/changes/api/li) from the
+# lexical `latest` base. We do NOT join clauses by chunk_id (synthetic, UNSTABLE across a
+# re-published `latest`) — the catalogue is chunk_id-independent (joins on spec/release/
+# clause at query time). HNSW is not built (RAM); serve does exact-scan vectors.
 mkdir -p "$(dirname "$OUT")"
+log "merge lots → clauses + vectors → $OUT"
+CGO_ENABLED=1 "$GO" run "$ROOT/cmd/merge" --out "$OUT" --no-hnsw "$a" "$b"
 LEX_URL="${LEX_URL:-https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.zst}"
-log "pull lexical base (catalogue) ← $LEX_URL"
+log "pull lexical base (catalogue source) ← $LEX_URL"
 curl -fsSL --retry 5 -o "$OUT.lex.zst" "$LEX_URL"
-zstd -d --long=27 -f "$OUT.lex.zst" -o "$OUT"; rm -f "$OUT.lex.zst"
-log "overlay lot vectors onto the lexical base → $OUT"
-CGO_ENABLED=1 "$GO" run "$ROOT/cmd/overlay" --base "$OUT" --vec "$a" --vec "$b"
+zstd -d --long=27 -f "$OUT.lex.zst" -o "$OUT.lex"; rm -f "$OUT.lex.zst"
+log "copy catalogue from lexical base into the merged DB"
+CGO_ENABLED=1 "$GO" run "$ROOT/cmd/overlay" --base "$OUT" --catalogue-from "$OUT.lex"
+rm -f "$OUT.lex"
 
 # 3. validate (gate). pending>0 ⇒ incomplete (e.g. a lot did not fully embed) → WARN.
 log "validate"
