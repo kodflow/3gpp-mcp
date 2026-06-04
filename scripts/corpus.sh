@@ -18,8 +18,11 @@
 #   (e.g. SET=Rel-4) to ingest older releases; Rel-99 / Phase* stay out.
 #   Override: SET=Rel-15 scripts/corpus.sh   or   scripts/corpus.sh --set Rel-15
 #
-# "Official" only: modern 5-digit specs, highest version per release. Drafts
-# (v0/v1/v2) and legacy GSM (4-digit / series 00-13) are excluded at the source.
+# Source of truth = the 3GPP STATUS REPORT (via cmd/discover --emit-worklist):
+# EVERY (spec,release) it lists at/above the floor is fetched — drafts (v0/v1/v2)
+# INCLUDED, so the index matches the site and nothing is silently dropped. Legacy
+# GSM (4-digit / series 00-13) is omitted by the report → archive enumeration,
+# opt-in via LEGACY_GSM=1.
 # HTML comes from LibreOffice headless — the only tool reading the ~55% legacy
 # binary .doc while keeping structure (headings = clauses, tables). The query
 # MCP binary stays pure-Go; LibreOffice is used only here, offline.
@@ -48,8 +51,10 @@ source "$SCRIPT_DIR/lib/convert.sh"
 CONV_TIMEOUT="${CONV_TIMEOUT:-900}"   # was a hard 240s — big specs (28552/33501) need ~700s
 
 SET="${SET:-Rel-99}"          # release floor (env-overridable). Rel-99 = every real
-                              # 3GPP release (Rel-99 + Rel-4..latest); pre-Rel-99
-                              # drafts (major 0/1/2) skipped. Future releases auto.
+                              # 3GPP release (Rel-99 + Rel-4..latest). Floor is on the
+                              # RELEASE (per the status report), NOT the version-major,
+                              # so a draft v1.x of an in-scope release is kept. Future
+                              # releases auto.
 JOBS=4                        # per-spec workers (soffice is RAM-heavy)
 ENUM_JOBS=8                   # enumeration workers (network-bound)
 SERIES_FILTER=""
@@ -200,21 +205,50 @@ if [[ "$DO_CONVERT" -eq 1 ]] && ! command -v soffice >/dev/null 2>&1; then
   log "soffice now available: $(soffice --version 2>/dev/null | head -1)"
 fi
 
-# ----- enumerate (filtered to SET) -----
+# ----- enumerate (status-report-driven; the FIX for the chronic index gap) -----
+# The manifest is the FETCH worklist "<release> <url> <name>". We build it from the
+# 3GPP status report — the SAME source cmd/discover diffs the published index
+# against — so the builder fetches EXACTLY every (spec,release) the site lists
+# (drafts v0/v1/v2 INCLUDED) and the index matches the site by construction. The
+# old archive-listing + version-major→release heuristic silently dropped ~72% of
+# the perpetual delta (drafts skipped by a version-major floor; v3.x of Rel-4
+# mis-filed under Rel-99); driving from the report closes that. Legacy GSM 4-digit
+# specs are omitted by the report, so they keep the archive enumeration (opt-in).
 MANIFEST="$ORIGIN/.manifest.tsv"
 if [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
-  log "enumerating specs with releases >= $SET (major>=$SET_MAJOR), enum-jobs=$ENUM_JOBS ..."
-  if [[ -n "$SERIES_FILTER" ]]; then SERIES_LIST="$SERIES_FILTER"
-  else SERIES_LIST="$(fetch "$BASE/" | grep -oE '[0-9]{2}_series' | sed 's/_series//' | sort -u | tr '\n' ' ')"; fi
-  : > "$WORKDIR/pairs"
-  for s in $SERIES_LIST; do
-    for spec in $(fetch "$BASE/${s}_series/" 2>/dev/null | grep -oE "${s}\.[0-9]{2,3}" | sort -u); do
-      printf '%s %s\n' "$s" "$spec" >> "$WORKDIR/pairs"
+  log "building fetch worklist from the 3GPP status report (release floor $SET) ..."
+  : > "$MANIFEST"
+  wl_args=(--emit-worklist --floor "$SET")
+  [[ -n "$SERIES_FILTER" ]] && wl_args+=(--series "$SERIES_FILTER")
+  if ( cd "$ROOT" && CGO_ENABLED=0 go run ./cmd/discover "${wl_args[@]}" ) >> "$MANIFEST"; then
+    log "worklist: $(wc -l < "$MANIFEST") (spec,release) entries from status report"
+  else
+    log "WARN: status-report worklist failed — falling back to archive enumeration"
+    if [[ -n "$SERIES_FILTER" ]]; then SERIES_LIST="$SERIES_FILTER"
+    else SERIES_LIST="$(fetch "$BASE/" | grep -oE '[0-9]{2}_series' | sed 's/_series//' | sort -u | tr '\n' ' ')"; fi
+    : > "$WORKDIR/pairs"
+    for s in $SERIES_LIST; do
+      for spec in $(fetch "$BASE/${s}_series/" 2>/dev/null | grep -oE "${s}\.[0-9]{2,3}" | sort -u); do
+        printf '%s %s\n' "$s" "$spec" >> "$WORKDIR/pairs"
+      done
     done
-  done
-  log "resolving versions for $(wc -l < "$WORKDIR/pairs") specs ..."
-  xargs -P "$ENUM_JOBS" -n2 bash -c 'emit_spec "$0" "$1"' < "$WORKDIR/pairs" || true
-  cat "$WORKDIR"/*.lines 2>/dev/null | sort -u > "$MANIFEST" || true
+    xargs -P "$ENUM_JOBS" -n2 bash -c 'emit_spec "$0" "$1"' < "$WORKDIR/pairs" || true
+    cat "$WORKDIR"/*.lines 2>/dev/null >> "$MANIFEST" || true
+  fi
+  # Legacy GSM Phase-1/2 (opt-in): the status report omits 4-digit specs, so the
+  # archive enumeration is the only source for them. Append, never replace.
+  if [[ "${LEGACY_GSM:-0}" == "1" ]]; then
+    legacy_series="$(printf '%s\n' ${SERIES_FILTER:-01 02 03 04 05 06 07 08 09 10 11 12 13} | tr ' ' '\n' | grep -E '^(0[1-9]|1[0-3])$' || true)"
+    : > "$WORKDIR/pairs"
+    for s in $legacy_series; do
+      for spec in $(fetch "$BASE/${s}_series/" 2>/dev/null | grep -oE "${s}\.[0-9]{2,3}" | sort -u); do
+        printf '%s %s\n' "$s" "$spec" >> "$WORKDIR/pairs"
+      done
+    done
+    [[ -s "$WORKDIR/pairs" ]] && { xargs -P "$ENUM_JOBS" -n2 bash -c 'emit_spec "$0" "$1"' < "$WORKDIR/pairs" || true; }
+    cat "$WORKDIR"/*.lines 2>/dev/null >> "$MANIFEST" || true
+  fi
+  sort -u -o "$MANIFEST" "$MANIFEST"
 fi
 TOTAL=$(wc -l < "$MANIFEST" 2>/dev/null || echo 0); TOTAL="${TOTAL//[[:space:]]/}"
 log "manifest: $TOTAL files (releases >= $SET)"
