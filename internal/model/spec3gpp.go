@@ -85,14 +85,25 @@ func IsLegacyGSM(specNum string) bool { return len(specNum) == 4 }
 // DecodeVersionCode turns a 3-char code ("i60") into its release ("Rel-18")
 // and dotted version ("18.6.0"). ok is false when the code is malformed.
 func DecodeVersionCode(code string) (release, version string, ok bool) {
-	if len(code) != 3 {
-		return "", "", false
+	switch len(code) {
+	case 3:
+		// Compact form: one base-36-ish char per component (h60 = 17.6.0).
+		maj, v2, v3 := decodeChar(code[0]), decodeChar(code[1]), decodeChar(code[2])
+		if maj < 0 || v2 < 0 || v3 < 0 {
+			return "", "", false
+		}
+		return ReleaseFromMajor(maj), fmt.Sprintf("%d.%d.%d", maj, v2, v3), true
+	case 6:
+		// 6-digit decimal form for high components: two digits each (083700 = 8.37.0).
+		maj, e1 := strconv.Atoi(code[0:2])
+		v2, e2 := strconv.Atoi(code[2:4])
+		v3, e3 := strconv.Atoi(code[4:6])
+		if e1 != nil || e2 != nil || e3 != nil {
+			return "", "", false
+		}
+		return ReleaseFromMajor(maj), fmt.Sprintf("%d.%d.%d", maj, v2, v3), true
 	}
-	maj, v2, v3 := decodeChar(code[0]), decodeChar(code[1]), decodeChar(code[2])
-	if maj < 0 || v2 < 0 || v3 < 0 {
-		return "", "", false
-	}
-	return ReleaseFromMajor(maj), fmt.Sprintf("%d.%d.%d", maj, v2, v3), true
+	return "", "", false
 }
 
 // EncodeVersionCode is the inverse of DecodeVersionCode: "18.6.0" -> "i60".

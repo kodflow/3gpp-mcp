@@ -20,6 +20,33 @@ const sampleHTML = "<!-- 3GPP-MCP-DEGRADED: emf-wmf-stripped; 2 figure(s) omitte
 	"<tr><td>2024-06-01</td><td>SA3#100</td><td>0123</td><td>F</td><td>19.6.0</td><td>Fix X2 handling</td></tr></table>" +
 	"</body></html>"
 
+// TestMetaReleaseFromDirAndMultipart locks the ingest-attribution fix: the release
+// comes from the …/convert/<Rel>/ directory (the worklist), the version from the
+// code, and multi-part / 6-digit filenames parse. Before the fix a draft v1.x.x of
+// a Rel-20 spec was filed as "Rel-1" and multi-part / high-minor specs were dropped.
+func TestMetaReleaseFromDirAndMultipart(t *testing.T) {
+	const body = "<html><body><h1>1\tScope</h1><p>text body of the clause.</p></body></html>"
+	cases := []struct {
+		path, spec, rel, ver string
+	}{
+		{"/x/convert/Rel-20/21802-111.html", "21.802", "Rel-20", "1.1.1"},      // draft major≠release
+		{"/x/convert/Rel-19/21919-100.html", "21.919", "Rel-19", "1.0.0"},      // draft of a current release
+		{"/x/convert/Rel-18/36521-1-i00.html", "36.521-1", "Rel-18", "18.0.0"}, // multi-part
+		{"/x/convert/Rel-8/24229-083700.html", "24.229", "Rel-8", "8.37.0"},    // 6-digit high-minor
+		{"/x/convert/Rel-99/23501-300.html", "23.501", "Rel-99", "3.0.0"},      // major 3 = Rel-99
+	}
+	for _, c := range cases {
+		ps, err := Parse(c.path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("%s: %v", c.path, err)
+		}
+		if ps.Spec.SpecID != c.spec || ps.Version.Release != c.rel || ps.Version.Version != c.ver {
+			t.Errorf("%s → spec=%q rel=%q ver=%q; want %q/%q/%q",
+				c.path, ps.Spec.SpecID, ps.Version.Release, ps.Version.Version, c.spec, c.rel, c.ver)
+		}
+	}
+}
+
 func TestParse(t *testing.T) {
 	ps, err := Parse("/x/convert/Rel-19/33128-j60.html", strings.NewReader(sampleHTML))
 	if err != nil {
