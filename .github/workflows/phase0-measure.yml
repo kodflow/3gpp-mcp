@@ -57,7 +57,7 @@ jobs:
       matrix:
         vectors: ${{ fromJSON(github.event.inputs.hnsw_vectors) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -117,7 +117,7 @@ jobs:
     env:
       CORPUS_DROP_ZIPS: "1" # CI default-on cleanup (plan §1.4)
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -181,7 +181,7 @@ jobs:
       EMBED_MODEL_DIR: data/models/bge-m3
       ONNXRUNTIME_SHARED_LIBRARY_PATH: data/models/onnxruntime/lib/libonnxruntime.so
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
