@@ -159,7 +159,15 @@ func headerIndex(header []string) map[string]int {
 }
 
 // normSpecID extracts "23.501" from a cell that may wrap it in a link/text.
-var reSpecID = regexp.MustCompile(`\b(\d{2}\.\d{3})\b`)
+// The OPTIONAL "-N" part suffix is kept for MULTI-PART specs (the conformance
+// test specs: 36.521-1, 36.523-3, 34.123-1, 51.010-1, 37.571-2…). Each part is a
+// distinct document with its own archive directory (…/36.521-1/) and its own
+// status-report version line; dropping the suffix collapsed every part onto the
+// parent "36.521", whose directory does NOT exist → the fetch built
+// /36.521/36521-….zip, 403'd, and the whole test-spec family never indexed (a
+// large slice of the chronic drift). Keeping it makes the status report, the fetch
+// URL, and the filename-derived ingest spec_id all agree.
+var reSpecID = regexp.MustCompile(`\b(\d{2}\.\d{3}(?:-\d+)?)\b`)
 
 func normSpecID(s string) string {
 	if m := reSpecID.FindStringSubmatch(s); m != nil {
