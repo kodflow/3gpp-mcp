@@ -36,19 +36,28 @@ func (m *multiFlag) Set(v string) error {
 func main() {
 	base := flag.String("base", "", "full lexical base DB to overlay vectors onto (modified IN PLACE — pass a copy)")
 	var vecs multiFlag
-	flag.Var(&vecs, "vec", "a vector shard (clauses+embedding) to overlay; repeat for each lot")
+	flag.Var(&vecs, "vec", "a vector shard (clauses+embedding) to overlay onto the base by chunk_id; repeat for each lot")
+	catFrom := flag.String("catalogue-from", "", "copy the catalogue tables (specs/spec_versions/acronyms/changes/evolutions/api_*/li_*/releases/asn1_types) from this DB into the base — use when the base is a CLAUSES-ONLY lots-merge (the lots carry clauses+vectors but no catalogue). chunk_id-independent.")
 	flag.Parse()
-	if *base == "" || len(vecs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: overlay --base BASE.duckdb --vec SHARD1.duckdb [--vec SHARD2.duckdb ...]")
+	if *base == "" || (len(vecs) == 0 && *catFrom == "") {
+		fmt.Fprintln(os.Stderr, "usage: overlay --base BASE.duckdb [--vec SHARD.duckdb ...] [--catalogue-from LEX.duckdb]")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *base, vecs); err != nil {
+	if err := run(context.Background(), *base, vecs, *catFrom); err != nil {
 		fmt.Fprintln(os.Stderr, "overlay:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, base string, vecs []string) error {
+// catalogueTables are every table EXCEPT clauses — they describe specs/releases/terms
+// and join to clauses by (spec_id, release, clause_path) at QUERY time, never by the
+// synthetic chunk_id, so they can be copied wholesale regardless of chunk_id values.
+var catalogueTables = []string{
+	"specs", "spec_versions", "acronyms", "evolutions", "releases", "changes",
+	"api_operations", "api_schemas", "li_events", "li_event_fields", "li_nf_clauses", "asn1_types",
+}
+
+func run(ctx context.Context, base string, vecs []string, catFrom string) error {
 	if _, err := os.Stat(base); err != nil {
 		return fmt.Errorf("base %s: %w", base, err)
 	}
@@ -58,6 +67,30 @@ func run(ctx context.Context, base string, vecs []string) error {
 	}
 	defer func() { _ = db.Close() }()
 	sqldb := db.DB()
+
+	// Copy the catalogue from a full lexical base into a clauses-only base. The base's
+	// catalogue tables are empty (a lots-merge has only clauses); fill them from src.
+	if catFrom != "" {
+		if _, err := os.Stat(catFrom); err != nil {
+			return fmt.Errorf("catalogue-from %s: %w", catFrom, err)
+		}
+		if _, err := sqldb.ExecContext(ctx, "ATTACH '"+strings.ReplaceAll(catFrom, "'", "''")+"' AS cat (READ_ONLY)"); err != nil {
+			return fmt.Errorf("attach catalogue %s: %w", catFrom, err)
+		}
+		for _, t := range catalogueTables {
+			res, err := sqldb.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s SELECT * FROM cat.%s", t, t))
+			if err != nil {
+				// A table may be absent in either side (older schema) — skip, don't abort.
+				fmt.Fprintf(os.Stderr, "[overlay] catalogue %s: skipped (%v)\n", t, err)
+				continue
+			}
+			n, _ := res.RowsAffected()
+			fmt.Fprintf(os.Stderr, "[overlay] catalogue %s: +%d rows\n", t, n)
+		}
+		if _, err := sqldb.ExecContext(ctx, "DETACH cat"); err != nil {
+			return fmt.Errorf("detach catalogue: %w", err)
+		}
+	}
 
 	var before int64
 	_ = sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&before)
