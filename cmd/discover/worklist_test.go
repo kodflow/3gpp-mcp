@@ -47,3 +47,23 @@ func TestSeriesSet(t *testing.T) {
 		t.Fatalf("sub-shard|comma filter: %v", s)
 	}
 }
+
+// TestAbsentLedgerStopsReflag is the "100% accounted" contract: a (spec,release)
+// the absent-ledger records at the SAME version the site shows must NOT be flagged
+// (3GPP never published it — nothing to fetch), but a NEWER site version re-flags
+// it (it may have appeared since). `have` models the merge of index + absent.
+func TestAbsentLedgerStopsReflag(t *testing.T) {
+	floor := major("Rel-99") // 3 → Rel-19 (19) is in scope
+	site := map[string]string{"21.100|Rel-19": "19.6.0"}
+
+	// Ledgered absent at the same version → no drift.
+	have := map[string]string{"21.100|Rel-19": "19.6.0"}
+	if got := deltaSeries(site, have, floor, false); len(got) != 0 {
+		t.Fatalf("ledgered-at-same-version must not flag; got %v", got)
+	}
+	// Ledgered at an older version, site bumped → re-flag the series.
+	have = map[string]string{"21.100|Rel-19": "19.5.0"}
+	if got := deltaSeries(site, have, floor, false); !got["21"] {
+		t.Fatalf("newer site version must re-flag; got %v", got)
+	}
+}
