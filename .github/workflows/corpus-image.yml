@@ -16,10 +16,10 @@ on:
         description: "Go build tags (empty = lexical; 'onnx' = semantic query path)"
         type: string
         default: ""
-      corpus_ref:
-        description: "OCI corpus artifact to bake (validated global)"
+      release_tag:
+        description: "GitHub Release to bake the corpus from (its 3gpp.duckdb.zst asset)"
         type: string
-        default: "ghcr.io/kodflow/3gpp-corpus:latest"
+        default: "latest"
       push:
         description: "Push the image to GHCR"
         type: boolean
@@ -46,34 +46,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install ORAS
-        run: |
-          set -euo pipefail
-          VER=1.2.0
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${VER}/oras_${VER}_linux_amd64.tar.gz" -o /tmp/oras.tgz
-          tar -C /tmp -xzf /tmp/oras.tgz oras && sudo mv /tmp/oras /usr/local/bin/
-
-      - name: Login GHCR (oras + docker)
-        run: |
-          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Pull the VALIDATED global corpus → image-data/ (bake-only, no merge)
+      - name: Pull the published corpus → image-data/ (from the Release, bake-only, no merge)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -euo pipefail
           mkdir -p image-data
-          if ! oras manifest fetch "${{ github.event.inputs.corpus_ref }}" >/dev/null 2>&1; then
-            echo "::error::corpus artifact ${{ github.event.inputs.corpus_ref }} not found." \
-                 "Publish a validated global corpus first (bootstrap §4 / Corpus Maintenance §6)." >&2
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
+          # The corpus DB is published as the 3gpp.duckdb.zst asset on the rolling
+          # Release by `Corpus · Build` (corpus-matrix.yml). Bake it as-is — NO merge,
+          # NO rebuild. Lexical today; the same asset path carries the embedded DB
+          # later. Fails fast with an actionable message if the build hasn't run.
+          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D image-data/; then
+            echo "::error::no 3gpp.duckdb.zst on Release '$TAG' — run 'Corpus · Build' first to publish it." >&2
             exit 1
           fi
-          oras pull "${{ github.event.inputs.corpus_ref }}" -o image-data/
-          # Accept either a raw or zstd-compressed DB; decompress if needed.
-          if [ -f image-data/3gpp.duckdb.zst ]; then
-            sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
-            zstd -d --long=27 -f image-data/3gpp.duckdb.zst -o image-data/3gpp.duckdb
-            rm -f image-data/3gpp.duckdb.zst
-          fi
-          test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb in artifact" >&2; exit 1; }
+          zstd -d --long=27 -f image-data/3gpp.duckdb.zst -o image-data/3gpp.duckdb
+          rm -f image-data/3gpp.duckdb.zst
+          test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb after decompress" >&2; exit 1; }
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:

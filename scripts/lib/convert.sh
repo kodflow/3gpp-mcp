@@ -67,24 +67,56 @@ convert_doc() {
     CONV_STATUS=clean; return 0
   fi
 
-  # Attempt 2 — only OOXML .docx can be de-metafiled; legacy OLE .doc cannot.
-  case "$inner" in
-    *.docx|*.DOCX) ;;
-    *) return 1;;
-  esac
-  tmp="$(mktemp -d)"; base="$(basename "$inner")"; base="${base%.*}"
-  work="$tmp/$base.docx"; cp -f "$inner" "$work"
-  n_emf="$(unzip -l "$work" 2>/dev/null | grep -icE '\.(emf|wmf|x-emf)$' || true)"
-  if [[ "$n_emf" -eq 0 ]]; then rm -rf "$tmp"; return 1; fi   # crash wasn't a metafile
-  zip -dq "$work" 'word/media/*.emf' 'word/media/*.wmf' 'word/media/*.x-emf' 2>/dev/null || true
-  if produced="$(_soffice_html "$work")"; then
-    { printf '<!-- 3GPP-MCP-DEGRADED: emf-wmf-stripped; soffice HTML export crashed on embedded vector metafiles; %s figure(s) omitted; text+tables intact -->\n' "$n_emf"
-      cat "$produced"; } > "$target"
-    rm -rf "$(dirname "$produced")" "$tmp"
+  # A degraded conversion is tagged in two ways (HTML comment + .degraded.tsv).
+  _degraded() { # <reason> <count>
     mkdir -p "$(dirname "$DEGRADED_TSV")"
-    printf '%s\t%s\t%s\temf-wmf-stripped\n' "$(date -Is)" "$label" "$n_emf" >> "$DEGRADED_TSV"
-    CONV_STATUS=degraded; return 0
-  fi
+    printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$label" "${2:-0}" "$1" >> "$DEGRADED_TSV"
+    CONV_STATUS=degraded
+  }
 
-  rm -rf "$tmp"; return 1
+  case "$inner" in
+  *.docx|*.DOCX)
+    # Attempt 2 — strip the crash-inducing EMF/WMF metafiles from the .docx (a
+    # zip) and retry soffice: text + tables survive, only vector figures are lost.
+    tmp="$(mktemp -d)"; base="$(basename "$inner")"; base="${base%.*}"
+    work="$tmp/$base.docx"; cp -f "$inner" "$work"
+    n_emf="$(unzip -l "$work" 2>/dev/null | grep -icE '\.(emf|wmf|x-emf)$' || true)"
+    if [[ "$n_emf" -gt 0 ]]; then
+      zip -dq "$work" 'word/media/*.emf' 'word/media/*.wmf' 'word/media/*.x-emf' 2>/dev/null || true
+      if produced="$(_soffice_html "$work")"; then
+        { printf '<!-- 3GPP-MCP-DEGRADED: emf-wmf-stripped; soffice HTML export crashed on embedded vector metafiles; %s figure(s) omitted; text+tables intact -->\n' "$n_emf"
+          cat "$produced"; } > "$target"
+        rm -rf "$(dirname "$produced")" "$tmp"; _degraded emf-wmf-stripped "$n_emf"; return 0
+      fi
+    fi
+    rm -rf "$tmp"
+    # Attempt 3 — pandoc on the original .docx (a different OOXML reader; salvages
+    # the docs soffice can't render at all). Tables + headings survive.
+    if command -v pandoc >/dev/null 2>&1; then
+      if pandoc -f docx -t html --quiet -o "$target.pd" "$inner" 2>/dev/null && [[ -s "$target.pd" ]]; then
+        { printf '<!-- 3GPP-MCP-DEGRADED: pandoc-fallback; soffice HTML export failed; text+tables via pandoc -->\n'
+          cat "$target.pd"; } > "$target"
+        rm -f "$target.pd"; _degraded pandoc-fallback 0; return 0
+      fi
+      rm -f "$target.pd"
+    fi
+    return 1
+    ;;
+  *.doc|*.DOC)
+    # Attempt 4 — legacy OLE .doc that soffice crashed on: salvage the NORMATIVE
+    # TEXT with antiword/catdoc (no figures, flattened tables, but the clause text
+    # is indexed instead of the whole spec being lost). Last resort, tagged.
+    local txt=""
+    if command -v antiword >/dev/null 2>&1; then txt="$(antiword -w 0 "$inner" 2>/dev/null || true)"; fi
+    if [[ -z "$txt" ]] && command -v catdoc >/dev/null 2>&1; then txt="$(catdoc -w "$inner" 2>/dev/null || true)"; fi
+    if [[ -n "$txt" ]]; then
+      { printf '<!-- 3GPP-MCP-DEGRADED: doc-text-salvage; soffice crashed on legacy .doc; text-only (no tables/figures) -->\n<html><body><pre>\n'
+        printf '%s' "$txt" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+        printf '\n</pre></body></html>\n'; } > "$target"
+      _degraded doc-text-salvage 0; return 0
+    fi
+    return 1
+    ;;
+  esac
+  return 1
 }

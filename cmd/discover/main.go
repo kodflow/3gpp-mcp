@@ -59,6 +59,9 @@ func main() {
 	floor := flag.String("floor", "Rel-99", "lowest release (Rel-99 = all real 3GPP releases; pre-Rel-99 drafts dropped)")
 	all := flag.Bool("all", false, "force a full build (every series), ignoring the index")
 	includeLegacy := flag.Bool("include-legacy-gsm", false, "also enumerate legacy GSM Phase-1/2 series (2-digit < 21). The status report omits their 4-digit specs and the release floor would drop them, so they are added explicitly; corpus.sh enumerates each series' specs over FTP and skips any that don't exist.")
+	listDrift := flag.Bool("list-drift", false, "DIAGNOSTIC: instead of the matrix, print TSV of every (spec,release) whose site version is newer than the index — spec_id<TAB>release<TAB>site_version<TAB>indexed_version<TAB>state (missing|stale). This is the perpetual delta the build never closes; use it to find specs that never index (fetch/convert failures), not to exclude them.")
+	emitWL := flag.Bool("emit-worklist", false, "instead of the matrix, print the FETCH worklist '<release> <archive-url> <name>' for EVERY (spec,release) the status report lists at/above the floor — drafts (v0/v1/v2) INCLUDED. This drives corpus.sh from the same source discover diffs against, so the builder and the index agree by construction (closes the attribution gap). One line per (spec,release).")
+	seriesFilter := flag.String("series", "", "with --emit-worklist: restrict to these 2-digit series (space/comma separated, e.g. '23 33'); empty = all")
 	flag.Parse()
 
 	site, err := fetchStatus(*statusURL)
@@ -69,6 +72,23 @@ func main() {
 	idx := loadIndex(*indexPath)
 	full := *all || len(idx) == 0
 	floorMajor := major(*floor)
+
+	// Diagnostic dump: every key the site has newer/new than the index, split into
+	// missing (never indexed) vs stale (indexed at an older version). This is the
+	// raw material for fixing the chronic gap — emitted, never silently dropped.
+	if *listDrift {
+		dumpDrift(site, idx, floorMajor)
+		return
+	}
+
+	// Fetch worklist (the FIX for the chronic gap): emit one line per (spec,release)
+	// the status report lists at/above the floor, INCLUDING drafts. corpus.sh
+	// consumes this instead of guessing versions from the archive listing + the
+	// version-major, so the builder fetches exactly what discover diffs against.
+	if *emitWL {
+		emitWorklist(site, floorMajor, *seriesFilter)
+		return
+	}
 
 	series := deltaSeries(site, idx, floorMajor, full)
 
@@ -228,6 +248,139 @@ func deltaSeries(site, idx map[string]string, floorMajor int, full bool) map[str
 		}
 	}
 	return series
+}
+
+// dumpDrift prints, per (spec,release) where the site version is newer than the
+// index, a TSV row "spec<TAB>release<TAB>site_ver<TAB>idx_ver<TAB>state". state is
+// "missing" when the key was never indexed (idx==""), "stale" when it is indexed
+// at an older version. The trailing stderr summary counts each state and the
+// affected series. This is the perpetual delta the build re-flags every run; the
+// rows are the work-list for closing it (fetch/convert fixes), not an exclude-list.
+func dumpDrift(site, idx map[string]string, floorMajor int) {
+	type entry struct{ spec, rel, sv, iv, state string }
+	var es []entry
+	missing, stale := 0, 0
+	series := map[string]bool{}
+	for key, ver := range site {
+		spec, rel := splitKey(key)
+		if major(rel) < floorMajor {
+			continue
+		}
+		iv := idx[key]
+		if cmpVer(ver, iv) <= 0 {
+			continue
+		}
+		state := "stale"
+		if iv == "" {
+			state = "missing"
+			missing++
+		} else {
+			stale++
+		}
+		series[spec[:2]] = true
+		es = append(es, entry{spec, rel, ver, iv, state})
+	}
+	sort.Slice(es, func(i, j int) bool {
+		if es[i].spec != es[j].spec {
+			return es[i].spec < es[j].spec
+		}
+		return es[i].rel < es[j].rel
+	})
+	for _, e := range es {
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\n", e.spec, e.rel, e.sv, e.iv, e.state)
+	}
+	fmt.Fprintf(os.Stderr, "drift: total=%d missing=%d stale=%d series=%d\n",
+		len(es), missing, stale, len(series))
+}
+
+// statusBase is the 3GPP archive root; the per-spec directory + version-coded zip
+// name reconstruct the exact download URL corpus.sh's process_spec already fetches.
+const statusBase = "https://www.3gpp.org/ftp/Specs/archive"
+
+// emitWorklist prints the fetch worklist "<release> <url> <name>" for every
+// (spec,release) the status report lists at/above the floor (by RELEASE, not by
+// version-major — so v0/v1/v2 drafts of an in-scope release are kept). The version
+// is encoded back to the 3-char archive code (X.Y.Z -> base36 each). A version
+// whose component exceeds 35 (un-encodable in the 3-char scheme) is counted and
+// skipped — it falls to the small fetch/convert residual, never silently dropped.
+func emitWorklist(site map[string]string, floorMajor int, seriesFilter string) {
+	allow := seriesSet(seriesFilter) // nil => all series
+	keys := make([]string, 0, len(site))
+	for k := range site {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	n, skipped := 0, 0
+	for _, key := range keys {
+		spec, rel := splitKey(key)
+		if rel == "" || len(spec) < 2 || major(rel) < floorMajor {
+			continue
+		}
+		if allow != nil && !allow[spec[:2]] {
+			continue
+		}
+		code, ok := encodeVerCode(site[key])
+		if !ok {
+			skipped++
+			continue
+		}
+		num := strings.Replace(spec, ".", "", 1)
+		name := num + "-" + code + ".zip"
+		url := statusBase + "/" + spec[:2] + "_series/" + spec + "/" + name
+		fmt.Printf("%s %s %s\n", rel, url, name)
+		n++
+	}
+	fmt.Fprintf(os.Stderr, "emit-worklist: %d entries (%d un-encodable versions skipped)\n", n, skipped)
+}
+
+// encodeVerCode turns "X.Y.Z" into the 3GPP archive's 3-char version code, where
+// each component 0..35 maps to '0'..'9','a'..'z' (the inverse of corpus.sh's
+// decode_char). Missing components default to 0. Returns false if a component is
+// not a number or exceeds 35 (outside the single-char encoding).
+func encodeVerCode(ver string) (string, bool) {
+	parts := strings.SplitN(ver, ".", 3)
+	var code [3]byte
+	for i := 0; i < 3; i++ {
+		n := 0
+		if i < len(parts) && parts[i] != "" {
+			v, err := strconv.Atoi(parts[i])
+			if err != nil {
+				return "", false
+			}
+			n = v
+		}
+		if n < 0 || n > 35 {
+			return "", false
+		}
+		if n < 10 {
+			code[i] = byte('0' + n)
+		} else {
+			code[i] = byte('a' + n - 10)
+		}
+	}
+	return string(code[:]), true
+}
+
+// seriesSet parses a "23 33" / "23,33" / "24|Rel-19" filter into a set of 2-digit
+// series prefixes. Empty input returns nil (= no filter, all series).
+func seriesSet(filter string) map[string]bool {
+	filter = strings.TrimSpace(filter)
+	if filter == "" {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, tok := range strings.FieldsFunc(filter, func(r rune) bool { return r == ' ' || r == ',' }) {
+		if i := strings.IndexByte(tok, '|'); i >= 0 { // "24|Rel-19" -> "24"
+			tok = tok[:i]
+		}
+		if len(tok) >= 2 {
+			set[tok[:2]] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
 }
 
 // splitKey splits a corpus-index / site key "spec_id|Rel-NN" into its parts. A

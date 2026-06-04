@@ -488,8 +488,11 @@ jobs:
           echo "relflag=$relflag" >> "$GITHUB_OUTPUT"
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "parsed shard key '$KEY' → series=$series release='${rel:-<all>}' tag=$tag"
-      - name: Install deps (LibreOffice + build)
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
+      - name: Install deps (LibreOffice + .doc/.docx fallback converters + build)
+        # pandoc (OOXML soffice can't render) + antiword/catdoc (legacy OLE .doc
+        # text salvage) are the convert.sh fallback chain that recovers specs which
+        # crash soffice — so they get indexed instead of staying in the drift gap.
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui pandoc antiword catdoc
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
           # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
@@ -935,6 +938,17 @@ jobs:
         run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
+      - name: Export embedding delta (work-list) — the 2nd .zst
+        run: |
+          # The delta = clauses WHERE embedding IS NULL (text + chunk_id, no vectors)
+          # — exactly the input a GPU embed run consumes. On a lexical build that is
+          # the whole corpus; on an incremental delta it is only what moved. It
+          # REUSES the DB already on the runner (no rebuild) and is the companion of
+          # cmd/overlay, which merges the returned (chunk_id → vector) back in.
+          go build -trimpath -o bin/export-delta ./cmd/export-delta
+          ./bin/export-delta --db data/3gpp.duckdb --out data/3gpp.delta.duckdb --zstd
+          sha256sum data/3gpp.delta.duckdb | awk '{print $1"  3gpp.delta.duckdb"}' > data/3gpp.delta.duckdb.sha256
+          ls -lh data/3gpp.delta.duckdb.zst
       # Always upload the merged DB + indexes as an artifact (even on a publish
       # run) — cheap, and gives an inspectable copy of every run including the
       # scoped tests that intentionally never touch `latest`.
@@ -945,6 +959,8 @@ jobs:
           path: |
             data/3gpp.duckdb.zst
             data/3gpp.duckdb.sha256
+            data/3gpp.delta.duckdb.zst
+            data/3gpp.delta.duckdb.sha256
             data/corpus-index.json
             data/subject-index.json
             data/build-index.json
@@ -1015,6 +1031,7 @@ jobs:
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
           gh release upload latest --repo "$GITHUB_REPOSITORY" \
             data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 \
+            data/3gpp.delta.duckdb.zst data/3gpp.delta.duckdb.sha256 \
             data/corpus-index.json data/subject-index.json data/build-index.json --clobber
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
