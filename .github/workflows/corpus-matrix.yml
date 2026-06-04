@@ -582,7 +582,7 @@ jobs:
       # HTML (and the origin zips) lets corpus.sh convert/download only the delta.
       #
       # This is a PURE optimisation, decoupled from the shard DB on purpose:
-      #   - separate cache namespace (`convert-v1-…`), separate from `shard-v2-…`,
+      #   - separate cache namespace (`convert-v2-…`), separate from `shard-v2-…`,
       #     so a convert-cache miss/eviction NEVER affects shard correctness and a
       #     stale convert restore is harmless — corpus.sh re-converts anything
       #     missing and ingest re-reads HTML from disk regardless.
@@ -602,9 +602,9 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
           restore-keys: |
-            convert-v1-${{ steps.shard.outputs.tag }}-
+            convert-v2-${{ steps.shard.outputs.tag }}-
       - name: Download + convert series ${{ steps.shard.outputs.tag }}
         env:
           # default-ON disk cleanup when embedding (the vectorized shard + model
@@ -630,7 +630,7 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v1-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success
