@@ -8,7 +8,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light
+.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
 
 all: build ## Build the binary
 
@@ -88,6 +88,9 @@ clean: ## Remove build artefacts
 
 install: build ## Install binary to $$GOBIN (or $$GOPATH/bin)
 	install -m 0755 $(BUILD_DIR)/$(BIN) $${GOBIN:-$$(go env GOPATH)/bin}/$(BIN)
+
+convert-smoke: ## Prove the convert fallback chain recovers the hardest specs (needs LibreOffice + pandoc/antiword/catdoc)
+	./scripts/convert-smoke.sh
 
 light-artifacts: ## Emit the 2 .zst (full lexical DB + embedding delta) from LEX=<lexical.duckdb>
 	./scripts/light-artifacts.sh
