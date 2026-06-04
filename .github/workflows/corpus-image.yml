@@ -24,6 +24,12 @@ on:
         description: "Push the image to GHCR"
         type: boolean
         default: true
+  # Auto-bake: after each successful 'Corpus · Build' (the daily lexical publish to
+  # `latest`), rebuild the runtime image from the freshly published 3gpp.duckdb.zst
+  # so the image tracks the corpus with no manual step. Gated on success below.
+  workflow_run:
+    workflows: ["Corpus · Build"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -36,6 +42,8 @@ jobs:
   bake-and-push:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Run on manual dispatch, or only when the chained Corpus · Build SUCCEEDED.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write # pull the private corpus artifact + push the image
@@ -49,7 +57,8 @@ jobs:
       - name: Pull the published corpus → image-data/ (from the Release, bake-only, no merge)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.release_tag }}
+          # workflow_run (auto-bake) carries no inputs → default to the rolling 'latest'.
+          TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
           mkdir -p image-data
