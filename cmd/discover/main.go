@@ -62,6 +62,7 @@ func main() {
 	listDrift := flag.Bool("list-drift", false, "DIAGNOSTIC: instead of the matrix, print TSV of every (spec,release) whose site version is newer than the index — spec_id<TAB>release<TAB>site_version<TAB>indexed_version<TAB>state (missing|stale). This is the perpetual delta the build never closes; use it to find specs that never index (fetch/convert failures), not to exclude them.")
 	emitWL := flag.Bool("emit-worklist", false, "instead of the matrix, print the FETCH worklist '<release> <archive-url> <name>' for EVERY (spec,release) the status report lists at/above the floor — drafts (v0/v1/v2) INCLUDED. This drives corpus.sh from the same source discover diffs against, so the builder and the index agree by construction (closes the attribution gap). One line per (spec,release).")
 	seriesFilter := flag.String("series", "", "with --emit-worklist: restrict to these 2-digit series (space/comma separated, e.g. '23 33'); empty = all")
+	absentPath := flag.String("absent-index", "", "absent-index.json (spec|rel -> version 3GPP lists but never published as a downloadable file). A key absent at the SAME version is treated as ACCOUNTED (not re-flagged) — this is what lets the perpetual residue reach 0 actionable drift. A higher site version re-flags it (maybe now published).")
 	flag.Parse()
 
 	site, err := fetchStatus(*statusURL)
@@ -73,11 +74,27 @@ func main() {
 	full := *all || len(idx) == 0
 	floorMajor := major(*floor)
 
+	// "have" = what needs no fetch: a key is covered when it is INDEXED at the site
+	// version OR LEDGERED-ABSENT at the site version (3GPP never published it). The
+	// drift/worklist compare against `have`, so genuinely-absent specs stop being
+	// re-flagged every run — the residue the user saw as eternal FAILDL/drift. A
+	// NEWER site version still re-flags (it may have been published since).
+	absent := loadIndex(*absentPath)
+	have := make(map[string]string, len(idx)+len(absent))
+	for k, v := range idx {
+		have[k] = v
+	}
+	for k, v := range absent {
+		if cmpVer(v, have[k]) > 0 {
+			have[k] = v
+		}
+	}
+
 	// Diagnostic dump: every key the site has newer/new than the index, split into
 	// missing (never indexed) vs stale (indexed at an older version). This is the
 	// raw material for fixing the chronic gap — emitted, never silently dropped.
 	if *listDrift {
-		dumpDrift(site, idx, floorMajor)
+		dumpDrift(site, have, floorMajor)
 		return
 	}
 
@@ -90,7 +107,7 @@ func main() {
 		return
 	}
 
-	series := deltaSeries(site, idx, floorMajor, full)
+	series := deltaSeries(site, have, floorMajor, full)
 
 	// Subject delta (plan TROU #1): a subject whose code changed (footprint shifts
 	// vs the published subject-index.json) forces its owning series back into the
@@ -172,8 +189,8 @@ func main() {
 	if full {
 		mode = "full"
 	}
-	fmt.Fprintf(os.Stderr, "discover: mode=%s site_keys=%d indexed=%d subject-changed=%v identity-drift=%v -> %d series: %v\n",
-		mode, len(site), len(idx), subjChanged, identityDrift, len(out), out)
+	fmt.Fprintf(os.Stderr, "discover: mode=%s site_keys=%d indexed=%d absent-ledger=%d subject-changed=%v identity-drift=%v -> %d series: %v\n",
+		mode, len(site), len(idx), len(absent), subjChanged, identityDrift, len(out), out)
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b)) // stdout = the JSON matrix
 }
