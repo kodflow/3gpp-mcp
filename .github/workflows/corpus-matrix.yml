@@ -488,8 +488,11 @@ jobs:
           echo "relflag=$relflag" >> "$GITHUB_OUTPUT"
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "parsed shard key '$KEY' → series=$series release='${rel:-<all>}' tag=$tag"
-      - name: Install deps (LibreOffice + build)
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui
+      - name: Install deps (LibreOffice + .doc/.docx fallback converters + build)
+        # pandoc (OOXML soffice can't render) + antiword/catdoc (legacy OLE .doc
+        # text salvage) are the convert.sh fallback chain that recovers specs which
+        # crash soffice — so they get indexed instead of staying in the drift gap.
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui pandoc antiword catdoc
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
           # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
