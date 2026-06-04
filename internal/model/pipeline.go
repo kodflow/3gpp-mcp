@@ -14,7 +14,7 @@ import (
 // can't incrementally mix data produced by different indexing mechanics
 // (CLAUDE.md / plan §15 invariant #2).
 const (
-	ParserVersion   = "html-v1"        // htmlparse / ooxml clause+table extraction
+	ParserVersion   = "html-v2"        // htmlparse / ooxml clause+table extraction (v2: release from the convert/<Rel>/ dir, multi-part -N + 6-digit version codes — forces a full re-ingest so already-'done' specs are re-attributed)
 	ChunkingVersion = "clause-leaf-v1" // one chunk per clause leaf (no token windows)
 	SchemaVersion   = "1"              // mirrors store schema_meta "schema_version"
 )
