@@ -1,0 +1,61 @@
+name: Corpus · Coverage ledger
+
+# Produces the absent-index.json ledger: the (spec,release) the 3GPP status report
+# lists but that have NO downloadable file in the archive (no same-release version)
+# — the irreducible residue. Published to the rolling `latest` Release so the
+# `Corpus · Build` discover step subtracts it (`--absent-index`) and actionable
+# drift converges to 0 ("100% accounted": indexed | fallback-recoverable | absent).
+#
+# It verifies the WHOLE worklist with verify-coverage.sh (range-GET + the real
+# download_zip resolution: exact URL, then same-release archive-highest fallback,
+# 3-char + 6-digit codes). ~20k light requests → run weekly, off-peak; the absent
+# set changes slowly. Manual dispatch any time.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 2 * * 0" # Sundays ~02:23 UTC
+
+permissions:
+  contents: write # upload absent-index.json to the `latest` Release
+
+concurrency:
+  group: corpus-coverage
+  cancel-in-progress: true
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Emit the worklist from the live status report
+        run: CGO_ENABLED=0 go run ./cmd/discover --emit-worklist --floor Rel-99 > worklist.txt
+      - name: Verify coverage (exact + same-release fallback) over the whole worklist
+        run: JOBS=10 bash scripts/verify-coverage.sh worklist.txt coverage
+      - name: Build absent-index.json from the genuine-absent rows
+        run: |
+          bash scripts/build-absent-index.sh coverage/results.tsv absent-index.json
+          echo "ledger size: $(grep -c '\": \"' absent-index.json || echo 0)"
+      - name: Upload artifact (audit copy)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-ledger
+          path: |
+            absent-index.json
+            coverage/results.tsv
+          retention-days: 14
+      - name: Publish absent-index.json to `latest`
+        run: |
+          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
+              --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
+          gh release upload latest --repo "$GITHUB_REPOSITORY" absent-index.json --clobber
