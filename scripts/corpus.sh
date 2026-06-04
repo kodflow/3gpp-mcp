@@ -155,16 +155,66 @@ emit_spec() {
 }
 export -f emit_spec; export BASE WORKDIR SET_MAJOR LEGACY_GSM
 
+# download_zip <rel> <url> <name> — robustly fetch one spec zip. Prints the local
+# path on success (rc 0); rc 1 + a FAILDL log on genuine absence. Strategy:
+#   1. the worklist URL, with AGGRESSIVE retry: transient (000/429/5xx) up to 6×
+#      with backoff; 403/404 twice (a momentary edge miss) — measured ~0.8% of
+#      URLs are genuinely absent, so we don't burn long backoff on them.
+#   2. FALLBACK (the auto-fix): if the exact version is absent, list the spec's
+#      archive dir and take the HIGHEST version actually present at/above the floor
+#      — recovers "status report ahead of the archive" cases. The release stays the
+#      worklist's (correct attribution). Dir 403/empty ⇒ genuine absent ⇒ FAILDL.
+download_zip() {
+  local rel="$1" url="$2" name="$3" zip="$ORIGIN/$1/$3" t=0 code dir prefix html best bestkey f c3 m v2 v3 key
+  [[ -s "$zip" ]] && { printf '%s\n' "$zip"; return 0; }
+  mkdir -p "$ORIGIN/$rel"
+  while :; do
+    code=$(curl -s -A "$UA" --connect-timeout 20 --max-time 1800 -o "$zip.part" -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+    if [[ ( "$code" == 200 || "$code" == 206 ) && -s "$zip.part" ]]; then mv -f "$zip.part" "$zip"; printf '%s\n' "$zip"; return 0; fi
+    rm -f "$zip.part"; t=$((t+1))
+    case "$code" in
+      000|429|5*) [[ $t -ge 6 ]] && break; sleep $(( t*3 < 30 ? t*3 : 30 ));;  # transient: long retry
+      403|404)    [[ $t -ge 2 ]] && break; sleep 2;;                            # likely genuine: brief retry
+      *) break;;
+    esac
+  done
+  # FALLBACK — highest version actually in the archive dir (>= floor).
+  dir="${url%/*}/"; prefix="${name%.zip}"; prefix="${prefix%-*}"
+  html="$(fetch "$dir" 2>/dev/null || true)"
+  if [[ -n "$html" ]]; then
+    bestkey=-1; best=""
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      c3="${f##*-}"; c3="${c3%.zip}"
+      m="$(decode_char "${c3:0:1}")"; (( m == 999 || m < SET_MAJOR )) && continue
+      v2="$(decode_char "${c3:1:1}")"; v3="$(decode_char "${c3:2:1}")"
+      (( v2 == 999 )) && v2=0; (( v3 == 999 )) && v3=0
+      key=$(( m*10000 + v2*100 + v3 ))
+      (( key > bestkey )) && { bestkey=$key; best="$f"; }
+    done < <(printf '%s' "$html" | grep -oE "${prefix}-[0-9a-z]{3}\.zip" | sort -u)
+    if [[ -n "$best" ]]; then
+      if fetch -o "$ORIGIN/$rel/$best.part" "${dir}${best}"; then
+        mv -f "$ORIGIN/$rel/$best.part" "$ORIGIN/$rel/$best"
+        echo "$(date -Is) FALLBACK $url -> $best" >&2
+        printf '%s\n' "$ORIGIN/$rel/$best"; return 0
+      fi
+      rm -f "$ORIGIN/$rel/$best.part"
+    fi
+  fi
+  echo "$(date -Is) FAILDL $url" >&2
+  return 1
+}
+export -f download_zip
+
 # ON-THE-FLY worker: one spec -> download (if missing) -> unzip + convert (if missing)
 process_spec() {
   local rel="$1" url="$2" name="$3" zip tmp inner base target
-  zip="$ORIGIN/$rel/$name"
-  if [[ "$DO_DOWNLOAD" -eq 1 && ! -s "$zip" ]]; then
-    mkdir -p "$ORIGIN/$rel"
-    if fetch -o "$zip.part" "$url"; then mv -f "$zip.part" "$zip"
-    else rm -f "$zip.part"; echo "$(date -Is) FAILDL $url" >&2; fi
+  if [[ "$DO_DOWNLOAD" -eq 1 ]]; then
+    zip="$(download_zip "$rel" "$url" "$name")" || zip=""
+  else
+    zip="$ORIGIN/$rel/$name"; [[ -s "$zip" ]] || zip=""
   fi
-  [[ "$DO_CONVERT" -eq 1 && -s "$zip" ]] || return 0
+  [[ "$DO_CONVERT" -eq 1 && -n "$zip" && -s "$zip" ]] || return 0
   mkdir -p "$CONVERT/$rel"
   tmp="$(mktemp -d)"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
