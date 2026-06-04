@@ -40,8 +40,13 @@ var (
 	reAnnexSub = regexp.MustCompile(`^([A-Z]\.[0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$`)
 	reAnnex    = regexp.MustCompile(`(?i)^Annex\s+([A-Z][0-9]*)\s*[:.)]?\s*(.*)$`)
 	reWS       = regexp.MustCompile(`[ \t\x{00a0}]+`)
-	reFileName = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
-	reDate     = regexp.MustCompile(`\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{2})/(\d{4})\b`)
+	// num = 5 digits, optionally a "-N" multi-part suffix (36521-1, 34123-2 …);
+	// code = the 3-char compact OR 6-digit decimal version code (083700 = 8.37.0).
+	reFileName = regexp.MustCompile(`^([0-9]{5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:_.*)?$`)
+	// A release directory name in …/convert/<Rel>/<file>; the AUTHORITATIVE release
+	// (from the status-report-driven worklist), not the version-major.
+	reReleaseDir = regexp.MustCompile(`^(Rel-[0-9]+|GSM|Phase[0-9]+)$`)
+	reDate       = regexp.MustCompile(`\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{2})/(\d{4})\b`)
 )
 
 // ParseFile parses the HTML spec at path (…/convert/<Rel>/<num>-<code>.html).
@@ -87,6 +92,15 @@ func (ps *ParsedSpec) metaFromFilename(path string) error {
 	release, version, ok := model.DecodeVersionCode(code)
 	if !ok {
 		return fmt.Errorf("bad version code %q in %q", code, base)
+	}
+	// The release is the worklist's (the …/convert/<Rel>/ directory), NOT the
+	// version-major: a draft v1.x.x of a Rel-20 spec lives under Rel-20, and the
+	// status report agrees — deriving it from the major would mis-file it as Rel-1
+	// and discover would re-flag the (spec,Rel-20) key forever. Fall back to the
+	// version-major decode only when the parent dir is not a release (e.g. a test
+	// fixture writing a bare file).
+	if dir := filepath.Base(filepath.Dir(path)); reReleaseDir.MatchString(dir) {
+		release = dir
 	}
 	series := model.SeriesOf(specID)
 	ps.Spec = model.Spec{
