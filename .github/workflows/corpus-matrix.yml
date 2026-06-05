@@ -31,11 +31,14 @@
 #                    A scoped/test run pushes only its shard image (never :latest).
 #
 #  OPERATIONAL PREREQS (one-time, GHCR migration — plan velvety-nibbling):
-#    1. Make the packages PRIVATE (a public-repo package is born PUBLIC; the merge
-#       job FAIL-CLOSES the publish if 3gpp-corpus/3gpp-shard are public):
-#         gh api -X PATCH /user/packages/container/3gpp-corpus/visibility -f visibility=private
-#         gh api -X PATCH /user/packages/container/3gpp-shard/visibility  -f visibility=private
-#       (a package exists only after its first push → set private after the first run.)
+#    1. Make the packages PRIVATE — there is NO REST API for package visibility, it
+#       is UI-ONLY: github.com/users/<owner>/packages → 3gpp-corpus (and 3gpp-shard,
+#       3gpp-mcp, 3gpp-vec) → Package settings → Change visibility → Private. A
+#       package exists only after its first push, so: 1st run creates it (PUBLIC by
+#       default) → set it private in the UI ONCE → every later push stays private.
+#       The merge job FAIL-CLOSES the publish (read-only visibility assertion) if
+#       3gpp-corpus/3gpp-shard are public, so a forgotten/reverted package blocks
+#       publication instead of leaking verbatim 3GPP text.
 #    2. Retention (the `prune` job) deletes old package versions, which GITHUB_TOKEN
 #       CANNOT do → add a classic PAT secret GHCR_PAT (scope: delete:packages).
 #       Without it, prune no-ops with a notice (old versions just accumulate).
@@ -1145,9 +1148,9 @@ jobs:
           docker buildx build --push -f data/Dockerfile.corpus \
             -t "${REPO}:${DATE}" -t "${REPO}:latest" data/
           echo "published ${REPO}:${DATE} + :latest"
-          # best-effort: ensure private (Step 0 is the reliable path; GITHUB_TOKEN may lack the scope)
-          gh api -X PATCH "/user/packages/container/3gpp-corpus/visibility" -f visibility=private >/dev/null 2>&1 \
-            && echo "3gpp-corpus set private" || echo "could not auto-set private — ensure Step 0 done"
+          # NOTE: package visibility is UI-only (no REST API) — set 3gpp-corpus
+          # private ONCE in the UI after the first publish; the assertion above
+          # fail-closes any later run while it is public. See the header PREREQS.
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
   # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,
