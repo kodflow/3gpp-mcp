@@ -13,6 +13,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/catalog"
 	"github.com/kodflow/3gpp-mcp/internal/store"
@@ -83,8 +85,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Per-spec metadata overlay (only specs present on disk).
+	// Per-spec metadata overlay (only specs present on disk). A spec the report
+	// lists but the DB lacks (never ingested) is an enrich MISS — collect the ids
+	// so the omission is visible in CI logs, not hidden behind a bare count.
 	updated := 0
+	var missed []string
 	for _, s := range specs {
 		ok, err := db.UpdateSpecMeta(ctx, s.SpecID, s.Title, s.DocType, s.WorkingGroup)
 		if err != nil {
@@ -93,6 +98,8 @@ func main() {
 		}
 		if ok {
 			updated++
+		} else {
+			missed = append(missed, s.SpecID)
 		}
 	}
 	if err := db.SetVersionMetadataSource(ctx, "dynareport"); err != nil {
@@ -101,8 +108,18 @@ func main() {
 	}
 
 	fmt.Printf("ingest-catalog done (version=%s)\n", Version)
-	fmt.Printf("  db=%s\n  releases=%d specs_updated=%d/%d version_rows_stamped=%d\n",
-		*out, len(rows), updated, len(specs), stamped)
+	fmt.Printf("  db=%s\n  releases=%d specs_updated=%d/%d version_rows_stamped=%d specs_missed=%d\n",
+		*out, len(rows), updated, len(specs), stamped, len(missed))
+	if len(missed) > 0 {
+		sort.Strings(missed)
+		const sample = 60
+		shown := missed
+		if len(shown) > sample {
+			shown = shown[:sample]
+		}
+		fmt.Fprintf(os.Stderr, "[catalog] %d report specs absent from DB (not ingested), e.g.: %s\n",
+			len(missed), strings.Join(shown, " "))
+	}
 }
 
 // load returns the report bytes: cached file when offline, else fetch + cache.

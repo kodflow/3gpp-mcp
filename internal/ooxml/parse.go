@@ -28,6 +28,9 @@ type ParsedSpec struct {
 	Clauses  []model.Clause
 	Changes  []model.Change
 	Degraded bool
+	// SawChangeHistory mirrors htmlparse: a matched "Change History" heading,
+	// regardless of captured row count (true + 0 changes == parse miss).
+	SawChangeHistory bool
 }
 
 // Shared with htmlparse's grammar (kept local so ooxml has no HTML dependency;
@@ -204,6 +207,7 @@ func (w *builder) onHeading(text string) {
 	if isChangeHistory(text) {
 		w.flush()
 		w.inChangeHistory = true
+		w.ps.SawChangeHistory = true
 		w.cur = nil
 		return
 	}

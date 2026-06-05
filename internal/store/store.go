@@ -844,6 +844,24 @@ func releaseRecencySQL(col string) string {
 	END`
 }
 
+// versionRecencySQL orders a dotted "X.Y.Z" version NEWEST-first NUMERICALLY.
+// A raw `version DESC` is a STRING sort, so "18.9.0" wrongly sorts AFTER "18.10.0"
+// (9 > 1 lexically) → LatestVersion/VersionForRelease/get_changelog/get_spec would
+// cite a STALE version once a release reaches its 10th minor/patch. Compare each
+// component as an integer (TRY_CAST → NULL on a non-numeric/missing part, coalesced
+// to 0). col must be a trusted column identifier (never user input).
+func versionRecencySQL(col string) string { return versionOrderSQL(col, "DESC") }
+
+// versionOrderSQL is versionRecencySQL with an explicit direction ("DESC" =
+// newest-first, "ASC" = oldest-first). dir must be a literal "ASC"/"DESC" set by
+// the caller, never user input.
+func versionOrderSQL(col, dir string) string {
+	c := func(n int) string {
+		return `COALESCE(TRY_CAST(split_part(` + col + `, '.', ` + strconv.Itoa(n) + `) AS INTEGER), 0) ` + dir
+	}
+	return c(1) + `, ` + c(2) + `, ` + c(3)
+}
+
 // releasesOrdered returns a spec's releases oldest-first by release recency
 // (Rel-99 first, then Rel-4..Rel-20), via the shared releaseRecencySQL.
 func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, error) {
@@ -932,7 +950,7 @@ func (s *Store) ListReleases(ctx context.Context, specID string) ([]model.SpecVe
 		`SELECT spec_id, release, version, freeze_date, docx_url
 		 FROM spec_versions WHERE spec_id = ?
 		 ORDER BY `+releaseRecencySQL("release")+` DESC,
-		          version DESC, freeze_date DESC NULLS LAST`, specID)
+		          `+versionRecencySQL("version")+`, freeze_date DESC NULLS LAST`, specID)
 	if err != nil {
 		return nil, err
 	}
@@ -1012,7 +1030,7 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT cr_number, cr_revision, spec_id, from_version, to_version,
 		        meeting, category, clauses, summary, tdoc_url
-		 FROM changes WHERE spec_id = ? ORDER BY to_version`, specID)
+		 FROM changes WHERE spec_id = ? ORDER BY `+versionOrderSQL("to_version", "ASC"), specID)
 	if err != nil {
 		return nil, err
 	}
