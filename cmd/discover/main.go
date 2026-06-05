@@ -62,7 +62,8 @@ func main() {
 	listDrift := flag.Bool("list-drift", false, "DIAGNOSTIC: instead of the matrix, print TSV of every (spec,release) whose site version is newer than the index — spec_id<TAB>release<TAB>site_version<TAB>indexed_version<TAB>state (missing|stale). This is the perpetual delta the build never closes; use it to find specs that never index (fetch/convert failures), not to exclude them.")
 	emitWL := flag.Bool("emit-worklist", false, "instead of the matrix, print the FETCH worklist '<release> <archive-url> <name>' for EVERY (spec,release) the status report lists at/above the floor — drafts (v0/v1/v2) INCLUDED. This drives corpus.sh from the same source discover diffs against, so the builder and the index agree by construction (closes the attribution gap). One line per (spec,release).")
 	seriesFilter := flag.String("series", "", "with --emit-worklist: restrict to these 2-digit series (space/comma separated, e.g. '23 33'); empty = all")
-	absentPath := flag.String("absent-index", "", "absent-index.json (spec|rel -> version 3GPP lists but never published as a downloadable file). A key absent at the SAME version is treated as ACCOUNTED (not re-flagged) — this is what lets the perpetual residue reach 0 actionable drift. A higher site version re-flags it (maybe now published).")
+	absentPath := flag.String("absent-index", "", "absent-index.json (spec|rel -> version 3GPP lists but never published as a downloadable file). A key absent at the SAME version is treated as ACCOUNTED (not re-flagged) — this is what lets the perpetual residue reach 0 actionable drift. A higher site version re-flags it (maybe now published). Accepts a COMMA-SEPARATED list of files (e.g. the genuine-absent ledger + the draft ledger), merged with the highest version winning.")
+	emitDrafts := flag.Bool("emit-draft-ledger", false, "instead of the matrix, print absent-index-format JSON for every status-report key at a DRAFT version (major < 3) and an in-scope release. Merge into --absent-index so v0/v1/v2 drafts 3GPP never publishes stop re-flagging as missing, without excluding them from --emit-worklist.")
 	flag.Parse()
 
 	site, err := fetchStatus(*statusURL)
@@ -79,7 +80,7 @@ func main() {
 	// drift/worklist compare against `have`, so genuinely-absent specs stop being
 	// re-flagged every run — the residue the user saw as eternal FAILDL/drift. A
 	// NEWER site version still re-flags (it may have been published since).
-	absent := loadIndex(*absentPath)
+	absent := loadMergedIndex(*absentPath)
 	have := make(map[string]string, len(idx)+len(absent))
 	for k, v := range idx {
 		have[k] = v
@@ -104,6 +105,13 @@ func main() {
 	// version-major, so the builder fetches exactly what discover diffs against.
 	if *emitWL {
 		emitWorklist(site, floorMajor, *seriesFilter)
+		return
+	}
+
+	// Draft ledger (C1): emit the v0/v1/v2 draft keys so they can be merged into
+	// --absent-index and stop re-flagging. Offline, deterministic.
+	if *emitDrafts {
+		emitDraftLedger(site, floorMajor, *seriesFilter)
 		return
 	}
 
@@ -438,6 +446,69 @@ func loadIndex(path string) map[string]string {
 	}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+// loadMergedIndex loads one or more comma-separated ledger files, merging them
+// keyed "spec|Rel" with the HIGHEST version winning (the same "newer re-flags"
+// rule used for `have`). Lets the genuine-absent ledger (from verify-coverage)
+// and the draft ledger (from --emit-draft-ledger) be passed together as one
+// --absent-index without a separate merge step. A missing file is skipped.
+func loadMergedIndex(spec string) map[string]string {
+	out := map[string]string{}
+	for _, p := range strings.Split(spec, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		for k, v := range loadIndex(p) {
+			if cmpVer(v, out[k]) > 0 {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// emitDraftLedger prints the absent-index-format JSON for every status-report key
+// whose VERSION is a draft (major < 3, i.e. v0/v1/v2) at an in-scope release. 3GPP
+// routinely lists a spec at a draft version it never publishes as a stable file, so
+// these keys re-flag as "missing" on every run. Ledgering them at their draft
+// version silences that perpetual noise WITHOUT excluding them from the fetch
+// worklist (which still includes drafts — "index everything"): when 3GPP later
+// freezes the spec the version major becomes >= 3, the key changes, and it re-enters
+// drift naturally. Deterministic + offline (status report only; no network).
+func emitDraftLedger(site map[string]string, floorMajor int, seriesFilter string) {
+	allow := seriesSet(seriesFilter)
+	keys := make([]string, 0, len(site))
+	for k := range site {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fmt.Println("{")
+	first := true
+	n := 0
+	for _, key := range keys {
+		spec, rel := splitKey(key)
+		if rel == "" || len(spec) < 2 || major(rel) < floorMajor {
+			continue
+		}
+		if allow != nil && !allow[spec[:2]] {
+			continue
+		}
+		if major(site[key]) >= 3 { // not a draft
+			continue
+		}
+		if !first {
+			fmt.Println(",")
+		}
+		first = false
+		fmt.Printf("  %q: %q", key, site[key])
+		n++
+	}
+	if !first {
+		fmt.Println()
+	}
+	fmt.Println("}")
+	fmt.Fprintf(os.Stderr, "draft-ledger: %d draft keys (version major < 3) at release-major >= %d\n", n, floorMajor)
 }
 
 // loadBuildIndex reads the published build-index.json (the three canonical
