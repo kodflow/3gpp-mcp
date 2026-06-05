@@ -233,9 +233,21 @@ process_spec() {
   [[ "$DO_CONVERT" -eq 1 && -n "$zip" && -s "$zip" ]] || return 0
   mkdir -p "$CONVERT/$rel"
   tmp="$(mktemp -d)"
+  # The ingest classifier (classifyFile/reFile) keys off the CODED filename
+  # (NNNNN[-N]-CODE…). The HTML is named after the inner doc — fine for multi-part
+  # zips whose inner docs ship coded names (36521-1-i00_s00-s05), but MANY single-doc
+  # zips ship a HUMAN inner name ("TR 21.877 v0.7.0.doc") → the converted HTML would
+  # NOT classify and is SILENTLY DROPPED at ingest (the draft/old-TR 0-keys bug).
+  # So: prefix the HTML base with the ZIP's coded name unless the inner name already
+  # starts with it (reFile's optional _suffix then classifies it correctly).
+  local zipbase; zipbase="$(basename "$zip")"; zipbase="${zipbase%.zip}"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
     while IFS= read -r inner; do
       base="$(basename "$inner")"; base="${base%.*}"
+      case "$base" in
+        "$zipbase"*) : ;;
+        *) base="${zipbase}_$(printf '%s' "$base" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//;s/-*$//')" ;;
+      esac
       target="$CONVERT/$rel/$base.html"
       [[ -s "$target" ]] && continue
       # convert_doc: clean export, else EMF/WMF-strip retry (tagged degraded).
