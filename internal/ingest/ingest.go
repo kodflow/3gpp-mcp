@@ -29,11 +29,12 @@ import (
 // parsedSpec is the parser-agnostic result; both htmlparse and ooxml produce the
 // same fields, so the ingest loop is independent of which parser ran.
 type parsedSpec struct {
-	Spec     model.Spec
-	Version  model.SpecVersion
-	Clauses  []model.Clause
-	Changes  []model.Change
-	Degraded bool
+	Spec             model.Spec
+	Version          model.SpecVersion
+	Clauses          []model.Clause
+	Changes          []model.Change
+	Degraded         bool
+	SawChangeHistory bool
 }
 
 // parserFor returns the (file extension, parse func) for the configured parser.
@@ -46,7 +47,7 @@ func parserFor(name string) (string, func(string) (*parsedSpec, error)) {
 			if err != nil {
 				return nil, err
 			}
-			return &parsedSpec{ps.Spec, ps.Version, ps.Clauses, ps.Changes, ps.Degraded}, nil
+			return &parsedSpec{ps.Spec, ps.Version, ps.Clauses, ps.Changes, ps.Degraded, ps.SawChangeHistory}, nil
 		}
 	}
 	return ".html", func(p string) (*parsedSpec, error) {
@@ -54,7 +55,7 @@ func parserFor(name string) (string, func(string) (*parsedSpec, error)) {
 		if err != nil {
 			return nil, err
 		}
-		return &parsedSpec{ps.Spec, ps.Version, ps.Clauses, ps.Changes, ps.Degraded}, nil
+		return &parsedSpec{ps.Spec, ps.Version, ps.Clauses, ps.Changes, ps.Degraded, ps.SawChangeHistory}, nil
 	}
 }
 
@@ -178,6 +179,18 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		}
 	}
 
+	// A RELEASE-scoped run (opt.Releases set, e.g. a per-release embed lot) sees
+	// only a SUBSET of a spec's versions, so its "latest-in-run" may be older than
+	// the global latest. Writing that older version's (truncated) Change-History
+	// annex via ReplaceChanges would DELETE the fuller cumulative history a
+	// full/series build wrote and regress the changelog. The per-series CI publish
+	// path leaves opt.Releases empty (filters by series), so it is unaffected and
+	// still authoritative. In lot mode we therefore SKIP change writes and warn.
+	lotMode := len(opt.Releases) > 0
+	if lotMode {
+		logf("release-scoped run (releases=%v): change-history writes suppressed to avoid truncating the cumulative annex", opt.Releases)
+	}
+
 	// Resume mode: keep the existing DB (if any) and skip already-done specs.
 	// Fresh mode (default): drop the file so the run is deterministic.
 	resuming := opt.Resume && fileExists(dbPath)
@@ -281,15 +294,24 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 			return st, err
 		}
 
-		if latest[j.specID] == j.version && len(ps.Changes) > 0 {
+		if latest[j.specID] == j.version {
+			// Parse miss signal: the annex heading matched but no rows were
+			// captured (a fuller build would have rows). Surface it; don't write.
+			if ps.SawChangeHistory && len(ps.Changes) == 0 {
+				logf("[degraded] %s %s: Change History heading matched but 0 rows parsed", ps.Spec.SpecID, j.version)
+			}
 			// ReplaceChanges = DELETE WHERE spec_id=? + INSERT — keeps the
 			// cumulative change history idempotent on --resume (prior attempt
 			// may have inserted these rows; the changes table has no unique
-			// constraint, so a plain INSERT would duplicate them).
-			if err := db.ReplaceChanges(ctx, ps.Spec.SpecID, ps.Changes); err != nil {
-				return st, err
+			// constraint, so a plain INSERT would duplicate them). Suppressed in
+			// lot mode (see lotMode above) so a release subset never truncates a
+			// fuller annex.
+			if !lotMode && len(ps.Changes) > 0 {
+				if err := db.ReplaceChanges(ctx, ps.Spec.SpecID, ps.Changes); err != nil {
+					return st, err
+				}
+				st.Changes += len(ps.Changes)
 			}
-			st.Changes += len(ps.Changes)
 		}
 		// Domain subjects extend indexing on the specs they own (LI on 33.128,
 		// glossary on 21.905, …). The core stays generic: no hardcoded spec ids.
