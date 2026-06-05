@@ -165,16 +165,21 @@ export -f emit_spec; export BASE WORKDIR SET_MAJOR LEGACY_GSM
 #      — recovers "status report ahead of the archive" cases. The release stays the
 #      worklist's (correct attribution). Dir 403/empty ⇒ genuine absent ⇒ FAILDL.
 download_zip() {
-  local rel="$1" url="$2" name="$3" zip="$ORIGIN/$1/$3" t=0 code dir prefix html best bestkey f c3 m v2 v3 key
+  local rel="$1" url="$2" name="$3" zip="$ORIGIN/$1/$3" t=0 j code dir prefix html best bestkey f c3 m v2 v3 key
   [[ -s "$zip" ]] && { printf '%s\n' "$zip"; return 0; }
   mkdir -p "$ORIGIN/$rel"
   while :; do
     code=$(curl -s -A "$UA" --connect-timeout 20 --max-time 1800 -o "$zip.part" -w '%{http_code}' "$url" 2>/dev/null || echo 000)
     if [[ ( "$code" == 200 || "$code" == 206 ) && -s "$zip.part" ]]; then mv -f "$zip.part" "$zip"; printf '%s\n' "$zip"; return 0; fi
     rm -f "$zip.part"; t=$((t+1))
+    # Jitter (0-2s, per-worker via $RANDOM) de-synchronises the parallel workers so
+    # a retry storm doesn't re-hammer the 3GPP host on the same beat — a frequent
+    # cause of spurious 403/429 on this archive.
+    j=$(( RANDOM % 3 ))
     case "$code" in
-      000|429|5*) [[ $t -ge 6 ]] && break; sleep $(( t*3 < 30 ? t*3 : 30 ));;  # transient: long retry
-      403|404)    [[ $t -ge 2 ]] && break; sleep 2;;                            # likely genuine: brief retry
+      000|429|5*) [[ $t -ge 6 ]] && break; sleep $(( (t*3 < 30 ? t*3 : 30) + j ));;  # transient: long backoff
+      403)        [[ $t -ge 5 ]] && break; sleep $(( (t*t < 20 ? t*t : 20) + j ));;  # 403 is often transient WAF/rate here: quadratic backoff + jitter, MORE tries before giving up
+      404)        [[ $t -ge 2 ]] && break; sleep 1;;                                 # 404 = genuine absent: don't hammer
       *) break;;
     esac
   done
@@ -241,9 +246,28 @@ process_spec() {
   # So: prefix the HTML base with the ZIP's coded name unless the inner name already
   # starts with it (reFile's optional _suffix then classifies it correctly).
   local zipbase; zipbase="$(basename "$zip")"; zipbase="${zipbase%.zip}"
+  # Canonicalise an underscore code-separator (NNNNN_CODE -> NNNNN-CODE): the
+  # ingest classifier wants the dash form, so a stray underscore would otherwise
+  # leave the file unclassified and silently dropped.
+  local recode='s/^([0-9]{4,5}(-[0-9]+)?)_([0-9a-z]{3}|[0-9]{6})/\1-\3/'
+  zipbase="$(printf '%s' "$zipbase" | sed -E "$recode")"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
-    while IFS= read -r inner; do
+    # Candidate spec documents, minus: Word owner-lock stubs (._*, ~$* — e.g. the
+    # 28552 sample media), and pure readme / release-note placeholders. Some zips
+    # (e.g. 55.226) ship ONLY a readme and no spec doc — converting it would index
+    # junk under the spec id, so a doc-less zip is skipped explicitly.
+    local -a docs=()
+    while IFS= read -r f; do docs+=("$f"); done < <(
+      find "$tmp" -type f \( -iname '*.doc' -o -iname '*.docx' \) \
+        -not -name '._*' -not -name '~$*' \
+        -not -iname 'readme*' -not -iname '*release note*' -not -iname '*release-note*')
+    if [[ ${#docs[@]} -eq 0 ]]; then
+      echo "$(date -Is) SKIPZIP $zip :: no spec document (placeholder/readme only)" >&2
+      rm -rf "$tmp"; return 0
+    fi
+    for inner in "${docs[@]}"; do
       base="$(basename "$inner")"; base="${base%.*}"
+      base="$(printf '%s' "$base" | sed -E "$recode")"   # underscore -> dash code sep
       case "$base" in
         "$zipbase"*) : ;;
         *) base="${zipbase}_$(printf '%s' "$base" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//;s/-*$//')" ;;
@@ -256,9 +280,7 @@ process_spec() {
       else
         echo "$(date -Is) FAILCV $zip :: $(basename "$inner")" >&2
       fi
-      # '~$*' = Word owner-lock stubs bundled inside some spec zips (e.g. 28552
-      # sample media) — never real documents, only noise in the FAILCV log.
-    done < <(find "$tmp" -type f \( -iname '*.doc' -o -iname '*.docx' \) -not -name '._*' -not -name '~$*')
+    done
   fi
   rm -rf "$tmp"
 }
