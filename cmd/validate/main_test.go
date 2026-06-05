@@ -75,6 +75,43 @@ func TestValidateGate(t *testing.T) {
 	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), minClauses: 999}); res.OK {
 		t.Error("min-clauses 999 on a 3-clause DB should FAIL, got OK")
 	}
+
+	// empty-meta (B4a): seedDB writes clauses but NO specs rows → every distinct
+	// spec id is missing catalog title/WG. max=0 must FAIL; a generous max passes.
+	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), emptyMetaGuard: true, maxEmptyMeta: 0}); res.OK {
+		t.Error("empty-meta: 2 clause-bearing specs without catalog metadata should FAIL at max=0, got OK")
+	}
+	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), emptyMetaGuard: true, maxEmptyMeta: 5}); !res.OK {
+		t.Errorf("empty-meta: max=5 should PASS on a 2-spec DB, got %+v", res.Checks)
+	}
+	// A DB whose specs are fully enriched passes even at max=0.
+	if res = runChecks(ctx, checkCfg{db: seedEnrichedDB(t), emptyMetaGuard: true, maxEmptyMeta: 0}); !res.OK {
+		t.Errorf("empty-meta: fully-enriched DB should PASS at max=0, got %+v", res.Checks)
+	}
+}
+
+// seedEnrichedDB writes clauses AND complete specs rows (title + working_group)
+// for every clause-bearing spec, so the empty-meta guard finds zero gaps.
+func seedEnrichedDB(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "enriched.duckdb")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "1", Heading: "h", Text: "t"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS", WorkingGroup: "S2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpdateSpecMeta(context.Background(), "23.501", "System architecture for the 5G System", "TS", "S2"); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	return path
 }
 
 // TestChecksum verifies the sha256 sidecar comparison.
