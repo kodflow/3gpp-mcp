@@ -497,7 +497,15 @@ jobs:
         # pandoc (OOXML soffice can't render) + antiword/catdoc (legacy OLE .doc
         # text salvage) are the convert.sh fallback chain that recovers specs which
         # crash soffice — so they get indexed instead of staying in the drift gap.
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui pandoc antiword catdoc
+        # Retry: a transient apt-mirror hiccup must NOT fail the whole series shard
+        # (observed: 6/30 shards died at a ~30s apt flake, zeroing entire series).
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui pandoc antiword catdoc; then ok=1; break; fi
+            echo "apt attempt $i failed; retrying in $((i*10))s" >&2; sleep $((i*10))
+          done
+          [ "$ok" = 1 ]
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
           # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
@@ -874,7 +882,13 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install deps
-        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd python3
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            if sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config zstd python3; then ok=1; break; fi
+            echo "apt attempt $i failed; retrying in $((i*10))s" >&2; sleep $((i*10))
+          done
+          [ "$ok" = 1 ]
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: shards
