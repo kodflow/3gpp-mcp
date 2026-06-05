@@ -33,6 +33,11 @@ type ParsedSpec struct {
 	Clauses  []model.Clause
 	Changes  []model.Change
 	Degraded bool // converted with EMF/WMF stripped (figures missing)
+	// SawChangeHistory is true when a "Change History" heading was matched,
+	// regardless of how many rows the following table yielded. A true value with
+	// len(Changes)==0 signals a parse miss (heading found, table not captured) —
+	// the ingest loop surfaces it as a degraded signal.
+	SawChangeHistory bool
 }
 
 var (
@@ -173,6 +178,7 @@ func (w *walker) onHeading(text string) {
 	if isChangeHistory(text) {
 		w.flush()
 		w.inChangeHistory = true
+		w.ps.SawChangeHistory = true
 		w.cur = nil
 		return
 	}
