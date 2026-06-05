@@ -54,26 +54,28 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pull the published corpus → image-data/ (from the Release, bake-only, no merge)
+      - name: Pull the published corpus image → image-data/ (bake-only, no merge)
         env:
-          GH_TOKEN: ${{ github.token }}
           # workflow_run (auto-bake) carries no inputs → default to the rolling 'latest'.
           TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
           mkdir -p image-data
-          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zstd
-          # The corpus DB is published as the 3gpp.duckdb.zst asset on the rolling
-          # Release by `Corpus · Build` (corpus-matrix.yml). Bake it as-is — NO merge,
-          # NO rebuild. Lexical today; the same asset path carries the embedded DB
-          # later. Fails fast with an actionable message if the build hasn't run.
-          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D image-data/; then
-            echo "::error::no 3gpp.duckdb.zst on Release '$TAG' — run 'Corpus · Build' first to publish it." >&2
+          # The corpus DB is published as the PRIVATE data-only image
+          # ghcr.io/<owner>/3gpp-corpus:<tag> by `Corpus · Build` (corpus-matrix.yml).
+          # Pull it and extract /3gpp.duckdb — NO merge, NO rebuild. Fails fast with
+          # an actionable message if the build hasn't published it yet.
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
+          if ! docker pull "$img"; then
+            echo "::error::no $img — run 'Corpus · Build' first to publish it." >&2
             exit 1
           fi
-          zstd -d --long=27 -f image-data/3gpp.duckdb.zst -o image-data/3gpp.duckdb
-          rm -f image-data/3gpp.duckdb.zst
-          test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb after decompress" >&2; exit 1; }
+          cid=$(docker create "$img")
+          docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
+          docker rm "$cid" >/dev/null
+          test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb after extract" >&2; exit 1; }
+          ls -lh image-data/3gpp.duckdb
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:

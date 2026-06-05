@@ -24,9 +24,21 @@
 #                      publish-vec   → embed=true only: push vector sub-bases→GHCR
 #
 #  WHAT it PUBLISHES Only when publish_to_latest=true AND it's a whole-corpus run
-#                    (no series_scope, not a PR): the `latest` Release gets the
-#                    lexical DB + indexes; embed=true also pushes GHCR 3gpp-vec.
-#                    A scoped/test run = ARTIFACTS ONLY (never clobbers `latest`).
+#                    (no series_scope, not a PR): the PRIVATE GHCR data image
+#                    ghcr.io/<owner>/3gpp-corpus:<YYYY-MM-DD>+:latest (DB+indexes);
+#                    embed=true also pushes GHCR 3gpp-vec. Shards are PRIVATE images
+#                    ghcr.io/<owner>/3gpp-shard:<series>[-embed][-<run_id>].
+#                    A scoped/test run pushes only its shard image (never :latest).
+#
+#  OPERATIONAL PREREQS (one-time, GHCR migration — plan velvety-nibbling):
+#    1. Make the packages PRIVATE (a public-repo package is born PUBLIC; the merge
+#       job FAIL-CLOSES the publish if 3gpp-corpus/3gpp-shard are public):
+#         gh api -X PATCH /user/packages/container/3gpp-corpus/visibility -f visibility=private
+#         gh api -X PATCH /user/packages/container/3gpp-shard/visibility  -f visibility=private
+#       (a package exists only after its first push → set private after the first run.)
+#    2. Retention (the `prune` job) deletes old package versions, which GITHUB_TOKEN
+#       CANNOT do → add a classic PAT secret GHCR_PAT (scope: delete:packages).
+#       Without it, prune no-ops with a notice (old versions just accumulate).
 #
 #  WHAT it does NOT  No semantic by default (embed=false → lexical only; embedding
 #                    is the separate manual "Corpus · Embed (Kaggle GPU)" job). Does
@@ -450,6 +462,12 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
+    # packages: write to PUSH this series' shard image to GHCR (replaces the
+    # actions/cache shard baseline + artifact); read to PULL the prior shard
+    # image as the --resume baseline. (GHCR migration — plan velvety-nibbling.)
+    permissions:
+      contents: read
+      packages: write
     # Per-shard timeout, driven by the workflow input shard_timeout_minutes
     # (default 360, max enforceable on free hosted runners — the platform itself
     # kills the job at exactly that, which is why ANY value > 360 is a no-op).
@@ -466,6 +484,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # buildx (container driver) is required for `docker buildx build --push` of
+      # the FROM-scratch shard image to GHCR.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       # A matrix entry is either a bare series ("24") or a series|release sub-shard
       # ("24|Rel-19"). Sub-sharding a big series by release keeps each job under the
       # 6h cap so it finishes in one slot instead of relying on the auto-resume
@@ -683,23 +704,29 @@ jobs:
           h="$(find $files -type f \( -name '*.go' -o -name '*.sql' \) 2>/dev/null | sort | xargs sha256sum | sha256sum | cut -c1-40)"
           echo "hash=$h" >> "$GITHUB_OUTPUT"
           echo "shard code-hash (embed=${{ github.event.inputs.embed }}): $h"
-      - name: Cross-run shard cache (resume baseline from prior runs)
-        id: shard_cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            dist/shard-${{ steps.shard.outputs.tag }}.duckdb
-            dist/shard-${{ steps.shard.outputs.tag }}.report.json
-          # mode (embed true/false) is part of the namespace so a lexical shard
-          # (no vectors) is NEVER restored into an embed run — otherwise --resume
-          # would see every spec 'done' and skip embedding, producing a
-          # vector-less shard that fails the embedded_clauses gate. v2 bump
-          # invalidates the old (mode-less, subject-less) cache namespace. The tag
-          # is series or series-release so sub-shards have independent cache slots.
-          key: shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-${{ steps.codehash.outputs.hash }}
-          restore-keys: |
-            shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-flr${{ github.event.inputs.embed_floor }}-
-            shard-v2-${{ steps.shard.outputs.tag }}-emb${{ github.event.inputs.embed }}-
+      # Cross-run resume baseline = the PRIOR shard image on GHCR (replaces the
+      # actions/cache shard slot). Best-effort: pull the rolling :<tag> image and
+      # extract its /shard.duckdb so --resume skips already-done specs. First run
+      # or a series with no prior tag → no image → fresh ingest (Note-resume below
+      # handles both). The convert cache (raw HTML) is UNCHANGED — orthogonal perf.
+      # NOTE: an embed run must NOT resume from a lexical (vector-less) shard, so we
+      # only pull when this run's embed mode matches the published image's. We tag
+      # embed images distinctly (see the push step) and gate the pull on embed mode.
+      - name: GHCR login (resume pull + shard push)
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Resume baseline from prior shard image (best-effort)
+        run: |
+          mkdir -p dist
+          img="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-shard:${{ steps.shard.outputs.tag }}${{ github.event.inputs.embed == 'true' && '-embed' || '' }}"
+          if docker pull "$img" 2>/dev/null; then
+            cid=$(docker create "$img")
+            docker cp "$cid:/shard.duckdb" "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" 2>/dev/null || true
+            docker cp "$cid:/shard.report.json" "dist/shard-${{ steps.shard.outputs.tag }}.report.json" 2>/dev/null || true
+            docker rm "$cid" >/dev/null
+            echo "resume baseline pulled from $img"
+          else
+            echo "no prior shard image ($img) — fresh ingest"
+          fi
       # Intra-run fallback: a partial DB uploaded by an EARLIER attempt of the
       # SAME run (e.g. the auto-rerun cycle after a 6h-cap kill) takes priority
       # over the cross-run cache hit (it's strictly more recent). Best-effort:
@@ -842,7 +869,7 @@ jobs:
       # Upload artifact ALWAYS (success or failure) so the next attempt of
       # this same job can --resume from the partial DB on disk. retention-days
       # is short (1d) — these are temp shards, not the published corpus.
-      - name: Upload shard artifact (always — feeds --resume on retry)
+      - name: Upload shard artifact (always — feeds --resume on retry + publish-vec)
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -853,6 +880,24 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
           overwrite: true   # each attempt of this matrix slice replaces the prior partial
+      # Push the shard as a FROM-scratch GHCR image so the merge job can COPY --from
+      # it (an ORAS artifact manifest is NOT COPY --from-able; a real image is). The
+      # rolling :<tag> is the resume baseline for the next run; :<tag>-<run_id> is an
+      # immutable handle for that run's merge + debugging. Always (even a 6h-cap
+      # partial) so the next run resumes. Embed runs tag distinctly (-embed) so a
+      # lexical run never resumes from a vector-bearing image and vice-versa.
+      - name: Push shard image to GHCR (always — replaces the shard cache/artifact baseline)
+        if: always()
+        run: |
+          [ -s "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" ] || { echo "no shard DB on disk — nothing to push"; exit 0; }
+          sfx="${{ github.event.inputs.embed == 'true' && '-embed' || '' }}"
+          cp "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" dist/shard.duckdb
+          : > dist/shard.report.json
+          [ -s "dist/shard-${{ steps.shard.outputs.tag }}.report.json" ] && cp "dist/shard-${{ steps.shard.outputs.tag }}.report.json" dist/shard.report.json
+          printf 'FROM scratch\nCOPY shard.duckdb /shard.duckdb\nCOPY shard.report.json /shard.report.json\n' > dist/Dockerfile.shard
+          base="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-shard:${{ steps.shard.outputs.tag }}${sfx}"
+          docker buildx build --push -f dist/Dockerfile.shard \
+            -t "$base" -t "${base}-${{ github.run_id }}" dist/
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
   # Runs in BOTH modes:
@@ -870,7 +915,8 @@ jobs:
     if: needs.discover.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # only merge may clobber the DB asset on 'latest'
+      contents: write # optional public-release step (off by default)
+      packages: write # pull base + shard images, push the 3gpp-corpus image
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -889,51 +935,78 @@ jobs:
             echo "apt attempt $i failed; retrying in $((i*10))s" >&2; sleep $((i*10))
           done
           [ "$ok" = 1 ]
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: shards
-          pattern: shard-*
-          merge-multiple: true
-      - name: Merge → consolidated DB (+ index)
+      - name: GHCR login (pull base + shard images, push corpus image)
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Merge shard images → consolidated DB (generated Dockerfile, merge in build)
+        env:
+          MATRIX: ${{ needs.discover.outputs.matrix }}
+          OWNER: ${{ github.repository_owner }}
+          FULL: ${{ needs.discover.outputs.full }}
+          PUBLISH: ${{ needs.discover.outputs.publish }}
+          EMBED: ${{ github.event.inputs.embed }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          go build -trimpath -o bin/merge ./cmd/merge
-          mkdir -p data
-          base_arg=""
-          # Delta run: start from the existing DB and let each shard's series replace it.
-          #
-          # FAIL-CLOSED on a PUBLISHING delta run (PR-1,
-          # delta-publish-clobbers-latest-on-base-download-failure): if this run is
-          # authorised to clobber `latest` (publish=true) and is a delta (full=false),
-          # a missing/failed base download MUST abort — merging delta-only shards with
-          # no --base produces a fresh DB of just the changed series, and clobbering
-          # `latest` with it would shrink the published corpus to a handful of specs.
-          # The `2>/dev/null` that used to swallow the error is GONE so the failure is
-          # visible in the log. A NON-publishing delta run may still degrade to a fresh
-          # artifacts-only build (it never touches `latest`).
-          if [ "${{ needs.discover.outputs.full }}" != "true" ]; then
-            if gh release download latest --repo "$GITHUB_REPOSITORY" -p 3gpp.duckdb.zst -D .; then
-              zstd -d 3gpp.duckdb.zst -o base.duckdb
-              base_arg="--base base.duckdb"
-              echo "incremental: using existing latest DB as base"
-            elif [ "${{ needs.discover.outputs.publish }}" = "true" ]; then
-              echo "::error::delta publish run could not fetch the 'latest' base DB — refusing to clobber latest with a delta-only rebuild"
-              exit 1
-            else
-              echo "::notice::no base available; non-publishing run proceeds as a fresh rebuild (artifacts only)"
+          set -eu
+          sfx=""; [ "$EMBED" = "true" ] && sfx="-embed"
+          strip=""; [ "$EMBED" = "true" ] && strip="--strip-embeddings"
+          corpus="ghcr.io/${OWNER}/3gpp-corpus:latest"
+          # ---- base probe (delta only): the prior corpus image is the --base ----
+          # FAIL-CLOSED on a publishing delta with no base (preserves the old
+          # delta-publish-clobbers-latest guard): a delta-only merge would shrink
+          # latest to a few series. A non-publishing run may degrade to fresh.
+          BASE_PRESENT=0
+          if [ "$FULL" != "true" ] && docker manifest inspect "$corpus" >/dev/null 2>&1; then
+            BASE_PRESENT=1
+          fi
+          if [ "$FULL" != "true" ] && [ "$BASE_PRESENT" = 0 ]; then
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::delta publish run: no 3gpp-corpus:latest base image — refusing to clobber latest with a delta-only rebuild"; exit 1
             fi
+            echo "::notice::no base image; non-publishing run proceeds as a fresh rebuild (artifacts only)"
           fi
-          # When embed=true the shards carry FLOAT[1024] embeddings + a per-shard
-          # HNSW. Stripping them in the merged output keeps the lexical Release
-          # asset slim (vectors live in the GHCR per-series sub-bases — see
-          # publish-vec). The strip step also clears vector-specific schema_meta
-          # so the slim DB doesn't claim semantic capability it can't deliver.
-          strip_arg=""
-          if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            strip_arg="--strip-embeddings"
+          # Extract the base DB for the pre-publish count guard (and confirm pullable).
+          if [ "$BASE_PRESENT" = 1 ]; then
+            docker pull "$corpus"
+            cid=$(docker create "$corpus"); docker cp "$cid:/3gpp.duckdb" base.duckdb; docker rm "$cid" >/dev/null
+            ls -lh base.duckdb
           fi
-          ./bin/merge --out data/3gpp.duckdb --index-out data/corpus-index.json \
-            --subject-index-out data/subject-index.json \
-            --build-index-out data/build-index.json $base_arg $strip_arg shards/*.duckdb
+          # ---- keep base.duckdb OUT of the build context (it can be ~8 GB) ----
+          printf '%s\n' base.duckdb mergeout data .git '*.zst' '*.sha256' > .dockerignore
+          # ---- generate Dockerfile.merge (CI-only, never committed) ----
+          # shards stage = one COPY --from per series of THIS run's immutable shard
+          # image (:<tag><sfx>-<run_id>); merge stage compiles + runs cmd/merge IN the
+          # build (DuckDB links statically → golang+CGO is all it needs).
+          {
+            echo "# syntax=docker/dockerfile:1"
+            echo "FROM scratch AS shards"
+            printf '%s' "$MATRIX" | jq -r '.[]' | while IFS= read -r key; do
+              series="${key%%|*}"; tag="$series"
+              [ "$key" != "$series" ] && tag="${series}-${key#*|}"
+              echo "COPY --from=ghcr.io/${OWNER}/3gpp-shard:${tag}${sfx}-${RUN_ID} /shard.duckdb /shards/${tag}.duckdb"
+            done
+            [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=${corpus} /3gpp.duckdb /base.duckdb"
+            echo "FROM golang:1.26-bookworm AS merge"
+            echo "WORKDIR /src"
+            echo "COPY go.mod go.sum ./"
+            echo "RUN go mod download"
+            echo "COPY . ."
+            echo "RUN CGO_ENABLED=1 GOTOOLCHAIN=local go build -trimpath -o /bin/merge ./cmd/merge"
+            echo "COPY --from=shards /shards /shards"
+            [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=shards /base.duckdb /base.duckdb"
+            base_arg=""; [ "$BASE_PRESENT" = 1 ] && base_arg="--base /base.duckdb"
+            echo "RUN mkdir -p /out && /bin/merge --out /out/3gpp.duckdb --index-out /out/corpus-index.json --subject-index-out /out/subject-index.json --build-index-out /out/build-index.json ${base_arg} ${strip} /shards/*.duckdb"
+            echo "FROM scratch AS export"
+            echo "COPY --from=merge /out/ /"
+          } > Dockerfile.merge
+          echo "----- Dockerfile.merge -----"; cat Dockerfile.merge; echo "----------------------------"
+          # ---- build: cmd/merge runs INSIDE the build; extract result to runner ----
+          docker buildx build -f Dockerfile.merge --output type=local,dest=mergeout .
+          mkdir -p data
+          cp mergeout/3gpp.duckdb        data/3gpp.duckdb
+          cp mergeout/corpus-index.json  data/corpus-index.json
+          cp mergeout/subject-index.json data/subject-index.json
+          cp mergeout/build-index.json   data/build-index.json
           ls -lh data/3gpp.duckdb
       - name: Enrich — catalogue overlay + 5GC OpenAPI (additive, idempotent)
         run: |
@@ -1039,19 +1112,42 @@ jobs:
             exit 1
           fi
           echo "count guard PASSED: corpus/API coverage did not shrink"
-      # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
-      # publish_to_latest=true. A scoped/test run never reaches this step, so it
-      # can't clobber latest no matter what inputs it was given.
-      - name: Publish DB + index to 'latest' (clobber)
+      # Anti-leak gate: the corpus images carry verbatim 3GPP text, so they MUST be
+      # private. A public-repo package is born PUBLIC; Step 0 (README) sets it
+      # private once, and this assertion fail-closes any later drift back to public.
+      # A not-yet-created package returns 'absent' (first run) → passes; the manual
+      # Step 0 makes it private right after that first push.
+      - name: Assert GHCR corpus/shard packages are private (anti-leak)
         if: needs.discover.outputs.publish == 'true'
         run: |
-          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
-              --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
-          gh release upload latest --repo "$GITHUB_REPOSITORY" \
-            data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 \
-            data/3gpp.delta.duckdb.zst data/3gpp.delta.duckdb.sha256 \
-            data/corpus-index.json data/subject-index.json data/build-index.json --clobber
+          for pkg in 3gpp-corpus 3gpp-shard; do
+            vis=$(gh api "/users/${{ github.repository_owner }}/packages/container/$pkg" --jq '.visibility' 2>/dev/null || echo absent)
+            echo "$pkg: $vis"
+            if [ "$vis" = "public" ]; then
+              echo "::error::GHCR package '$pkg' is PUBLIC — refusing to publish verbatim 3GPP text. Make it private: gh api -X PATCH /user/packages/container/$pkg/visibility -f visibility=private"
+              exit 1
+            fi
+          done
+      # Publish ONLY when discover authorised it = a whole-corpus, non-PR run with
+      # publish_to_latest=true (push/schedule/dispatch). A scoped/test run never
+      # reaches this step. The data-only corpus image (FROM scratch + the DB +
+      # indexes) replaces the old `latest` Release assets; tagged :YYYY-MM-DD for
+      # the 7-day rotation + :latest=newest (the prune job enforces retention).
+      - name: Publish corpus image to GHCR (:YYYY-MM-DD + :latest, clobber)
+        if: needs.discover.outputs.publish == 'true'
+        run: |
+          set -eu
+          printf 'FROM scratch\nCOPY 3gpp.duckdb /3gpp.duckdb\nCOPY corpus-index.json /corpus-index.json\nCOPY subject-index.json /subject-index.json\nCOPY build-index.json /build-index.json\n' > data/Dockerfile.corpus
+          # keep the heavy zst/delta out of the build context (only the 4 files COPYed)
+          printf '%s\n' '*.zst' '*.sha256' catalog Dockerfile.corpus > data/.dockerignore
+          DATE=$(date -u +%Y-%m-%d)
+          REPO="ghcr.io/${{ github.repository_owner }}/3gpp-corpus"
+          docker buildx build --push -f data/Dockerfile.corpus \
+            -t "${REPO}:${DATE}" -t "${REPO}:latest" data/
+          echo "published ${REPO}:${DATE} + :latest"
+          # best-effort: ensure private (Step 0 is the reliable path; GITHUB_TOKEN may lack the scope)
+          gh api -X PATCH "/user/packages/container/3gpp-corpus/visibility" -f visibility=private >/dev/null 2>&1 \
+            && echo "3gpp-corpus set private" || echo "could not auto-set private — ensure Step 0 done"
 
   # ---- 4. SEMANTIC (embed=true): distribute the per-series vectorized sub-bases
   # to GHCR (Option B). The sub-bases are the build-shard artifacts; we zstd each,
@@ -1117,3 +1213,68 @@ jobs:
           name: 3gpp-vec
           path: vec/
           retention-days: 7
+
+  # ---- 6. retention: keep the last 7 dated corpus images + rolling shard tags ---
+  # GHCR has no auto-prune. Deleting a USER package version needs a token with
+  # delete:packages — GITHUB_TOKEN does NOT have it, so this uses an optional
+  # GHCR_PAT secret (classic PAT, delete:packages). Without it the job no-ops with
+  # a notice (retention is housekeeping, never build-correctness). Gated on publish
+  # so scoped/PR runs never prune.
+  prune:
+    needs: [discover, merge]
+    if: needs.discover.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GHCR_PAT || github.token }}
+      OWNER: ${{ github.repository_owner }}
+      HAVE_PAT: ${{ secrets.GHCR_PAT != '' }}
+    steps:
+      - name: Prune old GHCR versions (keep 7 dated corpus + rolling shard tags)
+        run: |
+          set -eu
+          if [ "$HAVE_PAT" != "true" ]; then
+            echo "::notice::GHCR_PAT secret not set (needs delete:packages) — retention prune skipped. Old image versions will accumulate until a PAT is added."
+            exit 0
+          fi
+          gh api --paginate "/users/${OWNER}/packages/container/3gpp-corpus/versions" > corpus.json 2>/dev/null || echo '[]' > corpus.json
+          gh api --paginate "/users/${OWNER}/packages/container/3gpp-shard/versions"  > shard.json  2>/dev/null || echo '[]' > shard.json
+          python3 <<'PY'
+          import json, os, re, subprocess
+          from datetime import datetime, timezone, timedelta
+          owner = os.environ["OWNER"]
+          def load(p):
+              try: return json.load(open(p))
+              except Exception: return []
+          def tags_of(v): return v.get("metadata", {}).get("container", {}).get("tags") or []
+          def delete(pkg, vid, why):
+              print(f"delete {pkg} #{vid} ({why})")
+              subprocess.run(["gh", "api", "-X", "DELETE",
+                              f"/users/{owner}/packages/container/{pkg}/versions/{vid}"], check=False)
+          # corpus: keep :latest + the 7 newest YYYY-MM-DD; drop the rest (incl untagged).
+          cv = load("corpus.json")
+          DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+          keep = set(sorted({t for v in cv for t in tags_of(v) if DATE.match(t)}, reverse=True)[:7])
+          print("corpus keep dates:", sorted(keep, reverse=True))
+          for v in cv:
+              t = tags_of(v)
+              if "latest" in t or any(x in keep for x in t):
+                  continue
+              delete("3gpp-corpus", v["id"], f"tags={t or 'untagged'}")
+          # shard: keep rolling tags (no run-id suffix = resume baseline); drop untagged
+          # + run-id-only tags older than 7 days.
+          sv = load("shard.json")
+          cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+          RUNID = re.compile(r'-\d{6,}$')
+          for v in sv:
+              t = tags_of(v)
+              if any(not RUNID.search(x) for x in t):
+                  continue  # has a rolling tag → resume baseline, keep
+              try:
+                  ts = datetime.fromisoformat(v.get("created_at", "").replace("Z", "+00:00"))
+              except Exception:
+                  ts = cutoff
+              if ts < cutoff:
+                  delete("3gpp-shard", v["id"], f"tags={t or 'untagged'} created={v.get('created_at')}")
+          PY
