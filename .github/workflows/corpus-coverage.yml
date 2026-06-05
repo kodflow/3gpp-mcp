@@ -1,10 +1,13 @@
 name: Corpus · Coverage ledger
 
-# Produces the absent-index.json ledger: the (spec,release) the 3GPP status report
-# lists but that have NO downloadable file in the archive (no same-release version)
-# — the irreducible residue. Published to the rolling `latest` Release so the
-# `Corpus · Build` discover step subtracts it (`--absent-index`) and actionable
-# drift converges to 0 ("100% accounted": indexed | fallback-recoverable | absent).
+# Produces the absent-index.json ledger merging TWO accounted-for buckets:
+#   C2 genuine-absent — (spec,release) the status report lists but with NO
+#      downloadable file in the archive (no same-release version);
+#   C1 drafts — (spec,release) listed only at a v0/v1/v2 draft version 3GPP never
+#      publishes as a stable file.
+# Published to the rolling `latest` Release so the `Corpus · Build` discover step
+# subtracts it (`--absent-index`) and actionable drift converges to 0
+# ("100% accounted": indexed | fallback-recoverable | draft | genuine-absent).
 #
 # It verifies the WHOLE worklist with verify-coverage.sh (range-GET + the real
 # download_zip resolution: exact URL, then same-release archive-highest fallback,
@@ -41,16 +44,30 @@ jobs:
         run: CGO_ENABLED=0 go run ./cmd/discover --emit-worklist --floor Rel-99 > worklist.txt
       - name: Verify coverage (exact + same-release fallback) over the whole worklist
         run: JOBS=10 bash scripts/verify-coverage.sh worklist.txt coverage
-      - name: Build absent-index.json from the genuine-absent rows
+      - name: Build absent-index.json from the genuine-absent rows (C2)
         run: |
           bash scripts/build-absent-index.sh coverage/results.tsv absent-index.json
-          echo "ledger size: $(grep -c '\": \"' absent-index.json || echo 0)"
+          echo "genuine-absent ledger size: $(grep -c '\": \"' absent-index.json || echo 0)"
+      - name: Add draft keys (v0/v1/v2) to the ledger (C1)
+        # 3GPP lists many specs only at a draft version it never publishes as a
+        # stable file → they re-flag as "missing" forever. Ledger them at their
+        # draft version (offline, from the status report) and MERGE into the single
+        # absent-index.json so the Build's `discover --absent-index` subtracts both
+        # genuine-absent and drafts → actionable drift converges to the real residue.
+        # Drafts are still FETCHED (emit-worklist includes them); this only quiets
+        # drift reporting. A frozen (major>=3) version re-flags naturally.
+        run: |
+          CGO_ENABLED=0 go run ./cmd/discover --emit-draft-ledger --floor Rel-99 > draft-ledger.json
+          jq -s 'reduce .[] as $o ({}; . * $o)' absent-index.json draft-ledger.json > merged.json
+          mv merged.json absent-index.json
+          echo "ledger size after drafts: $(grep -c '\": \"' absent-index.json || echo 0)"
       - name: Upload artifact (audit copy)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-ledger
           path: |
             absent-index.json
+            draft-ledger.json
             coverage/results.tsv
           retention-days: 14
       - name: Publish absent-index.json to `latest`
