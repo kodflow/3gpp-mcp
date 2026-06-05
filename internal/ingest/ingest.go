@@ -91,7 +91,12 @@ type Stats struct {
 // (GSM Phase 1/2 = 4-digit series 00-12, different numbering — out of scope.)
 // Junk inner docs from embedded media lack the prefix and are excluded.
 // 5-digit = modern 3GPP spec (23501); 4-digit = legacy GSM Phase-1/2 (0408).
-var reFile = regexp.MustCompile(`^([0-9]{4,5})-([0-9a-z]{3})(?:_.*)?$`)
+// num = 4-5 digits + an OPTIONAL "-N" MULTI-PART spec suffix (36.521-1 → 36521-1);
+// code = the 3-char compact OR 6-digit decimal version code (083700 = 8.37.0); an
+// optional "_section" tail covers conformance test specs split into many docs in one
+// zip (36521-1-i00_s00-s05). This MUST mirror htmlparse.reFileName or files parse in
+// htmlparse but are dropped from the job list here (the multi-part-0-keys bug).
+var reFile = regexp.MustCompile(`^([0-9]{4,5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:_.*)?$`)
 
 // classifyFile maps a converted spec filename stem (e.g. "23501-i60" or "0408-720")
 // to its (specID, num, release, version). Modern specs decode via the 3GPP version
