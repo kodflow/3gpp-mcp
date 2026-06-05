@@ -65,7 +65,7 @@ jobs:
           # ghcr.io/<owner>/3gpp-corpus:<tag> by `Corpus · Build` (corpus-matrix.yml).
           # Pull it and extract /3gpp.duckdb — NO merge, NO rebuild. Fails fast with
           # an actionable message if the build hasn't published it yet.
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
           img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
           if ! docker pull "$img"; then
             echo "::error::no $img — run 'Corpus · Build' first to publish it." >&2
@@ -93,11 +93,14 @@ jobs:
             --require-fts --min-clauses 1 --max-empty-meta 100000
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # GHCR_PAT (not github.token): pushing with the CI token auto-links the image
+      # to this PUBLIC repo → it inherits PUBLIC visibility. A PAT push stays
+      # unlinked → born PRIVATE. (Same reason as corpus-matrix.)
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
@@ -105,8 +108,10 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=,format=short
+          # NO org.opencontainers.image.source label: it LINKS the package to the
+          # public repo and forces PUBLIC inheritance (the leak). Keep only a
+          # description; the image must stay PRIVATE (it bakes verbatim 3GPP text).
           labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in (PRIVATE)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
