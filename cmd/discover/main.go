@@ -42,13 +42,16 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
-// legacyGSMSeries is the documented GSM Phase-1/2 series range (2-digit, < 21) the
-// modern status report does not list. corpus.sh fetches each `<NN>_series/` directory
-// from the 3GPP FTP and skips any that is empty/absent, so including the whole range
-// is safe — empty ones produce no shard work.
-var legacyGSMSeries = []string{
-	"01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13",
-}
+// legacyGSMSeries is the GSM Phase-1/2 series (2-digit, < 21) the modern status
+// report does not list, added explicitly when --include-legacy-gsm is set.
+//
+// Scoped to "03" by design (C3): GSM Phase-1/2 is frozen 1992 history that never
+// grows, and a coverage audit found the full 01–13 sweep yields exactly ONE stable
+// downloadable doc (03.071) while spinning up ~12 empty matrix shards every build
+// (wasted scrape/convert/index churn). corpus.sh enumerates the 03_series dir and
+// picks up 03.071; the other ranges are dropped. Re-add a series here only if 3GPP
+// ever republishes its Phase-1/2 archive (it has not in 30+ years).
+var legacyGSMSeries = []string{"03"}
 
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
