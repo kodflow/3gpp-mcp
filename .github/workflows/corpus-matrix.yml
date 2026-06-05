@@ -715,8 +715,13 @@ jobs:
       # NOTE: an embed run must NOT resume from a lexical (vector-less) shard, so we
       # only pull when this run's embed mode matches the published image's. We tag
       # embed images distinctly (see the push step) and gate the pull on embed mode.
+      # Login with GHCR_PAT (NOT github.token): a package pushed by the CI's
+      # GITHUB_TOKEN is auto-LINKED to this PUBLIC repo and inherits its PUBLIC
+      # visibility (the leak we hit). A PAT-pushed, unlinked package is born
+      # PRIVATE (and public→private is irreversible, so birth-private is the only
+      # way). GHCR_PAT is REQUIRED for the private-image distribution.
       - name: GHCR login (resume pull + shard push)
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
       - name: Resume baseline from prior shard image (best-effort)
         run: |
           mkdir -p dist
@@ -921,7 +926,9 @@ jobs:
       contents: write # optional public-release step (off by default)
       packages: write # pull base + shard images, push the 3gpp-corpus image
     env:
-      GH_TOKEN: ${{ github.token }}
+      # GHCR_PAT so `gh api` can READ package visibility for the anti-leak
+      # assertion (github.token lacks read:packages); falls back if unset.
+      GH_TOKEN: ${{ secrets.GHCR_PAT || github.token }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -938,8 +945,10 @@ jobs:
             echo "apt attempt $i failed; retrying in $((i*10))s" >&2; sleep $((i*10))
           done
           [ "$ok" = 1 ]
+      # GHCR_PAT (not github.token) so the pushed 3gpp-corpus image is born PRIVATE
+      # (unlinked to the public repo). See the build-shard login note.
       - name: GHCR login (pull base + shard images, push corpus image)
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Merge shard images → consolidated DB (generated Dockerfile, merge in build)
         env:
