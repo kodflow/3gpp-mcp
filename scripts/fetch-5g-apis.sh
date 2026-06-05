@@ -93,6 +93,7 @@ if [[ "${releases[0]}" == "auto" ]]; then
 fi
 
 total_files=0
+total_missing=0
 for ref in "${releases[@]}"; do
   rel="${ref/REL-/Rel-}"          # REL-18 -> Rel-18 (matches corpus layout)
   log "resolving $ref ..."
@@ -106,27 +107,51 @@ for ref in "${releases[@]}"; do
   if [[ ${#files[@]} -eq 0 ]]; then warn "$ref: no YAML files listed (skip)"; continue; fi
 
   n=0
+  got=()                                                  # files actually on disk
   for f in "${files[@]}"; do
     out="$dest/$f"
-    if [[ -s "$out" ]]; then (( n++ )); continue; fi    # incremental
-    if curl -fsS -A "$UA" --max-time 60 -o "$out" "$RAW/$sha/$f" 2>/dev/null; then
-      (( n++ ))
+    if [[ -s "$out" ]]; then (( n++ )); got+=("$f"); continue; fi   # incremental
+    if curl -fsS -A "$UA" --max-time 60 -o "$out" "$RAW/$sha/$f" 2>/dev/null && [[ -s "$out" ]]; then
+      (( n++ )); got+=("$f")
     else
       warn "$ref: download failed for $f"
       rm -f "$out"
     fi
   done
 
-  # manifest (reproducibility record)
+  # manifest records REALITY: expected (listed) vs downloaded (on disk) vs missing,
+  # so a partial loss is auditable instead of hidden behind the expected list.
+  DOWNLOADED="$(printf '%s\n' ${got[@]+"${got[@]}"})" \
   python3 - "$dest/../manifest.json" "$rel" "$ref" "$sha" "${files[@]}" <<'PY'
-import json,sys,datetime
-out,rel,ref,sha=sys.argv[1:5]; files=sys.argv[5:]
-json.dump({"release":rel,"ref":ref,"sha":sha,"files":sorted(files),
+import json,os,sys,datetime
+out,rel,ref,sha=sys.argv[1:5]; expected=sorted(sys.argv[5:])
+got=sorted(x for x in os.environ.get("DOWNLOADED","").splitlines() if x)
+missing=sorted(set(expected)-set(got))
+json.dump({"release":rel,"ref":ref,"sha":sha,
+          "expected":expected,"downloaded":got,"missing":missing,
+          "expected_count":len(expected),"downloaded_count":len(got),"missing_count":len(missing),
+          "files":got,  # back-compat: ingest reads the files actually present
           "fetched_at":datetime.datetime.now(datetime.timezone.utc).isoformat()},
          open(out,"w"),indent=2)
 PY
-  log "$rel: $n/${#files[@]} YAML files in $dest"
+  miss=$(( ${#files[@]} - n ))
+  log "$rel: $n/${#files[@]} YAML files in $dest (missing=$miss)"
+  if (( miss > 0 )); then
+    # GitHub annotation (visible in the run summary) without blocking the build.
+    printf '::warning title=5g-apis incomplete::%s missing %d/%d OpenAPI YAML files\n' \
+      "$rel" "$miss" "${#files[@]}" >&2
+  fi
   (( total_files += n ))
+  (( total_missing += miss ))
 done
 
-log "done — $total_files YAML files under $OUT"
+log "done — $total_files YAML files under $OUT (total missing=$total_missing)"
+if (( total_missing > 0 )); then
+  printf '::warning title=5g-apis incomplete::%d OpenAPI YAML files missing across releases\n' \
+    "$total_missing" >&2
+  # Opt-in hard failure for CI that wants OpenAPI completeness to gate the build.
+  if [[ "${FETCH_APIS_STRICT:-0}" == "1" ]]; then
+    warn "FETCH_APIS_STRICT=1 and $total_missing files missing — failing"
+    exit 1
+  fi
+fi
