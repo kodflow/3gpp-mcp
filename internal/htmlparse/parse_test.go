@@ -82,6 +82,9 @@ func TestParse(t *testing.T) {
 	}
 
 	// change history parsed
+	if !ps.SawChangeHistory {
+		t.Error("SawChangeHistory should be true when a Change history heading matched")
+	}
 	if len(ps.Changes) != 1 {
 		t.Fatalf("want 1 change, got %d", len(ps.Changes))
 	}
