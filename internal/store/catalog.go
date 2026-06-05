@@ -73,10 +73,21 @@ func (s *Store) SpecExists(ctx context.Context, specID string) bool {
 // UpdateSpecMeta overlays authoritative title/doc_type/working_group onto an
 // existing spec row (DynaReport authoritative for metadata, §2.3). No-op if the
 // spec is not on disk.
+//
+// Each column is guarded so an EMPTY incoming value never clobbers an existing
+// non-empty one: a status-report row that lists a spec but omits its title/WG
+// (partial DynaReport entries do occur) must not erase metadata an earlier,
+// fuller overlay already wrote. A non-empty value always wins (authoritative).
+// The WHERE still matches the row, so the returned ok ("spec present on disk")
+// is unchanged even when every column is a no-op.
 func (s *Store) UpdateSpecMeta(ctx context.Context, specID, title, docType, wg string) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE specs SET title = ?, doc_type = ?, working_group = ? WHERE spec_id = ?`,
-		title, docType, wg, specID)
+		`UPDATE specs SET
+		   title         = CASE WHEN ? <> '' THEN ? ELSE title END,
+		   doc_type      = CASE WHEN ? <> '' THEN ? ELSE doc_type END,
+		   working_group = CASE WHEN ? <> '' THEN ? ELSE working_group END
+		 WHERE spec_id = ?`,
+		title, title, docType, docType, wg, wg, specID)
 	if err != nil {
 		return false, err
 	}

@@ -72,3 +72,54 @@ func TestCatalogOverlay(t *testing.T) {
 		t.Errorf("freeze_date = %v, want 2024-06-21", fz)
 	}
 }
+
+// TestUpdateSpecMetaNoClobber pins B2: a later overlay carrying EMPTY title/WG
+// (a partial DynaReport row) must NOT erase metadata a fuller overlay wrote,
+// while a non-empty value always wins.
+func TestUpdateSpecMetaNoClobber(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	_ = st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS", WorkingGroup: "SA2"})
+
+	// Full overlay writes good metadata.
+	if ok, err := st.UpdateSpecMeta(ctx, "23.501", "System architecture for the 5G System", "TS", "S2"); err != nil || !ok {
+		t.Fatalf("first overlay ok=%v err=%v", ok, err)
+	}
+	// Partial overlay: empty title + empty WG must be ignored; non-empty doc_type kept.
+	if ok, err := st.UpdateSpecMeta(ctx, "23.501", "", "TS", ""); err != nil || !ok {
+		t.Fatalf("partial overlay ok=%v err=%v", ok, err)
+	}
+
+	var title, dt, wg string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT title, doc_type, working_group FROM specs WHERE spec_id='23.501'`).
+		Scan(&title, &dt, &wg); err != nil {
+		t.Fatal(err)
+	}
+	if title != "System architecture for the 5G System" {
+		t.Errorf("title clobbered by empty overlay: %q", title)
+	}
+	if wg != "S2" {
+		t.Errorf("working_group clobbered by empty overlay: %q", wg)
+	}
+	if dt != "TS" {
+		t.Errorf("doc_type = %q, want TS", dt)
+	}
+
+	// A non-empty value still wins (authoritative correction).
+	if _, err := st.UpdateSpecMeta(ctx, "23.501", "", "", "S2x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT working_group FROM specs WHERE spec_id='23.501'`).Scan(&wg); err != nil {
+		t.Fatal(err)
+	}
+	if wg != "S2x" {
+		t.Errorf("non-empty WG did not win: %q", wg)
+	}
+}

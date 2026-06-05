@@ -47,6 +47,7 @@ func main() {
 		shaPath      = flag.String("sha", "", "sha256 sidecar for --zst (format: '<hex>  <name>')")
 		repoVis      = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
 		forbidFull   = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
+		maxEmptyMeta = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
 		report       = flag.String("report", "text", "text | json")
 	)
 	flag.Parse()
@@ -56,6 +57,7 @@ func main() {
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
+		emptyMetaGuard: *maxEmptyMeta >= 0, maxEmptyMeta: *maxEmptyMeta,
 	})
 
 	if *report == "json" {
@@ -82,6 +84,11 @@ type checkCfg struct {
 	expectedReleases                           []string
 	expectedIdentity, zst, sha, repoVisibility string
 	forbidFulltext                             bool
+	// emptyMetaGuard gates the catalog-coverage check; maxEmptyMeta is the
+	// threshold. A separate bool (not a sentinel) because 0 is a MEANINGFUL
+	// strict threshold here, so it cannot double as "disabled".
+	emptyMetaGuard bool
+	maxEmptyMeta   int
 }
 
 type check struct {
@@ -178,6 +185,18 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		res.add("require-fts", db.FTSAvailable(), "fts_available=%v", db.FTSAvailable())
 	}
 
+	// catalog coverage: specs that have indexed clauses but no catalog title/WG
+	// (the DynaReport overlay never matched them, or wrote empties) — surfaces the
+	// silent-partial-enrichment failure mode at publish time.
+	if cfg.emptyMetaGuard {
+		n, sample, err := emptyMetaSpecs(ctx, sqldb)
+		if err != nil {
+			res.add("empty-meta", false, "%v", err)
+		} else {
+			res.add("empty-meta", n <= cfg.maxEmptyMeta, "specs_with_clauses_missing_title_or_wg=%d (max=%d) e.g. %v", n, cfg.maxEmptyMeta, sample)
+		}
+	}
+
 	// anti-leak: a public channel must never carry verbatim clause text (content-based)
 	if cfg.repoVisibility == "public" && cfg.forbidFulltext {
 		var withText int
@@ -208,6 +227,42 @@ func distinctReleases(ctx context.Context, sqldb *sql.DB) ([]string, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// emptyMetaSpecs counts spec_ids that appear in `clauses` but whose `specs` row
+// is missing or carries an empty title/working_group, and returns up to 20 of
+// them as a sample for the failure detail. A LEFT JOIN catches the "no specs row
+// at all" case (overlay never ran) as well as the empty-string case.
+func emptyMetaSpecs(ctx context.Context, sqldb *sql.DB) (int, []string, error) {
+	const where = `s.spec_id IS NULL
+	     OR s.title IS NULL OR s.title = ''
+	     OR s.working_group IS NULL OR s.working_group = ''`
+	var n int
+	if err := sqldb.QueryRowContext(ctx,
+		`SELECT count(*) FROM (
+		   SELECT DISTINCT c.spec_id FROM clauses c
+		   LEFT JOIN specs s ON s.spec_id = c.spec_id
+		   WHERE `+where+`)`).Scan(&n); err != nil {
+		return 0, nil, fmt.Errorf("count empty-meta specs: %w", err)
+	}
+	rows, err := sqldb.QueryContext(ctx,
+		`SELECT DISTINCT c.spec_id FROM clauses c
+		 LEFT JOIN specs s ON s.spec_id = c.spec_id
+		 WHERE `+where+`
+		 ORDER BY c.spec_id LIMIT 20`)
+	if err != nil {
+		return n, nil, fmt.Errorf("sample empty-meta specs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var sample []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return n, sample, err
+		}
+		sample = append(sample, id)
+	}
+	return n, sample, rows.Err()
 }
 
 // splitCSV parses a comma-separated flag into a trimmed, empty-dropped slice.
