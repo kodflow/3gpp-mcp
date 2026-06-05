@@ -241,9 +241,28 @@ process_spec() {
   # So: prefix the HTML base with the ZIP's coded name unless the inner name already
   # starts with it (reFile's optional _suffix then classifies it correctly).
   local zipbase; zipbase="$(basename "$zip")"; zipbase="${zipbase%.zip}"
+  # Canonicalise an underscore code-separator (NNNNN_CODE -> NNNNN-CODE): the
+  # ingest classifier wants the dash form, so a stray underscore would otherwise
+  # leave the file unclassified and silently dropped.
+  local recode='s/^([0-9]{4,5}(-[0-9]+)?)_([0-9a-z]{3}|[0-9]{6})/\1-\3/'
+  zipbase="$(printf '%s' "$zipbase" | sed -E "$recode")"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
-    while IFS= read -r inner; do
+    # Candidate spec documents, minus: Word owner-lock stubs (._*, ~$* — e.g. the
+    # 28552 sample media), and pure readme / release-note placeholders. Some zips
+    # (e.g. 55.226) ship ONLY a readme and no spec doc — converting it would index
+    # junk under the spec id, so a doc-less zip is skipped explicitly.
+    local -a docs=()
+    while IFS= read -r f; do docs+=("$f"); done < <(
+      find "$tmp" -type f \( -iname '*.doc' -o -iname '*.docx' \) \
+        -not -name '._*' -not -name '~$*' \
+        -not -iname 'readme*' -not -iname '*release note*' -not -iname '*release-note*')
+    if [[ ${#docs[@]} -eq 0 ]]; then
+      echo "$(date -Is) SKIPZIP $zip :: no spec document (placeholder/readme only)" >&2
+      rm -rf "$tmp"; return 0
+    fi
+    for inner in "${docs[@]}"; do
       base="$(basename "$inner")"; base="${base%.*}"
+      base="$(printf '%s' "$base" | sed -E "$recode")"   # underscore -> dash code sep
       case "$base" in
         "$zipbase"*) : ;;
         *) base="${zipbase}_$(printf '%s' "$base" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//;s/-*$//')" ;;
@@ -256,9 +275,7 @@ process_spec() {
       else
         echo "$(date -Is) FAILCV $zip :: $(basename "$inner")" >&2
       fi
-      # '~$*' = Word owner-lock stubs bundled inside some spec zips (e.g. 28552
-      # sample media) — never real documents, only noise in the FAILCV log.
-    done < <(find "$tmp" -type f \( -iname '*.doc' -o -iname '*.docx' \) -not -name '._*' -not -name '~$*')
+    done
   fi
   rm -rf "$tmp"
 }
