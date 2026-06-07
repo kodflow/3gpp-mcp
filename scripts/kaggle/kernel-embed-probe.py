@@ -50,6 +50,10 @@ def duckdb_scalar(db, query):
 REPO = "https://github.com/kodflow/3gpp-mcp"
 BRANCH = os.environ.get("BRANCH", "feat/embed-pipeline-rebuild")
 SERIES = os.environ.get("SERIES", "21")
+# Lexical base now lives in the PRIVATE GHCR image (the public Release was retired).
+OWNER = os.environ.get("GHCR_OWNER", "kodflow")
+GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
+CRANE_VER = os.environ.get("CRANE_VER", "v0.20.2")
 FLOOR = os.environ.get("EMBED_FLOOR", "Rel-17")
 LIMIT = os.environ.get("PROBE_LIMIT", "3000")
 BGE_COMMIT = "5617a9f61b028005a4858fdac845db406aefb181"
@@ -101,13 +105,25 @@ if sh('git clone --depth 1 -b "%s" "%s" "%s"' % (BRANCH, REPO, src)).returncode 
         fail("clone")
 os.chdir(src)
 
-# ---- base slice from the published latest DB ------------------------------
+# ---- base slice from the PRIVATE GHCR corpus image ------------------------
+# (the public `latest` Release was retired by the GHCR migration). Pull with crane
+# using a read:packages token; `crane export` flattens the FROM-scratch image to a tar.
 BASE_DB = os.path.join(WORK, "base.duckdb")
-if sh('curl -fsSL --retry 5 -o "%s/full.zst" "%s/releases/download/latest/3gpp.duckdb.zst"'
-      % (WORK, REPO)).returncode != 0:
-    fail("db_dl")
-if sh('zstd -d --long=27 -f "%s/full.zst" -o "%s/full.duckdb"' % (WORK, WORK)).returncode != 0:
-    fail("decompress")
+if not GHCR_PAT:
+    fail("ghcr_pat_missing")
+if sh('curl -fsSL --retry 5 -o /tmp/crane.tgz '
+      '"https://github.com/google/go-containerregistry/releases/download/%s/'
+      'go-containerregistry_Linux_x86_64.tar.gz"' % CRANE_VER).returncode != 0:
+    fail("crane_dl")
+if sh('tar -xzf /tmp/crane.tgz -C /tmp crane').returncode != 0:
+    fail("crane_untar")
+if sh('printf %%s "$GHCR_PAT" | /tmp/crane auth login ghcr.io -u "%s" --password-stdin'
+      % OWNER).returncode != 0:
+    fail("ghcr_login")
+if sh('/tmp/crane export "ghcr.io/%s/3gpp-corpus:latest" - | tar -xC "%s" 3gpp.duckdb'
+      % (OWNER, WORK)).returncode != 0:
+    fail("ghcr_export")
+os.replace("%s/3gpp.duckdb" % WORK, "%s/full.duckdb" % WORK)
 slice_sql = ("ATTACH '%s/full.duckdb' AS s (READ_ONLY); "
              "CREATE TABLE clauses AS SELECT * FROM s.clauses WHERE substr(spec_id,1,2)='%s';" % (WORK, SERIES))
 if sh('duckdb "%s" "%s"' % (BASE_DB, slice_sql)).returncode != 0:
