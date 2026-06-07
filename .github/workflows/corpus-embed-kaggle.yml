@@ -114,6 +114,12 @@ jobs:
       KAGGLE_ACCELERATOR: ${{ github.event.inputs.accelerator }}
       MAX_RETRIES: ${{ github.event.inputs.max_retries }}
       BRANCH: ${{ github.ref_name }}
+      # Read-scoped GHCR token for the kernel's fresh-slice base pull (private
+      # 3gpp-corpus image). Prefer a dedicated read:packages-only GHCR_READ_PAT;
+      # fall back to GHCR_PAT so the loop works before the read-only token is added.
+      # A resume-only dispatch never pulls the base, so this can be empty then.
+      GHCR_OWNER: ${{ github.repository_owner }}
+      GHCR_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Guard — secrets present

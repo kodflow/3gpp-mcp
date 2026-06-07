@@ -63,6 +63,12 @@ def duckdb_scalar(db, query):
 
 
 REPO = "https://github.com/kodflow/3gpp-mcp"
+# The lexical base is pulled from the PRIVATE GHCR image, not the (retired) public
+# Release. OWNER namespaces the registry path; GHCR_PAT is a read:packages token the
+# driver injects (the kernel is is_private:true). CRANE_VER pins the puller.
+OWNER = os.environ.get("GHCR_OWNER", "kodflow")
+GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
+CRANE_VER = os.environ.get("CRANE_VER", "v0.20.2")
 BRANCH = os.environ.get("BRANCH", "main")
 FLOOR = os.environ.get("EMBED_FLOOR", "Rel-17")
 SERIES = os.environ.get("SERIES", "21")
@@ -165,12 +171,32 @@ if os.path.isfile(RESUME_DB):
     prior = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
     say("resume=present src=%s prior_embedded=%s" % (RESUME_DB, prior or "?"))
 else:
-    say("resume=absent (fresh slice from published latest)")
-    if sh('curl -fsSL --retry 5 -o "%s/full.zst" "%s/releases/download/latest/3gpp.duckdb.zst"'
-          % (WORK, REPO)).returncode != 0:
-        fail("db_dl")
-    if sh('zstd -d --long=27 -f "%s/full.zst" -o "%s/full.duckdb"' % (WORK, WORK)).returncode != 0:
-        fail("decompress")
+    say("resume=absent (fresh slice from PRIVATE GHCR corpus image)")
+    # The lexical base now lives ONLY in the PRIVATE GHCR image
+    # ghcr.io/<owner>/3gpp-corpus:latest (FROM scratch + /3gpp.duckdb) — the public
+    # `latest` Release was retired by the GHCR migration. Pull it with a read-scoped
+    # token: authenticate with crane, then `crane export` flattens the scratch image's
+    # filesystem to a tar from which we extract only the DB. The PAT is fed on STDIN
+    # (never on argv) so it cannot reach a captured log line.
+    if not GHCR_PAT:
+        fail("ghcr_pat_missing",
+             "GHCR_PAT absent from kernel env — the driver must inject a read:packages token")
+    if sh('curl -fsSL --retry 5 -o /tmp/crane.tgz '
+          '"https://github.com/google/go-containerregistry/releases/download/%s/'
+          'go-containerregistry_Linux_x86_64.tar.gz"' % CRANE_VER).returncode != 0:
+        fail("crane_dl")
+    if sh('tar -xzf /tmp/crane.tgz -C /tmp crane').returncode != 0:
+        fail("crane_untar")
+    login = sh('printf %%s "$GHCR_PAT" | /tmp/crane auth login ghcr.io -u "%s" --password-stdin'
+               % OWNER)
+    if login.returncode != 0:
+        fail("ghcr_login", (login.stderr or "").strip()[-160:])
+    img = "ghcr.io/%s/3gpp-corpus:latest" % OWNER
+    if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, WORK)).returncode != 0:
+        fail("ghcr_export", img)
+    if not os.path.isfile("%s/3gpp.duckdb" % WORK):
+        fail("ghcr_no_db", img)
+    os.replace("%s/3gpp.duckdb" % WORK, "%s/full.duckdb" % WORK)
     fulln = duckdb_scalar("%s/full.duckdb" % WORK, "SELECT count(*) FROM clauses;")
     say("full_clauses=%s" % fulln)
     # Emit the WHOLE-corpus per-release clause counts once (we have full.duckdb here,
