@@ -723,14 +723,18 @@ jobs:
       - name: GHCR login (resume pull + shard push)
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
       - name: Resume baseline from prior shard image (best-effort)
+        continue-on-error: true # purely a resume optimisation — must never fail the job
         run: |
           mkdir -p dist
           img="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-shard:${{ steps.shard.outputs.tag }}${{ github.event.inputs.embed == 'true' && '-embed' || '' }}"
           if docker pull "$img" 2>/dev/null; then
-            cid=$(docker create "$img")
+            # `docker create` on a FROM-scratch image (no CMD) errors "no command
+            # specified" unless a command arg is given — it is NEVER run, we only
+            # `docker cp` files out. The arg is a harmless placeholder.
+            cid=$(docker create "$img" /shard.duckdb) || { echo "create failed — fresh ingest"; exit 0; }
             docker cp "$cid:/shard.duckdb" "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" 2>/dev/null || true
             docker cp "$cid:/shard.report.json" "dist/shard-${{ steps.shard.outputs.tag }}.report.json" 2>/dev/null || true
-            docker rm "$cid" >/dev/null
+            docker rm "$cid" >/dev/null 2>&1 || true
             echo "resume baseline pulled from $img"
           else
             echo "no prior shard image ($img) — fresh ingest"
@@ -980,7 +984,8 @@ jobs:
           # Extract the base DB for the pre-publish count guard (and confirm pullable).
           if [ "$BASE_PRESENT" = 1 ]; then
             docker pull "$corpus"
-            cid=$(docker create "$corpus"); docker cp "$cid:/3gpp.duckdb" base.duckdb; docker rm "$cid" >/dev/null
+            # FROM-scratch image → docker create needs a (never-run) command arg.
+            cid=$(docker create "$corpus" /3gpp.duckdb); docker cp "$cid:/3gpp.duckdb" base.duckdb; docker rm "$cid" >/dev/null
             ls -lh base.duckdb
           fi
           # ---- keep base.duckdb OUT of the build context (it can be ~8 GB) ----

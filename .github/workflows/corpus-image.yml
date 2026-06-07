@@ -71,7 +71,8 @@ jobs:
             echo "::error::no $img — run 'Corpus · Build' first to publish it." >&2
             exit 1
           fi
-          cid=$(docker create "$img")
+          # FROM-scratch image → docker create needs a (never-run) command arg.
+          cid=$(docker create "$img" /3gpp.duckdb)
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
           test -f image-data/3gpp.duckdb || { echo "::error::no 3gpp.duckdb after extract" >&2; exit 1; }
