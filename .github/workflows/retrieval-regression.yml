@@ -84,16 +84,25 @@ jobs:
             echo "have_db=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          curl -fsSL --retry 5 -o /tmp/crane.tgz \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz"
-          tar -xzf /tmp/crane.tgz -C /tmp crane
-          printf '%s' "$GHCR_TOKEN" | /tmp/crane auth login ghcr.io -u "$OWNER" --password-stdin
           mkdir -p data
+          # Tolerate a missing / broken / unpullable base image: this gate is advisory
+          # infra and must NEVER fail a PR because the corpus image is temporarily
+          # absent (e.g. a dangling :latest after a prune). The whole pull is the
+          # condition of an `if`, so set -e/pipefail can't abort the job mid-pull — any
+          # failure just sets have_db=0 and the gate is skipped with a notice.
           # The corpus image is FROM scratch: `crane export` flattens its filesystem
           # to a tar from which we extract just the lexical DB.
-          /tmp/crane export "ghcr.io/${OWNER}/3gpp-corpus:latest" - | tar -xC data 3gpp.duckdb
-          test -s data/3gpp.duckdb
-          echo "have_db=1" >> "$GITHUB_OUTPUT"
+          if curl -fsSL --retry 5 -o /tmp/crane.tgz \
+                "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz" \
+             && tar -xzf /tmp/crane.tgz -C /tmp crane \
+             && printf '%s' "$GHCR_TOKEN" | /tmp/crane auth login ghcr.io -u "$OWNER" --password-stdin \
+             && /tmp/crane export "ghcr.io/${OWNER}/3gpp-corpus:latest" - | tar -xC data 3gpp.duckdb \
+             && test -s data/3gpp.duckdb; then
+            echo "have_db=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::could not pull a usable 3gpp-corpus base (broken/absent :latest?) — skipping retrieval gate (advisory)"
+            echo "have_db=0" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Score retrieval + gate vs baseline
         if: steps.db.outputs.have_db == '1'
