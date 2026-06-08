@@ -31,6 +31,10 @@ import (
 func main() {
 	dbPath := flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot (read-only)")
 	setPath := flag.String("set", "docs/inputs/eval/li_5gc_queries.json", "graded query set")
+	systemsCSV := flag.String("systems", "lexical,hybrid,rerank", "comma list of systems to score; a vector-less CI run passes -systems lexical to skip the embedding-dependent backends")
+	jsonOut := flag.String("json", "", "if set, write the macro-avg metrics per system (keyed by system) as JSON to this path — the machine-readable sidecar the regression gate consumes")
+	baseline := flag.String("baseline", "", "if set, compare metrics to this committed baseline JSON and exit 1 on any tracked-metric regression; a missing file is SEEDED from the current run (advisory, exit 0)")
+	tol := flag.Float64("tol", 0.02, "absolute tolerance for -baseline: a tracked metric must drop by more than this to fail the gate")
 	synth := flag.Int("synth-hnsw", 0, "Phase-0: insert N random vectors, build+freeze HNSW, report build time; then exit (measure peak RSS via /usr/bin/time -v)")
 	synthOut := flag.String("synth-out", "data/phase0-synth.duckdb", "output DB for --synth-hnsw (created then removed)")
 	synthBatch := flag.Int("synth-batch", 512, "rows per INSERT for --synth-hnsw")
@@ -60,28 +64,46 @@ func main() {
 	_ = st.LoadVSS(ctx)
 	eng := search.New(st)
 
-	systems := []struct {
+	// key namespaces the system in the JSON sidecar / baseline (stable, short);
+	// name is the human label in the table. The lexical key uses only FTS/BM25 so
+	// it scores on a vector-less DB; hybrid/rerank need embeddings.
+	type system struct {
+		key  string
 		name string
 		rank eval.Ranker
-	}{
-		{"lexical (BM25)", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
+	}
+	all := []system{
+		{"lexical", "lexical (BM25)", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
 			hits, err := st.SearchClauses(ctx, store.SearchQuery{
 				Text: q.Query, Filter: store.SpecFilter{Release: q.Release}, TopK: 20})
 			return eval.HitsToRefs(hits), err
 		}},
-		{"hybrid RRF", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
+		{"hybrid", "hybrid RRF", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
 			hits, err := eng.Search(ctx, search.Request{
 				Text: q.Query, Filter: store.SpecFilter{Release: q.Release}, TopK: 20})
 			return eval.HitsToRefs(hits), err
 		}},
-		{"hybrid + rerank", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
+		{"rerank", "hybrid + rerank", func(ctx context.Context, q eval.Query) ([]eval.Ref, error) {
 			hits, err := eng.Search(ctx, search.Request{
 				Text: q.Query, Filter: store.SpecFilter{Release: q.Release}, TopK: 20, Rerank: true})
 			return eval.HitsToRefs(hits), err
 		}},
 	}
+	want := map[string]bool{}
+	for _, k := range strings.Split(*systemsCSV, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			want[k] = true
+		}
+	}
+	systems := make([]system, 0, len(all))
+	for _, s := range all {
+		if want[s.key] {
+			systems = append(systems, s)
+		}
+	}
 
 	fmt.Printf("bench: %d queries, db=%s\n\n", len(set), *dbPath)
+	results := make(eval.Baseline, len(systems))
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "system\tnDCG@5\tnDCG@10\tRecall@10\tMRR@10\tSuccess@1")
 	for _, s := range systems {
@@ -90,10 +112,56 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", s.name, err)
 			os.Exit(1)
 		}
+		results[s.key] = avg
 		_, _ = fmt.Fprintf(w, "%s\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
 			s.name, avg.NDCG5, avg.NDCG10, avg.Recall10, avg.MRR, avg.Success1)
 	}
 	_ = w.Flush()
+
+	if *jsonOut != "" {
+		if err := eval.WriteBaseline(*jsonOut, results); err != nil {
+			fmt.Fprintf(os.Stderr, "write %s: %v\n", *jsonOut, err)
+			os.Exit(1)
+		}
+		fmt.Printf("\nwrote %s (%d systems)\n", *jsonOut, len(results))
+	}
+
+	if *baseline != "" {
+		if !gateAgainstBaseline(*baseline, results, *tol) {
+			os.Exit(1)
+		}
+	}
+}
+
+// gateAgainstBaseline compares results to the committed baseline and reports any
+// regression. A missing baseline is SEEDED from this run and the gate stays
+// advisory (returns true) — the first run on a branch can never block itself.
+// Returns false only when an existing baseline shows a real regression.
+func gateAgainstBaseline(path string, results eval.Baseline, tol float64) bool {
+	base, err := eval.LoadBaseline(path)
+	if os.IsNotExist(err) {
+		if werr := eval.WriteBaseline(path, results); werr != nil {
+			fmt.Fprintf(os.Stderr, "seed baseline %s: %v\n", path, werr)
+			return false
+		}
+		fmt.Printf("\nbaseline %s absent — SEEDED from this run (advisory, gate passes). Commit it to make the gate binding.\n", path)
+		return true
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load baseline %s: %v\n", path, err)
+		return false
+	}
+	regs := eval.Gate(results, base, tol)
+	if len(regs) == 0 {
+		fmt.Printf("\ngate OK: no tracked-metric regression beyond tol=%.3f vs %s\n", tol, path)
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "\nRETRIEVAL REGRESSION vs %s (tol=%.3f):\n", path, tol)
+	for _, r := range regs {
+		fmt.Fprintf(os.Stderr, "  %-8s %-18s baseline=%.3f current=%.3f delta=%.3f\n",
+			r.System, r.Metric, r.Baseline, r.Current, r.Delta)
+	}
+	return false
 }
 
 // runSynthHNSW populates a throwaway DB with N random Dim-d vectors generated
