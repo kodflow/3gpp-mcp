@@ -166,74 +166,98 @@ if not os.path.isfile(RESUME_DB):
     if _hits:
         say("resume=glob_found path=%s (env RESUME_DB=%s missed)" % (_hits[0], RESUME_DB))
         RESUME_DB = _hits[0]
-if os.path.isfile(RESUME_DB):
-    shutil.copy(RESUME_DB, EMBEDDED_DB)
-    prior = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
-    say("resume=present src=%s prior_embedded=%s" % (RESUME_DB, prior or "?"))
+# ALWAYS fresh-slice from the CURRENT private base, then carry over only the vectors
+# whose clause is byte-identical. A re-published base reshuffles chunk_ids for CHANGED
+# series, so copying a stale resume DB verbatim (the old behaviour) would embed old
+# clauses and MISALIGN on overlay (overlay matches by chunk_id). Instead the slice
+# carries the base's current chunk_ids, and the carry-over reuses a prior vector only
+# when (spec_id, release, clause_path, text) match exactly — so unchanged clauses keep
+# their vector (no GPU) while changed/new ones stay NULL and get re-embedded. This makes
+# the loop self-correcting: a stale resume DB can never poison a re-published series.
+RESUME_PRESENT = os.path.isfile(RESUME_DB)
+say("resume=%s src=%s" % ("present" if RESUME_PRESENT else "absent",
+                          RESUME_DB if RESUME_PRESENT else "-"))
+# The lexical base lives ONLY in the PRIVATE GHCR image ghcr.io/<owner>/3gpp-corpus:latest
+# (FROM scratch + /3gpp.duckdb) — the public `latest` Release was retired by the GHCR
+# migration. Pull it with a read-scoped token: authenticate with crane, then
+# `crane export` flattens the scratch image's filesystem to a tar from which we extract
+# only the DB. The PAT is fed on STDIN (never on argv) so it cannot reach a captured log.
+if not GHCR_PAT:
+    fail("ghcr_pat_missing",
+         "GHCR_PAT absent from kernel env — the driver must inject a read:packages token")
+if sh('curl -fsSL --retry 5 -o /tmp/crane.tgz '
+      '"https://github.com/google/go-containerregistry/releases/download/%s/'
+      'go-containerregistry_Linux_x86_64.tar.gz"' % CRANE_VER).returncode != 0:
+    fail("crane_dl")
+if sh('tar -xzf /tmp/crane.tgz -C /tmp crane').returncode != 0:
+    fail("crane_untar")
+login = sh('printf %%s "$GHCR_PAT" | /tmp/crane auth login ghcr.io -u "%s" --password-stdin'
+           % OWNER)
+if login.returncode != 0:
+    fail("ghcr_login", (login.stderr or "").strip()[-160:])
+img = "ghcr.io/%s/3gpp-corpus:latest" % OWNER
+if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, WORK)).returncode != 0:
+    fail("ghcr_export", img)
+if not os.path.isfile("%s/3gpp.duckdb" % WORK):
+    fail("ghcr_no_db", img)
+os.replace("%s/3gpp.duckdb" % WORK, "%s/full.duckdb" % WORK)
+fulln = duckdb_scalar("%s/full.duckdb" % WORK, "SELECT count(*) FROM clauses;")
+say("full_clauses=%s" % fulln)
+# Emit the WHOLE-corpus per-release clause counts once (we have full.duckdb here,
+# on Kaggle's fast network). The local dashboard reads this as its denominator,
+# so it never has to download the 7GB corpus on a flaky laptop link.
+rt = sh('duckdb "%s/full.duckdb" -noheader -list '
+        '"SELECT release || \'=\' || count(*) FROM clauses GROUP BY release;"' % WORK)
+if rt.returncode == 0 and rt.stdout.strip():
+    pairs = ",".join(l.strip() for l in rt.stdout.splitlines() if l.strip())
+    say("release_totals=%s" % pairs)
+# Lot mode slices by an explicit RELEASE SET; series mode by the 2-digit series.
+# The release labels are validated against the safe Rel-NN / phase grammar before
+# interpolation (they originate from the operator's lot definition, never the DB).
+if RELEASES:
+    rels = [r.strip() for r in RELEASES.split(",") if r.strip()]
+    for r in rels:
+        if not re.match(r"^[A-Za-z0-9._-]+$", r):
+            fail("bad_release", "release=%s" % r)
+    where = "release IN (%s)" % ",".join("'%s'" % r for r in rels)
 else:
-    say("resume=absent (fresh slice from PRIVATE GHCR corpus image)")
-    # The lexical base now lives ONLY in the PRIVATE GHCR image
-    # ghcr.io/<owner>/3gpp-corpus:latest (FROM scratch + /3gpp.duckdb) — the public
-    # `latest` Release was retired by the GHCR migration. Pull it with a read-scoped
-    # token: authenticate with crane, then `crane export` flattens the scratch image's
-    # filesystem to a tar from which we extract only the DB. The PAT is fed on STDIN
-    # (never on argv) so it cannot reach a captured log line.
-    if not GHCR_PAT:
-        fail("ghcr_pat_missing",
-             "GHCR_PAT absent from kernel env — the driver must inject a read:packages token")
-    if sh('curl -fsSL --retry 5 -o /tmp/crane.tgz '
-          '"https://github.com/google/go-containerregistry/releases/download/%s/'
-          'go-containerregistry_Linux_x86_64.tar.gz"' % CRANE_VER).returncode != 0:
-        fail("crane_dl")
-    if sh('tar -xzf /tmp/crane.tgz -C /tmp crane').returncode != 0:
-        fail("crane_untar")
-    login = sh('printf %%s "$GHCR_PAT" | /tmp/crane auth login ghcr.io -u "%s" --password-stdin'
-               % OWNER)
-    if login.returncode != 0:
-        fail("ghcr_login", (login.stderr or "").strip()[-160:])
-    img = "ghcr.io/%s/3gpp-corpus:latest" % OWNER
-    if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, WORK)).returncode != 0:
-        fail("ghcr_export", img)
-    if not os.path.isfile("%s/3gpp.duckdb" % WORK):
-        fail("ghcr_no_db", img)
-    os.replace("%s/3gpp.duckdb" % WORK, "%s/full.duckdb" % WORK)
-    fulln = duckdb_scalar("%s/full.duckdb" % WORK, "SELECT count(*) FROM clauses;")
-    say("full_clauses=%s" % fulln)
-    # Emit the WHOLE-corpus per-release clause counts once (we have full.duckdb here,
-    # on Kaggle's fast network). The local dashboard reads this as its denominator,
-    # so it never has to download the 7GB corpus on a flaky laptop link.
-    rt = sh('duckdb "%s/full.duckdb" -noheader -list '
-            '"SELECT release || \'=\' || count(*) FROM clauses GROUP BY release;"' % WORK)
-    if rt.returncode == 0 and rt.stdout.strip():
-        pairs = ",".join(l.strip() for l in rt.stdout.splitlines() if l.strip())
-        say("release_totals=%s" % pairs)
-    # Lot mode slices by an explicit RELEASE SET; series mode by the 2-digit series.
-    # The release labels are validated against the safe Rel-NN / phase grammar before
-    # interpolation (they originate from the operator's lot definition, never the DB).
-    if RELEASES:
-        rels = [r.strip() for r in RELEASES.split(",") if r.strip()]
-        for r in rels:
-            if not re.match(r"^[A-Za-z0-9._-]+$", r):
-                fail("bad_release", "release=%s" % r)
-        where = "release IN (%s)" % ",".join("'%s'" % r for r in rels)
+    where = "substr(spec_id,1,2)='%s'" % SERIES
+slice_sql = ("ATTACH '%s/full.duckdb' AS s (READ_ONLY); "
+             "CREATE TABLE clauses AS SELECT * FROM s.clauses "
+             "WHERE %s;" % (WORK, where))
+if sh('duckdb "%s" "%s"' % (EMBEDDED_DB, slice_sql)).returncode != 0:
+    fail("slice")
+sln = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses;")
+say("sliced_clauses=%s" % sln)
+if not (sln.isdigit() and int(sln) >= 1):
+    fail("empty_slice", "shard=%s full=%s" % (SHARD, fulln))
+# Carry over prior vectors from the resume DB onto the FRESH slice, keyed by the
+# clause's natural identity + exact text (NOT chunk_id, which is unstable across a
+# re-published base). Unchanged clauses recover their vector → no GPU; changed/new
+# clauses stay NULL → re-embedded. Non-fatal: a carry failure just means re-embed.
+if RESUME_PRESENT:
+    carry_sql = (
+        "ATTACH '%s' AS r (READ_ONLY); "
+        "UPDATE clauses SET embedding = rc.embedding, embedding_hash = rc.embedding_hash "
+        "FROM r.clauses rc "
+        "WHERE clauses.spec_id = rc.spec_id AND clauses.release = rc.release "
+        "AND clauses.clause_path = rc.clause_path AND clauses.text = rc.text "
+        "AND rc.embedding IS NOT NULL;" % RESUME_DB)
+    cr = sh('duckdb "%s" "%s"' % (EMBEDDED_DB, carry_sql))
+    if cr.returncode != 0:
+        say("resume_carry=failed detail=%s (continuing as fresh re-embed)"
+            % (cr.stderr or "").strip()[-120:])
     else:
-        where = "substr(spec_id,1,2)='%s'" % SERIES
-    slice_sql = ("ATTACH '%s/full.duckdb' AS s (READ_ONLY); "
-                 "CREATE TABLE clauses AS SELECT * FROM s.clauses "
-                 "WHERE %s;" % (WORK, where))
-    if sh('duckdb "%s" "%s"' % (EMBEDDED_DB, slice_sql)).returncode != 0:
-        fail("slice")
-    sln = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses;")
-    say("sliced_clauses=%s" % sln)
-    if not (sln.isdigit() and int(sln) >= 1):
-        fail("empty_slice", "shard=%s full=%s" % (SHARD, fulln))
-    # DISK: full.duckdb (~1.7GB) is consumed — drop it so /kaggle/working doesn't carry
-    # it alongside the growing embedded DB + models (the disk-exhaustion crash root cause).
-    try:
-        os.remove("%s/full.duckdb" % WORK)
-        say("cleanup=full.duckdb_removed")
-    except OSError:
-        pass
+        carried = duckdb_scalar(
+            EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
+        say("resume_carry=ok reused_vectors=%s of_sliced=%s" % (carried or "?", sln))
+# DISK: full.duckdb (~1.7GB) is consumed — drop it so /kaggle/working doesn't carry
+# it alongside the growing embedded DB + models (the disk-exhaustion crash root cause).
+try:
+    os.remove("%s/full.duckdb" % WORK)
+    say("cleanup=full.duckdb_removed")
+except OSError:
+    pass
 
 # ---- ONNX Runtime (GPU) + BGE-M3 -------------------------------------------
 if sh('curl -fsSL --retry 5 -o /tmp/ort.tgz '
