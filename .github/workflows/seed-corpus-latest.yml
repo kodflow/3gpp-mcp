@@ -82,7 +82,11 @@ jobs:
           printf '%s\n' 'Dockerfile.corpus' '.dockerignore' > seed/.dockerignore
           DATE=$(date -u +%Y-%m-%d)
           REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-corpus"
-          docker buildx build --push -f seed/Dockerfile.corpus \
+          # --provenance=false --sbom=false: publish :latest as a SINGLE plain image
+          # manifest, NOT a buildx provenance INDEX whose untagged child platform
+          # manifest the GHCR retention prune orphans → :latest dangles → pull 404 →
+          # the embed kernel's FAIL=ghcr_export. Exactly how the previous latest broke.
+          docker buildx build --push --provenance=false --sbom=false -f seed/Dockerfile.corpus \
             -t "${REPO}:latest" -t "${REPO}:${DATE}-seed" seed/
           echo "seeded ${REPO}:latest (+ ${DATE}-seed)"
 

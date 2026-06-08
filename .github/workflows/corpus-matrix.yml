@@ -908,7 +908,11 @@ jobs:
           [ -s "dist/shard-${{ steps.shard.outputs.tag }}.report.json" ] && cp "dist/shard-${{ steps.shard.outputs.tag }}.report.json" dist/shard.report.json
           printf 'FROM scratch\nCOPY shard.duckdb /shard.duckdb\nCOPY shard.report.json /shard.report.json\n' > dist/Dockerfile.shard
           base="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-shard:${{ steps.shard.outputs.tag }}${sfx}"
-          docker buildx build --push -f dist/Dockerfile.shard \
+          # --provenance=false --sbom=false: single plain manifest, no untagged child
+          # manifest the retention prune can orphan (same failure class that dangled
+          # 3gpp-corpus:latest → FAIL=ghcr_export). Shards are FROM-scratch data images,
+          # not runnable artifacts — provenance/SBOM add nothing but a prunable child.
+          docker buildx build --push --provenance=false --sbom=false -f dist/Dockerfile.shard \
             -t "$base" -t "${base}-${{ github.run_id }}" dist/
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
@@ -1159,7 +1163,13 @@ jobs:
           printf '%s\n' '*.zst' '*.sha256' catalog Dockerfile.corpus > data/.dockerignore
           DATE=$(date -u +%Y-%m-%d)
           REPO="ghcr.io/${{ github.repository_owner }}/3gpp-corpus"
-          docker buildx build --push -f data/Dockerfile.corpus \
+          # --provenance=false --sbom=false: publish :latest as a SINGLE plain image
+          # manifest, NOT a buildx provenance INDEX. An index references an untagged
+          # child platform manifest; the GHCR retention prune (job 6) deletes that
+          # "untagged" child and leaves :latest dangling → pull 404 → the embed kernel's
+          # crane export of the base fails with FAIL=ghcr_export and NOTHING embeds. A
+          # single manifest has no orphanable child, so the prune cannot break it.
+          docker buildx build --push --provenance=false --sbom=false -f data/Dockerfile.corpus \
             -t "${REPO}:${DATE}" -t "${REPO}:latest" data/
           echo "published ${REPO}:${DATE} + :latest"
           # NOTE: package visibility is UI-only (no REST API) — set 3gpp-corpus
