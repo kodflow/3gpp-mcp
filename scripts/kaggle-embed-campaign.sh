@@ -115,7 +115,7 @@ stage_kernel() {
 # poll_kernel SERIES — block until the kernel reaches a terminal state. Echoes
 # complete | error | cancel (the CLI exit code is unreliable, so parse the string).
 poll_kernel() {
-  local s="$1" slug out; slug="$(kernel_slug "$s")"
+  local s="$1" slug out last=""; slug="$(kernel_slug "$s")"
   while :; do
     out="$(kaggle kernels status "$slug" 2>&1 || true)"
     case "$out" in
@@ -123,6 +123,18 @@ poll_kernel() {
       *error*|*ERROR*)       echo error;    return 0 ;;
       *cancel*|*CANCEL*)     echo cancel;   return 0 ;;
     esac
+    # Heartbeat on STDERR only — stdout is this function's captured return value, so a
+    # log line there would corrupt `state="$(poll_kernel)"`. Emitting the status string
+    # on every CHANGE turns the previously-silent multi-hour poll into a visible signal:
+    # a kernel stuck in "queued" (GPU weekly quota exhausted, or the >2 concurrent-GPU
+    # session limit when 4 series are pushed at once) is now distinguishable from one
+    # actually "running" — instead of the log going dead after "push" with no way to
+    # tell forward progress from a silent stall.
+    local cur; cur="$(printf '%s' "$out" | tr '\n' ' ' | tail -c 80)"
+    if [ "$cur" != "$last" ]; then
+      echo "[kaggle-campaign] series $s: status -> $cur" >&2
+      last="$cur"
+    fi
     sleep 30
   done
 }
@@ -213,6 +225,12 @@ run_one() {
     local push_out push_rc
     if push_out="$(kaggle kernels push -p "$dir" --accelerator "$ACCELERATOR" 2>&1)"; then
       push_rc=0
+      # Surface the kernel URL + Kaggle's push acknowledgement on SUCCESS too. Without
+      # this the slug (hence the KAGGLE_USERNAME account it landed on) only ever reached
+      # the log on failure, leaving a successful push followed by a silent poll with no
+      # way to tell WHICH account is running it — exactly the ambiguity that cost a
+      # debugging session.
+      log "series $s: push OK -> https://www.kaggle.com/code/$(kernel_slug "$s") — $(printf '%s' "$push_out" | tr '\n' ' ' | tail -c 200)"
     else
       push_rc=$?
       log "series $s: push failed (rc=$push_rc): $(printf '%s' "$push_out" | tr '\n' ' ' | tail -c 400)"
