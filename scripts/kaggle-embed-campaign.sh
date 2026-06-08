@@ -113,15 +113,36 @@ stage_kernel() {
 }
 
 # poll_kernel SERIES — block until the kernel reaches a terminal state. Echoes
-# complete | error | cancel (the CLI exit code is unreliable, so parse the string).
+# complete | error | cancel | unreadable (the CLI exit code is unreliable, so parse
+# the string). POLL_MAX_UNREADABLE bounds the "unreadable" escape hatch below.
 poll_kernel() {
-  local s="$1" slug out last=""; slug="$(kernel_slug "$s")"
+  local s="$1" slug out last="" unreadable=0
+  local limit="${POLL_MAX_UNREADABLE:-20}"   # ×30s ≈ 10 min of consecutive API errors
+  slug="$(kernel_slug "$s")"
   while :; do
     out="$(kaggle kernels status "$slug" 2>&1 || true)"
     case "$out" in
       *complete*|*COMPLETE*) echo complete; return 0 ;;
       *error*|*ERROR*)       echo error;    return 0 ;;
       *cancel*|*CANCEL*)     echo cancel;   return 0 ;;
+      *running*|*RUNNING*|*queue*|*QUEUE*) unreadable=0 ;;  # legit in-progress; keep polling
+      *)
+        # `kaggle kernels status` returned NEITHER a terminal state NOR a recognised
+        # in-progress one: it printed an API error/exception (e.g. a bare
+        # ".../kernels.KernelsApiService/GetKernelSessionStatus" URL) instead of a
+        # status. That is exactly what made the poll hang for the whole 330-min box —
+        # the push "succeeds" but no run session is ever observable, typically because
+        # the Kaggle account behind KAGGLE_API_TOKEN/KAGGLE_USERNAME is not
+        # GPU/Internet-verified (no session starts), the slug namespace differs from the
+        # authenticated account, or the status API itself is down. Bound it: after
+        # `limit` CONSECUTIVE unreadable polls, give up with a distinct state instead of
+        # looping forever. A single transient error resets once a real status returns.
+        unreadable=$((unreadable + 1))
+        if [ "$unreadable" -ge "$limit" ]; then
+          echo unreadable
+          return 0
+        fi
+        ;;
     esac
     # Heartbeat on STDERR only — stdout is this function's captured return value, so a
     # log line there would corrupt `state="$(poll_kernel)"`. Emitting the status string
@@ -237,6 +258,15 @@ run_one() {
       sleep 15; continue
     fi
     local state; state="$(poll_kernel "$s")"
+    # Upstream guard 0 — UNOBSERVABLE SESSION: the push succeeded but `kaggle kernels
+    # status` stayed unreadable (API error, no run session). Retrying re-pushes a kernel
+    # that will again never start a session, so abort the series LOUDLY with the most
+    # likely root cause instead of burning the whole time box. This is deterministic for
+    # the run (same account/secret), so it is non-retryable like a fatal kernel failure.
+    if [ "$state" = unreadable ]; then
+      log "series $s: ABORT — push OK but no run session is observable (kaggle kernels status returned an API error, not a state, for ~$(( ${POLL_MAX_UNREADABLE:-20} * 30 / 60 )) min). Most likely the Kaggle account behind KAGGLE_API_TOKEN/KAGGLE_USERNAME is NOT phone/GPU/Internet-verified so no session starts, OR KAGGLE_USERNAME names a different account than the token. Fix the secrets to one verified account; not retrying (re-push would hang identically)."
+      return 2
+    fi
     mkdir -p "$STAGE/out-$s"
     timeout 300 kaggle kernels output "$(kernel_slug "$s")" -p "$STAGE/out-$s" >/dev/null 2>&1 || true
     version_state "$s"
