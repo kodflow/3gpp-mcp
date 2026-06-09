@@ -170,7 +170,7 @@ jobs:
           # HARD ASSERTIONS — never ship a :full that is silently lexical. The first
           # publish DID exactly that (DB.zst + vectors dropped by .dockerignore, model
           # never landed). Fail the bake LOUDLY if any semantic artifact is missing.
-          echo "=== image-data tree ==="; ls -laR image-data | head -60
+          echo "=== image-data tree ==="; { ls -laR image-data | head -60; } 2>/dev/null || true
           echo "=== sizes ==="; du -sh image-data image-data/* image-data/*/* 2>/dev/null || true
           test -s image-data/3gpp.duckdb.zst               || { echo "::error::baked DB.zst missing"; exit 1; }
           test -s image-data/models/bge-m3/model.onnx_data || { echo "::error::BGE-M3 weights (model.onnx_data) missing — bootstrap did not fetch the model"; exit 1; }
