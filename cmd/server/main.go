@@ -93,6 +93,16 @@ func serve(args []string) error {
 
 	ctx := context.Background()
 
+	// HTTP mode: bring /healthz up BEFORE the (possibly minutes-long) DB + vector
+	// bootstrap, so a puller sees 503 "loading" during startup and 200 "ready" only
+	// once the corpus is actually queryable (not connection-refused-then-instantly-up).
+	var httpReady func(*mcpserver.MCPServer, *store.Store)
+	var httpErrc <-chan error
+	if *httpAddr != "" {
+		httpReady, httpErrc = startEarlyHTTP(*httpAddr)
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] /healthz live on %s — loading corpus (status=loading)…\n", *httpAddr)
+	}
+
 	// Resolve the DB autonomously: an explicit/local path wins (dev); otherwise
 	// serve from the per-user cache, pulling it from the rolling 'latest' release
 	// when absent and refreshing it (best-effort, sha256-gated) when stale. A
@@ -196,9 +206,10 @@ func serve(args []string) error {
 	// the SAME *MCPServer on Streamable HTTP plus a copy-paste landing page; the
 	// engine is transport-agnostic, so nothing about retrieval changes.
 	if *httpAddr != "" {
-		fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP over Streamable HTTP on %s (endpoint /mcp, landing /, db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
+		httpReady(srv, st) // flip /healthz → 200 ready and wire the live MCP + /spec routes
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] READY: MCP over Streamable HTTP on %s (endpoint /mcp, landing /, db=%s, fts=%v, hnsw=%v, baseline=%s, status=ready)\n",
 			*httpAddr, effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
-		return serveHTTP(srv, st, *httpAddr)
+		return <-httpErrc
 	}
 	fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP on stdio (db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
 		effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
