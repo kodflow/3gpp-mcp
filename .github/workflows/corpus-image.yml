@@ -121,6 +121,13 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
+          # Free runner disk FIRST: the full bake stages ~15 GB (raw DB 6.4G + model
+          # 2.3G + vectors 3.4G + DB.zst 3G) and the default runner only has ~14 GB
+          # free on /. Reclaim the pre-installed toolchains we don't use.
+          echo "disk before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "disk after free:"; df -h / | tail -1
           rm -rf image-data && mkdir -p image-data/vec
           # 1) DB = the CURRENT lexical corpus from the PRIVATE GHCR image (the Release
           #    asset is frozen/older and its /releases/latest/download/ path 404s). The
@@ -160,7 +167,14 @@ jobs:
           else
             echo "::warning::no 3gpp-vec:latest-fp16 yet — full image ships lexical until vectors are published"
           fi
-          du -sh image-data image-data/* 2>/dev/null || true
+          # HARD ASSERTIONS — never ship a :full that is silently lexical. The first
+          # publish DID exactly that (DB.zst + vectors dropped by .dockerignore, model
+          # never landed). Fail the bake LOUDLY if any semantic artifact is missing.
+          echo "=== image-data tree ==="; ls -laR image-data | head -60
+          echo "=== sizes ==="; du -sh image-data image-data/* image-data/*/* 2>/dev/null || true
+          test -s image-data/3gpp.duckdb.zst               || { echo "::error::baked DB.zst missing"; exit 1; }
+          test -s image-data/models/bge-m3/model.onnx_data || { echo "::error::BGE-M3 weights (model.onnx_data) missing — bootstrap did not fetch the model"; exit 1; }
+          test -s image-data/vec/vec-manifest.json         || { echo "::error::vector sub-bases missing"; exit 1; }
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       # GHCR_PAT (not github.token): pushing with the CI token auto-links the image
