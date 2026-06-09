@@ -39,33 +39,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  bake-and-push:
-    runs-on: ubuntu-latest
+  build:
+    # MULTI-ARCH via NATIVE runners (NOT QEMU): each arch builds on its own runner so
+    # the CGO/DuckDB compile is native (fast) AND the full bake fetches the CORRECT
+    # ONNX Runtime for that arch (the bootstrap is arch-aware) — a QEMU build would bake
+    # the amd64 ORT into the arm64 image. Each (variant,arch) pushes BY DIGEST; the
+    # `manifest` job then fuses the per-arch digests into the multi-arch tags.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180 # full bakes DB + ONNX Runtime + BGE-M3 (~25 GB provision)
-    # Two image variants per run:
-    #   light → binary only; corpus bootstrapped from the network on first run.
-    #   full  → onnx binary + DB + vector sub-bases + BGE-M3 model baked as .zst
-    #           (entrypoint decompresses on first start) → offline semantic. = :latest.
     strategy:
       fail-fast: false
       matrix:
+        variant: [light, full]
+        arch: [amd64, arm64]
         include:
-          - variant: light
+          - variant: light # binary only; corpus bootstrapped from the network on first run.
             build_tags: ""
-            tag_lines: type=raw,value=light
-            # small binary-only build → GHA layer cache is worth it.
-            cache_from: type=gha
-            cache_to: type=gha,mode=max
-          - variant: full
+          - variant: full # onnx + DB + vectors + BGE-M3 baked → offline semantic. = :latest.
             build_tags: onnx
-            tag_lines: |
-              type=raw,value=latest
-              type=raw,value=full
-            # NO GHA cache: the baked DB + model layers are multi-GB and overflow /
-            # 504 the GitHub Actions Cache export (mode=max). Caching them is also
-            # pointless (they change rarely and dwarf the 10 GB cache budget).
-            cache_from: ""
-            cache_to: ""
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     # Run on manual dispatch, or only when the chained Corpus · Build SUCCEEDED.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
@@ -189,37 +184,86 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
-          tags: |
-            ${{ matrix.tag_lines }}
-            type=sha,prefix=${{ matrix.variant }}-,format=short
           # NO org.opencontainers.image.source label: it LINKS the package to the
           # public repo and forces PUBLIC inheritance (the leak). Keep only a
           # description; the image must stay PRIVATE (it bakes verbatim 3GPP text).
           labels: |
             org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in (PRIVATE)
+      # Build the SINGLE-arch image and push it BY DIGEST (no tags here — the `manifest`
+      # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
+      # the per-arch push a plain manifest so `imagetools` composes it cleanly.
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
-          push: ${{ github.event.inputs.push != 'false' }}
+          platforms: linux/${{ matrix.arch }}
           build-args: |
             BUILD_TAGS=${{ matrix.build_tags }}
             VARIANT=${{ matrix.variant }}
             VERSION=${{ github.sha }}
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Per-variant: light caches to GHA; full disables it (multi-GB baked layers
-          # 504 the cache export — see matrix). provenance/sbom only when pushing (the
-          # attestation step needs a pushed digest; skip on push=false test builds).
-          cache-from: ${{ matrix.cache_from }}
-          cache-to: ${{ matrix.cache_to }}
-          provenance: ${{ github.event.inputs.push != 'false' && 'mode=max' || 'false' }}
-          sbom: ${{ github.event.inputs.push != 'false' }}
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        if: ${{ github.event.inputs.push != 'false' && steps.build.outputs.digest != '' }}
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/3gpp-mcp,push-by-digest=true,name-canonical=true,push=${{ github.event.inputs.push != 'false' }}
+      - name: Export digest for the manifest job
+        if: ${{ github.event.inputs.push != 'false' }}
+        run: |
+          mkdir -p /tmp/digests
+          d='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${d#sha256:}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: ${{ github.event.inputs.push != 'false' }}
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Fuse the per-arch (amd64 + arm64) digests of each variant into the multi-arch tags.
+  manifest:
+    needs: build
+    if: ${{ github.event.inputs.push != 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: light
+            tag_lines: type=raw,value=light
+          - variant: full
+            tag_lines: |
+              type=raw,value=latest
+              type=raw,value=full
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: digests-${{ matrix.variant }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          tags: |
+            ${{ matrix.tag_lines }}
+            type=sha,prefix=${{ matrix.variant }}-,format=short
+      - name: Create multi-arch manifest from the per-arch digests
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          REPO=ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' "$DOCKER_METADATA_OUTPUT_JSON")
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create $tags $(printf "${REPO}@sha256:%s " *)
+      - name: Verify multi-arch
+        run: |
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:${{ matrix.variant == 'full' && 'latest' || 'light' }}" \
+            | grep -E "Platform|MediaType" | head
