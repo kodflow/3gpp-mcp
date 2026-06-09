@@ -54,3 +54,21 @@ fall back to the official 3GPP `url` the MCP returned.
 Guardrails: TS by default; carry `(release, version)` when ordering (3GPP versions are
 non-monotonic); if `server_info` says semantic is off, say search is lexical; all
 reasoning is yours, the MCP only does cited retrieval.
+
+---
+
+## Running the server (image variants + readiness)
+
+- **`ghcr.io/<owner>/3gpp-mcp:full` (= `:latest`)** — semantic, batteries-included: the
+  corpus DB + vector sub-bases + BGE-M3 model are baked in (as `.zst`, decompressed into
+  `/data` on first start). Mount a named volume so `--rm` pays that decompression once:
+  `-v 3gpp-mcp-data:/data`.
+- **`:light`** — binary only (lexical/BM25); bootstraps the DB from the network on first
+  run. Small image.
+- Transports: stdio (`docker run -i --rm … serve`, the Claude-Code contract — no `-t`),
+  or HTTP (`-e MCP_TRANSPORT=http`, then `claude mcp add --transport http 3gpp
+  http://host:8765/mcp`).
+- Readiness (HTTP): `GET /healthz` → `503 {"status":"loading"}` while the corpus/vectors
+  load, `200 {"status":"ready"}` when queryable. Wait for `ready`.
+- Semantic is per-series: a series whose vectors aren't baked yet falls back to lexical;
+  `server_info` reports the active modes.
