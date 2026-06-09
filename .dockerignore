@@ -19,3 +19,8 @@ tests/
 **/*_test.go
 node_modules/
 *.log
+# CRITICAL: re-include EVERYTHING under image-data AFTER the *.zst / *.duckdb
+# excludes above. Those patterns also matched the BAKED artifacts (image-data/
+# 3gpp.duckdb.zst, image-data/vec/*.duckdb.zst), silently dropping the DB +
+# vectors from the build context → the :full image shipped lexical (DB only).
+!image-data/**
