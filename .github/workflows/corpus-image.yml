@@ -96,14 +96,24 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf image-data && mkdir -p image-data/vec
-          # 1) DB + ONNX Runtime + BGE-M3 + reranker via the binary's own provisioner
-          #    (single source of truth for what a semantic install needs).
+          # 1) DB = the CURRENT lexical corpus from the PRIVATE GHCR image (the Release
+          #    asset is frozen/older and its /releases/latest/download/ path 404s). The
+          #    corpus image is FROM scratch → `docker create` needs a (never-run) cmd arg.
+          echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
+          docker pull "$img"
+          cid=$(docker create "$img" /noop)
+          docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
+          docker rm "$cid" >/dev/null
+          test -s image-data/3gpp.duckdb
+          # 2) ONNX Runtime + BGE-M3 + reranker via the binary's own provisioner
+          #    (--skip-db: the DB is provided above, don't refetch a stale one).
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
-          /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic
-          # 2) gate on the freshly provisioned DB BEFORE compressing it.
+          /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db
+          # 3) gate on the baked DB BEFORE compressing it.
           CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
             --require-fts --min-clauses 1 --max-empty-meta 100000
-          # 3) keep the DB as .zst (small image; entrypoint decompresses on first start).
+          # 4) keep the DB as .zst (small image; entrypoint decompresses on first start).
           zstd -q --long=27 image-data/3gpp.duckdb -o image-data/3gpp.duckdb.zst
           rm -f image-data/3gpp.duckdb
           # 4) vector sub-bases (already .zst) from the fp16 channel; degrade to lexical
