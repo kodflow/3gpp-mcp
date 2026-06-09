@@ -9,9 +9,11 @@ import (
 	_ "embed"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -87,20 +89,66 @@ func imageRef() string {
 	return defaultImage
 }
 
-// serveHTTP mounts the MCP Streamable HTTP transport + the landing routes on one
-// mux and blocks. Diagnostics already went to stderr in serve(); request logging
-// here is intentionally minimal.
-func serveHTTP(srv *mcpserver.MCPServer, st *store.Store, addr string) error {
-	stream := mcpserver.NewStreamableHTTPServer(srv, mcpserver.WithEndpointPath(mcpEndpointPath))
+// startEarlyHTTP brings the HTTP listener up IMMEDIATELY — before the (possibly
+// minutes-long) DB + vector bootstrap — so a puller (devcontainer, k8s/compose
+// healthcheck) can tell three states apart instead of just up/down:
+//   - connection refused → the process is not started
+//   - 503 {"status":"loading"} → started, still pulling/opening the corpus
+//   - 200 {"status":"ready"}   → corpus + vectors attached, MCP endpoint live
+//
+// The MCP and /spec routes 503 until markReady installs the real handlers, so a
+// client never gets a half-open engine. markReady is called once serve() has the
+// store + MCPServer; it flips the readiness flag under a write lock. Returns the
+// channel carrying the eventual ListenAndServe error so serve() can block on it.
+func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.Store), errc <-chan error) {
+	var (
+		mu     sync.RWMutex
+		stream http.Handler
+		spec   http.HandlerFunc
+		ready  bool
+	)
+	loading := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"status":"loading"}`+"\n")
+	}
 	mux := http.NewServeMux()
-	mux.Handle(mcpEndpointPath, stream)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		mu.RLock()
+		r := ready
+		mu.RUnlock()
+		if !r {
+			loading(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ready"}`+"\n")
+	})
+	mux.HandleFunc(mcpEndpointPath, func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		h := stream
+		mu.RUnlock()
+		if h == nil {
+			loading(w)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 	// /spec/{spec_id}/{release}/{clause} (+ query-string fallback) renders the
 	// exact indexed clause text so a citation in an HTTP-mode answer is clickable.
-	mux.HandleFunc("/spec/", specDocHandler(st))
-	mux.HandleFunc("/spec", specDocHandler(st))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	specGate := func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		h := spec
+		mu.RUnlock()
+		if h == nil {
+			loading(w)
+			return
+		}
+		h(w, r)
+	}
+	mux.HandleFunc("/spec/", specGate)
+	mux.HandleFunc("/spec", specGate)
+	// Static routes are independent of the corpus, so they serve from the first instant.
 	mux.HandleFunc("/llms.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = fmt.Fprint(w, substHost(aiPrompt, hostOr(r.Host)))
@@ -110,7 +158,18 @@ func serveHTTP(srv *mcpserver.MCPServer, st *store.Store, addr string) error {
 		_, _ = fmt.Fprint(w, skill3gpp)
 	})
 	mux.HandleFunc("/", landingHandler)
-	return http.ListenAndServe(addr, mux) //nolint:gosec // addr is operator-chosen; loopback by doctrine
+
+	ch := make(chan error, 1)
+	go func() { ch <- http.ListenAndServe(addr, mux) }() //nolint:gosec // addr is operator-chosen; loopback by doctrine
+
+	markReady = func(srv *mcpserver.MCPServer, st *store.Store) {
+		h := mcpserver.NewStreamableHTTPServer(srv, mcpserver.WithEndpointPath(mcpEndpointPath))
+		sp := specDocHandler(st)
+		mu.Lock()
+		stream, spec, ready = h, sp, true
+		mu.Unlock()
+	}
+	return markReady, ch
 }
 
 func hostOr(host string) string {

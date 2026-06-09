@@ -37,10 +37,17 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
 # ---- runtime ----------------------------------------------------------------
 # glibc base (NOT scratch/alpine): DuckDB's static lib + libstdc++/libgomp.
 FROM debian:bookworm-slim AS runtime
+# zstd: the FULL image bakes the corpus DB + vector sub-bases as .zst (small image);
+# the entrypoint decompresses them into /data on first start.
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-      libstdc++6 libgomp1 ca-certificates wget && \
+      libstdc++6 libgomp1 ca-certificates wget zstd && \
     rm -rf /var/lib/apt/lists/*
+
+# VARIANT is informational (light|full); the actual contents come from BUILD_TAGS
+# (onnx for full) and whether image-data/ was populated by the CI before the build.
+ARG VARIANT=light
+LABEL org.opencontainers.image.variant="${VARIANT}"
 
 # Non-root.
 RUN groupadd -g 10001 mcp && \

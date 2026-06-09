@@ -94,7 +94,9 @@ func runBootstrap(args []string) error {
 	cache := fs.String("cache", "", "cache dir (default: per-user cache, or $MCP3GPP_CACHE)")
 	dbURL := fs.String("db-url", "", "URL of the indexed DuckDB snapshot (.duckdb or .duckdb.zst)")
 	dbSHA := fs.String("db-sha256", "", "expected SHA-256 of the decompressed DB (recommended)")
+	skipDB := fs.Bool("skip-db", false, "do not fetch the DB (models/ONNX Runtime only) — for image bakes that provide the DB separately")
 	semantic := fs.Bool("semantic", false, "also fetch BGE-M3 + reranker models and ONNX Runtime (~5 GB)")
+	noReranker := fs.Bool("no-reranker", false, "with --semantic, fetch only the BGE-M3 embedder + ONNX Runtime, NOT the optional reranker (smaller, fewer flaky fetches)")
 	ortVer := fs.String("ort-version", bootstrap.DefaultORTVersion, "ONNX Runtime version")
 	_ = fs.Parse(args)
 
@@ -103,22 +105,24 @@ func runBootstrap(args []string) error {
 	}
 	ctx := context.Background()
 
-	dbPath, err := bootstrap.DBPath()
-	if err != nil {
-		return err
-	}
-	// No --db-url? Default to the rolling "latest" release, resolving its
-	// published sha256 so the download is verified out of the box.
-	url, sha := *dbURL, *dbSHA
-	if url == "" {
-		url = defaultDBURL
-		if sha == "" {
-			sha = remoteSHA(ctx, defaultDBSHAURL)
+	if !*skipDB {
+		dbPath, err := bootstrap.DBPath()
+		if err != nil {
+			return err
 		}
-	}
-	fmt.Fprintf(os.Stderr, "[bootstrap] DB %s → %s\n", url, dbPath)
-	if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: url, SHA256: sha, Dest: dbPath}); err != nil {
-		return err
+		// No --db-url? Default to the rolling "latest" release, resolving its
+		// published sha256 so the download is verified out of the box.
+		url, sha := *dbURL, *dbSHA
+		if url == "" {
+			url = defaultDBURL
+			if sha == "" {
+				sha = remoteSHA(ctx, defaultDBSHAURL)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "[bootstrap] DB %s → %s\n", url, dbPath)
+		if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: url, SHA256: sha, Dest: dbPath}); err != nil {
+			return err
+		}
 	}
 
 	if *semantic {
@@ -130,7 +134,10 @@ func runBootstrap(args []string) error {
 		if err := bootstrap.FetchORT(ctx, models, *ortVer); err != nil {
 			return err
 		}
-		arts := append(bootstrap.EmbedderArtifacts(models), bootstrap.RerankerArtifacts(models)...)
+		arts := bootstrap.EmbedderArtifacts(models)
+		if !*noReranker {
+			arts = append(arts, bootstrap.RerankerArtifacts(models)...)
+		}
 		if err := bootstrap.FetchAll(ctx, arts); err != nil {
 			return err
 		}
