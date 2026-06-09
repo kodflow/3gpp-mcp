@@ -267,7 +267,9 @@ jobs:
         run: |
           set -euo pipefail
           REPO=ghcr.io/${{ github.repository_owner }}/3gpp-mcp
-          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' "$DOCKER_METADATA_OUTPUT_JSON")
+          # DOCKER_METADATA_OUTPUT_JSON holds the JSON string itself (not a path);
+          # feed it on stdin, otherwise jq treats the JSON as a filename to open.
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON")
           # shellcheck disable=SC2046,SC2086
           docker buildx imagetools create $tags $(printf "${REPO}@sha256:%s " *)
       - name: Verify multi-arch
