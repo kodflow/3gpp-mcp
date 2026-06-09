@@ -124,10 +124,18 @@ jobs:
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
           test -s image-data/3gpp.duckdb
-          # 2) ONNX Runtime + BGE-M3 + reranker via the binary's own provisioner
-          #    (--skip-db: the DB is provided above, don't refetch a stale one).
+          # 2) ONNX Runtime + BGE-M3 embedder via the binary's own provisioner.
+          #    --skip-db: the DB is provided above (no stale refetch).
+          #    --no-reranker: the reranker is optional (axis #7) — skipping it keeps the
+          #    image smaller and removes the flaky 2nd large HF fetch that TLS-timed-out.
+          #    Retry: the HF/CDN fetch is occasionally slow → up to 3 attempts.
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
-          /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db
+          ok=0
+          for attempt in 1 2 3; do
+            if /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker; then ok=1; break; fi
+            echo "::warning::bootstrap attempt $attempt failed (transient HF/CDN?) — retrying"; sleep 20
+          done
+          [ "$ok" = 1 ] || { echo "::error::model/ORT bootstrap failed after 3 attempts"; exit 1; }
           # 3) gate on the baked DB BEFORE compressing it.
           CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
             --require-fts --min-clauses 1 --max-empty-meta 100000

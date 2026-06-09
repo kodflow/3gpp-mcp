@@ -96,6 +96,7 @@ func runBootstrap(args []string) error {
 	dbSHA := fs.String("db-sha256", "", "expected SHA-256 of the decompressed DB (recommended)")
 	skipDB := fs.Bool("skip-db", false, "do not fetch the DB (models/ONNX Runtime only) — for image bakes that provide the DB separately")
 	semantic := fs.Bool("semantic", false, "also fetch BGE-M3 + reranker models and ONNX Runtime (~5 GB)")
+	noReranker := fs.Bool("no-reranker", false, "with --semantic, fetch only the BGE-M3 embedder + ONNX Runtime, NOT the optional reranker (smaller, fewer flaky fetches)")
 	ortVer := fs.String("ort-version", bootstrap.DefaultORTVersion, "ONNX Runtime version")
 	_ = fs.Parse(args)
 
@@ -133,7 +134,10 @@ func runBootstrap(args []string) error {
 		if err := bootstrap.FetchORT(ctx, models, *ortVer); err != nil {
 			return err
 		}
-		arts := append(bootstrap.EmbedderArtifacts(models), bootstrap.RerankerArtifacts(models)...)
+		arts := bootstrap.EmbedderArtifacts(models)
+		if !*noReranker {
+			arts = append(arts, bootstrap.RerankerArtifacts(models)...)
+		}
 		if err := bootstrap.FetchAll(ctx, arts); err != nil {
 			return err
 		}
