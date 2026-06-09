@@ -75,14 +75,32 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # LIGHT: ship the binary only. image-data/ stays empty (.gitkeep) so the image
-      # carries no corpus; `serve` bootstraps the DB from the network on first run.
-      - name: Light — binary-only (no baked corpus)
+      # LIGHT: bake the SAME lexical corpus DB as full, but WITHOUT the vector
+      # sub-bases or the BGE-M3 model → offline lexical (BM25), small image. The
+      # distributed corpus DB is already lexical (vectors are the separate 3gpp-vec
+      # Option-B overlay, not an embedding column), so "light" = full minus the
+      # vec/model, NOT a strip step. (Baking is required: the runtime DB-bootstrap
+      # URL — releases/latest/download — 404s, so an empty light would have no DB.)
+      - name: Light — bake the lexical DB only (zst), no vectors/model
         if: matrix.variant == 'light'
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
-          rm -rf image-data && mkdir -p image-data && touch image-data/.gitkeep
-          echo "light: image-data empty (binary bootstraps the corpus at runtime)"
+          rm -rf image-data && mkdir -p image-data
+          echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
+          docker pull "$img"
+          cid=$(docker create "$img" /noop)
+          docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
+          docker rm "$cid" >/dev/null
+          test -s image-data/3gpp.duckdb
+          CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
+            --require-fts --min-clauses 1 --max-empty-meta 100000
+          zstd -q --long=27 image-data/3gpp.duckdb -o image-data/3gpp.duckdb.zst
+          rm -f image-data/3gpp.duckdb
+          du -sh image-data/* 2>/dev/null || true
 
       # FULL: bake the corpus DB + ONNX Runtime + BGE-M3 model + vector sub-bases into
       # image-data/ so the image is offline-semantic on pull. The DB + vectors are kept
