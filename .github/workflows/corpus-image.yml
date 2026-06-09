@@ -69,7 +69,7 @@ jobs:
       id-token: write # SLSA provenance attestation
       attestations: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
@@ -178,16 +178,16 @@ jobs:
           test -s image-data/models/bge-m3/model.onnx_data || { echo "::error::BGE-M3 weights (model.onnx_data) missing — bootstrap did not fetch the model"; exit 1; }
           test -s image-data/vec/vec-manifest.json         || { echo "::error::vector sub-bases missing"; exit 1; }
 
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       # GHCR_PAT (not github.token): pushing with the CI token auto-links the image
       # to this PUBLIC repo → it inherits PUBLIC visibility. A PAT push stays
       # unlinked → born PRIVATE. (Same reason as corpus-matrix.)
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+      - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
@@ -199,7 +199,7 @@ jobs:
       # Build the SINGLE-arch image and push it BY DIGEST (no tags here — the `manifest`
       # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
       # the per-arch push a plain manifest so `imagetools` composes it cleanly.
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         id: build
         with:
           context: .
@@ -249,13 +249,13 @@ jobs:
           pattern: digests-${{ matrix.variant }}-*
           path: /tmp/digests
           merge-multiple: true
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+      - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
