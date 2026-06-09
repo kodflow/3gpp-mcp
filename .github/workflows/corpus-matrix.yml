@@ -489,7 +489,7 @@ jobs:
           cache: true
       # buildx (container driver) is required for `docker buildx build --push` of
       # the FROM-scratch shard image to GHCR.
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       # A matrix entry is either a bare series ("24") or a series|release sub-shard
       # ("24|Rel-19"). Sub-sharding a big series by release keeps each job under the
       # 6h cap so it finishes in one slot instead of relying on the auto-resume
@@ -957,7 +957,7 @@ jobs:
       # (unlinked to the public repo). See the build-shard login note.
       - name: GHCR login (pull base + shard images, push corpus image)
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Merge shard images → consolidated DB (generated Dockerfile, merge in build)
         env:
           MATRIX: ${{ needs.discover.outputs.matrix }}
