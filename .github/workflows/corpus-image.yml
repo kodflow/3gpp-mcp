@@ -53,11 +53,19 @@ jobs:
           - variant: light
             build_tags: ""
             tag_lines: type=raw,value=light
+            # small binary-only build → GHA layer cache is worth it.
+            cache_from: type=gha
+            cache_to: type=gha,mode=max
           - variant: full
             build_tags: onnx
             tag_lines: |
               type=raw,value=latest
               type=raw,value=full
+            # NO GHA cache: the baked DB + model layers are multi-GB and overflow /
+            # 504 the GitHub Actions Cache export (mode=max). Caching them is also
+            # pointless (they change rarely and dwarf the 10 GB cache budget).
+            cache_from: ""
+            cache_to: ""
     # Run on manual dispatch, or only when the chained Corpus · Build SUCCEEDED.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
@@ -188,10 +196,13 @@ jobs:
             VERSION=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+          # Per-variant: light caches to GHA; full disables it (multi-GB baked layers
+          # 504 the cache export — see matrix). provenance/sbom only when pushing (the
+          # attestation step needs a pushed digest; skip on push=false test builds).
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: ${{ matrix.cache_to }}
+          provenance: ${{ github.event.inputs.push != 'false' && 'mode=max' || 'false' }}
+          sbom: ${{ github.event.inputs.push != 'false' }}
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         if: ${{ github.event.inputs.push != 'false' && steps.build.outputs.digest != '' }}
         with:
