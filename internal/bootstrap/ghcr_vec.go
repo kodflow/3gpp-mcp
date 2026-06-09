@@ -29,9 +29,20 @@ func FetchVecBases(ctx context.Context, owner, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	layers, err := ghcrLayers(ctx, repo, "latest", tok)
+	// Precision-aware channel resolution. The embed publish-vec job tags the fp16
+	// sub-bases `latest-fp16` (and fp32 the bare `latest`); a hardcoded `latest`
+	// here silently MISSED every fp16 publish → the server bootstrapped with NO
+	// vectors and ran lexical-only on a fresh pull. Try the fp16 channel first
+	// (the proven default), then fall back to the legacy fp32 `latest`.
+	layers, err := ghcrLayers(ctx, repo, "latest-fp16", tok)
+	if err != nil || len(layers) == 0 {
+		layers, err = ghcrLayers(ctx, repo, "latest", tok)
+	}
 	if err != nil {
 		return "", err
+	}
+	if len(layers) == 0 {
+		return "", fmt.Errorf("no vector sub-bases on ghcr.io/%s (tried latest-fp16, latest)", repo)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
