@@ -154,7 +154,14 @@ jobs:
           rm -f image-data/3gpp.duckdb
           # 4) vector sub-bases (already .zst) from the fp16 channel; degrade to lexical
           #    if none are published yet (coverage is being completed series by series).
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz" \
+          # oras CLI must match the RUNNER arch (this step runs natively, not in QEMU);
+          # a hardcoded amd64 binary fails with "Exec format error" on the arm64 runner.
+          case "$(uname -m)" in
+            x86_64)  oras_arch=amd64 ;;
+            aarch64) oras_arch=arm64 ;;
+            *) echo "::error::unsupported runner arch $(uname -m) for oras"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz" \
             | sudo tar -xz -C /usr/local/bin oras
           echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
           if oras pull "ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16" -o image-data/vec; then
