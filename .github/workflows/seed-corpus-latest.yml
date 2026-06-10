@@ -42,14 +42,19 @@ jobs:
   seed:
     runs-on: ubuntu-latest
     steps:
+      # checkout so the run: steps can source scripts/lib/retry.sh (shared backoff).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Pull the full lexical DB + indexes from the Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -eu
+          source scripts/lib/retry.sh
           mkdir -p seed
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+          retry gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             -p '3gpp.duckdb.zst' -p 'corpus-index.json' -p 'subject-index.json' \
             -p 'build-index.json' -D seed
           # zstd is preinstalled on ubuntu-latest; --long=27 matches the publish window.
@@ -77,7 +82,8 @@ jobs:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
           set -eu
-          echo "$GHCR_PAT" | docker login ghcr.io -u "${GITHUB_REPOSITORY_OWNER}" --password-stdin
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${GITHUB_REPOSITORY_OWNER}" --password-stdin'
           printf 'FROM scratch\nCOPY 3gpp.duckdb /3gpp.duckdb\nCOPY corpus-index.json /corpus-index.json\nCOPY subject-index.json /subject-index.json\nCOPY build-index.json /build-index.json\n' > seed/Dockerfile.corpus
           printf '%s\n' 'Dockerfile.corpus' '.dockerignore' > seed/.dockerignore
           DATE=$(date -u +%Y-%m-%d)
@@ -86,7 +92,7 @@ jobs:
           # manifest, NOT a buildx provenance INDEX whose untagged child platform
           # manifest the GHCR retention prune orphans → :latest dangles → pull 404 →
           # the embed kernel's FAIL=ghcr_export. Exactly how the previous latest broke.
-          docker buildx build --push --provenance=false --sbom=false -f seed/Dockerfile.corpus \
+          retry docker buildx build --push --provenance=false --sbom=false -f seed/Dockerfile.corpus \
             -t "${REPO}:latest" -t "${REPO}:${DATE}-seed" seed/
           echo "seeded ${REPO}:latest (+ ${DATE}-seed)"
 

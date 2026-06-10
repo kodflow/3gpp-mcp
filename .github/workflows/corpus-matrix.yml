@@ -122,7 +122,12 @@ on:
   # HANDS-OFF daily refresh: a delta build that picks up new 3GPP spec versions
   # (discover diffs the live status report) AND new 5GC OpenAPI releases (fetch auto).
   # Near-no-op when nothing moved (~1-2 min discover, empty matrix). Publishes `latest`,
-  # includes Phase 1/2. NEVER embeds — that's the separate manual Kaggle job.
+  # includes Phase 1/2. CONTINUITY: this lexical build does NOT embed on-runner (CPU is
+  # ~1 clause/s); instead, when the repo VARIABLE `AUTO_EMBED_ON_BUILD` == 'true' and a
+  # delta was published, the `dispatch-embed` job hands the changed series to the GPU
+  # embed (Corpus · Embed (Kaggle GPU)) so vectors track the corpus automatically. With
+  # the variable unset (default) the embed stays a separate, independently-dispatchable
+  # job — no surprise Kaggle spend. Either way the two halves are one coherent system.
   schedule:
     - cron: "17 4 * * *"   # every day ~04:17 UTC (off-peak, not midnight)
 
@@ -348,7 +353,9 @@ jobs:
           # only if disk-pressure on the runner becomes a real problem.
           WITH_RERANKER: "1"
         run: |
-          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends zstd
           # GitHub Release assets are CAPPED at 2 GiB (HTTP 422 "size must be less
           # than 2147483648"). A single tarball of BGE-M3 + reranker + ORT is
           # 3.16 GiB compressed (6.4 GiB raw). The fix is to split along the
@@ -487,6 +494,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Warm buildkit with a retry'd pull so the buildx builder boot survives a
+      # transient Docker Hub timeout (the exact break that failed this scheduled
+      # build on 2026-06-08..10). build-push then finds it locally cached.
+      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+        run: |
+          source scripts/lib/retry.sh
+          retry docker pull moby/buildkit:buildx-stable-1
       # buildx (container driver) is required for `docker buildx build --push` of
       # the FROM-scratch shard image to GHCR.
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -555,7 +569,8 @@ jobs:
           # whether the restore here pulls it (and whether HF fallback fetches it).
           WITH_RERANKER: ${{ needs.model.outputs.with_reranker || '1' }}
         run: |
-          sudo apt-get install -y --no-install-recommends zstd
+          source scripts/lib/retry.sh
+          retry sudo apt-get install -y --no-install-recommends zstd
           mkdir -p data/models
           ort="${ORT_ASSET:-ort-${ORT_VERSION}.tar.zst}"
           bge="${BGE_ASSET:-bge-m3.tar.zst}"
@@ -721,7 +736,9 @@ jobs:
       # PRIVATE (and public→private is irreversible, so birth-private is the only
       # way). GHCR_PAT is REQUIRED for the private-image distribution.
       - name: GHCR login (resume pull + shard push)
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+        run: |
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
       - name: Resume baseline from prior shard image (best-effort)
         continue-on-error: true # purely a resume optimisation — must never fail the job
         run: |
@@ -901,6 +918,7 @@ jobs:
       - name: Push shard image to GHCR (always — replaces the shard cache/artifact baseline)
         if: always()
         run: |
+          source scripts/lib/retry.sh
           [ -s "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" ] || { echo "no shard DB on disk — nothing to push"; exit 0; }
           sfx="${{ github.event.inputs.embed == 'true' && '-embed' || '' }}"
           cp "dist/shard-${{ steps.shard.outputs.tag }}.duckdb" dist/shard.duckdb
@@ -912,7 +930,7 @@ jobs:
           # manifest the retention prune can orphan (same failure class that dangled
           # 3gpp-corpus:latest → FAIL=ghcr_export). Shards are FROM-scratch data images,
           # not runnable artifacts — provenance/SBOM add nothing but a prunable child.
-          docker buildx build --push --provenance=false --sbom=false -f dist/Dockerfile.shard \
+          retry docker buildx build --push --provenance=false --sbom=false -f dist/Dockerfile.shard \
             -t "$base" -t "${base}-${{ github.run_id }}" dist/
 
   # ---- 3. fuse the partial DBs (delta = replace changed series in base) -----
@@ -956,7 +974,13 @@ jobs:
       # GHCR_PAT (not github.token) so the pushed 3gpp-corpus image is born PRIVATE
       # (unlinked to the public repo). See the build-shard login note.
       - name: GHCR login (pull base + shard images, push corpus image)
-        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+        run: |
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
+      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+        run: |
+          source scripts/lib/retry.sh
+          retry docker pull moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Merge shard images → consolidated DB (generated Dockerfile, merge in build)
         env:
@@ -968,6 +992,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -eu
+          source scripts/lib/retry.sh
           sfx=""; [ "$EMBED" = "true" ] && sfx="-embed"
           strip=""; [ "$EMBED" = "true" ] && strip="--strip-embeddings"
           corpus="ghcr.io/${OWNER}/3gpp-corpus:latest"
@@ -987,7 +1012,7 @@ jobs:
           fi
           # Extract the base DB for the pre-publish count guard (and confirm pullable).
           if [ "$BASE_PRESENT" = 1 ]; then
-            docker pull "$corpus"
+            retry docker pull "$corpus"
             # FROM-scratch image → docker create needs a (never-run) command arg.
             cid=$(docker create "$corpus" /3gpp.duckdb); docker cp "$cid:/3gpp.duckdb" base.duckdb; docker rm "$cid" >/dev/null
             ls -lh base.duckdb
@@ -1022,7 +1047,7 @@ jobs:
           } > Dockerfile.merge
           echo "----- Dockerfile.merge -----"; cat Dockerfile.merge; echo "----------------------------"
           # ---- build: cmd/merge runs INSIDE the build; extract result to runner ----
-          docker buildx build -f Dockerfile.merge --output type=local,dest=mergeout .
+          retry docker buildx build -f Dockerfile.merge --output type=local,dest=mergeout .
           mkdir -p data
           cp mergeout/3gpp.duckdb        data/3gpp.duckdb
           cp mergeout/corpus-index.json  data/corpus-index.json
@@ -1158,6 +1183,7 @@ jobs:
         if: needs.discover.outputs.publish == 'true'
         run: |
           set -eu
+          source scripts/lib/retry.sh
           printf 'FROM scratch\nCOPY 3gpp.duckdb /3gpp.duckdb\nCOPY corpus-index.json /corpus-index.json\nCOPY subject-index.json /subject-index.json\nCOPY build-index.json /build-index.json\n' > data/Dockerfile.corpus
           # keep the heavy zst/delta out of the build context (only the 4 files COPYed)
           printf '%s\n' '*.zst' '*.sha256' catalog Dockerfile.corpus > data/.dockerignore
@@ -1169,7 +1195,7 @@ jobs:
           # "untagged" child and leaves :latest dangling → pull 404 → the embed kernel's
           # crane export of the base fails with FAIL=ghcr_export and NOTHING embeds. A
           # single manifest has no orphanable child, so the prune cannot break it.
-          docker buildx build --push --provenance=false --sbom=false -f data/Dockerfile.corpus \
+          retry docker buildx build --push --provenance=false --sbom=false -f data/Dockerfile.corpus \
             -t "${REPO}:${DATE}" -t "${REPO}:latest" data/
           echo "published ${REPO}:${DATE} + :latest"
           # NOTE: package visibility is UI-only (no REST API) — set 3gpp-corpus
@@ -1193,6 +1219,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ORAS_VERSION: "1.2.0"
     steps:
+      # checkout so the run: steps can source scripts/lib/retry.sh (shared backoff).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: shards
@@ -1200,9 +1230,10 @@ jobs:
           merge-multiple: true
       - name: Install zstd + jq + ORAS (pinned)
         run: |
-          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd jq
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin oras
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends zstd jq
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           oras version
       - name: Package sub-bases + vec-manifest
         run: |
@@ -1225,11 +1256,12 @@ jobs:
       - name: Push sub-bases + manifest to GHCR (rolling 'latest')
         if: needs.discover.outputs.publish == 'true'
         run: |
-          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin'
           cd vec
           args="vec-manifest.json:application/json"
           for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
-          oras push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest" \
+          retry oras push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:latest" \
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
@@ -1240,6 +1272,49 @@ jobs:
           name: 3gpp-vec
           path: vec/
           retention-days: 7
+
+  # ---- 5b. CONTINUITY (opt-in): after a PUBLISHED lexical delta, hand the changed
+  # series to the GPU embed so the semantic vectors track the corpus automatically.
+  # This is the download→diff→reindex→re-embed handoff that makes the two halves one
+  # continuum WITHOUT losing independence (the embed workflow stays dispatchable on
+  # its own). Gated on a repo variable AUTO_EMBED_ON_BUILD=='true' so it can never
+  # cause surprise Kaggle GPU spend, and skipped when the run already embedded
+  # on-runner (embed=true). publish-vec (additive) folds the new series into the
+  # existing 3gpp-vec channel, so partial catch-ups converge.
+  dispatch-embed:
+    needs: [discover, merge]
+    if: >-
+      needs.discover.outputs.publish == 'true' &&
+      needs.discover.outputs.matrix != '[]' &&
+      github.event.inputs.embed != 'true' &&
+      vars.AUTO_EMBED_ON_BUILD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # dispatch the embed workflow
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MATRIX: ${{ needs.discover.outputs.matrix }}
+      FLOOR: ${{ needs.discover.outputs.floor }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Dispatch GPU embed for the changed series
+        run: |
+          source scripts/lib/retry.sh
+          # discover.matrix is a JSON array of "series" or "series|release" keys; the
+          # embed takes unique space-separated series (it re-embeds only changed clauses).
+          series="$(printf '%s' "$MATRIX" | jq -r '[.[] | split("|")[0]] | unique | join(" ")')"
+          if [ -z "$series" ] || [ "$series" = "null" ]; then
+            echo "::notice::no changed series — nothing to embed"; exit 0
+          fi
+          echo "dispatching GPU embed for changed series: $series (floor=${FLOOR:-Rel-99})"
+          retry gh workflow run corpus-embed-kaggle.yml \
+            -f series_list="$series" \
+            -f embed_floor="${FLOOR:-Rel-99}" \
+            -f precision=fp16 \
+            -f publish=true
 
   # ---- 6. retention: keep the last 7 dated corpus images + rolling shard tags ---
   # GHCR has no auto-prune. Deleting a USER package version needs a token with
