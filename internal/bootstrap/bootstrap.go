@@ -18,8 +18,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/kodflow/3gpp-mcp/internal/retry"
 )
 
 // CacheDir is the per-user cache root for mcp-3gpp artifacts. Override with
@@ -79,52 +81,65 @@ func Fetch(ctx context.Context, a Artifact) error {
 	if err := os.MkdirAll(filepath.Dir(a.Dest), 0o755); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "mcp-3gpp-bootstrap")
-	resp, err := HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("get %s: %w", a.URL, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("get %s: status %s", a.URL, resp.Status)
-	}
-
-	var src io.Reader = resp.Body
-	if strings.HasSuffix(a.URL, ".zst") {
-		zr, err := zstd.NewReader(resp.Body)
+	// The download (network + decompress + write + verify) is idempotent — it
+	// writes to a .part temp and renames on success — so retry it on transient
+	// failures (connection reset, 5xx, a truncated body that fails the hash).
+	return netRetry(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 		if err != nil {
-			return fmt.Errorf("zstd %s: %w", a.URL, err)
+			return err
 		}
-		defer zr.Close()
-		src = zr
-	}
+		req.Header.Set("User-Agent", "mcp-3gpp-bootstrap")
+		resp, err := HTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("get %s: %w", a.URL, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("get %s: status %s", a.URL, resp.Status)
+		}
 
-	tmp := a.Dest + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), src); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("download %s: %w", a.URL, err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if a.SHA256 != "" {
-		if got := hex.EncodeToString(h.Sum(nil)); got != strings.ToLower(a.SHA256) {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("sha256 mismatch for %s: got %s want %s", a.Dest, got, a.SHA256)
+		var src io.Reader = resp.Body
+		if strings.HasSuffix(a.URL, ".zst") {
+			zr, err := zstd.NewReader(resp.Body)
+			if err != nil {
+				return fmt.Errorf("zstd %s: %w", a.URL, err)
+			}
+			defer zr.Close()
+			src = zr
 		}
-	}
-	return os.Rename(tmp, a.Dest)
+
+		tmp := a.Dest + ".part"
+		f, err := os.Create(tmp)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		if _, err := io.Copy(io.MultiWriter(f, h), src); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("download %s: %w", a.URL, err)
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		if a.SHA256 != "" {
+			if got := hex.EncodeToString(h.Sum(nil)); got != strings.ToLower(a.SHA256) {
+				_ = os.Remove(tmp)
+				return fmt.Errorf("sha256 mismatch for %s: got %s want %s", a.Dest, got, a.SHA256)
+			}
+		}
+		return os.Rename(tmp, a.Dest)
+	})
+}
+
+// netRetry runs a flaky GHCR/HTTP operation with the package's shared backoff
+// policy (5 attempts, 2s→30s exponential backoff + jitter). Used by every
+// network fetch in bootstrap so a transient throttle/5xx never hard-fails a
+// self-provisioning start. The wrapped op MUST be idempotent.
+func netRetry(ctx context.Context, fn func() error) error {
+	return retry.Do(ctx, 5, 2*time.Second, 30*time.Second, fn)
 }
 
 // FetchAll fetches artifacts sequentially, stopping at the first error.
