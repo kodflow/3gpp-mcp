@@ -64,7 +64,12 @@ COPY --chown=mcp:mcp image-data/ /data/mcp-3gpp/
 ENV MCP3GPP_CACHE=/data/mcp-3gpp \
     MCP_TRANSPORT=stdio \
     MCP_PORT=8765
-RUN chown -R mcp:mcp /data
+# The baked subtree (/data/mcp-3gpp, up to ~15 GB on :full) is ALREADY mcp-owned by
+# the COPY --chown above. A `chown -R /data` here would rewrite every one of those
+# files into a NEW image layer, ~doubling the build's disk and overflowing the runner
+# ("No space left on device" during chown). Only the /data mount root needs its
+# ownership fixed, so chown the directory itself — NOT recursively.
+RUN chown mcp:mcp /data
 USER mcp:mcp
 WORKDIR /home/mcp
 VOLUME ["/data"]
