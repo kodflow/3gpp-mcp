@@ -94,6 +94,18 @@ TIME_BUDGET = int(os.environ.get("EMBED_TIME_BUDGET", "39000"))
 RELEASES = os.environ.get("EMBED_RELEASES", "").strip()
 LOT = os.environ.get("LOT", "").strip()
 SHARD = ("lot%s" % LOT) if RELEASES else ("s%s" % SERIES)
+# Fail-fast allowlists: these env values are interpolated into shell commands
+# (crane login/export/manifest/blob), SQL (the series slice) and the vec tag, and
+# the kernel env also holds GHCR_PAT — so constrain each to the exact grammar it
+# can legitimately have and refuse anything else up front (never shell surface).
+if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", OWNER):
+    fail("bad_owner", "GHCR_OWNER=%s" % OWNER)
+if PRECISION not in ("fp32", "fp16"):
+    fail("bad_precision", "EMBED_PRECISION=%s" % PRECISION)
+if not re.match(r"^\d{2}$", SERIES):
+    fail("bad_series", "SERIES=%s" % SERIES)
+if not re.match(r"^[A-Za-z0-9]{0,8}$", LOT):
+    fail("bad_lot", "LOT=%s" % LOT)
 os.chdir(WORK)
 os.environ.pop("EMBEDDER", None)  # force the real onnx/CUDA backend (never Local)
 
@@ -243,13 +255,17 @@ if not (sln.isdigit() and int(sln) >= 1):
 
 def carry_from(src_db, origin):
     """Reuse prior vectors from src_db; returns True when the UPDATE ran."""
+    # DuckDB ATTACH takes no prepared-statement placeholders — the path must be a
+    # literal. Ours are program-built, but RESUME_DB can come from env/glob, so
+    # escape quotes rather than trust the mount path's spelling.
+    src_lit = src_db.replace("'", "''")
     carry_sql = (
         "ATTACH '%s' AS r (READ_ONLY); "
         "UPDATE clauses SET embedding = rc.embedding, embedding_hash = rc.embedding_hash "
         "FROM r.clauses rc "
         "WHERE clauses.spec_id = rc.spec_id AND clauses.release = rc.release "
         "AND clauses.clause_path = rc.clause_path AND clauses.text = rc.text "
-        "AND rc.embedding IS NOT NULL;" % src_db)
+        "AND rc.embedding IS NOT NULL;" % src_lit)
     cr = sh('duckdb "%s" "%s"' % (EMBEDDED_DB, carry_sql))
     if cr.returncode != 0:
         say("resume_carry=failed src=%s detail=%s (continuing as fresh re-embed)"
@@ -301,9 +317,9 @@ if not RESUME_PRESENT:
             r"^(s|shard-)\d{2}(-[A-Za-z0-9.-]+)?\.duckdb\.zst$" if RELEASES
             else r"^(s|shard-)%s(-[A-Za-z0-9.-]+)?\.duckdb\.zst$" % re.escape(SERIES))
         subs = []
-        for l in layers:
-            t = (l.get("annotations") or {}).get("org.opencontainers.image.title", "")
-            d = l.get("digest", "")
+        for layer in layers:
+            t = (layer.get("annotations") or {}).get("org.opencontainers.image.title", "")
+            d = layer.get("digest", "")
             if want.match(t) and re.match(r"^sha256:[0-9a-f]{64}$", d):
                 subs.append((t, d))
         say("resume_ghcr=channel ref=%s sub_bases=%d" % (VEC_REF, len(subs)))
