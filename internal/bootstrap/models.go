@@ -131,32 +131,37 @@ func FetchORT(ctx context.Context, modelsDir, version string) error {
 		return nil
 	}
 	url := fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/%s.tgz", version, pkg)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("get ORT: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("get ORT: status %s", resp.Status)
-	}
-	// Buffer + verify the sha256 BEFORE extracting: ORT is dlopen'd native code,
-	// so an unverified/tampered tarball is an RCE vector (fail closed). Cap the
-	// read so a malicious/broken peer can't OOM us with an unbounded body (ORT
-	// tarballs are tens of MB; a real one over the cap just fails the checksum).
-	const maxORTBytes = 256 << 20 // 256 MiB
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxORTBytes))
-	if err != nil {
-		return fmt.Errorf("read ORT: %w", err)
-	}
-	if err := verifyORT(pkg, body); err != nil {
-		return err
-	}
-	// Extract, stripping the leading "<pkg>/" component into modelsDir/onnxruntime.
-	return extractTarGz(bytes.NewReader(body), filepath.Join(modelsDir, "onnxruntime"), pkg+"/")
+	// Retry the whole fetch+verify+extract on transient failures (GitHub release
+	// CDN drops). The sha256 verify runs every attempt, so a truncated body just
+	// re-downloads; extraction overwrites, so a re-run is safe.
+	return netRetry(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := HTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("get ORT: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("get ORT: status %s", resp.Status)
+		}
+		// Buffer + verify the sha256 BEFORE extracting: ORT is dlopen'd native code,
+		// so an unverified/tampered tarball is an RCE vector (fail closed). Cap the
+		// read so a malicious/broken peer can't OOM us with an unbounded body (ORT
+		// tarballs are tens of MB; a real one over the cap just fails the checksum).
+		const maxORTBytes = 256 << 20 // 256 MiB
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxORTBytes))
+		if err != nil {
+			return fmt.Errorf("read ORT: %w", err)
+		}
+		if err := verifyORT(pkg, body); err != nil {
+			return err
+		}
+		// Extract, stripping the leading "<pkg>/" component into modelsDir/onnxruntime.
+		return extractTarGz(bytes.NewReader(body), filepath.Join(modelsDir, "onnxruntime"), pkg+"/")
+	})
 }
 
 func extractTarGz(r io.Reader, destDir, stripPrefix string) error {

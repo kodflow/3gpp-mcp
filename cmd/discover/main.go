@@ -24,6 +24,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/enrichmeta"
 	"github.com/kodflow/3gpp-mcp/internal/model"
+	"github.com/kodflow/3gpp-mcp/internal/retry"
 	"github.com/kodflow/3gpp-mcp/internal/subjectmeta"
 )
 
@@ -212,18 +214,29 @@ func main() {
 // (the activeRel-/deadRel- section anchors) is shared, not re-derived from a flat
 // regex that only saw the single highest version of each spec.
 func fetchStatus(url string) (map[string]string, error) {
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) discover")
+	// The status-report fetch gates the WHOLE delta decision (which series to
+	// reindex); a single transient hiccup must not abort the daily build, so
+	// retry with backoff before giving up.
 	c := &http.Client{Timeout: 60 * time.Second}
-	resp, err := c.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status-report GET %s: %d", url, resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
+	var body []byte
+	err := retry.Do(context.Background(), 5, 2*time.Second, 30*time.Second, func() error {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) discover")
+		resp, err := c.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("status-report GET %s: %d", url, resp.StatusCode)
+		}
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		body = b
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
