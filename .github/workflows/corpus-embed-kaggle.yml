@@ -167,6 +167,10 @@ jobs:
       ORAS_VERSION: "1.2.0"
       EMBED_PRECISION: ${{ github.event.inputs.precision }}
     steps:
+      # checkout so the run: steps can source scripts/lib/retry.sh (shared backoff).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: shards
@@ -176,14 +180,16 @@ jobs:
           # (shards/vec-s<NN>/) and key the sub-base by the dir's series number.
       - name: Install zstd + jq + ORAS (pinned)
         run: |
-          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends zstd jq
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin oras
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends zstd jq
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           oras version
       - name: Merge with the existing channel, then push (ADDITIVE — never clobber)
         run: |
           set -euo pipefail
-          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin'
           # Channel + manifest model are PRECISION-SCOPED so fp16 and fp32 sub-bases
           # can never share one OCI tag (and thus one HNSW): an fp16 corpus and an
           # fp32 query must never mix (EmbedIdentity invariant). fp32 keeps :latest.
@@ -194,7 +200,7 @@ jobs:
           mkdir -p vec
           # 1) Seed vec/ from the EXISTING channel so OTHER series' sub-bases survive a
           #    single-series re-publish (absent → first publish, start empty).
-          if oras pull "$REF" -o vec 2>/dev/null; then
+          if RETRY_MAX=2 retry oras pull "$REF" -o vec 2>/dev/null; then
             echo "pulled existing channel:"; ls -1 vec || true
           else
             echo "no existing channel — first publish"
@@ -228,7 +234,7 @@ jobs:
           cd vec
           args="vec-manifest.json:application/json"
           for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
-          oras push "$REF" \
+          retry oras push "$REF" \
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
