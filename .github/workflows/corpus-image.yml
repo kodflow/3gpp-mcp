@@ -91,10 +91,11 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
+          source scripts/lib/retry.sh
           rm -rf image-data && mkdir -p image-data
-          echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
-          docker pull "$img"
+          retry docker pull "$img"
           cid=$(docker create "$img" /noop)
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
@@ -116,6 +117,7 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag || 'latest' }}
         run: |
           set -euo pipefail
+          source scripts/lib/retry.sh
           # Free runner disk FIRST: the full bake stages ~15 GB (raw DB 6.4G + model
           # 2.3G + vectors 3.4G + DB.zst 3G) and the default runner only has ~14 GB
           # free on /. Reclaim the pre-installed toolchains we don't use.
@@ -127,9 +129,9 @@ jobs:
           # 1) DB = the CURRENT lexical corpus from the PRIVATE GHCR image (the Release
           #    asset is frozen/older and its /releases/latest/download/ path 404s). The
           #    corpus image is FROM scratch → `docker create` needs a (never-run) cmd arg.
-          echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+          retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
-          docker pull "$img"
+          retry docker pull "$img"
           cid=$(docker create "$img" /noop)
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
@@ -138,14 +140,10 @@ jobs:
           #    --skip-db: the DB is provided above (no stale refetch).
           #    --no-reranker: the reranker is optional (axis #7) — skipping it keeps the
           #    image smaller and removes the flaky 2nd large HF fetch that TLS-timed-out.
-          #    Retry: the HF/CDN fetch is occasionally slow → up to 3 attempts.
+          #    Retry: the HF/CDN fetch is occasionally slow → shared backoff policy.
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
-          ok=0
-          for attempt in 1 2 3; do
-            if /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker; then ok=1; break; fi
-            echo "::warning::bootstrap attempt $attempt failed (transient HF/CDN?) — retrying"; sleep 20
-          done
-          [ "$ok" = 1 ] || { echo "::error::model/ORT bootstrap failed after 3 attempts"; exit 1; }
+          RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap model/ORT" \
+            retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker
           # 3) gate on the baked DB BEFORE compressing it.
           CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
             --require-fts --min-clauses 1 --max-empty-meta 100000
@@ -161,10 +159,11 @@ jobs:
             aarch64) oras_arch=arm64 ;;
             *) echo "::error::unsupported runner arch $(uname -m) for oras"; exit 1 ;;
           esac
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin oras
-          echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
-          if oras pull "ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16" -o image-data/vec; then
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
+          retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
+          # retry the vector pull (transient GHCR throttle) BEFORE degrading to lexical,
+          # so a network blip never silently ships a vectorless :full image.
+          if RETRY_MAX=2 retry oras pull "ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16" -o image-data/vec; then
             echo "vectors baked: $(ls image-data/vec)"
           else
             echo "::warning::no 3gpp-vec:latest-fp16 yet — full image ships lexical until vectors are published"
@@ -178,6 +177,14 @@ jobs:
           test -s image-data/models/bge-m3/model.onnx_data || { echo "::error::BGE-M3 weights (model.onnx_data) missing — bootstrap did not fetch the model"; exit 1; }
           test -s image-data/vec/vec-manifest.json         || { echo "::error::vector sub-bases missing"; exit 1; }
 
+      # Warm the buildkit image with a retry'd pull so the buildx builder boot does
+      # not hard-fail on a transient Docker Hub timeout (the exact class of break
+      # that killed the scheduled corpus build). build-push then finds it cached.
+      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          retry docker pull moby/buildkit:buildx-stable-1
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       # GHCR_PAT (not github.token): pushing with the CI token auto-links the image
       # to this PUBLIC repo → it inherits PUBLIC visibility. A PAT push stays

@@ -69,22 +69,27 @@ func FetchVecBases(ctx context.Context, owner, dir string) (string, error) {
 // ghcrToken fetches an anonymous pull token for a public GHCR repository.
 func ghcrToken(ctx context.Context, repo string) (string, error) {
 	u := "https://ghcr.io/token?service=ghcr.io&scope=repository:" + repo + ":pull"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, err := HTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ghcr token: %s", resp.Status)
-	}
-	var t struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return "", err
-	}
-	return t.Token, nil
+	var token string
+	err := netRetry(ctx, func() error {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		resp, err := HTTPClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("ghcr token: %s", resp.Status)
+		}
+		var t struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
+			return err
+		}
+		token = t.Token
+		return nil
+	})
+	return token, err
 }
 
 type ghcrLayer struct{ digest, title string }
@@ -93,79 +98,87 @@ type ghcrLayer struct{ digest, title string }
 // (the org.opencontainers.image.title annotation set by `oras push`).
 func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, error) {
 	u := "https://ghcr.io/v2/" + repo + "/manifests/" + ref
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ghcr manifest: %s", resp.Status)
-	}
-	var m struct {
-		Layers []struct {
-			Digest      string            `json:"digest"`
-			Annotations map[string]string `json:"annotations"`
-		} `json:"layers"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, err
-	}
-	out := make([]ghcrLayer, 0, len(m.Layers))
-	for _, l := range m.Layers {
-		out = append(out, ghcrLayer{digest: l.Digest, title: l.Annotations["org.opencontainers.image.title"]})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("ghcr manifest %s has no layers", repo)
-	}
-	return out, nil
+	var out []ghcrLayer
+	err := netRetry(ctx, func() error {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := HTTPClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("ghcr manifest: %s", resp.Status)
+		}
+		var m struct {
+			Layers []struct {
+				Digest      string            `json:"digest"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"layers"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			return err
+		}
+		layers := make([]ghcrLayer, 0, len(m.Layers))
+		for _, l := range m.Layers {
+			layers = append(layers, ghcrLayer{digest: l.Digest, title: l.Annotations["org.opencontainers.image.title"]})
+		}
+		if len(layers) == 0 {
+			return fmt.Errorf("ghcr manifest %s has no layers", repo)
+		}
+		out = layers
+		return nil
+	})
+	return out, err
 }
 
 // ghcrPullBlob downloads a blob by digest to dest, zstd-decompressing if asked.
 func ghcrPullBlob(ctx context.Context, repo, digest, token, dest string, decompress bool) error {
 	u := "https://ghcr.io/v2/" + repo + "/blobs/" + digest
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("blob %s: %s", digest, resp.Status)
-	}
-	tmp := dest + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	var src io.Reader = resp.Body
-	var zr *zstd.Decoder
-	if decompress {
-		if zr, err = zstd.NewReader(resp.Body); err != nil {
-			_ = f.Close()
+	// Idempotent (writes .part then renames) → safe to retry on transient drops.
+	return netRetry(ctx, func() error {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := HTTPClient.Do(req)
+		if err != nil {
 			return err
 		}
-		src = zr
-	}
-	_, copyErr := io.Copy(f, src)
-	if zr != nil {
-		zr.Close()
-	}
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	return os.Rename(tmp, dest) // atomic
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("blob %s: %s", digest, resp.Status)
+		}
+		tmp := dest + ".part"
+		f, err := os.Create(tmp)
+		if err != nil {
+			return err
+		}
+		var src io.Reader = resp.Body
+		var zr *zstd.Decoder
+		if decompress {
+			if zr, err = zstd.NewReader(resp.Body); err != nil {
+				_ = f.Close()
+				return err
+			}
+			src = zr
+		}
+		_, copyErr := io.Copy(f, src)
+		if zr != nil {
+			zr.Close()
+		}
+		closeErr := f.Close()
+		if copyErr != nil {
+			_ = os.Remove(tmp)
+			return copyErr
+		}
+		if closeErr != nil {
+			_ = os.Remove(tmp)
+			return closeErr
+		}
+		return os.Rename(tmp, dest) // atomic
+	})
 }

@@ -63,8 +63,9 @@ jobs:
 
       - name: Install deps (build + LibreOffice + zstd)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config zstd libreoffice-writer-nogui
 
       - name: Resolve scope
@@ -120,7 +121,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          source scripts/lib/retry.sh
           gh release view latest >/dev/null 2>&1 || \
-            gh release create latest --latest --title "latest" \
+            retry gh release create latest --latest --title "latest" \
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
-          gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber
+          retry gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber
