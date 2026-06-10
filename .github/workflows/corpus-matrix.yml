@@ -122,7 +122,12 @@ on:
   # HANDS-OFF daily refresh: a delta build that picks up new 3GPP spec versions
   # (discover diffs the live status report) AND new 5GC OpenAPI releases (fetch auto).
   # Near-no-op when nothing moved (~1-2 min discover, empty matrix). Publishes `latest`,
-  # includes Phase 1/2. NEVER embeds — that's the separate manual Kaggle job.
+  # includes Phase 1/2. CONTINUITY: this lexical build does NOT embed on-runner (CPU is
+  # ~1 clause/s); instead, when the repo VARIABLE `AUTO_EMBED_ON_BUILD` == 'true' and a
+  # delta was published, the `dispatch-embed` job hands the changed series to the GPU
+  # embed (Corpus · Embed (Kaggle GPU)) so vectors track the corpus automatically. With
+  # the variable unset (default) the embed stays a separate, independently-dispatchable
+  # job — no surprise Kaggle spend. Either way the two halves are one coherent system.
   schedule:
     - cron: "17 4 * * *"   # every day ~04:17 UTC (off-peak, not midnight)
 
@@ -1267,6 +1272,49 @@ jobs:
           name: 3gpp-vec
           path: vec/
           retention-days: 7
+
+  # ---- 5b. CONTINUITY (opt-in): after a PUBLISHED lexical delta, hand the changed
+  # series to the GPU embed so the semantic vectors track the corpus automatically.
+  # This is the download→diff→reindex→re-embed handoff that makes the two halves one
+  # continuum WITHOUT losing independence (the embed workflow stays dispatchable on
+  # its own). Gated on a repo variable AUTO_EMBED_ON_BUILD=='true' so it can never
+  # cause surprise Kaggle GPU spend, and skipped when the run already embedded
+  # on-runner (embed=true). publish-vec (additive) folds the new series into the
+  # existing 3gpp-vec channel, so partial catch-ups converge.
+  dispatch-embed:
+    needs: [discover, merge]
+    if: >-
+      needs.discover.outputs.publish == 'true' &&
+      needs.discover.outputs.matrix != '[]' &&
+      github.event.inputs.embed != 'true' &&
+      vars.AUTO_EMBED_ON_BUILD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # dispatch the embed workflow
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MATRIX: ${{ needs.discover.outputs.matrix }}
+      FLOOR: ${{ needs.discover.outputs.floor }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Dispatch GPU embed for the changed series
+        run: |
+          source scripts/lib/retry.sh
+          # discover.matrix is a JSON array of "series" or "series|release" keys; the
+          # embed takes unique space-separated series (it re-embeds only changed clauses).
+          series="$(printf '%s' "$MATRIX" | jq -r '[.[] | split("|")[0]] | unique | join(" ")')"
+          if [ -z "$series" ] || [ "$series" = "null" ]; then
+            echo "::notice::no changed series — nothing to embed"; exit 0
+          fi
+          echo "dispatching GPU embed for changed series: $series (floor=${FLOOR:-Rel-99})"
+          retry gh workflow run corpus-embed-kaggle.yml \
+            -f series_list="$series" \
+            -f embed_floor="${FLOOR:-Rel-99}" \
+            -f precision=fp16 \
+            -f publish=true
 
   # ---- 6. retention: keep the last 7 dated corpus images + rolling shard tags ---
   # GHCR has no auto-prune. Deleting a USER package version needs a token with
