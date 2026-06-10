@@ -62,7 +62,7 @@ jobs:
           mv merged.json absent-index.json
           echo "ledger size after drafts: $(grep -c '\": \"' absent-index.json || echo 0)"
       - name: Upload artifact (audit copy)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-ledger
           path: |
@@ -72,7 +72,10 @@ jobs:
           retention-days: 14
       - name: Publish absent-index.json to `latest`
         run: |
+          # Retry the Release ops — a transient GitHub API 401/5xx here drops the
+          # freshly-regenerated ledger and the daily delta stops converging.
+          source scripts/lib/retry.sh
           gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
+            retry gh release create latest --repo "$GITHUB_REPOSITORY" --latest --title "latest" \
               --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
-          gh release upload latest --repo "$GITHUB_REPOSITORY" absent-index.json --clobber
+          retry gh release upload latest --repo "$GITHUB_REPOSITORY" absent-index.json --clobber
