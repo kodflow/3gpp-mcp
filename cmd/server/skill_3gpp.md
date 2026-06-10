@@ -57,18 +57,15 @@ reasoning is yours, the MCP only does cited retrieval.
 
 ---
 
-## Running the server (image variants + readiness)
+## Connecting (HTTP — hosted, nothing to install)
 
-- **`ghcr.io/<owner>/3gpp-mcp:full` (= `:latest`)** — semantic, batteries-included: the
-  corpus DB + vector sub-bases + BGE-M3 model are baked in (as `.zst`, decompressed into
-  `/data` on first start). Mount a named volume so `--rm` pays that decompression once:
-  `-v 3gpp-mcp-data:/data`.
-- **`:light`** — binary only (lexical/BM25); bootstraps the DB from the network on first
-  run. Small image.
-- Transports: stdio (`docker run -i --rm … serve`, the Claude-Code contract — no `-t`),
-  or HTTP (`-e MCP_TRANSPORT=http`, then `claude mcp add --transport http 3gpp
-  http://host:8765/mcp`).
-- Readiness (HTTP): `GET /healthz` → `503 {"status":"loading"}` while the corpus/vectors
-  load, `200 {"status":"ready"}` when queryable. Wait for `ready`.
-- Semantic is per-series: a series whose vectors aren't baked yet falls back to lexical;
+- The server is reachable over MCP Streamable HTTP at `http://<host>/mcp`. Add it with
+  `claude mcp add --transport http 3gpp http://<host>/mcp`, or in any mcpServers client:
+  `{ "mcpServers": { "3gpp": { "type": "http", "url": "http://<host>/mcp" } } }`.
+- To drive it without an MCP client, `GET http://<host>/help` returns the exact JSON-RPC
+  recipe (initialize → notifications/initialized → tools/call, with the `Mcp-Session-Id`
+  header flow).
+- Readiness: `GET /healthz` → `503 {"status":"loading"}` while the corpus/vectors load,
+  `200 {"status":"ready"}` when queryable. Wait for `ready`.
+- Semantic is per-series: a series whose vectors aren't loaded yet falls back to lexical;
   `server_info` reports the active modes.
