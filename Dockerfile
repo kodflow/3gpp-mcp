@@ -72,7 +72,11 @@ ENV MCP3GPP_CACHE=/data/mcp-3gpp \
 RUN chown mcp:mcp /data
 USER mcp:mcp
 WORKDIR /home/mcp
-VOLUME ["/data"]
+# NO VOLUME declaration — deliberately (issue #124/#125). `VOLUME /data` made Docker
+# COPY the multi-GB baked subtree into every named volume (and K8s deploys mirrored
+# that with a seed-copy initContainer), doubling the corpus on disk. The full image
+# now bakes RAW files and serve opens them READ-ONLY in place, so no volume is
+# needed at all; mount one explicitly only if you want a writable cache (light).
 
 # Soft healthcheck: only meaningful in http mode; in stdio mode it is a no-op pass.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \

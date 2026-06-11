@@ -19,20 +19,29 @@
 set -e
 
 # decompress_baked expands any baked *.zst artifact under the cache into its raw
-# sibling (idempotent: skips when the target already exists, so a persistent /data
-# volume pays this once). Keeps the IMAGE small while serve reads raw files.
+# sibling, then DELETES the .zst (issue #124: keeping both doubled the volume).
+# Idempotent: skips when the target already exists. The FULL image now bakes RAW
+# files (nothing to do here); this path remains for :light and legacy volumes.
+# NB: deletion only happens after a SUCCESSFUL decompress, and only on a writable
+# filesystem — on a read-only image layer the rm just no-ops with a warning.
 decompress_baked() {
   cache="${MCP3GPP_CACHE:-/data/mcp-3gpp}"
   [ -d "$cache" ] || return 0
   command -v zstd >/dev/null 2>&1 || return 0
   find "$cache" -type f -name '*.zst' 2>/dev/null | while IFS= read -r z; do
     out="${z%.zst}"
-    [ -f "$out" ] && continue
+    if [ -f "$out" ]; then
+      rm -f "$z" 2>/dev/null || true   # raw already there → the .zst is pure duplication
+      continue
+    fi
     echo "[entrypoint] decompressing $(basename "$z") → $(basename "$out")…" >&2
     # --long=31 accepts any compression window; fall back to the default frame.
-    zstd -d -q --long=31 "$z" -o "$out" 2>/dev/null \
-      || zstd -d -q "$z" -o "$out" 2>/dev/null \
-      || echo "[entrypoint] WARN: failed to decompress $z" >&2
+    if zstd -d -q --long=31 "$z" -o "$out" 2>/dev/null \
+      || zstd -d -q "$z" -o "$out" 2>/dev/null; then
+      rm -f "$z" 2>/dev/null || echo "[entrypoint] note: $z kept (read-only fs)" >&2
+    else
+      echo "[entrypoint] WARN: failed to decompress $z" >&2
+    fi
   done
 }
 
@@ -50,6 +59,13 @@ case "${1:-serve}" in
   serve)
     shift 2>/dev/null || true
     decompress_baked
+    # Baked model registry (full image, fp16): point the embedder at the baked
+    # models.yaml so the client EmbedIdentity matches the baked fp16 vectors —
+    # without it the registry default (fp32) mismatches and semantic is refused.
+    cache="${MCP3GPP_CACHE:-/data/mcp-3gpp}"
+    if [ -z "${EMBED_MODELS_CONFIG:-}" ] && [ -f "$cache/models/models.yaml" ]; then
+      export EMBED_MODELS_CONFIG="$cache/models/models.yaml"
+    fi
     # shellcheck disable=SC2046 # intentional word-split: baked_flags emits 0..N flags
     set -- $(baked_flags) "$@"
     if [ "${MCP_TRANSPORT:-stdio}" = "http" ]; then
