@@ -46,15 +46,16 @@ image is ready almost instantly; light/first-run pulls the DB so loads longer).
 ## Install the /3gpp skill (strict cited-answer format)
 
 The MCP registration gives Claude the *tools*; the **/3gpp skill** pins the strict
-12-field cited-answer protocol on top. Inside this repo it is already active
-(project-scope `.claude/commands/3gpp.md`); anywhere else, install it user-scope:
+12-field cited-answer protocol on top. The skill is **embedded in the server binary**
+(single source, always version-matched) — install it FROM THE SERVER, never from the
+repository. Inside this repo it is already active (project-scope
+`.claude/commands/3gpp.md`); anywhere else, install it user-scope:
 
 ```bash
 mkdir -p ~/.claude/commands
-# stdio install (no local HTTP endpoint) — fetch from the public repo:
-curl -fsSL https://raw.githubusercontent.com/kodflow/3gpp-mcp/main/.claude/commands/3gpp.md \
-  -o ~/.claude/commands/3gpp.md
-# HTTP install — the running server serves its own copy (always version-matched):
+# stdio install — the binary prints its own embedded skill:
+docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md
+# HTTP install — the running server serves the same bytes:
 curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/commands/3gpp.md
 ```
 
