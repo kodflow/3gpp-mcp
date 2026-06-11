@@ -106,11 +106,16 @@ jobs:
           rm -f image-data/3gpp.duckdb
           du -sh image-data/* 2>/dev/null || true
 
-      # FULL: bake the corpus DB + ONNX Runtime + BGE-M3 model + vector sub-bases into
-      # image-data/ so the image is offline-semantic on pull. The DB + vectors are kept
-      # as .zst (the entrypoint decompresses them into /data on first start) to keep the
-      # image small; the model/ORT are stored raw (they don't compress).
-      - name: Full — bake DB + ONNX Runtime + BGE-M3 + vectors (zst) into image-data/
+      # FULL: bake ONE fused, RAW corpus DB (lexical + vectors overlaid by natural
+      # identity — issue #125) + the fp16 BGE-M3 + ONNX Runtime into image-data/, so
+      # serve reads everything IN PLACE, read-only, with no volume and no first-start
+      # decompression. Raw on purpose: the registry compresses layers for transfer
+      # anyway, while baking .zst forced a decompress-into-volume copy that doubled
+      # the on-disk footprint (issue #124). The model is converted to fp16 AT BAKE
+      # (same onnxruntime.transformers recipe as the Kaggle kernel) so the client
+      # EmbedIdentity matches the fp16 vectors — with the registry-default fp32
+      # model the serve coherence guard refused the vectors (silently lexical).
+      - name: Full — bake fused raw DB (identity overlay) + fp16 BGE-M3 + ORT
         if: matrix.variant == 'full'
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
@@ -133,7 +138,7 @@ jobs:
           sudo docker image prune -af 2>/dev/null || true
           sudo apt-get clean 2>/dev/null || true
           echo "disk after free:"; df -h / | tail -1
-          rm -rf image-data && mkdir -p image-data/vec
+          rm -rf image-data && mkdir -p image-data
           # 1) DB = the CURRENT lexical corpus from the PRIVATE GHCR image (the Release
           #    asset is frozen/older and its /releases/latest/download/ path 404s). The
           #    corpus image is FROM scratch → `docker create` needs a (never-run) cmd arg.
@@ -143,25 +148,63 @@ jobs:
           cid=$(docker create "$img" /noop)
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
+          docker rmi "$img" >/dev/null 2>&1 || true   # DISK: the pulled copy is consumed
           test -s image-data/3gpp.duckdb
           # 2) ONNX Runtime + BGE-M3 embedder via the binary's own provisioner.
           #    --skip-db: the DB is provided above (no stale refetch).
           #    --no-reranker: the reranker is optional (axis #7) — skipping it keeps the
           #    image smaller and removes the flaky 2nd large HF fetch that TLS-timed-out.
-          #    Retry: the HF/CDN fetch is occasionally slow → shared backoff policy.
+          #    Retry: the HF/CDN fetch is occasionally slow/429 → shared backoff policy.
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
           RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap model/ORT" \
             retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker
-          # 3) gate on the baked DB BEFORE compressing it.
+          # 3) fp16 conversion of OUR pinned fp32 ONNX (keep_io_types) — the exact
+          #    recipe the Kaggle kernel uses, so the resulting EmbedIdentity equals the
+          #    one stamped in the published sub-bases. The fp32 source is then DROPPED
+          #    (the image ships fp16 only: half the weight, matching vectors).
+          python3 -m pip install --quiet onnx onnxruntime
+          mkdir -p image-data/models/bge-m3-fp16
+          cat > /tmp/convfp16.py <<'PY'
+          import onnx
+          from onnxruntime.transformers.onnx_model import OnnxModel
+          m = onnx.load("image-data/models/bge-m3/model.onnx")
+          om = OnnxModel(m)
+          om.convert_float_to_float16(keep_io_types=True)
+          onnx.save(om.model, "image-data/models/bge-m3-fp16/model.onnx",
+                    save_as_external_data=True, all_tensors_to_one_file=True,
+                    location="model.onnx_data")
+          print("fp16_saved")
+          PY
+          python3 /tmp/convfp16.py
+          cp image-data/models/bge-m3/tokenizer.json image-data/models/bge-m3-fp16/
+          rm -rf image-data/models/bge-m3
+          # Registry override baked alongside the model: ABSOLUTE paths at the image's
+          # cache location; field values mirror the kernel's models.yaml exactly so
+          # the EmbedIdentity digest equals the sub-bases' embedding_model stamp.
+          cat > image-data/models/models.yaml <<'YAML'
+          active: bge-m3-fp16
+          models:
+            - name: bge-m3-fp16
+              family: bge-m3
+              dir: /data/mcp-3gpp/models/bge-m3-fp16
+              precision: fp16
+              dim: 1024
+              normalization: l2
+              revision: 5617a9f
+              tokenizer_revision: 5617a9f
+              tokenizer_dir: /data/mcp-3gpp/models/bge-m3-fp16
+              inputs: [input_ids, attention_mask]
+              output: sentence_embedding
+          YAML
+          # 4) gate on the baked DB BEFORE fusing vectors into it.
           CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
             --require-fts --min-clauses 1 --max-empty-meta 100000
-          # 4) keep the DB as .zst (small image; entrypoint decompresses on first start).
-          zstd -q --long=27 image-data/3gpp.duckdb -o image-data/3gpp.duckdb.zst
-          rm -f image-data/3gpp.duckdb
-          # 4) vector sub-bases (already .zst) from the fp16 channel; degrade to lexical
-          #    if none are published yet (coverage is being completed series by series).
-          # oras CLI must match the RUNNER arch (this step runs natively, not in QEMU);
-          # a hardcoded amd64 binary fails with "Exec format error" on the arm64 runner.
+          # 5) FUSE the published vectors INTO the DB (issue #125): pull the fp16
+          #    channel's sub-bases ONE AT A TIME (manifest + per-blob fetch — never the
+          #    whole channel at once: runner-disk peak stays ≈ final DB + 1 sub-base)
+          #    and overlay each by natural identity. cmd/overlay also stamps the
+          #    shards' embedding_model into the DB meta (coherence-checked).
+          # oras CLI must match the RUNNER arch (this step runs natively, not in QEMU).
           case "$(uname -m)" in
             x86_64)  oras_arch=amd64 ;;
             aarch64) oras_arch=arm64 ;;
@@ -169,21 +212,35 @@ jobs:
           esac
           retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
-          # retry the vector pull (transient GHCR throttle) BEFORE degrading to lexical,
-          # so a network blip never silently ships a vectorless :full image.
-          if RETRY_MAX=2 retry oras pull "ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16" -o image-data/vec; then
-            echo "vectors baked: $(ls image-data/vec)"
-          else
-            echo "::warning::no 3gpp-vec:latest-fp16 yet — full image ships lexical until vectors are published"
-          fi
-          # HARD ASSERTIONS — never ship a :full that is silently lexical. The first
-          # publish DID exactly that (DB.zst + vectors dropped by .dockerignore, model
-          # never landed). Fail the bake LOUDLY if any semantic artifact is missing.
+          CGO_ENABLED=1 go build -o /tmp/overlay ./cmd/overlay
+          VREF="ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16"
+          retry oras manifest fetch "$VREF" > /tmp/vec-manifest.json
+          # Both naming schemes can coexist on the channel (s<NN> from the Kaggle
+          # publish, shard-<NN>[-Rel-X] from on-runner embeds) — accept both.
+          jq -r '.layers[] | select((.annotations["org.opencontainers.image.title"] // "") | test("^(s|shard-)[0-9]{2}.*\\.duckdb\\.zst$")) | .digest + " " + .annotations["org.opencontainers.image.title"]' \
+            /tmp/vec-manifest.json > /tmp/subs.txt
+          test -s /tmp/subs.txt || { echo "::error::no vector sub-bases on $VREF — refusing to ship a silently-lexical :full"; exit 1; }
+          echo "fusing $(wc -l < /tmp/subs.txt) sub-bases:"; cat /tmp/subs.txt
+          : > /tmp/overlay.log
+          while read -r digest title; do
+            echo "--- $title ---"; df -h / | tail -1
+            retry oras blob fetch "$VREF@$digest" --output /tmp/sub.duckdb.zst
+            zstd -d -q -f --long=31 /tmp/sub.duckdb.zst -o /tmp/sub.duckdb
+            rm -f /tmp/sub.duckdb.zst
+            /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb 2>&1 | tee -a /tmp/overlay.log
+            rm -f /tmp/sub.duckdb
+          done < /tmp/subs.txt
+          # HARD ASSERTIONS — never ship a :full that is silently lexical (the first
+          # publish DID exactly that). The DB stays RAW (no .zst — serve reads in place).
           echo "=== image-data tree ==="; { ls -laR image-data | head -60; } 2>/dev/null || true
           echo "=== sizes ==="; du -sh image-data image-data/* image-data/*/* 2>/dev/null || true
-          test -s image-data/3gpp.duckdb.zst               || { echo "::error::baked DB.zst missing"; exit 1; }
-          test -s image-data/models/bge-m3/model.onnx_data || { echo "::error::BGE-M3 weights (model.onnx_data) missing — bootstrap did not fetch the model"; exit 1; }
-          test -s image-data/vec/vec-manifest.json         || { echo "::error::vector sub-bases missing"; exit 1; }
+          vectorised="$(grep -oE 'done: [0-9]+ clauses vectorised' /tmp/overlay.log | tail -1 | grep -oE '[0-9]+' || echo 0)"
+          echo "fused vectorised clauses: $vectorised"
+          [ "$vectorised" -ge 2000000 ] || { echo "::error::fused DB has only $vectorised vectorised clauses (< 2,000,000) — channel incomplete or overlay mis-matched"; exit 1; }
+          grep -q 'embedding_model stamped:' /tmp/overlay.log || { echo "::error::embedding_model not stamped — serve would refuse semantic"; exit 1; }
+          test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
+          test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
+          test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
 
       # Warm the buildkit image with a retry'd pull so the buildx builder boot does
       # not hard-fail on a transient Docker Hub timeout (the exact class of break

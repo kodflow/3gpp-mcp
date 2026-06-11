@@ -1,16 +1,22 @@
 // Command overlay writes the embedding vectors from one or more vector shards onto a
-// FULL lexical base DB, keyed by chunk_id. It is the correct way to assemble a single
-// serveable DB from the Kaggle lots: the lot outputs are CLAUSES-ONLY (the embed kernel
-// slices only the clauses table), so they carry vectors but NOT the catalogue
-// (specs/spec_versions/acronyms/changes/api/li). The lexical `latest` base carries the
-// whole catalogue + the same clauses (by chunk_id) WITHOUT vectors. overlay UPDATEs the
-// base's clauses.embedding / embedding_hash from each shard where the shard has a vector.
+// FULL lexical base DB, keyed by the clause's NATURAL IDENTITY
+// (spec_id, release, clause_path, text) — the same proven match the Kaggle kernel's
+// carry-over uses, and deliberately NOT chunk_id: a lexical republish renumbers
+// chunk_ids for changed series, so in the window before the embed catch-up a stale
+// sub-base overlaid by chunk_id could attach vectors to the WRONG clauses. With
+// identity matching a stale sub-base simply does not match the changed clauses (they
+// stay NULL → lexical until the catch-up re-embeds them) — self-correcting, never
+// mis-keyed. The shards are CLAUSES-ONLY (the embed kernel slices only the clauses
+// table), so they carry vectors but NOT the catalogue; the lexical base carries the
+// whole catalogue + the same clauses WITHOUT vectors.
 //
-//	overlay --base lex.duckdb --vec lotA.duckdb --vec lotB.duckdb
+//	overlay --base lex.duckdb --vec s21.duckdb --vec s23.duckdb …
 //
-// Result: a full DB (catalogue + clauses + the shards' vectors). FTS from the base is
-// kept; HNSW is NOT built here (RAM-hungry — freeze it later). The base is modified
-// in place, so pass a COPY if you want to keep the lexical-only original.
+// Result: a full DB (catalogue + clauses + the shards' vectors), with the shards'
+// embedding_model stamped into schema_meta (coherence-checked across shards) so the
+// serve-time model guard sees the fused DB exactly like a published sub-base. FTS
+// from the base is kept; HNSW is NOT built here (RAM-hungry — freeze it later). The
+// base is modified in place, so pass a COPY if you want the lexical-only original.
 package main
 
 import (
@@ -96,6 +102,11 @@ func run(ctx context.Context, base string, vecs []string, catFrom string) error 
 	_ = sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&before)
 	fmt.Fprintf(os.Stderr, "[overlay] base %s: %d clauses already vectorised\n", base, before)
 
+	// embedModel collects the shards' embedding_model meta. All shards feeding ONE
+	// fused DB must agree (mixing models/precisions in one store is forbidden — the
+	// EmbedIdentity invariant); the agreed value is stamped into the base so the
+	// serve-time coherence guard sees the fused DB like a published sub-base.
+	embedModel := ""
 	for i, v := range vecs {
 		if _, err := os.Stat(v); err != nil {
 			return fmt.Errorf("vec %s: %w", v, err)
@@ -105,11 +116,25 @@ func run(ctx context.Context, base string, vecs []string, catFrom string) error 
 		if _, err := sqldb.ExecContext(ctx, "ATTACH '"+strings.ReplaceAll(v, "'", "''")+"' AS "+alias+" (READ_ONLY)"); err != nil {
 			return fmt.Errorf("attach %s: %w", v, err)
 		}
-		// Overlay ONLY where the shard actually has a vector, matched by chunk_id.
+		var m string
+		_ = sqldb.QueryRowContext(ctx,
+			"SELECT value FROM "+alias+".schema_meta WHERE key = 'embedding_model'").Scan(&m)
+		switch {
+		case m == "":
+			fmt.Fprintf(os.Stderr, "[overlay] %s: no embedding_model meta (older shard?)\n", v)
+		case embedModel == "":
+			embedModel = m
+		case m != embedModel:
+			return fmt.Errorf("shard %s embedding_model=%q != %q from earlier shards — refusing to fuse mixed models into one DB", v, m, embedModel)
+		}
+		// Overlay ONLY where the shard actually has a vector, matched by the clause's
+		// natural identity + exact text (NOT chunk_id — unstable across republishes).
 		res, err := sqldb.ExecContext(ctx, fmt.Sprintf(
 			`UPDATE clauses SET embedding = s.embedding, embedding_hash = s.embedding_hash
 			 FROM %s.clauses AS s
-			 WHERE clauses.chunk_id = s.chunk_id AND s.embedding IS NOT NULL`, alias))
+			 WHERE clauses.spec_id = s.spec_id AND clauses.release = s.release
+			   AND clauses.clause_path = s.clause_path AND clauses.text = s.text
+			   AND s.embedding IS NOT NULL`, alias))
 		if err != nil {
 			return fmt.Errorf("overlay %s: %w", v, err)
 		}
@@ -126,6 +151,12 @@ func run(ctx context.Context, base string, vecs []string, catFrom string) error 
 	// Stamp the pipeline version so a downstream consumer treats it consistently.
 	if err := db.SetMeta("pipeline_version", "overlay"); err != nil {
 		return err
+	}
+	if embedModel != "" {
+		if err := db.SetMeta("embedding_model", embedModel); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "[overlay] embedding_model stamped: %s\n", embedModel)
 	}
 	var after int64
 	_ = sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&after)
