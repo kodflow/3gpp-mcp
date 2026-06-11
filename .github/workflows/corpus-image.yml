@@ -39,7 +39,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Materialise the BGE-M3 model ONCE per run and hand it to every build leg as
+  # a run artifact, so the legs never each hit HuggingFace (three 429 bake
+  # deaths in one day). Source order inside restore-bge.sh: the durable
+  # 'models' release cache first, one pinned HF fetch at most. The weights are
+  # arch-independent ONNX, so a single artifact serves amd64 AND arm64.
+  model:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Best-effort by design: a failed prefetch must NEVER gate the matrix — each
+    # full leg falls back to restore-bge.sh on a missing artifact anyway.
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Materialise BGE-M3 (models release → HF once)
+        run: scripts/restore-bge.sh bge-cache
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bge-m3-model
+          path: bge-cache/bge-m3
+          retention-days: 1
+          if-no-files-found: warn
+
   build:
+    needs: model
     # MULTI-ARCH via NATIVE runners (NOT QEMU): each arch builds on its own runner so
     # the CGO/DuckDB compile is native (fast) AND the full bake fetches the CORRECT
     # ONNX Runtime for that arch (the bootstrap is arch-aware) — a QEMU build would bake
@@ -77,6 +106,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # The model prefetched ONCE by the `model` job (arch-independent weights).
+      # Missing artifact is tolerated — the bake step falls back to restore-bge.sh.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: matrix.variant == 'full'
+        continue-on-error: true
+        with:
+          name: bge-m3-model
+          path: bge-cache/bge-m3
 
       # LIGHT: bake the SAME lexical corpus DB as full, but WITHOUT the vector
       # sub-bases or the BGE-M3 model → offline lexical (BM25), small image. The
@@ -152,31 +190,19 @@ jobs:
           docker rm "$cid" >/dev/null
           docker rmi "$img" >/dev/null 2>&1 || true   # DISK: the pulled copy is consumed
           test -s image-data/3gpp.duckdb
-          # 2a) BGE-M3 from OUR 'models' release cache FIRST — HuggingFace has
-          #     rate-limited the runners repeatedly (429; three bake deaths in one
-          #     day). The release is the durable cache corpus-matrix's model job
-          #     already maintains (<2GiB .partNN splits + whole-archive sha256), and
-          #     the model archive is ARCH-INDEPENDENT (ONNX weights) so one asset
-          #     serves both legs. ORT is NOT restored from there on purpose: that
-          #     asset is amd64-only, while bootstrap fetches ORT arch-natively from
-          #     the Microsoft GitHub release (which has never rate-limited us).
-          #     The commit is read from the Go pin (single source — no third copy).
-          BGE_COMMIT="$(grep -oE 'BGECommit = "[0-9a-f]{40}"' internal/bootstrap/models.go | grep -oE '[0-9a-f]{40}')"
-          BGE_ASSET="bge-m3-${BGE_COMMIT:0:8}.tar.zst"
-          if gh release download models --repo "$GITHUB_REPOSITORY" \
-               --pattern "${BGE_ASSET}.part*" --pattern "${BGE_ASSET}.sha256" -D /tmp/bge-restore 2>/dev/null; then
-            cat /tmp/bge-restore/"${BGE_ASSET}".part* > /tmp/bge-restore/"$BGE_ASSET"
-            if (cd /tmp/bge-restore && sha256sum -c "$BGE_ASSET.sha256" >/dev/null 2>&1); then
-              mkdir -p image-data/models
-              tar -C image-data/models --use-compress-program=unzstd -xf /tmp/bge-restore/"$BGE_ASSET"
-              echo "BGE-M3 restored from the models release ($BGE_ASSET) — bootstrap will skip the HF fetch"
-            else
-              echo "::warning::models-release archive failed sha256 — falling back to the HF fetch"
-              rm -rf image-data/models/bge-m3
-            fi
-            rm -rf /tmp/bge-restore
+          # 2a) BGE-M3 WITHOUT touching HuggingFace: the run artifact prefetched
+          #     ONCE by the `model` job, else restore-bge.sh (the durable 'models'
+          #     release first, one pinned HF fetch as the very last resort). ORT is
+          #     NOT covered on purpose: that asset is arch-specific and bootstrap
+          #     fetches it arch-natively from the Microsoft GitHub release (which
+          #     has never rate-limited us).
+          if [ -s bge-cache/bge-m3/model.onnx_data ]; then
+            mkdir -p image-data/models
+            cp -a bge-cache/bge-m3 image-data/models/
+            echo "BGE-M3 from the run artifact (prefetched once by the model job)"
           else
-            echo "::warning::$BGE_ASSET absent from the 'models' release — falling back to the HF fetch"
+            echo "::warning::bge-m3-model artifact absent — restoring directly"
+            scripts/restore-bge.sh image-data/models
           fi
           # 2b) ONNX Runtime (+ BGE-M3 only if 2a fell through) via the binary's own
           #    provisioner — Fetch() is idempotent, a present file with a matching
