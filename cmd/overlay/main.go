@@ -44,12 +44,13 @@ func main() {
 	var vecs multiFlag
 	flag.Var(&vecs, "vec", "a vector shard (clauses+embedding) to overlay onto the base by chunk_id; repeat for each lot")
 	catFrom := flag.String("catalogue-from", "", "copy the catalogue tables (specs/spec_versions/acronyms/changes/evolutions/api_*/li_*/releases/asn1_types) from this DB into the base — use when the base is a CLAUSES-ONLY lots-merge (the lots carry clauses+vectors but no catalogue). chunk_id-independent.")
+	embedModel := flag.String("embedding-model", "", "canonical EmbedIdentity to stamp into the base meta (see cmd/embedid). Needed for shards that predate the unconditional embedding_model stamp (--no-hnsw kernel outputs carried none); when a shard DOES carry the meta it must agree with this value (fail-closed).")
 	flag.Parse()
 	if *base == "" || (len(vecs) == 0 && *catFrom == "") {
-		fmt.Fprintln(os.Stderr, "usage: overlay --base BASE.duckdb [--vec SHARD.duckdb ...] [--catalogue-from LEX.duckdb]")
+		fmt.Fprintln(os.Stderr, "usage: overlay --base BASE.duckdb [--vec SHARD.duckdb ...] [--catalogue-from LEX.duckdb] [--embedding-model ID]")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *base, vecs, *catFrom); err != nil {
+	if err := run(context.Background(), *base, vecs, *catFrom, *embedModel); err != nil {
 		fmt.Fprintln(os.Stderr, "overlay:", err)
 		os.Exit(1)
 	}
@@ -63,7 +64,7 @@ var catalogueTables = []string{
 	"api_operations", "api_schemas", "li_events", "li_event_fields", "li_nf_clauses", "asn1_types",
 }
 
-func run(ctx context.Context, base string, vecs []string, catFrom string) error {
+func run(ctx context.Context, base string, vecs []string, catFrom, embedModelFlag string) error {
 	if _, err := os.Stat(base); err != nil {
 		return fmt.Errorf("base %s: %w", base, err)
 	}
@@ -102,11 +103,13 @@ func run(ctx context.Context, base string, vecs []string, catFrom string) error 
 	_ = sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&before)
 	fmt.Fprintf(os.Stderr, "[overlay] base %s: %d clauses already vectorised\n", base, before)
 
-	// embedModel collects the shards' embedding_model meta. All shards feeding ONE
-	// fused DB must agree (mixing models/precisions in one store is forbidden — the
-	// EmbedIdentity invariant); the agreed value is stamped into the base so the
-	// serve-time coherence guard sees the fused DB like a published sub-base.
-	embedModel := ""
+	// embedModel collects the shards' embedding_model meta, seeded by the explicit
+	// --embedding-model flag (the only truth for shards that predate the
+	// unconditional stamp). All sources feeding ONE fused DB must agree (mixing
+	// models/precisions in one store is forbidden — the EmbedIdentity invariant);
+	// the agreed value is stamped into the base so the serve-time coherence guard
+	// sees the fused DB like a published sub-base.
+	embedModel := embedModelFlag
 	for i, v := range vecs {
 		if _, err := os.Stat(v); err != nil {
 			return fmt.Errorf("vec %s: %w", v, err)
@@ -125,7 +128,7 @@ func run(ctx context.Context, base string, vecs []string, catFrom string) error 
 		case embedModel == "":
 			embedModel = m
 		case m != embedModel:
-			return fmt.Errorf("shard %s embedding_model=%q != %q from earlier shards — refusing to fuse mixed models into one DB", v, m, embedModel)
+			return fmt.Errorf("shard %s embedding_model=%q != %q (from --embedding-model or earlier shards) — refusing to fuse mixed models into one DB", v, m, embedModel)
 		}
 		// Overlay ONLY where the shard actually has a vector, matched by the clause's
 		// natural identity + exact text (NOT chunk_id — unstable across republishes).
