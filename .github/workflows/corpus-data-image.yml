@@ -1,0 +1,344 @@
+name: Corpus Data Image
+
+# =============================================================================
+# Bake the fused corpus (lexical DB + fp16 vectors + BGE-M3 fp16) into the
+# PURE-DATA image ghcr.io/<owner>/3gpp-data — the build-time base the 3gpp-mcp
+# full image inherits its ~22 GB data layer from (plan split-data-image,
+# follow-up of #125). Splitting data from code means a code-only mcp rebuild
+# pushes/pulls ~150 MB instead of ~15 GB.
+#
+# ONE bake (amd64 runner) — the content is arch-neutral (the arch-specific ORT
+# lives in the mcp layer). The image is then published as a MULTI-PLATFORM
+# manifest whose entries reference the SAME data blob (Dockerfile.data is
+# copy-only: no RUN, so buildx emits identical layers for both platforms; the
+# registry stores the blob once). A verify step asserts that property fail-loud.
+#
+# PR 1 (additive): manual dispatch only — the legacy corpus-image.yml full bake
+# stays authoritative until PR 2 switches the mcp build to consume this image.
+# PR 2 will add: workflow_run on "Corpus · Build" + chain into corpus-image.yml.
+#
+# ⚠ FIRST PUSH: the 3gpp-data package is created PUBLIC by default — set it
+# PRIVATE in the GitHub UI once (it embeds verbatim 3GPP text), same procedure
+# as 3gpp-corpus / 3gpp-mcp / 3gpp-vec.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_tag:
+        description: "3gpp-corpus tag to bake from"
+        type: string
+        default: "latest"
+      push:
+        description: "Push the data image to GHCR"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-data-image
+  cancel-in-progress: false # never kill an in-flight ~1h bake; queue instead
+
+jobs:
+  # Materialise the BGE-M3 model ONCE and hand it to the bake as a run artifact
+  # (same prefetch as corpus-image.yml: models-release cache first, one pinned
+  # HF fetch at most — HuggingFace 429-rate-limited the runners repeatedly).
+  model:
+    runs-on: ubuntu-latest
+    # Best-effort by design: the bake falls back to restore-bge.sh on a missing
+    # artifact, so the prefetch can never gate the pipeline.
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Materialise BGE-M3 (models release → HF once)
+        run: scripts/restore-bge.sh bge-cache
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bge-m3-model
+          path: bge-cache/bge-m3
+          retention-days: 1
+          if-no-files-found: warn
+
+  bake:
+    needs: model
+    runs-on: ubuntu-latest # ONE bake: the data content is arch-neutral
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write # pull the private corpus artifact + push the data image
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The bake stages ~27 GB in the workspace, and buildx (container driver)
+      # then needs roughly 2x that AGAIN in Docker storage (build-context copy +
+      # image snapshot) — the runner agent died of ENOSPC before this relocation
+      # existed. Move Docker's data-root to the big ephemeral /mnt disk so
+      # Docker/buildkit storage stops competing with the workspace. Guarded
+      # no-op when /mnt is absent or small.
+      - name: Relocate Docker data-root to /mnt (big ephemeral disk)
+        run: |
+          set -euo pipefail
+          free_mnt=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+          if [ "${free_mnt:-0}" -lt 40 ]; then
+            echo "/mnt absent or <40GB free (${free_mnt:-0}GB) — keeping the default data-root"
+            df -h | head -5
+            exit 0
+          fi
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker /etc/docker
+          if [ -s /etc/docker/daemon.json ]; then
+            sudo jq '. + {"data-root":"/mnt/docker"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl start docker
+          docker info --format 'docker data-root: {{.DockerRootDir}}'
+          df -h / /mnt | tail -2
+
+      # The model prefetched ONCE by the `model` job (arch-independent weights).
+      # Missing artifact is tolerated — the bake falls back to restore-bge.sh.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          name: bge-m3-model
+          path: bge-cache/bge-m3
+
+      # Verbatim move of corpus-image.yml's proven full bake (issue #125 chain:
+      # identity overlay #128, sympy #130, DUCK guard #131/#135, models-release
+      # restore #132/#133, embedding_model stamp #133, compaction on the
+      # emptiest disk #136/#137).
+      - name: Bake fused raw DB (identity overlay) + fp16 BGE-M3
+        id: bake
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          TAG: ${{ github.event.inputs.corpus_tag || 'latest' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          echo "disk before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules /opt/microsoft 2>/dev/null || true
+          sudo swapoff -a 2>/dev/null || true; sudo rm -f /mnt/swapfile /swapfile 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          echo "disk after free:"; df -h / | tail -1
+          rm -rf image-data && mkdir -p image-data
+          # 1) DB = the CURRENT lexical corpus from the PRIVATE GHCR image.
+          retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
+          img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
+          retry docker pull "$img"
+          cid=$(docker create "$img" /noop)
+          docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
+          docker rm "$cid" >/dev/null
+          docker rmi "$img" >/dev/null 2>&1 || true   # DISK: the pulled copy is consumed
+          test -s image-data/3gpp.duckdb
+          # 2a) BGE-M3 WITHOUT touching HuggingFace: run artifact, else restore-bge.sh.
+          if [ -s bge-cache/bge-m3/model.onnx_data ]; then
+            mkdir -p image-data/models
+            cp -a bge-cache/bge-m3 image-data/models/
+            echo "BGE-M3 from the run artifact (prefetched once by the model job)"
+          else
+            echo "::warning::bge-m3-model artifact absent — restoring directly"
+            scripts/restore-bge.sh image-data/models
+          fi
+          # 2b) ONNX Runtime + (BGE-M3 only if 2a fell through) via the provisioner —
+          #    ORT is needed by the fp16 conversion toolchain context only at bake; it
+          #    is NOT shipped in this data image (arch-specific → mcp layer).
+          CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
+          RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap model/ORT" \
+            retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker
+          # 3) fp16 conversion (keep_io_types) — kernel-identical recipe.
+          python3 -m pip install --quiet onnx onnxruntime sympy packaging
+          mkdir -p image-data/models/bge-m3-fp16
+          cat > /tmp/convfp16.py <<'PY'
+          import onnx
+          from onnxruntime.transformers.onnx_model import OnnxModel
+          m = onnx.load("image-data/models/bge-m3/model.onnx")
+          om = OnnxModel(m)
+          om.convert_float_to_float16(keep_io_types=True)
+          onnx.save(om.model, "image-data/models/bge-m3-fp16/model.onnx",
+                    save_as_external_data=True, all_tensors_to_one_file=True,
+                    location="model.onnx_data")
+          print("fp16_saved")
+          PY
+          python3 /tmp/convfp16.py
+          cp image-data/models/bge-m3/tokenizer.json image-data/models/bge-m3-fp16/
+          rm -rf image-data/models/bge-m3
+          cat > image-data/models/models.yaml <<'YAML'
+          active: bge-m3-fp16
+          models:
+            - name: bge-m3-fp16
+              family: bge-m3
+              dir: /data/mcp-3gpp/models/bge-m3-fp16
+              precision: fp16
+              dim: 1024
+              normalization: l2
+              revision: 5617a9f
+              tokenizer_revision: 5617a9f
+              tokenizer_dir: /data/mcp-3gpp/models/bge-m3-fp16
+              inputs: [input_ids, attention_mask]
+              output: sentence_embedding
+          YAML
+          # 4) gate on the baked DB BEFORE fusing vectors into it.
+          CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
+            --require-fts --min-clauses 1 --max-empty-meta 100000
+          # 5) FUSE the published vectors INTO the DB, one sub-base at a time.
+          case "$(uname -m)" in
+            x86_64)  oras_arch=amd64 ;;
+            aarch64) oras_arch=arm64 ;;
+            *) echo "::error::unsupported runner arch $(uname -m) for oras"; exit 1 ;;
+          esac
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
+          retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
+          CGO_ENABLED=1 go build -o /tmp/overlay ./cmd/overlay
+          EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
+          echo "embed identity (baked registry): $EMBED_ID"
+          test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
+          VREF="ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16"
+          retry oras manifest fetch "$VREF" > /tmp/vec-manifest.json
+          jq -r '.layers[] | select((.annotations["org.opencontainers.image.title"] // "") | test("^(s|shard-)[0-9]{2}.*\\.duckdb\\.zst$")) | .digest + " " + .annotations["org.opencontainers.image.title"]' \
+            /tmp/vec-manifest.json > /tmp/subs.txt
+          test -s /tmp/subs.txt || { echo "::error::no vector sub-bases on $VREF — refusing to ship a silently-lexical data image"; exit 1; }
+          echo "fusing $(wc -l < /tmp/subs.txt) sub-bases:"; cat /tmp/subs.txt
+          : > /tmp/overlay.log
+          skipped=0
+          while read -r digest title; do
+            echo "--- $title ---"; df -h / | tail -1
+            retry oras blob fetch "$VREF@$digest" --output /tmp/sub.duckdb.zst
+            if ! zstd -d -q -f --long=31 /tmp/sub.duckdb.zst -o /tmp/sub.duckdb 2>/dev/null \
+               || [ "$(dd if=/tmp/sub.duckdb bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ] \
+               || ! /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb --embedding-model "$EMBED_ID" 2>&1 | tee -a /tmp/overlay.log; then
+              echo "::warning::sub-base $title is invalid or failed to overlay — SKIPPED (its series stays lexical until the channel republishes it)"
+              skipped=$((skipped+1))
+            fi
+            rm -f /tmp/sub.duckdb.zst /tmp/sub.duckdb
+          done < /tmp/subs.txt
+          echo "sub-bases skipped: $skipped"
+          echo "=== sizes ==="; du -sh image-data image-data/* image-data/*/* 2>/dev/null || true
+          vectorised="$(grep -oE 'done: [0-9]+ clauses vectorised' /tmp/overlay.log | tail -1 | grep -oE '[0-9]+' || echo 0)"
+          echo "fused vectorised clauses: $vectorised"
+          [ "$vectorised" -ge 2000000 ] || { echo "::error::fused DB has only $vectorised vectorised clauses (< 2,000,000) — channel incomplete or overlay mis-matched"; exit 1; }
+          grep -q 'embedding_model stamped:' /tmp/overlay.log || { echo "::error::embedding_model not stamped — serve would refuse semantic"; exit 1; }
+          test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
+          test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
+          test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
+          # DISK FIRST, then COMPACT on the emptiest disk (see #136/#137 history).
+          rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt
+          scratch="image-data"
+          mnt_free="$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)"
+          if [ "${mnt_free:-0}" -ge 30 ]; then
+            sudo install -d -m 0777 /mnt/compact-scratch
+            scratch="/mnt/compact-scratch"
+          fi
+          compact="$scratch/3gpp.compact.duckdb"
+          echo "compaction scratch: $compact (mnt_free=${mnt_free:-0}G)"
+          if retry bash -c "curl -fsSL -o /tmp/duckdb.zip 'https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip'"; then
+            mkdir -p /tmp/dk && unzip -o -q /tmp/duckdb.zip -d /tmp/dk
+            cvec=0; cmeta=""
+            if /tmp/dk/duckdb -c "ATTACH 'image-data/3gpp.duckdb' AS src (READ_ONLY); ATTACH '$compact' AS dst; COPY FROM DATABASE src TO dst;" \
+               && cvec="$(/tmp/dk/duckdb -noheader -list "$compact" 'SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;')" \
+               && cmeta="$(/tmp/dk/duckdb -noheader -list "$compact" "SELECT value FROM schema_meta WHERE key = 'embedding_model';")" \
+               && [ "${cvec:-0}" -ge 2000000 ] && [ -n "$cmeta" ] \
+               && CGO_ENABLED=1 go run ./cmd/validate --db "$compact" \
+                    --require-fts --min-clauses 1 --max-empty-meta 100000; then
+              echo "compacted copy keeps vectors=$cvec embedding_model=$cmeta"
+              before=$(stat -c%s image-data/3gpp.duckdb); after=$(stat -c%s "$compact")
+              rm -f image-data/3gpp.duckdb
+              mv -f "$compact" image-data/3gpp.duckdb
+              echo "DB compacted: $((before/1024/1024)) MB -> $((after/1024/1024)) MB"
+            else
+              echo "::warning::compaction failed or lost FTS — keeping the (bloated) fused DB"
+              rm -f "$compact"
+            fi
+          else
+            echo "::warning::duckdb CLI unavailable — skipping compaction"
+          fi
+          go clean -cache -testcache -modcache 2>/dev/null || true
+          rm -rf /tmp/dk /tmp/duckdb.zip /mnt/compact-scratch 2>/dev/null || true
+          du -sh image-data image-data/* 2>/dev/null || true
+          df -h / /mnt 2>/dev/null || df -h /
+          # Provenance handed to the Dockerfile labels + downstream consumers.
+          {
+            echo "embed_identity=$EMBED_ID"
+            echo "rows=$vectorised"
+            echo "created=$(date -u +%FT%TZ)"
+            echo "datetag=$(date -u +%F)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Disk before image build (visibility)
+        run: df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          retry docker pull moby/buildkit:buildx-stable-1
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      # GHCR_PAT (not github.token): a CI-token push auto-links the package to
+      # this PUBLIC repo → PUBLIC visibility. A PAT push stays unlinked → born
+      # PRIVATE (same posture as 3gpp-corpus / 3gpp-mcp).
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # ONE build, BOTH platforms: the Dockerfile is copy-only (no RUN), so no
+      # QEMU/emulation is involved and both platform manifests reference the
+      # SAME data blob (pushed once). provenance:false keeps plain manifests.
+      - name: Build + push 3gpp-data (multi-platform, same blob)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.data
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event.inputs.push != 'false' }}
+          provenance: false
+          build-args: |
+            DATA_CREATED=${{ steps.bake.outputs.created }}
+            EMBED_IDENTITY=${{ steps.bake.outputs.embed_identity }}
+            DUCKDB_ROWS=${{ steps.bake.outputs.rows }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/3gpp-data:latest
+            ghcr.io/${{ github.repository_owner }}/3gpp-data:${{ steps.bake.outputs.datetag }}
+
+      # FAIL-LOUD same-blob assertion: both platform entries of the pushed index
+      # must reference the SAME data layer digest. This property is what makes
+      # the whole split worthwhile (one blob on the registry, dedup on pull) —
+      # if it ever breaks, fix the build, do not ship a doubled registry.
+      - name: Verify multi-platform manifests share ONE data blob
+        if: ${{ github.event.inputs.push != 'false' }}
+        run: |
+          set -euo pipefail
+          REF="ghcr.io/${{ github.repository_owner }}/3gpp-data:latest"
+          idx="$(docker buildx imagetools inspect "$REF" --raw)"
+          digests="$(printf '%s' "$idx" | jq -r '.manifests[] | select(.platform.os == "linux") | .digest')"
+          echo "platform manifests:"; printf '%s\n' "$digests"
+          layers=""
+          while IFS= read -r d; do
+            l="$(docker buildx imagetools inspect "$REF@$d" --raw | jq -r '.layers[-1].digest')"
+            echo "  $d -> data layer $l"
+            layers="$layers$l\n"
+          done <<< "$digests"
+          n="$(printf "$layers" | sort -u | grep -c . || true)"
+          [ "$n" = "1" ] || { echo "::error::platform manifests reference $n distinct data blobs — the same-blob property is broken"; exit 1; }
+          echo "OK: single shared data blob across platforms"
