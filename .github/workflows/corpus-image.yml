@@ -337,3 +337,20 @@ jobs:
           done
           [ "$fail" = 0 ] && echo "GATE OK: single shared data blob, correctly labeled, on both platforms"
           exit "$fail"
+      # ANTI-LEAK, fail-loud (the 3gpp-mcp package was found PUBLIC on 2026-06-11
+      # with the verbatim corpus inside — repo-page badge audit): verify after
+      # EVERY push, self-heal (PATCH to private), fail if the heal fails.
+      - name: Assert 3gpp-mcp is PRIVATE (self-heal then fail-loud)
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-mcp" --jq '.visibility' 2>/dev/null || echo absent)"
+          echo "3gpp-mcp visibility: $vis"
+          if [ "$vis" = "public" ]; then
+            echo "::warning::3gpp-mcp is PUBLIC — attempting self-heal to private"
+            gh api -X PATCH "/user/packages/container/3gpp-mcp/visibility" -f visibility=private >/dev/null 2>&1 || true
+            vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-mcp" --jq '.visibility' 2>/dev/null || echo absent)"
+            echo "after heal: $vis"
+          fi
+          [ "$vis" = "private" ] || { echo "::error::3gpp-mcp is '$vis' (must be private — verbatim 3GPP text). Fix in the UI: Packages → 3gpp-mcp → Settings → Change visibility."; exit 1; }

@@ -18,11 +18,14 @@ import (
 // publish-vec job as an OCI artifact (one zstd layer per sub-base + the manifest).
 const vecImage = "3gpp-vec"
 
-// FetchVecBases pulls the vector sub-bases + vec-manifest.json from the public
-// GHCR OCI artifact ghcr.io/<owner>/3gpp-vec:latest into dir (decompressing each
-// .zst), and returns the local vec-manifest.json path to hand to serve's
-// --vec-manifest. Anonymous pull (public package); any error is returned so the
-// caller can degrade to single-DB / lexical.
+// FetchVecBases pulls the vector sub-bases + vec-manifest.json from the GHCR
+// OCI artifact ghcr.io/<owner>/3gpp-vec into dir (decompressing each .zst), and
+// returns the local vec-manifest.json path to hand to serve's --vec-manifest.
+// Anonymous pull: the package is PRIVATE since 2026-06-12 (the sub-bases carry
+// verbatim clause text), so this legacy opt-in path (`serve -vec-ghcr`) now
+// fails the token handshake and the caller degrades to single-DB / lexical —
+// the fused-data image ships its vectors baked in and never calls this. Make
+// it token-aware only if a credentialed runtime pull is ever needed again.
 func FetchVecBases(ctx context.Context, owner, dir string) (string, error) {
 	repo := owner + "/" + vecImage
 	tok, err := ghcrToken(ctx, repo)

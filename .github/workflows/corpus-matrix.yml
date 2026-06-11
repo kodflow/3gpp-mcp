@@ -1339,7 +1339,7 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       HAVE_PAT: ${{ secrets.GHCR_PAT != '' }}
     steps:
-      - name: Prune old GHCR versions (keep 7 dated corpus + rolling shard tags)
+      - name: Prune old GHCR versions (7 dated corpus + 7 dated data + rolling shard tags)
         run: |
           set -eu
           if [ "$HAVE_PAT" != "true" ]; then
@@ -1348,6 +1348,7 @@ jobs:
           fi
           gh api --paginate "/users/${OWNER}/packages/container/3gpp-corpus/versions" > corpus.json 2>/dev/null || echo '[]' > corpus.json
           gh api --paginate "/users/${OWNER}/packages/container/3gpp-shard/versions"  > shard.json  2>/dev/null || echo '[]' > shard.json
+          gh api --paginate "/users/${OWNER}/packages/container/3gpp-data/versions"   > data.json   2>/dev/null || echo '[]' > data.json
           python3 <<'PY'
           import json, os, re, subprocess
           from datetime import datetime, timezone, timedelta
@@ -1370,6 +1371,17 @@ jobs:
               if "latest" in t or any(x in keep for x in t):
                   continue
               delete("3gpp-corpus", v["id"], f"tags={t or 'untagged'}")
+          # data (split-data-image): same policy as corpus — keep :latest + the 7
+          # newest YYYY-MM-DD dated tags; drop the rest (incl. untagged). Each
+          # version is ~15 GB compressed, so retention matters double here.
+          dv = load("data.json")
+          dkeep = set(sorted({t for v in dv for t in tags_of(v) if DATE.match(t)}, reverse=True)[:7])
+          print("data keep dates:", sorted(dkeep, reverse=True))
+          for v in dv:
+              t = tags_of(v)
+              if "latest" in t or any(x in dkeep for x in t):
+                  continue
+              delete("3gpp-data", v["id"], f"tags={t or 'untagged'}")
           # shard: keep rolling tags (no run-id suffix = resume baseline); drop untagged
           # + run-id-only tags older than 7 days.
           sv = load("shard.json")

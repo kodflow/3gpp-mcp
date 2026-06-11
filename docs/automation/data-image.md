@@ -33,11 +33,25 @@ corpus-matrix (lexical publish)          corpus-embed-kaggle (vectors)
 
 ## Status
 
-- PR 1 (this doc): additive — `Dockerfile.data` + `corpus-data-image.yml`,
-  manual dispatch only; the legacy full bake in `corpus-image.yml` stays
-  authoritative.
-- PR 2: switch — `Dockerfile` consumes `3gpp-data@digest` (stage `corpus` +
-  `COPY --link`), `corpus-image.yml` drops its bake, manifest-based dedupe gate.
-- PR 3: cleanup — prune extended to `3gpp-data`, docs completed.
+- PR 1 (#138, merged): additive — `Dockerfile.data` + `corpus-data-image.yml`
+  (manual dispatch; chain wiring landed with PR 2).
+- PR 2 (#139): switch — multi-target `Dockerfile` (base/light/full) consuming
+  `3gpp-data@digest` (stage `corpus` + `COPY --link`), `corpus-image.yml`
+  bake removed, `resolve` job (digest + ORT pins) + manifest-based `gate` job.
+- PR 3 (this change): cleanup — prune extended to `3gpp-data` (keep `:latest`
+  + 7 dated, each version ~15 GB compressed), `make inspect-layers` for local
+  dedupe eyeballing, docs completed.
+
+## Pulling from the labs
+
+The labs pulls the single private `3gpp-mcp` image with a **dedicated read-only
+token** — see [labs-pull.md](labs-pull.md) for the token, the Docker/Kubernetes
+recipes, and both rotation procedures (image + token).
+
+## Local helpers
+
+- `make image-light` — local light build (now `--target light`).
+- `make inspect-layers` — per-platform layers of the published `:latest` with
+  the `3gpp-data` blob highlighted (requires `crane` + GHCR login).
 
 Plan : `.claude/plans/split-data-image.md` (v2, durci par review externe).
