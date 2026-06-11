@@ -40,7 +40,13 @@ jobs:
           - os: macos-14
             config: .goreleaser.darwin.yaml
             id: darwin
-          - os: windows-latest
+          # Pinned (not windows-latest): GitHub is repointing the alias to
+          # windows-2025-vs2026 (June 15, 2026 — the NOTICE in every job log).
+          # This is a CGO/DuckDB build, so an under-the-feet MSVC/VS toolchain
+          # flip can break the link or change the C++ runtime silently. Same
+          # doctrine as the SHA-pinned actions: bump deliberately, after a
+          # validated run on the new image.
+          - os: windows-2025
             config: .goreleaser.windows.yaml
             id: windows
     runs-on: ${{ matrix.os }}
