@@ -348,9 +348,39 @@ jobs:
           test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
           test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
+          # COMPACT the fused DB: the identity overlay UPDATEd essentially every
+          # clause row and DuckDB's copy-on-write row groups leave ~25-30% dead
+          # space behind (~23 GB instead of ~17-18). That bloat is then paid ~3x
+          # by the image build (context copy + layer snapshot + export) and the
+          # runner died of ENOSPC twice. COPY FROM DATABASE into a fresh file is
+          # the documented reclaim. Belt-and-braces: re-validate FTS on the
+          # compacted copy and KEEP THE BLOATED ORIGINAL if anything is off
+          # (degrade to a bigger image, never to a broken one).
+          case "$(uname -m)" in x86_64) dk=amd64 ;; aarch64) dk=aarch64 ;; *) dk="" ;; esac
+          if [ -n "$dk" ] && retry bash -c "curl -fsSL -o /tmp/duckdb.zip 'https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-${dk}.zip'"; then
+            mkdir -p /tmp/dk && unzip -o -q /tmp/duckdb.zip -d /tmp/dk
+            cvec=0; cmeta=""
+            if /tmp/dk/duckdb -c "ATTACH 'image-data/3gpp.duckdb' AS src (READ_ONLY); ATTACH 'image-data/3gpp.compact.duckdb' AS dst; COPY FROM DATABASE src TO dst;" \
+               && cvec="$(/tmp/dk/duckdb -noheader -list image-data/3gpp.compact.duckdb 'SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;')" \
+               && cmeta="$(/tmp/dk/duckdb -noheader -list image-data/3gpp.compact.duckdb "SELECT value FROM schema_meta WHERE key = 'embedding_model';")" \
+               && [ "${cvec:-0}" -ge 2000000 ] && [ -n "$cmeta" ] \
+               && CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.compact.duckdb \
+                    --require-fts --min-clauses 1 --max-empty-meta 100000; then
+              echo "compacted copy keeps vectors=$cvec embedding_model=$cmeta"
+              before=$(stat -c%s image-data/3gpp.duckdb); after=$(stat -c%s image-data/3gpp.compact.duckdb)
+              mv -f image-data/3gpp.compact.duckdb image-data/3gpp.duckdb
+              echo "DB compacted: $((before/1024/1024)) MB -> $((after/1024/1024)) MB"
+            else
+              echo "::warning::compaction failed or lost FTS — keeping the (bloated) fused DB"
+              rm -f image-data/3gpp.compact.duckdb
+            fi
+          else
+            echo "::warning::duckdb CLI unavailable for $dk — skipping compaction"
+          fi
           # DISK: everything consumed by the bake is dead weight for the image
           # build that follows — drop it so the workspace holds image-data only.
-          rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt
+          rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt /tmp/dk /tmp/duckdb.zip
+          du -sh image-data image-data/* 2>/dev/null || true
           df -h / /mnt 2>/dev/null || df -h /
 
       - name: Disk before image build (visibility)
