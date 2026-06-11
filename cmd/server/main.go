@@ -41,6 +41,12 @@ func main() {
 			fmt.Fprintln(os.Stderr, "bootstrap:", err)
 			os.Exit(1)
 		}
+	case "skill":
+		// Print the embedded /3gpp skill (the same bytes the HTTP landing serves at
+		// /skill/3gpp.md) so a stdio-only install can fetch it FROM THE BINARY —
+		// always version-matched, never from the repository:
+		//   docker run --rm <image> skill > ~/.claude/commands/3gpp.md
+		fmt.Print(skill3gpp)
 	case "version", "-v", "--version":
 		fmt.Println(Version)
 	default:
@@ -217,5 +223,5 @@ func serve(args []string) error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|version>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|skill|version>\n", os.Args[0])
 }
