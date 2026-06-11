@@ -17,9 +17,11 @@ name: Corpus Data Image
 # stays authoritative until PR 2 switches the mcp build to consume this image.
 # PR 2 will add: workflow_run on "Corpus · Build" + chain into corpus-image.yml.
 #
-# ⚠ FIRST PUSH: the 3gpp-data package is created PUBLIC by default — set it
-# PRIVATE in the GitHub UI once (it embeds verbatim 3GPP text), same procedure
-# as 3gpp-corpus / 3gpp-mcp / 3gpp-vec.
+# VISIBILITY: the push uses GHCR_PAT (never the CI token) and the Dockerfile
+# carries no org.opencontainers.image.source label, so the package is UNLINKED
+# from this public repo and is BORN PRIVATE (same posture as 3gpp-corpus /
+# 3gpp-mcp / 3gpp-vec). The assert step below VERIFIES it after every push and
+# fails loud if the package is ever public (it embeds verbatim 3GPP text).
 # =============================================================================
 
 on:
@@ -342,3 +344,23 @@ jobs:
           n="$(printf "$layers" | sort -u | grep -c . || true)"
           [ "$n" = "1" ] || { echo "::error::platform manifests reference $n distinct data blobs — the same-blob property is broken"; exit 1; }
           echo "OK: single shared data blob across platforms"
+
+      # ANTI-LEAK, fail-loud: the PAT push posture makes the package born
+      # PRIVATE, but posture is not proof — verify after EVERY push, self-heal
+      # (PATCH to private) if it ever shows public, and fail if the heal fails.
+      # Runs with the PAT: only the package owner's token can read/patch it.
+      - name: Assert 3gpp-data is PRIVATE (self-heal then fail-loud)
+        if: ${{ github.event.inputs.push != 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-data" --jq '.visibility' 2>/dev/null || echo absent)"
+          echo "3gpp-data visibility: $vis"
+          if [ "$vis" = "public" ]; then
+            echo "::warning::3gpp-data is PUBLIC — attempting self-heal to private"
+            gh api -X PATCH "/user/packages/container/3gpp-data/visibility" -f visibility=private >/dev/null 2>&1 || true
+            vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-data" --jq '.visibility' 2>/dev/null || echo absent)"
+            echo "after heal: $vis"
+          fi
+          [ "$vis" = "private" ] || { echo "::error::3gpp-data is '$vis' (must be private — verbatim 3GPP text). Fix in the UI: Packages → 3gpp-data → Settings → Change visibility."; exit 1; }
