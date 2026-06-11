@@ -57,7 +57,7 @@ case "${1:-serve}" in
     fi
     exec mcp-3gpp serve "$@"
     ;;
-  bootstrap|version|-v|--version)
+  skill|bootstrap|version|-v|--version)
     exec mcp-3gpp "$@"
     ;;
   *)
