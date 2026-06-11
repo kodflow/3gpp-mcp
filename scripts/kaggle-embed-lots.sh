@@ -77,7 +77,9 @@ state_slug()  {                                                      # precision
 # creds) followed by the shared native kernel body, plus a kernel-metadata.json. No
 # dataset_sources on first push: the kernel fresh-slices the lot from the published
 # `latest` lexical DB (mounting a not-yet-existing resume Dataset is what Kaggle
-# rejects). A later run can resume by mounting state_slug once it holds partial state.
+# rejects). A later run can resume by mounting state_slug once it holds partial state;
+# without any mounted Dataset the kernel still carries published vectors over from
+# the durable GHCR 3gpp-vec channel, so a deleted Dataset never costs a full re-embed.
 stage_kernel() {
   local lot="$1" rels="$2" dir="$3"; mkdir -p "$dir"
   {
@@ -211,7 +213,9 @@ stage_resume() { # $1=lot  $2=rels
 cmd_resume() {
   require_cli
   # Phase 1: upload BOTH partials first, so each dataset is fully processed before its
-  # kernel mounts it (a not-yet-ready dataset would silently fresh-slice = re-embed all).
+  # kernel mounts it (a not-yet-ready dataset would silently fresh-slice and fall back
+  # to the GHCR vec carry-over — correct but it wastes the freshly-embedded partial
+  # that only lives in this upload).
   # RESUME_SKIP_UPLOAD=1 re-pushes the kernels against ALREADY-uploaded resume datasets
   # (e.g. after a code-only fix), avoiding a needless ~18GB re-upload.
   if [ "${RESUME_SKIP_UPLOAD:-0}" = 1 ]; then
