@@ -272,6 +272,14 @@ jobs:
           retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           CGO_ENABLED=1 go build -o /tmp/overlay ./cmd/overlay
+          # The canonical EmbedIdentity the baked models.yaml makes the server
+          # report — handed to overlay as the stamp. Needed because the channel's
+          # legacy sub-bases (--no-hnsw kernel outputs) carry NO embedding_model
+          # meta of their own; once republished by a stamped embed they must
+          # AGREE with this value (overlay fails closed on contradiction).
+          EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
+          echo "embed identity (baked registry): $EMBED_ID"
+          test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
           VREF="ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16"
           retry oras manifest fetch "$VREF" > /tmp/vec-manifest.json
           # Both naming schemes can coexist on the channel (s<NN> from the Kaggle
@@ -292,7 +300,7 @@ jobs:
             # integrity is still enforced by the >=2M assertion below.
             if ! zstd -d -q -f --long=31 /tmp/sub.duckdb.zst -o /tmp/sub.duckdb 2>/dev/null \
                || [ "$(dd if=/tmp/sub.duckdb bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ] \
-               || ! /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb 2>&1 | tee -a /tmp/overlay.log; then
+               || ! /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb --embedding-model "$EMBED_ID" 2>&1 | tee -a /tmp/overlay.log; then
               echo "::warning::sub-base $title is invalid or failed to overlay — SKIPPED (its series stays lexical until the channel republishes it)"
               skipped=$((skipped+1))
             fi
