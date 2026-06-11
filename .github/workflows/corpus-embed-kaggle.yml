@@ -292,6 +292,25 @@ jobs:
             --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             $args
+      # ANTI-LEAK, fail-loud (3gpp-vec was found PUBLIC on 2026-06-12 — the
+      # sub-bases carry the clause TEXT verbatim, not just vectors): verify
+      # after every publish, self-heal (PATCH to private), fail if the heal
+      # fails. NB: flipping private only degrades the legacy opt-in anonymous
+      # `serve -vec-ghcr` path; every CI consumer authenticates.
+      - name: Assert 3gpp-vec is PRIVATE (self-heal then fail-loud)
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-vec" --jq '.visibility' 2>/dev/null || echo absent)"
+          echo "3gpp-vec visibility: $vis"
+          if [ "$vis" = "public" ]; then
+            echo "::warning::3gpp-vec is PUBLIC — attempting self-heal to private"
+            gh api -X PATCH "/user/packages/container/3gpp-vec/visibility" -f visibility=private >/dev/null 2>&1 || true
+            vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-vec" --jq '.visibility' 2>/dev/null || echo absent)"
+            echo "after heal: $vis"
+          fi
+          [ "$vis" = "private" ] || { echo "::error::3gpp-vec is '$vis' (must be private — verbatim 3GPP clause text in the sub-bases). Fix in the UI: Packages → 3gpp-vec → Settings → Change visibility."; exit 1; }
       - name: Upload artifact (vectorized sub-bases)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
