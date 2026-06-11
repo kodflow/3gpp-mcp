@@ -97,6 +97,9 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          # light explicitly: the multi-target Dockerfile's full target needs a
+          # DATA_IMAGE (the 3gpp-data base) that a smoke build cannot provide.
+          target: light
           push: false
           load: false
           cache-from: type=gha

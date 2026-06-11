@@ -98,7 +98,7 @@ light-artifacts: ## Emit the 2 .zst (full lexical DB + embedding delta) from LEX
 image-light: ## Build the lexical (no-embed) runtime image 3gpp-mcp:light with LEX baked in
 	@test -s "$${LEX:-data/3gpp.lexical.duckdb}" || { echo "set LEX to a lexical DB (merge --strip-embeddings)"; exit 1; }
 	mkdir -p image-data && cp "$${LEX:-data/3gpp.lexical.duckdb}" image-data/3gpp.duckdb
-	docker build -t 3gpp-mcp:light .
+	docker build --target light -t 3gpp-mcp:light .
 	rm -f image-data/3gpp.duckdb
 	@echo "built 3gpp-mcp:light (lexical DB baked) — run: docker run -i --rm 3gpp-mcp:light serve"
 
