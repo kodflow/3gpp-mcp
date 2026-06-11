@@ -59,16 +59,24 @@ RULES:
 5. In HTTP mode, render each source as a clickable link to http://{{HOST}}/spec/<spec_id>/<release>/<clause>
    (the local page showing that clause's EXACT indexed text); otherwise fall back to the official 3GPP url from the MCP.
 
-INSTALL & CONFIGURE (HTTP — this is a hosted, shared server; nothing to pull or run):
-- Claude Code / Claude Desktop: ` + "`claude mcp add --transport http 3gpp http://{{HOST}}/mcp`" + `, then install the /3gpp skill:
+INSTALL & CONFIGURE — set up BOTH the MCP server and the /3gpp skill:
+- Claude Code / Claude Desktop (this hosted server; nothing to pull or run):
+  ` + "`claude mcp add --transport http 3gpp http://{{HOST}}/mcp`" + `, then install the /3gpp skill:
   ` + "`curl -fsSL http://{{HOST}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md`" + `
 - opencode / Codex / Cline / Continue / any mcpServers-style client: add to the client config
   { "mcpServers": { "3gpp": { "type": "http", "url": "http://{{HOST}}/mcp" } } }
+  and save http://{{HOST}}/skill/3gpp.md wherever the client keeps skills/instructions.
+- Prefer a LOCAL instance (Docker, offline-semantic)? docker login ghcr.io, then:
+  ` + "`claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data ghcr.io/kodflow/3gpp-mcp:latest serve`" + `
+  and the skill straight from the binary (always version-matched):
+  ` + "`docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md`" + `
 - Ollama / a local agent without native MCP: run an MCP→tool bridge pointed at http://{{HOST}}/mcp,
   or call the HTTP endpoint directly; load http://{{HOST}}/skill/3gpp.md as the system prompt.
 If you (the assistant) are reading this: figure out which of the above environments you are in,
-apply the matching configuration, install the /3gpp skill from http://{{HOST}}/skill/3gpp.md, and
-answer every 3GPP question in the strict format that skill defines.
+apply the matching configuration, install the /3gpp skill (from http://{{HOST}}/skill/3gpp.md or
+the binary's skill subcommand), then answer every 3GPP question in the strict format that skill
+defines. After installing, tell the user to restart their AI session so the MCP registration and
+the skill are both picked up.
 
 ENDPOINTS (this server, all over HTTP):
 - POST http://{{HOST}}/mcp — the MCP Streamable-HTTP endpoint (JSON-RPC; the handshake is below).
@@ -242,26 +250,33 @@ var landingTmpl = template.Must(template.New("landing").Parse(`<!doctype html>
 <h1>3gpp-mcp</h1>
 <p class="sub">Local-first retrieval over the full 3GPP corpus — exact spec fragments with citations, no hallucination.</p>
 
-<h2>1. Copy this prompt into any AI</h2>
+<h2>1. One prompt that sets up everything — paste into any AI</h2>
+<p>Paste the block below into <b>any</b> assistant (Claude Code, Claude Desktop, Cursor, opencode,
+Cline, Codex…): it makes the AI <b>connect to this MCP server AND install the <code>/3gpp</code>
+skill</b> (the strict cited-answer protocol) for whatever environment it is running in.</p>
 <div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre id="prompt">{{.Prompt}}</pre></div>
 <p>Or fetch it raw: <a href="/llms.txt"><code>/llms.txt</code></a></p>
 
-<h2>2. Connect (HTTP) — nothing to install or run</h2>
-<p>This is a hosted, shared server. Point your MCP client at <code>http://{{.Host}}/mcp</code>.</p>
-<p><b>Claude Code / Claude Desktop:</b></p>
-<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>claude mcp add --transport http 3gpp http://{{.Host}}/mcp</pre></div>
+<h2>2. Manual setup</h2>
+<p><b>Option A — this hosted server</b> (nothing to pull or run). Register the MCP, then install the skill:</p>
+<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>claude mcp add --transport http 3gpp http://{{.Host}}/mcp
+curl -fsSL http://{{.Host}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md</pre></div>
 <p><b>Generic <code>mcp.json</code></b> (opencode / Cline / Continue / Codex / any mcpServers client):</p>
 <div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>{
   "mcpServers": {
     "3gpp": { "type": "http", "url": "http://{{.Host}}/mcp" }
   }
 }</pre></div>
+<p><b>Option B — your own local instance</b> (Docker, offline-semantic; image is private →
+<code>docker login ghcr.io</code> first). The skill ships <b>inside the binary</b>, so it is always
+version-matched with the server:</p>
+<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>docker pull ghcr.io/kodflow/3gpp-mcp:latest
+claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data ghcr.io/kodflow/3gpp-mcp:latest serve
+docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md</pre></div>
+<p>Then restart your AI session (MCP registrations and skills are read at session start) and ask
+<code>/3gpp &lt;your question&gt;</code>.</p>
 
-<h2>3. Claude Code skill (strict cited answers)</h2>
-<p>Install the <code>/3gpp</code> skill, then ask <code>/3gpp &lt;your question&gt;</code>:</p>
-<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>curl -fsSL http://{{.Host}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md</pre></div>
-
-<h2>4. Query it directly (HTTP, no MCP client)</h2>
+<h2>3. Query it directly (HTTP, no MCP client)</h2>
 <p>The endpoint speaks JSON-RPC over <a href="/mcp"><code>/mcp</code></a>: <em>initialize</em> (keep the
 <code>Mcp-Session-Id</code> response header) → <em>notifications/initialized</em> → <em>tools/call</em>.
 The full recipe (with exact bodies) is at <a href="/help"><code>/help</code></a>.</p>

@@ -13,22 +13,27 @@ For every 3GPP question:
    `trace_evolution`, `find_cross_references`, `list_specs`, `search_api`, `li_events`,
    `server_info`. Cite-or-silent: every claim carries `{spec_id, release, version,
    clause, url}`. If nothing usable comes back, say so — invent nothing.
-3. **Answer in EXACTLY this format** (omit any META line that is not relevant; never pad):
+3. **Answer in EXACTLY this format** (omit any META line that is not relevant). The
+   frame is OPEN on the right: every META line starts with `│ ` and ends right after
+   its value — **never append a closing `│` and never pad with spaces** (hand-counted
+   padding cannot align reliably and renders crooked):
 
 ```
 🔎 Reformulé ▸ « <your reformulated query> »
 
-┌─ MÉTA ──────────────────────────────────────────────────────────────────────┐
-│ Releases   : <Rel-X → Rel-Z>                                                  │
-│ Domaine    : <5GC|EPC|IMS|RAN|LI|Security>        Stack : <4G|5G>             │
-│ NF / NE    : <AMF · SMF · … | MME · SGW · …>                                  │
-│ Interfaces : <N1 · N2 · N4 · … | S1 · X2 · …>                                 │
-│ Procédure  : <Registration | PDU Session Establishment | …>                  │
-│ Specs      : <TS 23.501 · TS 23.502 · …>                                     │
-│ WG         : <SA2 · CT1 · …>                       Type : <TS (normatif)|TR>  │
-│ Évolution  : <MME (4G) → AMF + SMF (5G) | —>                                  │
-│ Récup.     : <hybride|lexical|sémantique> · confiance <HAUTE|MOYENNE|PARTIELLE>│
-└──────────────────────────────────────────────────────────────────────────────┘
+┌─ MÉTA ────────────────────────────────────────────
+│ Releases   : <Rel-X → Rel-Z>
+│ Domaine    : <5GC|EPC|IMS|RAN|LI|Security>
+│ Stack      : <4G|5G>
+│ NF / NE    : <AMF · SMF · … | MME · SGW · …>
+│ Interfaces : <N1 · N2 · N4 · … | S1 · X2 · …>
+│ Procédure  : <Registration | PDU Session Establishment | …>
+│ Specs      : <TS 23.501 · TS 23.502 · …>
+│ WG         : <SA2 · CT1 · …>
+│ Type       : <TS (normatif)|TR>
+│ Évolution  : <MME (4G) → AMF + SMF (5G) | —>
+│ Récup.     : <hybride|lexical|sémantique> · confiance <HAUTE|MOYENNE|PARTIELLE>
+└───────────────────────────────────────────────────
 
 <full answer — as long as needed; inline [TS xx.xxx §y] citations; never truncate>
 
