@@ -162,7 +162,10 @@ jobs:
           #    recipe the Kaggle kernel uses, so the resulting EmbedIdentity equals the
           #    one stamped in the published sub-bases. The fp32 source is then DROPPED
           #    (the image ships fp16 only: half the weight, matching vectors).
-          python3 -m pip install --quiet onnx onnxruntime
+          # sympy + packaging: onnxruntime.transformers needs them for the symbolic
+          # shape inference a >2GB model requires — Kaggle's image preinstalls them,
+          # a GitHub runner does NOT (the first fused-bake run died on exactly this).
+          python3 -m pip install --quiet onnx onnxruntime sympy packaging
           mkdir -p image-data/models/bge-m3-fp16
           cat > /tmp/convfp16.py <<'PY'
           import onnx
