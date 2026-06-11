@@ -107,6 +107,36 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The FULL bake stages ~27 GB of fused data in the workspace, and the buildx
+      # container driver then needs roughly 2x that AGAIN in Docker storage (the
+      # build-context copy + the image snapshot) — the runner agent died mid
+      # `docker build` twice with / exhausted, leaving no error line. Relocate
+      # Docker's data-root to the runner's big ephemeral disk (/mnt, ~65-75 GB
+      # free on ubuntu-latest) so Docker/buildkit storage stops competing with
+      # the workspace. Guarded no-op when /mnt is absent or small (other runner
+      # layouts, e.g. the arm64 image whose / is already large).
+      - name: Relocate Docker data-root to /mnt (big ephemeral disk)
+        if: matrix.variant == 'full'
+        run: |
+          set -euo pipefail
+          free_mnt=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+          if [ "${free_mnt:-0}" -lt 40 ]; then
+            echo "/mnt absent or <40GB free (${free_mnt:-0}GB) — keeping the default data-root"
+            df -h | head -5
+            exit 0
+          fi
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker /etc/docker
+          if [ -s /etc/docker/daemon.json ]; then
+            sudo jq '. + {"data-root":"/mnt/docker"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl start docker
+          docker info --format 'docker data-root: {{.DockerRootDir}}'
+          df -h / /mnt | tail -2
+
       # The model prefetched ONCE by the `model` job (arch-independent weights).
       # Missing artifact is tolerated — the bake step falls back to restore-bge.sh.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -318,6 +348,14 @@ jobs:
           test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
           test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
+          # DISK: everything consumed by the bake is dead weight for the image
+          # build that follows — drop it so the workspace holds image-data only.
+          rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Disk before image build (visibility)
+        if: matrix.variant == 'full'
+        run: df -h / /mnt 2>/dev/null || df -h /
 
       # Warm the buildkit image with a retry'd pull so the buildx builder boot does
       # not hard-fail on a transient Docker Hub timeout (the exact class of break
