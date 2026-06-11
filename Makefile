@@ -104,3 +104,13 @@ image-light: ## Build the lexical (no-embed) runtime image 3gpp-mcp:light with L
 
 help: ## List targets
 	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+inspect-layers: ## Per-platform layers of the published :latest + the 3gpp-data blob (dedupe eyeball; needs crane + GHCR login)
+	@DATA_PM=$$(crane manifest ghcr.io/kodflow/3gpp-data:latest | jq -r '.manifests[0].digest // empty'); \
+	if [ -n "$$DATA_PM" ]; then DATA_LAYER=$$(crane manifest ghcr.io/kodflow/3gpp-data@$$DATA_PM | jq -r '.layers[-1].digest'); \
+	else DATA_LAYER=$$(crane manifest ghcr.io/kodflow/3gpp-data:latest | jq -r '.layers[-1].digest'); fi; \
+	echo "3gpp-data blob: $$DATA_LAYER"; \
+	for d in $$(crane manifest ghcr.io/kodflow/3gpp-mcp:latest | jq -r '.manifests[] | select(.platform.os=="linux") | .digest'); do \
+	  echo "== 3gpp-mcp@$$d =="; \
+	  crane manifest ghcr.io/kodflow/3gpp-mcp@$$d | jq -r --arg l "$$DATA_LAYER" '.layers[] | (if .digest == $$l then "DATA→ " else "      " end) + (.size|tostring) + "  " + .digest'; \
+	done
