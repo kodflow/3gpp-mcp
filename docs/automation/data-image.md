@@ -42,6 +42,12 @@ corpus-matrix (lexical publish)          corpus-embed-kaggle (vectors)
   + 7 dated, each version ~15 GB compressed), `make inspect-layers` for local
   dedupe eyeballing, docs completed.
 
+## Pulling from the labs
+
+The labs pulls the single private `3gpp-mcp` image with a **dedicated read-only
+token** — see [labs-pull.md](labs-pull.md) for the token, the Docker/Kubernetes
+recipes, and both rotation procedures (image + token).
+
 ## Local helpers
 
 - `make image-light` — local light build (now `--target light`).
