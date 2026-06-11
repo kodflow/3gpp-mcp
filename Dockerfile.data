@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# 3gpp-data — pure-data OCI image: the fused corpus DuckDB (lexical + fp16
+# vectors, identity-overlaid + compacted) and the BGE-M3 fp16 embedder, baked by
+# .github/workflows/corpus-data-image.yml.
+#
+# NOT runnable: FROM scratch, no entrypoint. It exists ONLY as a build-time base
+# for the 3gpp-mcp full image (stage `corpus` + COPY --link), so a code-only mcp
+# rebuild never re-creates / re-pushes / re-pulls these ~22 GB (plan
+# split-data-image, follow-up of issue #125).
+#
+# Content is ARCH-NEUTRAL (DuckDB file + ONNX weights). The arch-specific piece
+# (ONNX Runtime) deliberately lives in the mcp layer. Because this Dockerfile is
+# copy-only (no RUN), a multi-platform build emits one manifest per platform
+# that all reference the SAME data blob — pushed once, "Exists" for the others.
+#
+# uid/gid 10001 = the `mcp` user of the runtime image: the inherited layer must
+# already carry the right ownership (a chown at runtime would rewrite ~22 GB).
+# =============================================================================
+FROM scratch
+ARG DATA_CREATED=unknown
+ARG EMBED_IDENTITY=unknown
+ARG DUCKDB_ROWS=unknown
+LABEL org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp16) for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
+      io.kodflow.3gpp.data.created="${DATA_CREATED}" \
+      io.kodflow.3gpp.embedding.identity="${EMBED_IDENTITY}" \
+      io.kodflow.3gpp.duckdb.rows="${DUCKDB_ROWS}"
+COPY --chown=10001:10001 image-data/ /data/mcp-3gpp/
