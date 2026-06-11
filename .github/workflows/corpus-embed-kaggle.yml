@@ -217,6 +217,15 @@ jobs:
             [ -d "$d" ] || continue
             s="$(basename "$d" | sed 's/^vec-s//')"
             f="$(find "$d" -name '*.duckdb' | head -1)"; [ -n "$f" ] || continue
+            # Refuse to fold an invalid/empty artifact into the channel: a flaky
+            # `kernels output` pull once shipped an EMPTY s31 blob that poisoned
+            # every downstream consumer (the image bake died mid-fusion on it).
+            # The DUCK magic at offset 8 cheaply rejects garbage; the existing
+            # channel copy survives (the union below keeps prior entries).
+            if [ "$(dd if="$f" bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ]; then
+              echo "::warning::series $s artifact is not a valid DuckDB ($f, $(stat -c%s "$f" 2>/dev/null || echo '?') bytes) — NOT published"
+              continue
+            fi
             zstd -19 -T0 -f "$f" -o "vec/s$s.duckdb.zst"
             new="$(printf '%s' "$new" | jq --arg n "s$s.duckdb" '. + [$n]')"
           done
