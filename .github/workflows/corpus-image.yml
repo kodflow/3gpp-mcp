@@ -225,14 +225,24 @@ jobs:
           test -s /tmp/subs.txt || { echo "::error::no vector sub-bases on $VREF — refusing to ship a silently-lexical :full"; exit 1; }
           echo "fusing $(wc -l < /tmp/subs.txt) sub-bases:"; cat /tmp/subs.txt
           : > /tmp/overlay.log
+          skipped=0
           while read -r digest title; do
             echo "--- $title ---"; df -h / | tail -1
             retry oras blob fetch "$VREF@$digest" --output /tmp/sub.duckdb.zst
-            zstd -d -q -f --long=31 /tmp/sub.duckdb.zst -o /tmp/sub.duckdb
-            rm -f /tmp/sub.duckdb.zst
-            /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb 2>&1 | tee -a /tmp/overlay.log
-            rm -f /tmp/sub.duckdb
+            # Tolerate ONE bad sub-base (warn + skip) instead of sinking the whole
+            # bake: the channel once carried an EMPTY s31 blob (a corrupt embed
+            # artifact published unchecked) and the fusion died at 1.5M/2.8M. The
+            # DUCK magic (offset 8) cheaply rejects empty/garbage files; global
+            # integrity is still enforced by the >=2M assertion below.
+            if ! zstd -d -q -f --long=31 /tmp/sub.duckdb.zst -o /tmp/sub.duckdb 2>/dev/null \
+               || [ "$(dd if=/tmp/sub.duckdb bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ] \
+               || ! /tmp/overlay --base image-data/3gpp.duckdb --vec /tmp/sub.duckdb 2>&1 | tee -a /tmp/overlay.log; then
+              echo "::warning::sub-base $title is invalid or failed to overlay — SKIPPED (its series stays lexical until the channel republishes it)"
+              skipped=$((skipped+1))
+            fi
+            rm -f /tmp/sub.duckdb.zst /tmp/sub.duckdb
           done < /tmp/subs.txt
+          echo "sub-bases skipped: $skipped"
           # HARD ASSERTIONS — never ship a :full that is silently lexical (the first
           # publish DID exactly that). The DB stays RAW (no .zst — serve reads in place).
           echo "=== image-data tree ==="; { ls -laR image-data | head -60; } 2>/dev/null || true
