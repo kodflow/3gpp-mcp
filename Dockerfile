@@ -91,10 +91,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["serve"]
 
-# ---- light: lexical DB.zst baked from the build context ----------------------
-FROM base AS light
-COPY --chown=mcp:mcp image-data/ /data/mcp-3gpp/
-
 # ---- full: arch-native ORT (sha256-pinned) + the inherited data layer --------
 FROM base AS full
 ARG TARGETARCH
@@ -126,3 +122,10 @@ USER mcp:mcp
 # blob is NOT assumed — the workflow gate asserts the pushed mcp manifests
 # reference the EXACT 3gpp-data blob and fails loud otherwise.
 COPY --link --from=corpus /data/mcp-3gpp /data/mcp-3gpp
+
+# ---- light: lexical DB.zst baked from the build context ----------------------
+# LAST stage on purpose: a bare `docker build .` (CI image-smoke, casual local
+# builds) defaults to the final stage, and light is the only target that builds
+# without a DATA_IMAGE.
+FROM base AS light
+COPY --chown=mcp:mcp image-data/ /data/mcp-3gpp/
