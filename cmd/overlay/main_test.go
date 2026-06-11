@@ -63,7 +63,7 @@ func TestOverlayIdentityMatch(t *testing.T) {
 		{ChunkID: 2, SpecID: "23.501", Release: "Rel-18", Version: "18.0.0", ClausePath: "2", Heading: "h", Text: "OLD text"},
 	}, map[uint64]float32{99: 1, 2: 2}, "model-x")
 
-	if err := run(ctx, base, []string{shard}, ""); err != nil {
+	if err := run(ctx, base, []string{shard}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +105,41 @@ func TestOverlayRefusesMixedModels(t *testing.T) {
 	buildDB(t, a, cl, map[uint64]float32{1: 1}, "model-x")
 	buildDB(t, b, cl, map[uint64]float32{1: 2}, "model-y")
 
-	if err := run(ctx, base, []string{a, b}, ""); err == nil {
+	if err := run(ctx, base, []string{a, b}, "", ""); err == nil {
 		t.Fatal("mixed embedding_model across shards must be refused")
+	}
+}
+
+// TestOverlayStampsFlagOnMetalessShards: legacy --no-hnsw kernel outputs carry NO
+// embedding_model meta — the explicit --embedding-model flag must provide the
+// stamp, and a shard whose meta CONTRADICTS the flag must abort.
+func TestOverlayStampsFlagOnMetalessShards(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.duckdb")
+	shard := filepath.Join(dir, "shard.duckdb")
+	cl := []model.Clause{{ChunkID: 1, SpecID: "23.501", Release: "Rel-18", Version: "18.0.0", ClausePath: "1", Heading: "h", Text: "t"}}
+	buildDB(t, base, cl, nil, "")
+	buildDB(t, shard, cl, map[uint64]float32{1: 1}, "") // metaless (legacy)
+
+	if err := run(ctx, base, []string{shard}, "", "model-flag"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.OpenReadOnly(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if m := st.GetMeta(ctx, "embedding_model"); m != "model-flag" {
+		t.Fatalf("flag stamp missing: got %q want %q", m, "model-flag")
+	}
+
+	// A shard whose meta contradicts the flag must be refused.
+	base2 := filepath.Join(dir, "base2.duckdb")
+	other := filepath.Join(dir, "other.duckdb")
+	buildDB(t, base2, cl, nil, "")
+	buildDB(t, other, cl, map[uint64]float32{1: 2}, "model-y")
+	if err := run(ctx, base2, []string{other}, "", "model-flag"); err == nil {
+		t.Fatal("shard meta contradicting --embedding-model must be refused")
 	}
 }

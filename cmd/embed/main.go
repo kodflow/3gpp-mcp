@@ -280,6 +280,15 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 	if err := db.SetMeta("pipeline_version", model.PipelineVersion(e.ModelID())); err != nil {
 		return rep, err
 	}
+	// Stamp the embedder identity UNCONDITIONALLY — historically only
+	// BuildAndFreezeHNSW wrote it, so every --no-hnsw artifact (the whole
+	// Kaggle channel) shipped WITHOUT embedding_model: serve's ShardsCoherent
+	// read an absent key and silently refused the sub-bases, and the image
+	// fuse had no shard truth to copy. The meta states which model produced
+	// the vectors; that is true with or without an index.
+	if err := db.SetMeta("embedding_model", e.ModelID()); err != nil {
+		return rep, err
+	}
 
 	if cfg.buildHNSW {
 		// BuildAndFreezeHNSW also stamps embedding_model/dim/count + hnsw_state.
