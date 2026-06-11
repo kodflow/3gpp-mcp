@@ -43,10 +43,30 @@ Readiness: `GET /healthz` reports `503 {"status":"loading"}` while the corpus/ve
 load, then `200 {"status":"ready"}` — wait for `ready` before querying (a baked full
 image is ready almost instantly; light/first-run pulls the DB so loads longer).
 
+## Install the /3gpp skill (strict cited-answer format)
+
+The MCP registration gives Claude the *tools*; the **/3gpp skill** pins the strict
+12-field cited-answer protocol on top. Inside this repo it is already active
+(project-scope `.claude/commands/3gpp.md`); anywhere else, install it user-scope:
+
+```bash
+mkdir -p ~/.claude/commands
+# stdio install (no local HTTP endpoint) — fetch from the public repo:
+curl -fsSL https://raw.githubusercontent.com/kodflow/3gpp-mcp/main/.claude/commands/3gpp.md \
+  -o ~/.claude/commands/3gpp.md
+# HTTP install — the running server serves its own copy (always version-matched):
+curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/commands/3gpp.md
+```
+
+Restart the Claude Code instance afterwards: MCP registrations and `~/.claude/commands/`
+are both read at session start, so after the relaunch `claude mcp list` shows the server
+AND `/3gpp` appears in the skills list — nothing else to do.
+
 ## Verify
 
 ```bash
 claude mcp list           # expect: 3gpp — Connected
+ls ~/.claude/commands/3gpp.md             # skill present (user scope)
 curl -fsS http://localhost:8765/healthz   # HTTP mode: {"status":"ready"}
 ```
 
