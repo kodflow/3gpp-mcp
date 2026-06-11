@@ -68,6 +68,10 @@ jobs:
           retry sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config zstd libreoffice-writer-nogui
 
+      # Advisory drift guard — see scripts/lib/soffice-guard.sh for the rationale.
+      - name: Guard — LibreOffice version drift (advisory)
+        run: scripts/lib/soffice-guard.sh
+
       - name: Resolve scope
         id: scope
         run: |
