@@ -9,9 +9,12 @@
 #
 # Resume model (load-bearing for the 12h cap): each series keeps ONE output Kaggle
 # Dataset ${KAGGLE_USERNAME}/3gpp-embedded-s<NN> with 3gpp-embedded.duckdb. START:
-# if mounted as input, resume from it (embedding_hash skips done clauses); else build
-# a fresh lexical slice from the published `latest` DB. END: version the partial DB
-# back (driver does it from the laptop, or this tail if Kaggle Secrets are present).
+# if mounted as input, resume from it (embedding_hash skips done clauses); if the
+# Dataset is gone (Kaggle quota purge / account hiccup), fall back to the DURABLE
+# GHCR 3gpp-vec channel we own (the already-published sub-bases) as the carry-over
+# source; else build a fresh lexical slice from the published `latest` DB. END:
+# version the partial DB back (driver does it from the laptop, or this tail if
+# Kaggle Secrets are present).
 import glob
 import json
 import os
@@ -91,6 +94,18 @@ TIME_BUDGET = int(os.environ.get("EMBED_TIME_BUDGET", "39000"))
 RELEASES = os.environ.get("EMBED_RELEASES", "").strip()
 LOT = os.environ.get("LOT", "").strip()
 SHARD = ("lot%s" % LOT) if RELEASES else ("s%s" % SERIES)
+# Fail-fast allowlists: these env values are interpolated into shell commands
+# (crane login/export/manifest/blob), SQL (the series slice) and the vec tag, and
+# the kernel env also holds GHCR_PAT — so constrain each to the exact grammar it
+# can legitimately have and refuse anything else up front (never shell surface).
+if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", OWNER):
+    fail("bad_owner", "GHCR_OWNER=%s" % OWNER)
+if PRECISION not in ("fp32", "fp16"):
+    fail("bad_precision", "EMBED_PRECISION=%s" % PRECISION)
+if not re.match(r"^\d{2}$", SERIES):
+    fail("bad_series", "SERIES=%s" % SERIES)
+if not re.match(r"^[A-Za-z0-9]{0,8}$", LOT):
+    fail("bad_lot", "LOT=%s" % LOT)
 os.chdir(WORK)
 os.environ.pop("EMBEDDER", None)  # force the real onnx/CUDA backend (never Local)
 
@@ -231,26 +246,39 @@ sln = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses;")
 say("sliced_clauses=%s" % sln)
 if not (sln.isdigit() and int(sln) >= 1):
     fail("empty_slice", "shard=%s full=%s" % (SHARD, fulln))
-# Carry over prior vectors from the resume DB onto the FRESH slice, keyed by the
-# clause's natural identity + exact text (NOT chunk_id, which is unstable across a
-# re-published base). Unchanged clauses recover their vector → no GPU; changed/new
-# clauses stay NULL → re-embedded. Non-fatal: a carry failure just means re-embed.
-if RESUME_PRESENT:
+# Carry over prior vectors onto the FRESH slice, keyed by the clause's natural
+# identity + exact text (NOT chunk_id, which is unstable across a re-published
+# base). Unchanged clauses recover their vector → no GPU; changed/new clauses stay
+# NULL → re-embedded. Non-fatal: a carry failure just means re-embed. Shared by
+# BOTH carry-over sources (the Kaggle resume Dataset and the GHCR vec fallback).
+
+
+def carry_from(src_db, origin):
+    """Reuse prior vectors from src_db; returns True when the UPDATE ran."""
+    # DuckDB ATTACH takes no prepared-statement placeholders — the path must be a
+    # literal. Ours are program-built, but RESUME_DB can come from env/glob, so
+    # escape quotes rather than trust the mount path's spelling.
+    src_lit = src_db.replace("'", "''")
     carry_sql = (
         "ATTACH '%s' AS r (READ_ONLY); "
         "UPDATE clauses SET embedding = rc.embedding, embedding_hash = rc.embedding_hash "
         "FROM r.clauses rc "
         "WHERE clauses.spec_id = rc.spec_id AND clauses.release = rc.release "
         "AND clauses.clause_path = rc.clause_path AND clauses.text = rc.text "
-        "AND rc.embedding IS NOT NULL;" % RESUME_DB)
+        "AND rc.embedding IS NOT NULL;" % src_lit)
     cr = sh('duckdb "%s" "%s"' % (EMBEDDED_DB, carry_sql))
     if cr.returncode != 0:
-        say("resume_carry=failed detail=%s (continuing as fresh re-embed)"
-            % (cr.stderr or "").strip()[-120:])
-    else:
-        carried = duckdb_scalar(
-            EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
-        say("resume_carry=ok reused_vectors=%s of_sliced=%s" % (carried or "?", sln))
+        say("resume_carry=failed src=%s detail=%s (continuing as fresh re-embed)"
+            % (origin, (cr.stderr or "").strip()[-120:]))
+        return False
+    carried = duckdb_scalar(
+        EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;")
+    say("resume_carry=ok src=%s reused_vectors=%s of_sliced=%s" % (origin, carried or "?", sln))
+    return True
+
+
+if RESUME_PRESENT:
+    carry_from(RESUME_DB, "dataset")
 # DISK: full.duckdb (~1.7GB) is consumed — drop it so /kaggle/working doesn't carry
 # it alongside the growing embedded DB + models (the disk-exhaustion crash root cause).
 try:
@@ -258,6 +286,57 @@ try:
     say("cleanup=full.duckdb_removed")
 except OSError:
     pass
+# ---- GHCR vec fallback: resume survives a DELETED Kaggle Dataset -------------
+# The Kaggle resume Dataset is only a CACHE; the authoritative vectors are the
+# sub-bases published on GHCR 3gpp-vec (durable, owned). When the Dataset is gone,
+# carry over from the published channel instead of re-embedding the whole shard:
+# fetch the precision-scoped manifest with crane (already downloaded + logged in
+# for the base pull above), then pull each relevant s<NN>.duckdb.zst blob ONE AT A
+# TIME into /tmp — decompress, carry, delete — so disk stays bounded (the
+# disk-exhaustion crash lesson). Precision scoping (latest vs latest-fp16) keeps
+# fp16/fp32 vectors from ever mixing (EmbedIdentity invariant); embedding_hash is
+# carried too, so the embedder re-verifies identity anyway. Entirely non-fatal: a
+# missing channel / failed blob just means fresh embed for that part.
+if not RESUME_PRESENT:
+    VEC_TAG = "latest" if PRECISION == "fp32" else "latest-%s" % PRECISION
+    VEC_REF = "ghcr.io/%s/3gpp-vec:%s" % (OWNER, VEC_TAG)
+    mf = sh('/tmp/crane manifest "%s"' % VEC_REF)
+    if mf.returncode != 0:
+        say("resume_ghcr=absent ref=%s (no published channel — fresh embed)" % VEC_REF)
+    else:
+        try:
+            layers = json.loads(mf.stdout).get("layers", [])
+        except ValueError:
+            layers = []
+        # Lot mode spans every series for its release set → all sub-bases; series
+        # mode needs only its own. Two naming schemes coexist on the channel:
+        # s<NN>.duckdb.zst (the Kaggle publish-vec) and shard-<NN>[-Rel-X].duckdb.zst
+        # (corpus-matrix's on-runner embed) — accept both. Titles + digests are
+        # validated before any shell interpolation (they come from the registry).
+        want = re.compile(
+            r"^(s|shard-)\d{2}(-[A-Za-z0-9.-]+)?\.duckdb\.zst$" if RELEASES
+            else r"^(s|shard-)%s(-[A-Za-z0-9.-]+)?\.duckdb\.zst$" % re.escape(SERIES))
+        subs = []
+        for layer in layers:
+            t = (layer.get("annotations") or {}).get("org.opencontainers.image.title", "")
+            d = layer.get("digest", "")
+            if want.match(t) and re.match(r"^sha256:[0-9a-f]{64}$", d):
+                subs.append((t, d))
+        say("resume_ghcr=channel ref=%s sub_bases=%d" % (VEC_REF, len(subs)))
+        for title, digest in subs:
+            z, db = "/tmp/vec-sub.duckdb.zst", "/tmp/vec-sub.duckdb"
+            if sh('/tmp/crane blob "ghcr.io/%s/3gpp-vec@%s" > "%s"'
+                  % (OWNER, digest, z)).returncode != 0:
+                say("resume_ghcr=blob_failed title=%s (skipping)" % title)
+            elif sh('zstd -d -q -f "%s" -o "%s"' % (z, db)).returncode != 0:
+                say("resume_ghcr=zstd_failed title=%s (skipping)" % title)
+            else:
+                carry_from(db, "ghcr:%s" % title)
+            for p in (z, db):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 # ---- ONNX Runtime (GPU) + BGE-M3 -------------------------------------------
 if sh('curl -fsSL --retry 5 -o /tmp/ort.tgz '
