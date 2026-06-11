@@ -56,6 +56,13 @@ Embed is micro-granular and **now resumable across sessions**:
   `${USER}/3gpp-embedded-s<NN>`: the kernel versions the partial DB at the end and
   mounts it at the start of the next run. recent-first ordering means a kill leaves
   the **newest** releases done.
+- **The Kaggle Dataset is only a cache** — if it is deleted (quota purge, account
+  hiccup), the kernel falls back to the **durable GHCR `3gpp-vec` channel we own**:
+  it fetches the precision-scoped manifest (`latest` / `latest-fp16`) with the
+  already-authenticated crane, pulls the relevant `s<NN>.duckdb.zst` sub-base blobs
+  one at a time (disk-bounded), and carries their vectors onto the fresh slice via
+  the same natural-identity match (`spec_id, release, clause_path, text`). Only
+  never-published clauses re-embed; a lost Dataset never costs a full re-embed.
 - `--checkpoint-every 2000` flushes durably mid-run, so even a hard kill loses at
   most ~2000 clauses of progress.
 - The driver `scripts/kaggle-embed-campaign.sh` retries `MAX_RETRIES` times on ERROR and

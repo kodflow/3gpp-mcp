@@ -544,6 +544,12 @@ jobs:
             echo "apt attempt $i failed; retrying in $((i*10))s" >&2; sleep $((i*10))
           done
           [ "$ok" = 1 ]
+      # Conversion-determinism guard (advisory): LibreOffice is unpinned by design
+      # (apt-pinning on a runner is fragile; ingest normalization absorbs whitespace
+      # drift), so instead make any runner-image soffice bump VISIBLE as a warning
+      # before it can silently perturb extraction for a few specs.
+      - name: Guard — LibreOffice version drift (advisory)
+        run: scripts/lib/soffice-guard.sh
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
           # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
