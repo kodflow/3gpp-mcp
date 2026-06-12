@@ -104,6 +104,86 @@ func TestToggleAuthGate(t *testing.T) {
 	}
 }
 
+// TestOptionRows pins the explicit per-option state matrix: each pill must
+// carry an explicit state + reason so the dashboard never shows a bare on/off.
+func TestOptionRows(t *testing.T) {
+	get := func(rows []capOption, key string) capOption {
+		t.Helper()
+		for _, o := range rows {
+			if o.Key == key {
+				return o
+			}
+		}
+		t.Fatalf("option %q missing", key)
+		return capOption{}
+	}
+
+	// Prod-today shape: embedder + vectors + FTS, but NO frozen HNSW, no reranker
+	// → Semantic must say "degraded/exact-scan", HNSW "unavailable/non gelé".
+	noHNSW := search.State{
+		EmbedderEnabled: true, FTSEnabled: true, HNSWFrozen: false, RerankerEnabled: false,
+		LexicalOn: true, VectorOn: true, HNSWOn: true, EmbedderModelID: "m1",
+	}
+	rows := optionRows(noHNSW, "m1")
+	if len(rows) != 5 {
+		t.Fatalf("len(rows)=%d, want 5", len(rows))
+	}
+	for _, want := range []struct{ key, state, badge string }{
+		{"embedder", "on", "on"},
+		{"vector", "degraded", "exact-scan"},
+		{"hnsw", "unavailable", "non gelé"},
+		{"lexical", "on", "on"},
+		{"rerank", "unavailable", "n/a"},
+	} {
+		o := get(rows, want.key)
+		if o.State != want.state || o.Badge != want.badge {
+			t.Errorf("%s = (%s,%s), want (%s,%s)", want.key, o.State, o.Badge, want.state, want.badge)
+		}
+		if o.Reason == "" {
+			t.Errorf("%s has no reason — every option must be explicit", want.key)
+		}
+		if o.State != "on" && o.Fix == "" {
+			t.Errorf("%s is %s but has no fix hint", want.key, o.State)
+		}
+	}
+
+	// Everything baked + on → Semantic on (HNSW), reranker available on demand.
+	full := search.State{
+		EmbedderEnabled: true, FTSEnabled: true, HNSWFrozen: true, RerankerEnabled: true,
+		LexicalOn: true, VectorOn: true, HNSWOn: true, RerankOn: false, EmbedderModelID: "m1",
+	}
+	rows = optionRows(full, "m1")
+	if o := get(rows, "vector"); o.State != "on" || o.Badge != "on (HNSW)" {
+		t.Errorf("vector = (%s,%s), want (on,on (HNSW))", o.State, o.Badge)
+	}
+	if o := get(rows, "hnsw"); o.State != "on" {
+		t.Errorf("hnsw state = %s, want on", o.State)
+	}
+	if o := get(rows, "rerank"); o.State != "degraded" || o.Badge != "à la demande" {
+		t.Errorf("rerank = (%s,%s), want (degraded,à la demande)", o.State, o.Badge)
+	}
+
+	// Model mismatch severs the vector arm with an explicit, named reason.
+	rows = optionRows(full, "OTHER")
+	o := get(rows, "vector")
+	if o.State != "unavailable" {
+		t.Errorf("mismatch vector state = %s, want unavailable", o.State)
+	}
+	if !strings.Contains(o.Reason, "OTHER") || !strings.Contains(o.Reason, "m1") {
+		t.Errorf("mismatch reason must name both models, got %q", o.Reason)
+	}
+
+	// Toggled-off arms report "off" + how to re-enable (not "unavailable").
+	off := full
+	off.VectorOn, off.HNSWOn, off.LexicalOn = false, false, false
+	rows = optionRows(off, "m1")
+	for _, key := range []string{"vector", "hnsw", "lexical"} {
+		if o := get(rows, key); o.State != "off" {
+			t.Errorf("%s state = %s, want off", key, o.State)
+		}
+	}
+}
+
 func TestEmptyTokenRejectsEverything(t *testing.T) {
 	// crypto/rand failure path returns "" → the gate must reject all (fail-closed).
 	page := dashboardPageHandler("")
