@@ -121,6 +121,7 @@ type dashboardData struct {
 	dashStatic
 	State     search.State     `json:"state"`
 	Reason    string           `json:"reason"`
+	Options   []capOption      `json:"options"`
 	Process   procStats        `json:"process"`
 	Metrics   metrics.Snapshot `json:"metrics"`
 	UptimeSec int64            `json:"uptime_sec"`
@@ -146,6 +147,123 @@ func reasonFor(s search.State, dbModel string) string {
 	default:
 		return ""
 	}
+}
+
+// capOption is the EXPLICIT per-arm status block — one entry per dashboard pill.
+// It carries the live state, WHY the arm is in that state, and what would change
+// it. The explanation is computed server-side so the JSON (curl) and the HTML
+// page tell exactly the same story; the page renders these verbatim.
+type capOption struct {
+	Key      string `json:"key"`           // toggle name (lexical|vector|hnsw|rerank) or "embedder"
+	Label    string `json:"label"`         // display label
+	State    string `json:"state"`         // "on" | "degraded" | "off" | "unavailable"
+	Badge    string `json:"badge"`         // short pill text ("on", "exact-scan", "non gelé", …)
+	Toggle   bool   `json:"toggleable"`    // a runtime toggle exists for this arm
+	ToggleOn bool   `json:"toggle_on"`     // current toggle position (meaningful when Toggle)
+	Reason   string `json:"reason"`        // explicit cause, plain words
+	Fix      string `json:"fix,omitempty"` // remediation when not "on"
+}
+
+// optionRows derives the five explicit option blocks from the live engine state
+// + the DB's embedding model. Order = pill order on the page.
+func optionRows(s search.State, dbModel string) []capOption {
+	// ONNX embedder — pure capability (no runtime toggle): either the binary can
+	// vectorise a query or it can't.
+	emb := capOption{Key: "embedder", Label: "ONNX embedder"}
+	if s.EmbedderEnabled {
+		emb.State, emb.Badge = "on", "on"
+		emb.Reason = "BGE-M3 chargé (id " + s.EmbedderModelID + ") — vectorise les requêtes en local."
+	} else {
+		emb.State, emb.Badge = "unavailable", "absent"
+		emb.Reason = "Binaire compilé sans ONNX ou EMBEDDER=off : aucune vectorisation de requête possible."
+		emb.Fix = "Déployer le binaire onnx avec le modèle BGE-M3."
+	}
+
+	// Semantic (the vector arm) — needs the embedder, vectors in the DB, and the
+	// SAME model on both sides; full speed only with a frozen HNSW.
+	vec := capOption{Key: "vector", Label: "Semantic", Toggle: true, ToggleOn: s.VectorOn}
+	switch {
+	case !s.EmbedderEnabled:
+		vec.State, vec.Badge = "unavailable", "n/a"
+		vec.Reason = "Nécessite l'embedder ONNX (absent) : impossible de vectoriser la question."
+		vec.Fix = "Activer l'embedder (binaire onnx + modèle)."
+	case dbModel == "":
+		vec.State, vec.Badge = "unavailable", "sans vecteurs"
+		vec.Reason = "La base servie ne contient aucun embedding (build lexical)."
+		vec.Fix = "Re-baker l'image corpus-data avec les vecteurs."
+	case dbModel != s.EmbedderModelID:
+		vec.State, vec.Badge = "unavailable", "modèles ≠"
+		vec.Reason = "Modèle des vecteurs en base (" + dbModel + ") ≠ modèle requête (" + s.EmbedderModelID + ") : scores incomparables, bras coupé."
+		vec.Fix = "Aligner le modèle baké dans la DB et celui du binaire."
+	case !s.VectorOn:
+		vec.State, vec.Badge = "off", "off"
+		vec.Reason = "Bras vectoriel coupé à chaud (toggle opérateur)."
+		vec.Fix = "Cliquer la pastille pour le réactiver."
+	case s.HNSWFrozen && s.HNSWOn:
+		vec.State, vec.Badge = "on", "on (HNSW)"
+		vec.Reason = "Recherche par sens active : k-NN HNSW sur tout le corpus (~ms)."
+	default:
+		vec.State, vec.Badge = "degraded", "exact-scan"
+		vec.Reason = "Actif SANS index HNSW : cosine exact borné aux 200 candidats BM25 — recall réduit, latence accrue."
+		if s.HNSWFrozen {
+			vec.Fix = "Réactiver la pastille HNSW."
+		} else {
+			vec.Fix = "Re-baker l'image corpus-data avec l'index gelé (cmd/freeze-hnsw)."
+		}
+	}
+
+	// HNSW — the frozen index is a property of the served DB; the toggle only
+	// forces exact-scan for A/B.
+	hnsw := capOption{Key: "hnsw", Label: "HNSW", Toggle: true, ToggleOn: s.HNSWOn}
+	switch {
+	case !s.HNSWFrozen:
+		hnsw.State, hnsw.Badge = "unavailable", "non gelé"
+		hnsw.Reason = "Aucun index HNSW gelé dans la base servie : le bras vectoriel retombe en exact-scan."
+		hnsw.Fix = "Re-baker l'image corpus-data (cmd/freeze-hnsw gèle l'index au bake)."
+	case !s.HNSWOn:
+		hnsw.State, hnsw.Badge = "off", "off (manuel)"
+		hnsw.Reason = "Index présent mais coupé à chaud : exact-scan forcé (A/B latence)."
+		hnsw.Fix = "Cliquer la pastille pour le réactiver."
+	default:
+		hnsw.State, hnsw.Badge = "on", "on"
+		hnsw.Reason = "Index gelé chargé : plus-proches-voisins en quelques millisecondes."
+	}
+
+	// FTS (BM25) — capability = the FTS index exists in the DB; without it the
+	// store degrades to LIKE.
+	lex := capOption{Key: "lexical", Label: "FTS (BM25)", Toggle: true, ToggleOn: s.LexicalOn}
+	switch {
+	case !s.LexicalOn:
+		lex.State, lex.Badge = "off", "off"
+		lex.Reason = "Bras lexical coupé à chaud (toggle opérateur)."
+		lex.Fix = "Cliquer la pastille pour le réactiver."
+	case !s.FTSEnabled:
+		lex.State, lex.Badge = "degraded", "LIKE"
+		lex.Reason = "Index FTS absent de la base : repli LIKE (lent, sans scoring BM25)."
+		lex.Fix = "Re-baker la base (l'ingest crée l'index FTS)."
+	default:
+		lex.State, lex.Badge = "on", "on"
+		lex.Reason = "BM25 actif sur l'index FTS (heading + texte)."
+	}
+
+	// Reranker — capability = model shipped + onnx binary. When capable it is
+	// per-request by default; the toggle re-ranks EVERY query.
+	rr := capOption{Key: "rerank", Label: "Reranker", Toggle: true, ToggleOn: s.RerankOn}
+	switch {
+	case !s.RerankerEnabled:
+		rr.State, rr.Badge = "unavailable", "n/a"
+		rr.Reason = "Modèle bge-reranker-v2-m3 absent du bake (ou binaire sans ONNX) : aucun re-classement possible."
+		rr.Fix = "Re-baker l'image avec le modèle reranker."
+	case !s.RerankOn:
+		rr.State, rr.Badge = "degraded", "à la demande"
+		rr.Reason = "Disponible — appliqué seulement quand la requête passe rerank=true."
+		rr.Fix = "Cliquer pour re-classer TOUTES les requêtes (fenêtre top-20, +latence)."
+	default:
+		rr.State, rr.Badge = "on", "toutes les requêtes"
+		rr.Reason = "Cross-encoder re-classe la fenêtre des 20 meilleurs candidats sur chaque requête (+latence)."
+	}
+
+	return []capOption{emb, vec, hnsw, lex, rr}
 }
 
 // tokenOK accepts the dashboard token from ?token=, the dash_token cookie, or a
@@ -215,6 +333,7 @@ func dashboardJSONHandler(get func() (dashStatic, *search.Engine, bool), c *metr
 			dashStatic: corpus,
 			State:      state,
 			Reason:     reasonFor(state, corpus.EmbeddingModel),
+			Options:    optionRows(state, corpus.EmbeddingModel),
 			Process:    readProc(),
 			Metrics:    c.Snapshot(),
 			UptimeSec:  now.Unix() - corpus.StartedUnix,
@@ -299,6 +418,13 @@ const dashboardHTML = `<!doctype html>
   .dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--mut)}
   .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(46,194,126,.18)}
   .dot.off{background:var(--off);box-shadow:0 0 0 3px rgba(229,83,75,.18)}
+  .dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(214,162,58,.18)}
+  .optgrid{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .opt .st{font-weight:700;margin:.1rem 0 .3rem}
+  .opt .st.on{color:var(--ok)}.opt .st.warn{color:var(--warn)}
+  .opt .st.off{color:var(--off)}.opt .st.na{color:var(--mut)}
+  .opt p{color:var(--mut);font-size:.8rem;margin:.25rem 0}
+  .opt .fix{color:var(--accent)}
   .hint{color:var(--mut);font-size:.76rem;margin:.1rem 0 .6rem}
   details.doc{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:.5rem 1rem;margin:.2rem 0 1rem}
   details.doc summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:.85rem}
@@ -346,6 +472,9 @@ const dashboardHTML = `<!doctype html>
   </details>
   <div class="reason" id="reason"></div>
 
+  <h2>Options de recherche — détail</h2>
+  <div class="grid optgrid" id="opts"></div>
+
   <h2>Corpus</h2>
   <div class="grid">
     <div class="card"><h3>Clauses embedées</h3><div class="big" id="emb">–</div></div>
@@ -392,12 +521,21 @@ const fmt=n=>n==null?'–':n.toLocaleString(LOC);
 const ms=n=>n==null?'–':(n<10?n.toFixed(1):Math.round(n).toLocaleString(LOC));
 function dur(s){if(s==null)return'–';s=Math.max(0,s|0);const d=s/86400|0,h=s%86400/3600|0,m=s%3600/60|0;
   if(d)return d+'j '+h+'h';if(h)return h+'h '+m+'m';if(m)return m+'m';return s+'s';}
-// pill: capable→clickable (toggles name); on/off colour. name null = capability badge.
-function pill(label,capable,on,name){
-  const cls='pill'+(capable&&name?' click':'')+(capable?'':' na');
-  const click=capable&&name?(' onclick="tog(\''+name+'\','+(!on)+')"'):'';
-  const txt=capable?(on?'on':'off'):'n/a';
-  return '<span class="'+cls+'"'+click+'><span class="dot '+(capable?(on?'on':'off'):'')+'"></span>'+label+': '+txt+'</span>';
+// Per-option rendering: the server's d.options[] is the single source of truth
+// (state + badge + reason + fix) — pills and detail cards render it verbatim.
+const STCLS={on:'on',degraded:'warn',off:'off',unavailable:'na'};
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+function pill(o){
+  const click=o.toggleable&&o.state!=='unavailable';
+  const cls='pill'+(click?' click':'')+(o.state==='unavailable'?' na':'');
+  const on=click?(' onclick="tog(\''+o.key+'\','+(!o.toggle_on)+')"'):'';
+  const dot=o.state==='unavailable'?'':STCLS[o.state]||'';
+  return '<span class="'+cls+'"'+on+' title="'+esc(o.reason)+'"><span class="dot '+dot+'"></span>'+esc(o.label)+': '+esc(o.badge)+'</span>';
+}
+function optCard(o){
+  return '<div class="card opt"><h3>'+esc(o.label)+'</h3>'+
+    '<div class="st '+(STCLS[o.state]||'na')+'">'+esc(o.badge)+'</div>'+
+    '<p>'+esc(o.reason)+'</p>'+(o.fix?'<p class="fix">→ '+esc(o.fix)+'</p>':'')+'</div>';
 }
 async function tog(name,on){
   try{await fetch('/dashboard/toggle?name='+name+'&on='+on,{method:'POST',cache:'no-store'});}catch(e){}
@@ -423,14 +561,11 @@ async function tick(){
     const r=await fetch('/dashboard.json',{cache:'no-store'});
     if(r.status===401){$('foot').textContent='non autorisé — jeton manquant/invalide';return;}
     if(r.status===503){$('foot').textContent='chargement du corpus…';setTimeout(tick,1500);return;}
-    const d=await r.json();const s=d.state||{};
+    const d=await r.json();
     $('sub').textContent='v'+(d.version||'?').slice(0,12)+' · baseline '+(d.baseline||'?');
-    $('pills').innerHTML=
-      pill('ONNX embedder',s.embedder_enabled,s.embedder_enabled,null)+
-      pill('Semantic',s.embedder_enabled,s.vector_on&&s.embedder_enabled,'vector')+
-      pill('HNSW',s.hnsw_frozen,s.hnsw_on&&s.hnsw_frozen,'hnsw')+
-      pill('FTS (BM25)',true,s.lexical_on,'lexical')+
-      pill('Reranker',s.reranker_enabled,s.rerank_on&&s.reranker_enabled,'rerank');
+    const opts=d.options||[];
+    $('pills').innerHTML=opts.map(pill).join('');
+    $('opts').innerHTML=opts.map(optCard).join('');
     $('reason').textContent=d.reason?('sémantique réduit — '+d.reason):'';
     $('emb').innerHTML=fmt(d.embedded_clauses)+(d.total_clauses?' <small>/ '+fmt(d.total_clauses)+'</small>':'');
     $('tot').textContent=fmt(d.total_clauses);
