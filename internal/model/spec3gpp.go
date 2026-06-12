@@ -67,6 +67,28 @@ func ReleaseOrdinal(rel string) (int, bool) {
 	return n, true
 }
 
+// VersionMajor returns the integer major of a dotted "X.Y.Z" version, or -1 when
+// it cannot be parsed (fail-safe: an unparseable version is never "stable").
+func VersionMajor(version string) int {
+	s := version
+	if i := strings.IndexByte(version, '.'); i >= 0 {
+		s = version[:i]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// IsStableVersion reports whether a dotted 3GPP version is STABLE (published)
+// rather than a DRAFT. 3GPP drafts carry a major of 0/1/2 (work in progress
+// before a spec is first published for a release); major >= 3 is published
+// (3 = Release 1999, 4..20 = Rel-4..Rel-20). The server defaults to surfacing
+// stable content and labels every citation with this, so a client is never
+// silently handed a draft (CLAUDE.md §8 piège #8: frozen ≠ stable).
+func IsStableVersion(version string) bool { return VersionMajor(version) >= 3 }
+
 // ReleaseGSM is the coarse, HONEST release bucket for legacy GSM Phase-1/2 specs
 // (the 4-digit spec numbers / series 00-13). Their filename version-code scheme is
 // reverse-engineered and cannot be decoded to an exact 3GPP release line, so — by an

@@ -337,6 +337,14 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 		"spec_id": specID, "release": release, "version": version,
 		"count": len(out), "clauses": out, "citations": cites,
 		"obsolete_count": obsolete,
+		"stable":         model.IsStableVersion(version),
+	}
+	// Stable-first doctrine: the resolver already prefers a published version, so a
+	// draft here means NO stable version is indexed for this spec/release. Say so
+	// loudly rather than let the client treat work-in-progress text as normative.
+	if !model.IsStableVersion(version) {
+		resp["draft_warning"] = "returned version " + version +
+			" is a DRAFT (major < 3, work-in-progress); no stable/published version is indexed for this spec/release"
 	}
 	if !full {
 		resp["resource_hint"] = "Full clause text is omitted when truncated=true. " +
