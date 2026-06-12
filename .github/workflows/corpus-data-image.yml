@@ -34,6 +34,17 @@ on:
         description: "Push the data image to GHCR"
         type: boolean
         default: true
+      force:
+        description: "Bake even if the source corpus is unchanged"
+        type: boolean
+        default: true
+  # AUTO-UPDATE: a daily GUARDED tick. The bake produces non-reproducible bytes,
+  # so an unconditional schedule would re-push ~14 GB/day (and force the labs to
+  # re-pull) for ZERO real change. The `guard` job below skips the bake unless
+  # 3gpp-corpus:latest actually moved since the current 3gpp-data was built —
+  # so the labs only ever re-pulls the data layer when the corpus truly changed.
+  schedule:
+    - cron: "37 3 * * *" # ~04:37 Europe/Paris, after the corpus/embed converge
 
 permissions:
   contents: read
@@ -43,10 +54,51 @@ concurrency:
   cancel-in-progress: false # never kill an in-flight ~1h bake; queue instead
 
 jobs:
+  # CHANGE GUARD — compare 3gpp-corpus:latest's digest against the source-corpus
+  # digest stamped into the current 3gpp-data image. Skip the whole bake when
+  # they match (scheduled no-op days). A manual dispatch defaults force=true, so
+  # `/workflow run` always bakes; the schedule passes no force ⇒ digest decides.
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      changed: ${{ steps.g.outputs.changed }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Decide whether the source corpus changed
+        id: g
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          retry bash -c "curl -fsSL 'https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz' | sudo tar -xz -C /usr/local/bin crane"
+          retry bash -c 'printf %s "$GHCR_PAT" | crane auth login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
+          OWN="${{ github.repository_owner }}"
+          TAG="${{ github.event.inputs.corpus_tag || 'latest' }}"
+          force="${{ github.event.inputs.force }}"
+          SRC="$(retry crane digest "ghcr.io/$OWN/3gpp-corpus:$TAG")"
+          # The source-corpus digest baked into the live data image (empty if the
+          # label predates this guard, which forces a one-time rebake to stamp it).
+          CUR="$(crane config "ghcr.io/$OWN/3gpp-data:latest" 2>/dev/null | jq -r '.config.Labels["io.kodflow.3gpp.source.corpus"] // empty' || true)"
+          echo "source corpus=$SRC  baked-from=$CUR  force=$force"
+          if [ "$force" = "true" ] || [ -z "$CUR" ] || [ "$SRC" != "$CUR" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::baking — corpus changed ($CUR → $SRC) or forced"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::source corpus unchanged ($SRC) — skipping bake (no 14 GB re-push)"
+          fi
   # Materialise the BGE-M3 model ONCE and hand it to the bake as a run artifact
   # (same prefetch as corpus-image.yml: models-release cache first, one pinned
   # HF fetch at most — HuggingFace 429-rate-limited the runners repeatedly).
   model:
+    needs: guard
+    if: ${{ needs.guard.outputs.changed == 'true' }}
     runs-on: ubuntu-latest
     # Best-effort by design: the bake falls back to restore-bge.sh on a missing
     # artifact, so the prefetch can never gate the pipeline.
@@ -69,7 +121,8 @@ jobs:
           if-no-files-found: warn
 
   bake:
-    needs: model
+    needs: [guard, model]
+    if: ${{ needs.guard.outputs.changed == 'true' }}
     runs-on: ubuntu-latest # ONE bake: the data content is arch-neutral
     timeout-minutes: 180
     permissions:
@@ -147,6 +200,10 @@ jobs:
           retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
           retry docker pull "$img"
+          # Record the EXACT corpus digest this image is baked from — stamped as
+          # a label so the guard job can skip future no-op bakes (auto-update).
+          SRC_CORPUS="$(docker inspect "$img" --format '{{index .RepoDigests 0}}' 2>/dev/null | cut -d@ -f2 || true)"
+          echo "baked-from corpus digest: ${SRC_CORPUS:-unknown}"
           cid=$(docker create "$img" /noop)
           docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
           docker rm "$cid" >/dev/null
@@ -283,6 +340,7 @@ jobs:
             echo "rows=$vectorised"
             echo "created=$(date -u +%FT%TZ)"
             echo "datetag=$(date -u +%F)"
+            echo "source_corpus=${SRC_CORPUS:-unknown}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Disk before image build (visibility)
@@ -320,6 +378,7 @@ jobs:
             DATA_CREATED=${{ steps.bake.outputs.created }}
             EMBED_IDENTITY=${{ steps.bake.outputs.embed_identity }}
             DUCKDB_ROWS=${{ steps.bake.outputs.rows }}
+            SOURCE_CORPUS=${{ steps.bake.outputs.source_corpus }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/3gpp-data:latest
             ghcr.io/${{ github.repository_owner }}/3gpp-data:${{ steps.bake.outputs.datetag }}
