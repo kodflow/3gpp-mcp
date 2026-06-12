@@ -214,6 +214,7 @@ const dashboardHTML = `<!doctype html>
   <footer id="foot">connecting…</footer>
 </div>
 <script>
+const REFRESH_MS=20000; // auto-refresh cadence
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'–':n.toLocaleString('en-US');
 const ms=n=>n==null?'–':(n<10?n.toFixed(1):Math.round(n).toLocaleString('en-US'));
@@ -264,9 +265,9 @@ async function tick(){
     $('up').textContent=dur(d.uptime_sec);
     if(m.series)drawRpm(m.series);
     drawLat(m);
-    $('foot').textContent='updated '+new Date().toLocaleTimeString()+' · '+(m.samples||0)+' latency samples · auto-refresh 3s';
+    $('foot').textContent='updated '+new Date().toLocaleTimeString()+' · '+(m.samples||0)+' latency samples · auto-refresh 20s';
   }catch(e){$('foot').textContent='fetch error: '+e;}
-  setTimeout(tick,3000);
+  setTimeout(tick,REFRESH_MS);
 }
 tick();
 </script>
