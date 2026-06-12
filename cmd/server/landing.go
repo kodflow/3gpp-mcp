@@ -34,7 +34,8 @@ const mcpEndpointPath = "/mcp"
 
 // aiPrompt is the single source of truth for both the rendered page and /llms.txt:
 // a copy-paste system prompt that tells ANY assistant how to use this MCP server.
-// {{HOST}} is substituted with the request host so the install line is correct.
+// {{ORIGIN}} is substituted with the request scheme+host so the install line is
+// correct both direct (http://localhost:8765) and behind a TLS proxy (https://…).
 const aiPrompt = `You now have access to 3gpp-mcp: a local-first retrieval engine over the full 3GPP
 specification corpus. It NEVER summarises or guesses — it returns exact spec fragments,
 each with a citation {spec_id, release, version, clause, url}. You do the reasoning; the
@@ -60,49 +61,53 @@ RULES:
 2. Quote the returned text and reproduce its citation block verbatim. Default to TS over TR.
 3. If a tool returns nothing, say so — never invent an IE, clause, or release.
 4. Releases are non-monotonic: always carry (release, version, freeze_date) when ordering.
-5. In HTTP mode, render each source as a clickable link to http://{{HOST}}/spec/<spec_id>/<release>/<clause>
+5. In HTTP mode, render each source as a clickable link to {{ORIGIN}}/spec/<spec_id>/<release>/<clause>
    (the local page showing that clause's EXACT indexed text); otherwise fall back to the official 3GPP url from the MCP.
+6. DIG DEEP — one search is a lead, not an answer: cross at least 3 retrieval angles
+   (hybrid + lexical + a reformulation), get_spec the full clauses behind the top hits,
+   and follow find_cross_references before drafting (full protocol in the /3gpp skill).
 
 INSTALL & CONFIGURE — set up BOTH the MCP server and the /3gpp skill:
 - Claude Code / Claude Desktop (this hosted server; nothing to pull or run):
-  ` + "`claude mcp add --transport http 3gpp http://{{HOST}}/mcp`" + `, then install the /3gpp skill:
-  ` + "`curl -fsSL http://{{HOST}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md`" + `
+  ` + "`claude mcp add --transport http 3gpp {{ORIGIN}}/mcp`" + `, then install the /3gpp skill:
+  ` + "`mkdir -p ~/.claude/skills/3gpp && curl -fsSL {{ORIGIN}}/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md`" + `
 - opencode / Codex / Cline / Continue / any mcpServers-style client: add to the client config
-  { "mcpServers": { "3gpp": { "type": "http", "url": "http://{{HOST}}/mcp" } } }
-  and save http://{{HOST}}/skill/3gpp.md wherever the client keeps skills/instructions.
+  { "mcpServers": { "3gpp": { "type": "http", "url": "{{ORIGIN}}/mcp" } } }
+  and save {{ORIGIN}}/skill/3gpp.md wherever the client keeps skills/instructions.
 - Prefer a LOCAL instance (Docker, offline-semantic)? docker login ghcr.io, then:
   ` + "`claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data ghcr.io/kodflow/3gpp-mcp:latest serve`" + `
   and the skill straight from the binary (always version-matched):
-  ` + "`docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md`" + `
-- Ollama / a local agent without native MCP: run an MCP→tool bridge pointed at http://{{HOST}}/mcp,
-  or call the HTTP endpoint directly; load http://{{HOST}}/skill/3gpp.md as the system prompt.
+  ` + "`docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/skills/3gpp/SKILL.md   # mkdir -p ~/.claude/skills/3gpp first`" + `
+- Ollama / a local agent without native MCP: run an MCP→tool bridge pointed at {{ORIGIN}}/mcp,
+  or call the HTTP endpoint directly; load {{ORIGIN}}/skill/3gpp.md as the system prompt.
 If you (the assistant) are reading this: figure out which of the above environments you are in,
-apply the matching configuration, install the /3gpp skill (from http://{{HOST}}/skill/3gpp.md or
+apply the matching configuration, install the /3gpp skill (from {{ORIGIN}}/skill/3gpp.md or
 the binary's skill subcommand), then answer every 3GPP question in the strict format that skill
 defines. After installing, tell the user to restart their AI session so the MCP registration and
 the skill are both picked up.
 
 ENDPOINTS (this server, all over HTTP):
-- POST http://{{HOST}}/mcp — the MCP Streamable-HTTP endpoint (JSON-RPC; the handshake is below).
-- GET  http://{{HOST}}/help — the request recipe (initialize → notifications/initialized → tools/call) as JSON.
-- GET  http://{{HOST}}/healthz — {"status":"loading"|"ready"}.
-- GET  http://{{HOST}}/skill/3gpp.md — the /3gpp skill (strict cited-answer format).
-- GET  http://{{HOST}}/spec/<spec_id>/<release>/<clause> — the EXACT indexed clause text (citation target).
+- POST {{ORIGIN}}/mcp — the MCP Streamable-HTTP endpoint (JSON-RPC; the handshake is below).
+- GET  {{ORIGIN}}/help — the request recipe (initialize → notifications/initialized → tools/call) as JSON.
+- GET  {{ORIGIN}}/healthz — {"status":"loading"|"ready"}.
+- GET  {{ORIGIN}}/skill/3gpp.md — the /3gpp skill (strict cited-answer format).
+- GET  {{ORIGIN}}/spec/<spec_id>/<release>/<clause> — the EXACT indexed clause text (citation target).
 
 HOW TO CALL /mcp directly (no MCP client): POST JSON-RPC, keep the Mcp-Session-Id header from the
 initialize response, send notifications/initialized, then tools/call. GET /help returns the exact bodies.`
 
 type landingData struct {
-	Host   string
+	Origin string
 	Prompt string
 }
 
 // helpJSON is the request recipe served at /help: how to drive the /mcp endpoint
-// over plain HTTP with no MCP client. {{HOST}} is substituted with the request host.
+// over plain HTTP with no MCP client. {{ORIGIN}} is substituted with the request
+// scheme+host (proxy-aware, see originOf).
 const helpJSON = `{
   "server": "3gpp-mcp",
   "transport": "MCP Streamable HTTP (spec 2025-03-26)",
-  "endpoint": "http://{{HOST}}/mcp",
+  "endpoint": "{{ORIGIN}}/mcp",
   "content_type": "application/json",
   "accept": "application/json, text/event-stream",
   "handshake": [
@@ -201,14 +206,14 @@ func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.St
 	// Static routes are independent of the corpus, so they serve from the first instant.
 	mux.HandleFunc("/llms.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprint(w, substHost(aiPrompt, hostOr(r.Host)))
+		_, _ = fmt.Fprint(w, substOrigin(aiPrompt, originOf(r)))
 	})
 	// /help — the request recipe for driving /mcp directly. Answer OPTIONS too so a
 	// client probing the endpoint gets the same documentation instead of a 405.
 	mux.HandleFunc("/help", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Allow", "GET, OPTIONS")
-		_, _ = fmt.Fprint(w, substHost(helpJSON, hostOr(r.Host)))
+		_, _ = fmt.Fprint(w, substOrigin(helpJSON, originOf(r)))
 	})
 	mux.HandleFunc("/skill/3gpp.md", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
@@ -244,21 +249,43 @@ func hostOr(host string) string {
 	return host
 }
 
+// schemeOr resolves the scheme for absolute URLs in rendered docs, like hostOr
+// does for the host. A TLS-terminating proxy (Cloudflare, nginx) forwards plain
+// HTTP, so r.TLS alone would advertise http:// on an https:// deployment —
+// X-Forwarded-Proto wins, then the direct connection, then plain http.
+func schemeOr(r *http.Request) string {
+	// May be a comma-separated chain when several proxies stack; the first hop
+	// (the client-facing edge) is authoritative.
+	p, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	if p = strings.TrimSpace(p); p == "https" || p == "http" {
+		return p
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// originOf is the absolute base URL of this request as the CLIENT sees it.
+func originOf(r *http.Request) string {
+	return schemeOr(r) + "://" + hostOr(r.Host)
+}
+
 func landingHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	host := hostOr(r.Host)
-	data := landingData{Host: host, Prompt: substHost(aiPrompt, host)}
+	origin := originOf(r)
+	data := landingData{Origin: origin, Prompt: substOrigin(aiPrompt, origin)}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := landingTmpl.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-func substHost(s, host string) string {
-	return strings.ReplaceAll(s, "{{HOST}}", host)
+func substOrigin(s, origin string) string {
+	return strings.ReplaceAll(s, "{{ORIGIN}}", origin)
 }
 
 // landingTmpl renders a self-contained page (no external assets) with copy buttons.
@@ -289,12 +316,12 @@ skill</b> (the strict cited-answer protocol) for whatever environment it is runn
 
 <h2>2. Manual setup</h2>
 <p><b>Option A — this hosted server</b> (nothing to pull or run). Register the MCP, then install the skill:</p>
-<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>claude mcp add --transport http 3gpp http://{{.Host}}/mcp
-curl -fsSL http://{{.Host}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md</pre></div>
+<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>claude mcp add --transport http 3gpp {{.Origin}}/mcp
+mkdir -p ~/.claude/skills/3gpp && curl -fsSL {{.Origin}}/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md</pre></div>
 <p><b>Generic <code>mcp.json</code></b> (opencode / Cline / Continue / Codex / any mcpServers client):</p>
 <div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>{
   "mcpServers": {
-    "3gpp": { "type": "http", "url": "http://{{.Host}}/mcp" }
+    "3gpp": { "type": "http", "url": "{{.Origin}}/mcp" }
   }
 }</pre></div>
 <p><b>Option B — your own local instance</b> (Docker, offline-semantic; image is private →
@@ -302,7 +329,7 @@ curl -fsSL http://{{.Host}}/skill/3gpp.md -o ~/.claude/commands/3gpp.md</pre></d
 version-matched with the server:</p>
 <div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>docker pull ghcr.io/kodflow/3gpp-mcp:latest
 claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data ghcr.io/kodflow/3gpp-mcp:latest serve
-docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md</pre></div>
+docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/skills/3gpp/SKILL.md   # mkdir -p ~/.claude/skills/3gpp first</pre></div>
 <p>Then restart your AI session (MCP registrations and skills are read at session start) and ask
 <code>/3gpp &lt;your question&gt;</code>.</p>
 
@@ -310,7 +337,7 @@ docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.
 <p>The endpoint speaks JSON-RPC over <a href="/mcp"><code>/mcp</code></a>: <em>initialize</em> (keep the
 <code>Mcp-Session-Id</code> response header) → <em>notifications/initialized</em> → <em>tools/call</em>.
 The full recipe (with exact bodies) is at <a href="/help"><code>/help</code></a>.</p>
-<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>EP=http://{{.Host}}/mcp
+<div class="blk"><button class="copy" onclick="cp(this)">copy</button><pre>EP={{.Origin}}/mcp
 H='-H content-type:application/json -H accept:application/json,text/event-stream'
 # 1) initialize → grab the session id
 SID=$(curl -sD- -o/dev/null $H "$EP" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' | awk 'tolower($1)=="mcp-session-id:"{print $2}' | tr -d "\r")
