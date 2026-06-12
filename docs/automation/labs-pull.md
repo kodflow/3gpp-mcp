@@ -100,6 +100,68 @@ layers; a **corpus** change ships the full data layer once.
 
 Pulls in flight are unaffected; the new token authenticates the next pull.
 
+## 5. Auto-update (a pull + a read token is all the labs needs)
+
+The labs never rebuilds anything. The CI republishes the moving `:full` / `:light`
+tags whenever the **code** or the **corpus** changes; the labs just re-pulls and
+restarts. Pick one of:
+
+**Docker host — a tiny systemd timer (or cron):**
+
+```bash
+# /etc/cron.daily/3gpp-mcp-update  (chmod +x)
+#!/bin/sh
+echo "$GHCR_RO_TOKEN" | docker login ghcr.io -u <user> --password-stdin
+docker pull ghcr.io/kodflow/3gpp-mcp:full || exit 0   # no-op if unchanged
+docker compose -f /opt/3gpp-mcp/docker-compose.yml up -d
+docker image prune -f
+```
+
+A code-only republish ships only the small top layers (~150 MB); the ~14 GB data
+layer is inherited by digest, so an unchanged corpus means the pull transfers
+nothing. That is the whole point of the split — auto-update is cheap.
+
+**Docker host — Watchtower (zero-script):**
+
+```bash
+docker run -d --name watchtower --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/.docker/config.json:/config.json:ro \
+  containrrr/watchtower --interval 3600 --cleanup ghcr.io/kodflow/3gpp-mcp
+```
+
+**Kubernetes — pin the moving tag + a CronJob that restarts:**
+
+```yaml
+# image: ghcr.io/kodflow/3gpp-mcp:full  with imagePullPolicy: Always
+# then a daily CronJob:
+spec:
+  schedule: "17 4 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: mcp-restarter   # RBAC: patch deployments
+          containers:
+            - name: restart
+              image: bitnami/kubectl
+              command: ["kubectl","rollout","restart","deploy/mcp-3gpp"]
+          restartPolicy: OnFailure
+```
+
+`imagePullPolicy: Always` + a rollout restart re-pulls `:full`; unchanged layers
+are skipped. (Keep the `ghcr-3gpp` pull secret from §3 in the namespace.)
+
+### What triggers a new publish
+
+- **Code change** (push to `main` touching `cmd/server`, `internal/**`, the
+  Dockerfile…) → `corpus-image.yml` rebuilds the small top layers and moves the
+  tags. Cheap pull.
+- **Corpus change** → the data image is re-baked, then `corpus-image.yml` rebuilds
+  on the fresh data digest. One-time ~14 GB pull, then cheap again.
+
+The labs side stays identical in both cases: `docker pull` + the read token.
+
 ## Anti-leak guarantee
 
 Every workflow that pushes a `3gpp-*` package asserts the package is **private**
