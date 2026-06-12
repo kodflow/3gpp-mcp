@@ -37,7 +37,8 @@ func clientWithTR(t *testing.T) (*client.Client, context.Context) {
 		{FromTerm: "MME", ToTerm: "AMF", EvolutionType: "SPLIT", JustificationSpec: "23.501", JustificationClause: "4.2", Confidence: 0.9},
 	})
 
-	c, err := client.NewInProcessClient(New(st, "test", "", nil))
+	srv, _ := New(st, "test", "", nil)
+	c, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatal(err)
 	}

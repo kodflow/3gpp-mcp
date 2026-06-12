@@ -20,6 +20,7 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/mcp"
+	"github.com/kodflow/3gpp-mcp/internal/search"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -102,7 +103,7 @@ func serve(args []string) error {
 	// HTTP mode: bring /healthz up BEFORE the (possibly minutes-long) DB + vector
 	// bootstrap, so a puller sees 503 "loading" during startup and 200 "ready" only
 	// once the corpus is actually queryable (not connection-refused-then-instantly-up).
-	var httpReady func(*mcpserver.MCPServer, *store.Store)
+	var httpReady func(*mcpserver.MCPServer, *store.Store, search.Caps, string)
 	var httpErrc <-chan error
 	if *httpAddr != "" {
 		httpReady, httpErrc = startEarlyHTTP(*httpAddr)
@@ -203,7 +204,7 @@ func serve(args []string) error {
 		}
 	}
 
-	srv := mcp.New(st, Version, *release, vecShards)
+	srv, caps := mcp.New(st, Version, *release, vecShards)
 	scope := *release
 	if scope == "" {
 		scope = "latest"
@@ -212,7 +213,7 @@ func serve(args []string) error {
 	// the SAME *MCPServer on Streamable HTTP plus a copy-paste landing page; the
 	// engine is transport-agnostic, so nothing about retrieval changes.
 	if *httpAddr != "" {
-		httpReady(srv, st) // flip /healthz → 200 ready and wire the live MCP + /spec routes
+		httpReady(srv, st, caps, scope) // flip /healthz → 200 ready and wire the live MCP + /spec + dashboard routes
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] READY: MCP over Streamable HTTP on %s (endpoint /mcp, landing /, db=%s, fts=%v, hnsw=%v, baseline=%s, status=ready)\n",
 			*httpAddr, effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
 		return <-httpErrc

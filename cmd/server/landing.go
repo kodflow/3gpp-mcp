@@ -13,7 +13,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/kodflow/3gpp-mcp/internal/metrics"
+	"github.com/kodflow/3gpp-mcp/internal/search"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
@@ -112,7 +115,9 @@ const helpJSON = `{
     "/healthz": "GET → {\"status\":\"loading\"|\"ready\"}",
     "/llms.txt": "GET → the copy-paste system prompt",
     "/skill/3gpp.md": "GET → the /3gpp skill (strict cited-answer format)",
-    "/spec/<spec_id>/<release>/<clause>": "GET → the exact indexed clause text (citation target)"
+    "/spec/<spec_id>/<release>/<clause>": "GET → the exact indexed clause text (citation target)",
+    "/dashboard": "GET → live HTML metrics dashboard (ONNX/semantic status, embedded clauses, request rate + latency)",
+    "/dashboard.json": "GET → the dashboard's data (capabilities + corpus counts + request metrics)"
   }
 }
 `
@@ -128,13 +133,17 @@ const helpJSON = `{
 // client never gets a half-open engine. markReady is called once serve() has the
 // store + MCPServer; it flips the readiness flag under a write lock. Returns the
 // channel carrying the eventual ListenAndServe error so serve() can block on it.
-func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.Store), errc <-chan error) {
+func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.Store, search.Caps, string), errc <-chan error) {
 	var (
-		mu     sync.RWMutex
-		stream http.Handler
-		spec   http.HandlerFunc
-		ready  bool
+		mu        sync.RWMutex
+		stream    http.Handler
+		spec      http.HandlerFunc
+		ready     bool
+		dash      dashStatic
+		dashReady bool
 	)
+	coll := metrics.New()
+	started := time.Now()
 	loading := func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -192,16 +201,27 @@ func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.St
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		_, _ = fmt.Fprint(w, skill3gpp)
 	})
+	// Live dashboard: the page is static (serves from the first instant); its data
+	// endpoint reports {"status":"loading"} until markReady fills the snapshot.
+	mux.HandleFunc("/dashboard", dashboardPageHandler)
+	mux.HandleFunc("/dashboard.json", dashboardJSONHandler(func() (dashStatic, bool) {
+		mu.RLock()
+		defer mu.RUnlock()
+		return dash, dashReady
+	}, coll))
 	mux.HandleFunc("/", landingHandler)
 
 	ch := make(chan error, 1)
 	go func() { ch <- http.ListenAndServe(addr, mux) }() //nolint:gosec // addr is operator-chosen; loopback by doctrine
 
-	markReady = func(srv *mcpserver.MCPServer, st *store.Store) {
+	markReady = func(srv *mcpserver.MCPServer, st *store.Store, caps search.Caps, baseline string) {
 		h := mcpserver.NewStreamableHTTPServer(srv, mcpserver.WithEndpointPath(mcpEndpointPath))
 		sp := specDocHandler(st)
+		ds := buildDashStatic(st, caps, Version, baseline, started)
 		mu.Lock()
-		stream, spec, ready = h, sp, true
+		// Wrap the MCP handler so every /mcp request is timed into the dashboard.
+		stream, spec, ready = metricsMiddleware(coll, h), sp, true
+		dash, dashReady = ds, true
 		mu.Unlock()
 	}
 	return markReady, ch
@@ -289,7 +309,7 @@ curl -s $H -H "mcp-session-id: $SID" "$EP" -d '{"jsonrpc":"2.0","method":"notifi
 # 3) call a tool
 curl -s $H -H "mcp-session-id: $SID" "$EP" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_spec","arguments":{"query":"AMF registration","release":"Rel-18","top_k":5}}}'</pre></div>
 <p>Other endpoints: <a href="/healthz"><code>/healthz</code></a> · <a href="/llms.txt"><code>/llms.txt</code></a> ·
-<a href="/skill/3gpp.md"><code>/skill/3gpp.md</code></a> · <code>/spec/&lt;spec_id&gt;/&lt;release&gt;/&lt;clause&gt;</code></p>
+<a href="/skill/3gpp.md"><code>/skill/3gpp.md</code></a> · <a href="/dashboard"><code>/dashboard</code></a> · <code>/spec/&lt;spec_id&gt;/&lt;release&gt;/&lt;clause&gt;</code></p>
 
 <script>
 function cp(b){const p=b.parentElement.querySelector('pre');navigator.clipboard.writeText(p.innerText).then(()=>{b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)})}
