@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -133,17 +134,29 @@ const helpJSON = `{
 // client never gets a half-open engine. markReady is called once serve() has the
 // store + MCPServer; it flips the readiness flag under a write lock. Returns the
 // channel carrying the eventual ListenAndServe error so serve() can block on it.
-func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.Store, search.Caps, string), errc <-chan error) {
+func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.Store, *search.Engine, string), errc <-chan error) {
 	var (
-		mu        sync.RWMutex
-		stream    http.Handler
-		spec      http.HandlerFunc
-		ready     bool
-		dash      dashStatic
-		dashReady bool
+		mu         sync.RWMutex
+		stream     http.Handler
+		spec       http.HandlerFunc
+		ready      bool
+		dashCorpus dashStatic
+		dashEng    *search.Engine
+		dashReady  bool
 	)
 	coll := metrics.New()
 	started := time.Now()
+	// Dashboard auth: a random per-start token, printed to the container logs.
+	// Without it no dashboard call passes (the /mcp data plane stays open).
+	dashToken := newDashToken()
+	fmt.Fprintf(os.Stderr, "[3gpp-mcp] dashboard token: %s  (open /dashboard?token=%s)\n", dashToken, dashToken)
+	// getLive hands the dashboard handlers the corpus snapshot + the LIVE engine
+	// (for capabilities + runtime toggles) under the read lock.
+	getLive := func() (dashStatic, *search.Engine, bool) {
+		mu.RLock()
+		defer mu.RUnlock()
+		return dashCorpus, dashEng, dashReady
+	}
 	loading := func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -201,27 +214,24 @@ func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.St
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		_, _ = fmt.Fprint(w, skill3gpp)
 	})
-	// Live dashboard: the page is static (serves from the first instant); its data
-	// endpoint reports {"status":"loading"} until markReady fills the snapshot.
-	mux.HandleFunc("/dashboard", dashboardPageHandler)
-	mux.HandleFunc("/dashboard.json", dashboardJSONHandler(func() (dashStatic, bool) {
-		mu.RLock()
-		defer mu.RUnlock()
-		return dash, dashReady
-	}, coll))
+	// Live dashboard (token-gated): the page + data + the runtime toggle endpoint.
+	// The page serves from the first instant; the data reports loading until ready.
+	mux.HandleFunc("/dashboard", dashboardPageHandler(dashToken))
+	mux.HandleFunc("/dashboard.json", dashboardJSONHandler(getLive, coll, dashToken))
+	mux.HandleFunc("/dashboard/toggle", toggleHandler(getLive, dashToken))
 	mux.HandleFunc("/", landingHandler)
 
 	ch := make(chan error, 1)
 	go func() { ch <- http.ListenAndServe(addr, mux) }() //nolint:gosec // addr is operator-chosen; loopback by doctrine
 
-	markReady = func(srv *mcpserver.MCPServer, st *store.Store, caps search.Caps, baseline string) {
+	markReady = func(srv *mcpserver.MCPServer, st *store.Store, eng *search.Engine, baseline string) {
 		h := mcpserver.NewStreamableHTTPServer(srv, mcpserver.WithEndpointPath(mcpEndpointPath))
 		sp := specDocHandler(st)
-		ds := buildDashStatic(st, caps, Version, baseline, started)
+		ds := buildDashStatic(st, Version, baseline, started)
 		mu.Lock()
 		// Wrap the MCP handler so every /mcp request is timed into the dashboard.
 		stream, spec, ready = metricsMiddleware(coll, h), sp, true
-		dash, dashReady = ds, true
+		dashCorpus, dashEng, dashReady = ds, eng, true
 		mu.Unlock()
 	}
 	return markReady, ch

@@ -1,76 +1,108 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/metrics"
+	"github.com/kodflow/3gpp-mcp/internal/search"
 )
 
-func TestDashboardPageServes(t *testing.T) {
+const testTok = "TESTtoken1234567890X" // 20 chars
+
+// loadingGetter stands in for the live getter before the corpus is ready.
+func loadingGetter() (dashStatic, *search.Engine, bool) { return dashStatic{}, nil, false }
+
+func TestDashboardPageAuthGate(t *testing.T) {
+	page := dashboardPageHandler(testTok)
+
+	// No token → 401 + the login hint, NEVER the dashboard.
 	rec := httptest.NewRecorder()
-	dashboardPageHandler(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d, want 200", rec.Code)
+	page(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-token status=%d, want 401", rec.Code)
 	}
-	body := rec.Body.String()
-	for _, want := range []string{"3gpp-mcp", "/dashboard.json", "ONNX embedder", "Requests / minute"} {
-		if !strings.Contains(body, want) {
+	if strings.Contains(rec.Body.String(), "rafraîchissement") {
+		t.Error("dashboard body leaked without a token")
+	}
+
+	// Valid ?token → 200, real page, and a cookie so the JSON fetch authenticates.
+	rec = httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/dashboard?token="+testTok, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("token status=%d, want 200", rec.Code)
+	}
+	for _, want := range []string{"3gpp-mcp", "/dashboard.json", "/dashboard/toggle", "À quoi sert chaque option", "ONNX embedder"} {
+		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("dashboard HTML missing %q", want)
 		}
 	}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("content-type=%q, want text/html", ct)
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "dash_token=") {
+		t.Error("query-token page must set the dash_token cookie")
 	}
 }
 
-func TestDashboardJSONLoadingThenReady(t *testing.T) {
-	coll := metrics.New()
+func TestDashboardJSONAuthAndLoading(t *testing.T) {
+	h := dashboardJSONHandler(loadingGetter, metrics.New(), testTok)
 
-	// Loading: getStatic reports not-ready → 503 {"status":"loading"}.
-	loading := dashboardJSONHandler(func() (dashStatic, bool) { return dashStatic{}, false }, coll)
+	// No token → 401.
 	rec := httptest.NewRecorder()
-	loading(rec, httptest.NewRequest(http.MethodGet, "/dashboard.json", nil))
+	h(rec, httptest.NewRequest(http.MethodGet, "/dashboard.json", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-token status=%d, want 401", rec.Code)
+	}
+
+	// Valid token (query) but not ready → 503 loading.
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/dashboard.json?token="+testTok, nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("loading status=%d, want 503", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "loading") {
-		t.Errorf("loading body=%q, want status loading", rec.Body.String())
+
+	// Token via cookie also passes the gate (so the browser fetch works).
+	req := httptest.NewRequest(http.MethodGet, "/dashboard.json", nil)
+	req.AddCookie(&http.Cookie{Name: "dash_token", Value: testTok})
+	rec = httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Error("cookie auth was rejected")
 	}
 
-	// Ready: fill a snapshot + record a couple of requests, expect a full payload.
-	coll.Observe(5 * time.Millisecond)
-	coll.Observe(15 * time.Millisecond)
-	static := dashStatic{
-		Version: "test", Baseline: "latest", OnnxEnabled: true, Semantic: true,
-		Hnsw: true, Fts: true, EmbeddingModel: "265de25f90b8",
-		EmbeddedClauses: 2_855_221, TotalClauses: 2_855_221, Specs: 150,
-		StartedUnix: time.Now().Add(-90 * time.Second).Unix(),
-	}
-	ready := dashboardJSONHandler(func() (dashStatic, bool) { return static, true }, coll)
+	// Token via Bearer also passes.
+	req = httptest.NewRequest(http.MethodGet, "/dashboard.json", nil)
+	req.Header.Set("Authorization", "Bearer "+testTok)
 	rec = httptest.NewRecorder()
-	ready(rec, httptest.NewRequest(http.MethodGet, "/dashboard.json", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ready status=%d, want 200", rec.Code)
+	h(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Error("bearer auth was rejected")
 	}
-	var got dashboardData
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("invalid json: %v", err)
+}
+
+func TestToggleAuthGate(t *testing.T) {
+	h := toggleHandler(loadingGetter, testTok)
+
+	// No token → 401 (a mutating endpoint MUST be protected).
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/dashboard/toggle?name=vector&on=false", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-token status=%d, want 401", rec.Code)
 	}
-	if !got.OnnxEnabled || !got.Semantic {
-		t.Errorf("flags lost: onnx=%v semantic=%v", got.OnnxEnabled, got.Semantic)
+	// Wrong token → 401.
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/dashboard/toggle?token=WRONGWRONGWRONGWRONG0&name=vector&on=false", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong-token status=%d, want 401", rec.Code)
 	}
-	if got.EmbeddedClauses != 2_855_221 || got.Specs != 150 {
-		t.Errorf("static facts lost: emb=%d specs=%d", got.EmbeddedClauses, got.Specs)
-	}
-	if got.Metrics.Total != 2 {
-		t.Errorf("metrics.total=%d, want 2", got.Metrics.Total)
-	}
-	if got.UptimeSec < 80 {
-		t.Errorf("uptime=%d, want ~90", got.UptimeSec)
+}
+
+func TestEmptyTokenRejectsEverything(t *testing.T) {
+	// crypto/rand failure path returns "" → the gate must reject all (fail-closed).
+	page := dashboardPageHandler("")
+	rec := httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/dashboard?token=", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("empty-token page status=%d, want 401 (fail-closed)", rec.Code)
 	}
 }

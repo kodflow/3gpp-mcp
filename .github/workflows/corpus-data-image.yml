@@ -222,8 +222,11 @@ jobs:
           #    ORT is needed by the fp16 conversion toolchain context only at bake; it
           #    is NOT shipped in this data image (arch-specific → mcp layer).
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
-          RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap model/ORT" \
-            retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db --no-reranker
+          # Bake BOTH models: BGE-M3 (embedder) AND the BGE-reranker-v2-m3 cross-encoder
+          # (drop --no-reranker) so serve can turn the reranker on. ORT here is only for
+          # the fp16 conversion toolchain; it is NOT shipped in this data image.
+          RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap models/ORT" \
+            retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db
           # 3) fp16 conversion (keep_io_types) — kernel-identical recipe.
           python3 -m pip install --quiet onnx onnxruntime sympy packaging
           mkdir -p image-data/models/bge-m3-fp16
@@ -299,6 +302,7 @@ jobs:
           test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
           test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
+          test -s image-data/models/bge-reranker-v2-m3/model.onnx || { echo "::error::reranker model missing (drop --no-reranker?)"; exit 1; }
           # DISK FIRST, then COMPACT on the emptiest disk (see #136/#137 history).
           rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt
           scratch="image-data"
@@ -330,6 +334,19 @@ jobs:
           else
             echo "::warning::duckdb CLI unavailable — skipping compaction"
           fi
+          # 6) FREEZE the HNSW index on the (compacted) fused DB — the LAST DB step.
+          #    It MUST come after compaction: COPY FROM DATABASE does not copy custom
+          #    indexes, so freezing earlier would be undone. Without this the shipped
+          #    DB has hnsw_state="" → serve's LoadVSS refuses it → exact-scan →
+          #    server_info hnsw:false/semantic:false despite the vectors being baked.
+          #    freeze-hnsw indexes the EXISTING embedding column (no embedder/ONNX)
+          #    and fail-louds if the post-state is not "frozen".
+          #    NOTE (resources): HNSW on ~2.85M×1024 loads vectors into RAM + builds
+          #    the graph (several minutes). If this OOMs, move to a larger runner or
+          #    tune ef_construction/M.
+          echo "freezing HNSW index on the fused DB…"; df -h / | tail -1
+          CGO_ENABLED=1 go run ./cmd/freeze-hnsw --db image-data/3gpp.duckdb
+          echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
           go clean -cache -testcache -modcache 2>/dev/null || true
           rm -rf /tmp/dk /tmp/duckdb.zip /mnt/compact-scratch 2>/dev/null || true
           du -sh image-data image-data/* 2>/dev/null || true
