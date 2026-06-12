@@ -376,12 +376,13 @@ jobs:
       - name: Disk before image build (visibility)
         run: df -h / /mnt 2>/dev/null || df -h /
 
-      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+      - name: Install crane (streaming OCI push — low disk, replaces buildx)
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh
-          retry docker pull moby/buildkit:buildx-stable-1
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+          retry go install github.com/google/go-containerregistry/cmd/crane@v0.20.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/crane" version
       # GHCR_PAT (not github.token): a CI-token push auto-links the package to
       # this PUBLIC repo → PUBLIC visibility. A PAT push stays unlinked → born
       # PRIVATE (same posture as 3gpp-corpus / 3gpp-mcp).
@@ -391,61 +392,56 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
 
-      # DISK-SAFE per-arch build (ENOSPC fix): a single multi-platform build
-      # materialises BOTH arches' 14 GB compressed + ~22 GB uncompressed data
-      # layers AT ONCE (~70 GB peak) and killed the runner with ENOSPC. Instead
-      # build each arch SEQUENTIALLY, push it by digest, prune buildkit between
-      # arches (peak = ONE arch ≈ 36 GB, fits comfortably on either disk), then
-      # fuse the two digests into the multi-arch tags. Dockerfile.data is RUN-free
-      # → no QEMU; full inherits the matching arch's data layer via FROM.
-      - name: Build + push 3gpp-data per-arch (sequential, disk-safe) + fuse manifest
+      # DISK-SAFE build via crane STREAMING (replaces docker buildx). The fused DB
+      # is ~33 GB (the frozen HNSW index keeps a fp32 copy of the 2.85M×1024 vectors
+      # on top of the column). buildx materialised the context + layer on disk
+      # (~50 GB peak) and repeatedly ENOSPC'd the runner ROOT disk (/) — buildkit
+      # spills to /tmp/host paths even with data-root on /mnt — killing the agent.
+      # crane streams the data layer straight to GHCR (digest computed DURING upload
+      # via go-containerregistry stream.Layer), so peak disk ≈ 0 beyond the DB that
+      # already exists on disk. Dockerfile.data is just `FROM debian-slim` + LABELs +
+      # `COPY --chown=10001:10001 image-data/ /data/mcp-3gpp/`, reproduced here:
+      # per-arch append onto the arch's debian base, labels via crane mutate, then
+      # fuse the two arch manifests into the multi-arch index. crane authenticates
+      # via the docker config written by docker/login-action above.
+      - name: Build + push 3gpp-data per-arch (crane streaming, disk-safe) + fuse
         if: ${{ github.event.inputs.push != 'false' }}
         run: |
           set -euo pipefail
           REPO="ghcr.io/${{ github.repository_owner }}/3gpp-data"
-          # The fused DB is now ~33 GB: the frozen HNSW index (usearch) keeps its OWN
-          # fp32 copy of the 2.85M×1024 vectors (~12 GB) on top of the DB's column.
-          # The build context + buildkit scratch must therefore live ENTIRELY on the
-          # big /mnt disk — keeping the 33 GB context on the root disk ENOSPC'd it.
-          # buildkit's data-root is already /mnt; move the context there and point
-          # TMPDIR + the metadata files there too. Moving image-data off / also frees
-          # ~33 GB on /.
-          sudo mkdir -p /mnt/databuild /mnt/tmp
-          sudo chmod 0777 /mnt/databuild /mnt/tmp
-          # NON-sudo mv: keep runner ownership so the buildx client can read the
-          # context (a root-owned context fails the build). 0777 on databuild lets
-          # the runner write here.
-          mv image-data /mnt/databuild/image-data
-          cp Dockerfile.data /mnt/databuild/Dockerfile.data
-          export TMPDIR=/mnt/tmp
-          echo "context on /mnt; FULL /mnt capacity:"; df -h /mnt; df -h / | tail -1
+          BASE="debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716"
+          source scripts/lib/retry.sh
+          # Stage the DB under its in-image path WITHOUT copying 33 GB: a rename on
+          # the same filesystem is instant and uses no extra disk. The tar then
+          # streams these paths verbatim into the layer (data/mcp-3gpp/… → /data/mcp-3gpp/).
+          rm -rf data-stage && mkdir -p data-stage/data
+          mv image-data data-stage/data/mcp-3gpp
           digests=""
           for arch in amd64 arm64; do
-            echo "=== build linux/$arch ==="; df -h / /mnt 2>/dev/null | tail -2
-            docker buildx build --platform "linux/$arch" \
-              -f /mnt/databuild/Dockerfile.data \
-              --build-arg DATA_CREATED='${{ steps.bake.outputs.created }}' \
-              --build-arg EMBED_IDENTITY='${{ steps.bake.outputs.embed_identity }}' \
-              --build-arg DUCKDB_ROWS='${{ steps.bake.outputs.rows }}' \
-              --build-arg SOURCE_CORPUS='${{ steps.bake.outputs.source_corpus }}' \
-              --provenance=false \
-              --metadata-file "/mnt/tmp/meta-$arch.json" \
-              --output "type=image,name=$REPO,push-by-digest=true,name-canonical=true,push=true" \
-              /mnt/databuild
-            d="$(jq -r '."containerimage.digest"' "/mnt/tmp/meta-$arch.json")"
-            test -n "$d" && [ "$d" != "null" ] || { echo "::error::no digest for linux/$arch"; exit 1; }
+            echo "=== crane append linux/$arch ==="; df -h / 2>/dev/null | tail -1
+            bdig="$(retry crane digest --platform "linux/$arch" "$BASE")"
+            # Stream the data layer: no intermediate tarball, no buildx, no /tmp blob.
+            # --owner/--group mirror Dockerfile.data's COPY --chown=10001:10001.
+            tar -C data-stage --owner=10001 --group=10001 -cf - data \
+              | retry crane append -b "debian:bookworm-slim@$bdig" -f - -t "$REPO:stage-$arch"
+            # LABELs (metadata-only re-push to the same tag; mirrors Dockerfile.data).
+            retry crane mutate "$REPO:stage-$arch" \
+              --label org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp16) base for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
+              --label io.kodflow.3gpp.data.created="${{ steps.bake.outputs.created }}" \
+              --label io.kodflow.3gpp.embedding.identity="${{ steps.bake.outputs.embed_identity }}" \
+              --label io.kodflow.3gpp.duckdb.rows="${{ steps.bake.outputs.rows }}" \
+              --label io.kodflow.3gpp.source.corpus="${{ steps.bake.outputs.source_corpus }}" \
+              -t "$REPO:stage-$arch"
+            d="$(retry crane digest "$REPO:stage-$arch")"
+            test -n "$d" || { echo "::error::no digest for linux/$arch"; exit 1; }
             echo "linux/$arch -> $d"
-            digests="$digests $REPO@$d"
-            # Free the just-built layer before the next arch (it is safe on the
-            # registry now) so the peak stays at ONE arch's worth of storage.
-            docker buildx prune -af >/dev/null 2>&1 || true
+            digests="$digests -m $REPO@$d"
           done
+          # Fuse the two arch manifests into a multi-arch index (metadata-only).
           # shellcheck disable=SC2086
-          docker buildx imagetools create \
-            -t "$REPO:latest" \
-            -t "$REPO:${{ steps.bake.outputs.datetag }}" \
-            $digests
-          echo "fused multi-arch:"; docker buildx imagetools inspect "$REPO:latest" | grep -E 'Platform|MediaType' | head
+          retry crane index append -t "$REPO:latest" $digests
+          retry crane tag "$REPO:latest" "${{ steps.bake.outputs.datetag }}"
+          echo "fused multi-arch:"; crane manifest "$REPO:latest" | jq -r '.manifests[]|"\(.platform.os)/\(.platform.architecture)"'
 
       # FAIL-LOUD multi-arch assertion: the pushed index must carry BOTH
       # linux/amd64 and linux/arm64, and each platform's last layer (the data
@@ -457,13 +453,14 @@ jobs:
         run: |
           set -euo pipefail
           REF="ghcr.io/${{ github.repository_owner }}/3gpp-data:latest"
-          idx="$(docker buildx imagetools inspect "$REF" --raw)"
+          idx="$(crane manifest "$REF")"
           fail=0
           for p in amd64 arm64; do
             d="$(printf '%s' "$idx" | jq -r --arg a "$p" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest')"
             test -n "$d" || { echo "::error::no linux/$p manifest on $REF"; fail=1; continue; }
-            l="$(docker buildx imagetools inspect "$REF@$d" --raw | jq -r '.layers[-1].digest')"
-            sz="$(docker buildx imagetools inspect "$REF@$d" --raw | jq -r '.layers[-1].size')"
+            m="$(crane manifest "$REF@$d")"
+            l="$(printf '%s' "$m" | jq -r '.layers[-1].digest')"
+            sz="$(printf '%s' "$m" | jq -r '.layers[-1].size')"
             echo "linux/$p -> data layer $l (${sz} bytes)"
             [ "${sz:-0}" -gt 1073741824 ] || { echo "::error::linux/$p last layer is ${sz:-0} bytes (< 1 GiB) — data layer missing"; fail=1; }
           done
