@@ -30,7 +30,7 @@ import (
 // vecShards (optional) are attached sub-base aliases from store.AttachShards —
 // when present, the vector arm runs the Option-B scatter-gather over them
 // instead of the single-DB HNSW.
-func New(st *store.Store, version, baseline string, vecShards []string) *server.MCPServer {
+func New(st *store.Store, version, baseline string, vecShards []string) (*server.MCPServer, search.Caps) {
 	eng := search.New(st)
 	eng.UseVectorShards(vecShards)
 	scope := "latest release"
@@ -138,7 +138,7 @@ func New(st *store.Store, version, baseline string, vecShards []string) *server.
 			s.AddTool(tr.Tool, tr.Handler)
 		}
 	}
-	return s
+	return s, eng.Caps()
 }
 
 type handlers struct {

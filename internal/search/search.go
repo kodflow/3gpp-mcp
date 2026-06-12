@@ -100,6 +100,24 @@ func (e *Engine) EmbedderModelID() string { return e.emb.ModelID() }
 // RerankerEnabled reports whether the cross-encoder reranker is available.
 func (e *Engine) RerankerEnabled() bool { return e.rr.Enabled() }
 
+// Caps is a static snapshot of the engine's retrieval capabilities, taken once at
+// startup so a caller (e.g. the HTTP dashboard) can report them without holding a
+// live *Engine or reconstructing an embedder (the ORT session is ~GBs of RAM).
+type Caps struct {
+	EmbedderEnabled bool
+	EmbedderModelID string
+	RerankerEnabled bool
+}
+
+// Caps returns the engine's capability snapshot.
+func (e *Engine) Caps() Caps {
+	return Caps{
+		EmbedderEnabled: e.EmbedderEnabled(),
+		EmbedderModelID: e.EmbedderModelID(),
+		RerankerEnabled: e.RerankerEnabled(),
+	}
+}
+
 // Request parameterises a search. Mode selects which retrieval arms run:
 // "" / "hybrid" = lexical ⊕ vector, "lexical" = BM25 only, "semantic" = vector
 // only (degrades to lexical when no embedder/vectors — never returns nothing).
