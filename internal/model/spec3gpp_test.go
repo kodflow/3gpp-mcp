@@ -26,6 +26,28 @@ func TestDecodeVersionCode(t *testing.T) {
 	}
 }
 
+func TestIsStableVersion(t *testing.T) {
+	cases := []struct {
+		ver    string
+		stable bool
+	}{
+		{"19.6.0", true},  // Rel-19 published
+		{"20.1.0", true},  // Rel-20 published
+		{"3.0.0", true},   // major 3 == Rel-99, published
+		{"2.0.0", false},  // draft
+		{"2.15.0", false}, // draft (high minor, still major 2)
+		{"1.0.0", false},  // draft
+		{"0.2.0", false},  // early draft
+		{"", false},       // unparseable → fail-safe not-stable
+		{"GSM", false},    // legacy bucket label, not a dotted version
+	}
+	for _, c := range cases {
+		if got := IsStableVersion(c.ver); got != c.stable {
+			t.Errorf("IsStableVersion(%q) = %v, want %v", c.ver, got, c.stable)
+		}
+	}
+}
+
 func TestEncodeRoundTrip(t *testing.T) {
 	for _, ver := range []string{"19.6.0", "18.15.0", "20.1.0"} {
 		code, ok := EncodeVersionCode(ver)
