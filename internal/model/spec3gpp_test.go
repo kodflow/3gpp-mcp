@@ -12,6 +12,8 @@ func TestDecodeVersionCode(t *testing.T) {
 		{"hf0", "Rel-17", "17.15.0", true}, // f = 15
 		{"k10", "Rel-20", "20.1.0", true},
 		{"3a0", "Rel-99", "3.10.0", true}, // major 3 == Rel-99
+		{"500", "Rel-5", "5.0.0", true},   // legacy GSM numeric code (#129); dir overrides rel to GSM
+		{"700", "Rel-7", "7.0.0", true},   // legacy GSM numeric code (#129)
 		{"zz", "", "", false},             // too short
 		{"!!!", "", "", false},            // invalid chars
 	}
