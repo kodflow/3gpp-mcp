@@ -95,6 +95,13 @@ func TestToggleAuthGate(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("wrong-token status=%d, want 401", rec.Code)
 	}
+	// GET with a VALID token → 405 (mutating endpoint is POST-only; a GET must not
+	// flip a toggle even with the token — CSRF-like / accidental pre-fetch).
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/dashboard/toggle?token="+testTok+"&name=vector&on=false", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET status=%d, want 405", rec.Code)
+	}
 }
 
 func TestEmptyTokenRejectsEverything(t *testing.T) {
