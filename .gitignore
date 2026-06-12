@@ -16,6 +16,8 @@ Thumbs.db
 /.claude/*
 # Exception: project-specific commands are committed
 !/.claude/commands/
+# Exception: project-scope agent skills (e.g. the /3gpp SKILL.md) are committed
+!/.claude/skills/
 # Exception: feature tracking database (RTM) is committed
 !/.claude/features.json
 # CLAUDE.md files are now ALL committed (funnel documentation structure)
