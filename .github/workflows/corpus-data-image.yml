@@ -124,7 +124,7 @@ jobs:
     needs: [guard, model]
     if: ${{ needs.guard.outputs.changed == 'true' }}
     runs-on: ubuntu-latest # ONE bake: the data content is arch-neutral
-    timeout-minutes: 180
+    timeout-minutes: 300 # fusion + HNSW freeze (swap-backed, slower) + multi-arch build
     permissions:
       contents: read
       packages: write # pull the private corpus artifact + push the data image
@@ -344,8 +344,21 @@ jobs:
           #    NOTE (resources): HNSW on ~2.85M×1024 loads vectors into RAM + builds
           #    the graph (several minutes). If this OOMs, move to a larger runner or
           #    tune ef_construction/M.
-          echo "freezing HNSW index on the fused DB…"; df -h / | tail -1
+          # Memory cushion: the HNSW build loads ~12 GB of vectors (2.85M×1024) +
+          # the graph into RAM; a bare 16 GB runner OOMs (the agent dies → "operation
+          # was canceled"). A big swapfile on /mnt lets it complete (slower, never
+          # killed). The early cleanup swapoff'd to reclaim disk — re-arm it here.
+          echo "arming swap for the HNSW build…"
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
+          if sudo fallocate -l 28G /mnt/hnsw-swap 2>/dev/null || sudo dd if=/dev/zero of=/mnt/hnsw-swap bs=1M count=28672 status=none; then
+            sudo chmod 600 /mnt/hnsw-swap && sudo mkswap /mnt/hnsw-swap >/dev/null && sudo swapon /mnt/hnsw-swap && echo "swap armed:" && free -h | grep -i swap
+          else
+            echo "::warning::could not create swapfile — HNSW build may OOM"
+          fi
+          echo "freezing HNSW index on the fused DB…"; df -h / /mnt | tail -2; free -h | head -2
           CGO_ENABLED=1 go run ./cmd/freeze-hnsw --db image-data/3gpp.duckdb
+          sudo swapoff /mnt/hnsw-swap 2>/dev/null || true; sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
           echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
           go clean -cache -testcache -modcache 2>/dev/null || true
           rm -rf /tmp/dk /tmp/duckdb.zip /mnt/compact-scratch 2>/dev/null || true
