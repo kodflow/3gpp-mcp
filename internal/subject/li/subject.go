@@ -95,6 +95,7 @@ func (*Subject) EnrichTerm(ctx context.Context, db *store.Store, term, baseline 
 		"asn1_citation": model.Citation{
 			SpecID: t.SpecID, Release: t.Release, Version: version,
 			Clause: "ASN.1 type " + t.TypeName, URL: model.ArchiveURL(t.SpecID, version),
+			Stable: model.IsStableVersion(version),
 		},
 	}, true
 }
@@ -126,7 +127,7 @@ func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallT
 	for _, e := range view.Events {
 		cites = append(cites, model.Citation{
 			SpecID: specID, Release: release, Version: version, Clause: e.Clause,
-			URL: model.ArchiveURL(specID, version),
+			URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version),
 		})
 	}
 	return jsonResult(map[string]any{
@@ -188,7 +189,7 @@ func liEventsAuthoritative(ctx context.Context, db *store.Store, release, nf str
 	for c := range clauseSet {
 		cites = append(cites, model.Citation{
 			SpecID: specID, Release: release, Version: version, Clause: c,
-			URL: model.ArchiveURL(specID, version),
+			URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version),
 		})
 	}
 	return jsonResult(map[string]any{
