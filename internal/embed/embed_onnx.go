@@ -829,11 +829,22 @@ func graphOptOn() bool {
 }
 
 // sessionOptionsFor builds the ORT SessionOptions for the requested execution
-// provider. With neither CUDA nor EMBED_GRAPH_OPT it returns (nil, nil) — the ORT
-// default, byte-identical to the historical CPU path. Otherwise it allocates a
-// SessionOptions (caller owns Destroy()) and, best-effort:
-//   - EMBED_GRAPH_OPT: ENABLE_ALL graph fusion + optional warm-start cache
-//     (EMBED_GRAPH_CACHE) so the fused graph is reused across cold starts.
+// provider. It ALWAYS allocates a SessionOptions (caller owns Destroy()) and sets
+// an EXPLICIT graph-optimisation level — never leaving it unset.
+//
+// Why explicit, always: when no level is set, ORT's DEFAULT is ORT_ENABLE_ALL,
+// which runs the EXTENDED fusions. One of them, SimplifiedLayerNormFusion, throws
+// on the bge-m3-fp16 export under onnxruntime 1.26 ("GetIndexFromName … node which
+// does not exist"), so the first session creation failed and the embedder
+// degraded to Disabled{} in prod — lexical-only despite the vectors being baked
+// (issue: embedder-disabled-extended-fusion). The historical "return (nil,nil) on
+// CPU" path was exactly that ORT-default-ALL trap. We now default to ENABLE_BASIC
+// (level 1: safe constant-folding/redundant-node passes, SKIPS the extended
+// fusion). Graph optimisation is numerically equivalent, so query vectors stay
+// cosine-compatible with the baked DB vectors — no re-embed.
+//
+//   - EMBED_GRAPH_OPT (opt-in): escalate to ENABLE_ALL + optional warm-start cache
+//     (EMBED_GRAPH_CACHE) for a model KNOWN compatible (e.g. a future re-export).
 //   - CUDA: appends the CUDA EP pinned to `device` after tuning it for steady-state
 //     batch embedding (heuristic conv search, same-stream copies, stable arena;
 //     gpu_mem_limit only when EMBED_GPU_MEM is set so small GPUs aren't starved).
@@ -844,18 +855,20 @@ func graphOptOn() bool {
 // returns an error, so the embedder degrades to Disabled{} instead of crashing.
 func sessionOptionsFor(ep string, device int) (*ort.SessionOptions, error) {
 	graphOpt := graphOptOn()
-	if ep != EPCUDA && !graphOpt {
-		return nil, nil
-	}
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, err
 	}
+	// BASIC by default (overrides ORT's ENABLE_ALL default); ALL only on opt-in.
+	var level ort.GraphOptimizationLevel = ort.GraphOptimizationLevelEnableBasic
 	if graphOpt {
-		if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
-			_ = opts.Destroy()
-			return nil, err
-		}
+		level = ort.GraphOptimizationLevelEnableAll
+	}
+	if err := opts.SetGraphOptimizationLevel(level); err != nil {
+		_ = opts.Destroy()
+		return nil, err
+	}
+	if graphOpt {
 		if cache := os.Getenv("EMBED_GRAPH_CACHE"); cache != "" {
 			// Best-effort: a cache-path error must not sink the whole session.
 			if err := opts.SetOptimizedModelFilePath(cache); err != nil {
