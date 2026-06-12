@@ -411,11 +411,14 @@ jobs:
           # TMPDIR + the metadata files there too. Moving image-data off / also frees
           # ~33 GB on /.
           sudo mkdir -p /mnt/databuild /mnt/tmp
-          sudo chmod 0777 /mnt/tmp
-          sudo mv image-data /mnt/databuild/image-data
+          sudo chmod 0777 /mnt/databuild /mnt/tmp
+          # NON-sudo mv: keep runner ownership so the buildx client can read the
+          # context (a root-owned context fails the build). 0777 on databuild lets
+          # the runner write here.
+          mv image-data /mnt/databuild/image-data
           cp Dockerfile.data /mnt/databuild/Dockerfile.data
           export TMPDIR=/mnt/tmp
-          echo "context on /mnt; disk:"; df -h / /mnt | tail -2
+          echo "context on /mnt; FULL /mnt capacity:"; df -h /mnt; df -h / | tail -1
           digests=""
           for arch in amd64 arm64; do
             echo "=== build linux/$arch ==="; df -h / /mnt 2>/dev/null | tail -2
