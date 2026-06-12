@@ -211,12 +211,17 @@ const dashboardHTML = `<!doctype html>
   <h2>Latency distribution</h2>
   <div class="card span3"><div class="lat" id="latbars"></div></div>
 
-  <footer id="foot">connecting…</footer>
+  <footer id="foot">connexion…</footer>
 </div>
 <script>
+// Auto-refresh cadence: ?refresh=<seconds> overrides (e.g. ?refresh=10); default 60s.
+// Guarded to a sane minimum so a typo can't hammer the endpoint.
+const REFRESH_MS=(()=>{const v=parseInt(new URLSearchParams(location.search).get('refresh'),10);
+  return Math.max(2,Number.isFinite(v)&&v>0?v:60)*1000;})();
+const LOC='fr-FR',TZ='Europe/Paris';
 const $=id=>document.getElementById(id);
-const fmt=n=>n==null?'–':n.toLocaleString('en-US');
-const ms=n=>n==null?'–':(n<10?n.toFixed(1):Math.round(n).toLocaleString('en-US'));
+const fmt=n=>n==null?'–':n.toLocaleString(LOC);
+const ms=n=>n==null?'–':(n<10?n.toFixed(1):Math.round(n).toLocaleString(LOC));
 function dur(s){if(s==null)return'–';s=Math.max(0,s|0);const d=s/86400|0,h=s%86400/3600|0,m=s%3600/60|0;
   if(d)return d+'d '+h+'h';if(h)return h+'h '+m+'m';if(m)return m+'m';return s+'s';}
 function pill(label,on,offText){const ok=!!on;return '<span class="pill"><span class="dot '+(ok?'on':'off')+'"></span>'+
@@ -239,7 +244,7 @@ function drawLat(m){
 async function tick(){
   try{
     const r=await fetch('/dashboard.json',{cache:'no-store'});
-    if(r.status===503){$('foot').textContent='corpus loading…';setTimeout(tick,1500);return;}
+    if(r.status===503){$('foot').textContent='chargement du corpus…';setTimeout(tick,1500);return;}
     const d=await r.json();
     $('sub').textContent='v'+(d.version||'?').slice(0,12)+' · baseline '+(d.baseline||'?');
     $('pills').innerHTML=
@@ -264,9 +269,9 @@ async function tick(){
     $('up').textContent=dur(d.uptime_sec);
     if(m.series)drawRpm(m.series);
     drawLat(m);
-    $('foot').textContent='updated '+new Date().toLocaleTimeString()+' · '+(m.samples||0)+' latency samples · auto-refresh 3s';
-  }catch(e){$('foot').textContent='fetch error: '+e;}
-  setTimeout(tick,3000);
+    $('foot').textContent='mis à jour '+new Date().toLocaleTimeString(LOC,{timeZone:TZ})+' · '+(m.samples||0)+' échantillons de latence · rafraîchissement '+(REFRESH_MS/1000)+'s';
+  }catch(e){$('foot').textContent='erreur de requête : '+e;}
+  setTimeout(tick,REFRESH_MS);
 }
 tick();
 </script>
