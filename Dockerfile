@@ -76,6 +76,13 @@ COPY --from=builder /out/mcp-3gpp /usr/local/bin/mcp-3gpp
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Bake the DuckDB loadable extensions (fts, vss) into the image NOW, while the
+# build has network: serve INSTALLs them at startup otherwise, and a no-egress
+# NetworkPolicy / read-only rootfs silently degrades BM25→LIKE and HNSW→exact-
+# scan (observed in prod as fts:false/hnsw:false). The binary's own DuckDB does
+# the install so the artefacts match the statically linked version exactly.
+RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.duckdb
+
 ENV MCP3GPP_CACHE=/data/mcp-3gpp \
     MCP_TRANSPORT=stdio \
     MCP_PORT=8765
@@ -126,6 +133,9 @@ RUN groupadd -g 10001 mcp && \
 COPY --from=builder /out/mcp-3gpp /usr/local/bin/mcp-3gpp
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Same extension bake as the `base` stage (full cannot share it: different FROM).
+RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.duckdb
 
 # ORT is the ONLY arch-specific piece, fetched from the Microsoft GitHub release
 # (never rate-limited us) and verified against the same sha256 pins as

@@ -48,6 +48,15 @@ func main() {
 		// always version-matched, never from the repository:
 		//   docker run --rm <image> skill > ~/.claude/skills/3gpp/SKILL.md
 		fmt.Print(skill3gpp)
+	case "prefetch-extensions":
+		// IMAGE-BUILD step: install fts+vss into ~/.duckdb so serve never needs
+		// the network at startup (no-egress / read-only deployments keep BM25 +
+		// HNSW instead of degrading to LIKE + exact-scan). Hard-fails the build
+		// when an extension cannot be installed AND loaded.
+		if err := prefetchExtensions(); err != nil {
+			fmt.Fprintln(os.Stderr, "prefetch-extensions:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Println(Version)
 	default:
@@ -224,5 +233,26 @@ func serve(args []string) error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|skill|version>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|skill|prefetch-extensions|version>\n", os.Args[0])
+}
+
+// prefetchExtensions installs+loads the serve-side DuckDB extensions (fts, vss)
+// and prints where they landed, as build-log evidence the image is offline-ready.
+func prefetchExtensions() error {
+	ctx := context.Background()
+	if err := store.PrefetchExtensions(ctx); err != nil {
+		return err
+	}
+	paths, err := store.InstalledExtensionPaths(ctx)
+	if err != nil {
+		return err
+	}
+	for _, ext := range []string{"fts", "vss"} {
+		p, ok := paths[ext]
+		if !ok {
+			return fmt.Errorf("%s reported not installed after prefetch", ext)
+		}
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] extension %s installed at %s\n", ext, p)
+	}
+	return nil
 }
