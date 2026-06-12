@@ -30,13 +30,17 @@ FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf8
 ARG DATA_CREATED=unknown
 ARG EMBED_IDENTITY=unknown
 ARG DUCKDB_ROWS=unknown
+ARG SOURCE_CORPUS=unknown
 # NO org.opencontainers.image.source label — it would link the package to this
 # public repo and force PUBLIC inheritance. The package must stay PRIVATE
 # (verbatim 3GPP text); corpus-data-image.yml asserts it after every push.
+# io.kodflow.3gpp.source.corpus = the 3gpp-corpus digest this data was baked
+# from; the bake's `guard` job reads it to skip no-op rebakes (auto-update).
 LABEL org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp16) base for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
       io.kodflow.3gpp.data.created="${DATA_CREATED}" \
       io.kodflow.3gpp.embedding.identity="${EMBED_IDENTITY}" \
-      io.kodflow.3gpp.duckdb.rows="${DUCKDB_ROWS}"
+      io.kodflow.3gpp.duckdb.rows="${DUCKDB_ROWS}" \
+      io.kodflow.3gpp.source.corpus="${SOURCE_CORPUS}"
 # The data layer — kept LAST and the only large layer so resolve/gate can
 # identify it as `.layers[-1]` of each platform manifest.
 COPY --chown=10001:10001 image-data/ /data/mcp-3gpp/
