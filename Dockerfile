@@ -4,16 +4,24 @@
 #
 #   light : binary + the lexical DB.zst baked from image-data/ (BM25 offline);
 #           the DB is decompressed into place on first start by the entrypoint.
-#   full  : binary + ONNX Runtime (arch-native, sha256-pinned) + the ~22 GB
-#           fused corpus INHERITED from the pure-data image 3gpp-data via the
-#           `corpus` stage + COPY --link — a code-only rebuild re-creates only
-#           the small top layers; the data blob is reused by digest, so pushes
-#           and pulls shrink from ~15 GB to ~150 MB (plan split-data-image).
+#   full  : binary + ONNX Runtime (arch-native, sha256-pinned) + the ~14 GB
+#           fused corpus INHERITED from the data image 3gpp-data via
+#           `FROM ${DATA_IMAGE}`. Inheritance (NOT COPY) is what makes full's
+#           manifest REFERENCE 3gpp-data's data layer by digest, so a code-only
+#           rebuild re-creates only the small top layers and pushes/pulls shrink
+#           from ~15 GB to ~150 MB (plan split-data-image).
+#
+# WHY FROM and not COPY: `COPY --from` (even `--link`) re-tars the files into a
+# NEW content-addressed layer — it never shares the source image's blob (the
+# gate caught this: per-arch 14 GB layers with fresh digests). Only `FROM`
+# inheritance lists the base's layers verbatim in the child manifest. The data
+# image is therefore arch-specific and multi-arch (one data blob per platform);
+# buildx picks the matching arch for each native build leg.
 #
 # DATA_IMAGE is resolved BY DIGEST by corpus-image.yml (crane digest on
-# 3gpp-data:latest) and stamped into the io.kodflow.3gpp.data.digest label;
-# the workflow gate then asserts the pushed manifests reference the EXACT
-# 3gpp-data blob (COPY --link is an optimisation, never a trusted guarantee).
+# 3gpp-data:latest) and stamped into io.kodflow.3gpp.data.digest; the workflow
+# gate then asserts each pushed platform manifest references that arch's exact
+# 3gpp-data data blob.
 #
 # Default CMD is `serve` on stdio (the Claude-Code contract). Set
 # MCP_TRANSPORT=http (+ MCP_PORT) for the HTTP/landing mode.
@@ -41,32 +49,25 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
       -ldflags="-s -w -X main.Version=${VERSION}" \
       -o /out/mcp-3gpp ./cmd/server
 
-# ---- corpus (full only): the pure-data base, resolved by digest --------------
-# Copy-only stage — never executed, so the (arch-neutral) data image serves
-# both platforms. With the scratch default (light builds) the stage is simply
-# never reached; a full build without DATA_IMAGE fails loud on the COPY below.
-FROM ${DATA_IMAGE} AS corpus
-
-# ---- base runtime -------------------------------------------------------------
-# glibc base (NOT scratch/alpine): DuckDB's static lib + libstdc++/libgomp.
-# DIGEST-PINNED (split-data-image review): an unpinned tag can swap the base
-# under our feet and churn the small layers' stability; bump deliberately.
+# ---- base runtime (LIGHT) ----------------------------------------------------
+# glibc base (NOT scratch/alpine): DuckDB's static lib needs libstdc++/libgomp.
+# DIGEST-PINNED: an unpinned tag can swap the base under our feet and churn the
+# small layers' stability; bump deliberately. This is ALSO the base of the
+# 3gpp-data image (Dockerfile.data), so full — which inherits 3gpp-data — shares
+# the identical debian base layer.
 FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS base
 # zstd: light decompresses its baked DB.zst on first start; wget: HEALTHCHECK +
-# the full target's pinned ORT fetch. apt lists live in the cache mounts, not
-# in the layer.
+# the full target's pinned ORT fetch. apt lists live in the cache mounts.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -qq && \
     apt-get install -y --no-install-recommends \
       libstdc++6 libgomp1 ca-certificates wget zstd
 
-# VARIANT is informational (light|full); contents come from the build target.
 ARG VARIANT=light
 LABEL org.opencontainers.image.variant="${VARIANT}"
 
-# Non-root. uid/gid 10001 matches the ownership baked into the 3gpp-data layer
-# (a runtime chown would rewrite ~22 GB).
+# Non-root. uid/gid 10001 matches the ownership baked into the 3gpp-data layer.
 RUN groupadd -g 10001 mcp && \
     useradd -u 10001 -g mcp -d /home/mcp -m -s /usr/sbin/nologin mcp && \
     install -d -o mcp -g mcp /data /data/mcp-3gpp
@@ -91,15 +92,43 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["serve"]
 
-# ---- full: arch-native ORT (sha256-pinned) + the inherited data layer --------
-FROM base AS full
+# ---- full: inherits the data layer FROM 3gpp-data, adds runtime + ORT --------
+# `FROM ${DATA_IMAGE}` = the 3gpp-data base (debian + the ~14 GB data layer,
+# uid 10001). Everything below is small top layers: the apt runtime libs, the
+# mcp user, the binary, the entrypoint, and the arch-native ONNX Runtime. A
+# code-only change rebuilds ONLY these; the inherited data layer is referenced
+# by digest and never re-pushed/re-pulled.
+#
+# The apt + user + binary + entrypoint block is intentionally kept in lockstep
+# with the `base` stage above (full cannot share `base` since its FROM differs).
+FROM ${DATA_IMAGE} AS full
 ARG TARGETARCH
 ARG ORT_VERSION=1.26.0
 ARG ORT_SHA256_AMD64
 ARG ORT_SHA256_ARM64
-USER root
-# ORT is the ONLY arch-specific piece, fetched from the Microsoft GitHub
-# release (never rate-limited us) and verified against the same sha256 pins as
+ARG VARIANT=full
+LABEL org.opencontainers.image.variant="${VARIANT}"
+
+# Runtime libs (the data base is debian-slim — same pin as `base`, so this apt
+# layer is identical to light's and dedupes on the registry).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      libstdc++6 libgomp1 ca-certificates wget zstd
+
+# Non-root mcp user (uid 10001 = the data layer's baked ownership). /data/mcp-3gpp
+# already exists from the data layer; install -d is a no-op confirmation on it.
+RUN groupadd -g 10001 mcp && \
+    useradd -u 10001 -g mcp -d /home/mcp -m -s /usr/sbin/nologin mcp && \
+    install -d -o mcp -g mcp /data
+
+COPY --from=builder /out/mcp-3gpp /usr/local/bin/mcp-3gpp
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# ORT is the ONLY arch-specific piece, fetched from the Microsoft GitHub release
+# (never rate-limited us) and verified against the same sha256 pins as
 # scripts/fetch-model.sh — corpus-image.yml extracts and injects them so there
 # is no second copy of the pin. Layout matches bootstrap.ORTLibPath:
 # <cache>/models/onnxruntime/lib/libonnxruntime.so
@@ -116,12 +145,18 @@ RUN set -eu; \
     tar -C /data/mcp-3gpp/models/onnxruntime --strip-components=1 -xzf /tmp/ort.tgz; \
     chown -R mcp:mcp /data/mcp-3gpp/models/onnxruntime; \
     rm /tmp/ort.tgz
+
+ENV MCP3GPP_CACHE=/data/mcp-3gpp \
+    MCP_TRANSPORT=stdio \
+    MCP_PORT=8765
 USER mcp:mcp
-# The ~22 GB corpus layer, inherited from 3gpp-data (ownership already baked
-# there). --link = BuildKit reuse/rebase optimisation; the byte-identity of the
-# blob is NOT assumed — the workflow gate asserts the pushed mcp manifests
-# reference the EXACT 3gpp-data blob and fails loud otherwise.
-COPY --link --from=corpus /data/mcp-3gpp /data/mcp-3gpp
+WORKDIR /home/mcp
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD sh -c '[ "$MCP_TRANSPORT" != "http" ] || wget -q --spider "http://127.0.0.1:${MCP_PORT}/healthz"' || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["serve"]
 
 # ---- light: lexical DB.zst baked from the build context ----------------------
 # LAST stage on purpose: a bare `docker build .` (CI image-smoke, casual local

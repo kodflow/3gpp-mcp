@@ -62,7 +62,8 @@ jobs:
     outputs:
       data_image: ${{ steps.r.outputs.data_image }}
       data_digest: ${{ steps.r.outputs.data_digest }}
-      data_layer: ${{ steps.r.outputs.data_layer }}
+      data_layer_amd64: ${{ steps.r.outputs.data_layer_amd64 }}
+      data_layer_arm64: ${{ steps.r.outputs.data_layer_arm64 }}
       ort_version: ${{ steps.r.outputs.ort_version }}
       ort_sha_amd64: ${{ steps.r.outputs.ort_sha_amd64 }}
       ort_sha_arm64: ${{ steps.r.outputs.ort_sha_arm64 }}
@@ -81,24 +82,27 @@ jobs:
           retry bash -c 'printf %s "$GHCR_PAT" | crane auth login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           REPO="ghcr.io/${{ github.repository_owner }}/3gpp-data"
           DATA_DIGEST="$(retry crane digest "$REPO:latest")"
-          # The data layer = the LAST layer of any platform manifest of 3gpp-data
-          # (its own workflow asserts all platforms share that single blob).
-          PM="$(crane manifest "$REPO:latest" | jq -r '.manifests[0].digest // empty')"
-          if [ -n "$PM" ]; then
-            DATA_LAYER="$(crane manifest "$REPO@$PM" | jq -r '.layers[-1].digest')"
-          else
-            DATA_LAYER="$(crane manifest "$REPO:latest" | jq -r '.layers[-1].digest')"
-          fi
+          # PER-ARCH data layer = the LAST layer of EACH platform manifest of
+          # 3gpp-data (debian-based ⇒ each arch carries its own data blob; full
+          # inherits the matching one via FROM). The gate compares each mcp
+          # platform against its arch's data blob.
+          IDX="$(crane manifest "$REPO:latest")"
+          PM_A="$(printf '%s' "$IDX" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest')"
+          PM_R="$(printf '%s' "$IDX" | jq -r '.manifests[] | select(.platform.architecture=="arm64") | .digest')"
+          test -n "$PM_A" && test -n "$PM_R" || { echo "::error::3gpp-data:latest is not multi-arch (amd64=$PM_A arm64=$PM_R)"; exit 1; }
+          DATA_LAYER_A="$(crane manifest "$REPO@$PM_A" | jq -r '.layers[-1].digest')"
+          DATA_LAYER_R="$(crane manifest "$REPO@$PM_R" | jq -r '.layers[-1].digest')"
           # ORT pins single-sourced from scripts/fetch-model.sh (ort_pin_test keeps
           # them in lockstep with the Go DefaultORTVersion).
           ORT_V="$(grep -oE 'ORT_VERSION:-[0-9.]+' scripts/fetch-model.sh | head -1 | cut -d- -f2)"
           SHA_A="$(grep -E 'onnxruntime-linux-x64-' scripts/fetch-model.sh | grep -oE '[0-9a-f]{64}' | head -1)"
           SHA_R="$(grep -E 'onnxruntime-linux-aarch64-' scripts/fetch-model.sh | grep -oE '[0-9a-f]{64}' | head -1)"
-          test -n "$DATA_DIGEST" && test -n "$DATA_LAYER" && test -n "$ORT_V" && test -n "$SHA_A" && test -n "$SHA_R"
+          test -n "$DATA_DIGEST" && test -n "$DATA_LAYER_A" && test -n "$DATA_LAYER_R" && test -n "$ORT_V" && test -n "$SHA_A" && test -n "$SHA_R"
           {
             echo "data_image=$REPO@$DATA_DIGEST"
             echo "data_digest=$DATA_DIGEST"
-            echo "data_layer=$DATA_LAYER"
+            echo "data_layer_amd64=$DATA_LAYER_A"
+            echo "data_layer_arm64=$DATA_LAYER_R"
             echo "ort_version=$ORT_V"
             echo "ort_sha_amd64=$SHA_A"
             echo "ort_sha_arm64=$SHA_R"
@@ -203,7 +207,8 @@ jobs:
       # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
       # the per-arch push a plain manifest so `imagetools` composes it cleanly.
       # target = the variant: `light` bakes image-data/ (zst), `full` inherits the
-      # ~22 GB data layer from 3gpp-data@digest (stage corpus + COPY --link).
+      # ~14 GB data layer from 3gpp-data@digest via `FROM ${DATA_IMAGE}` (the
+      # arch-native leg picks the matching platform's data layer).
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         id: build
         with:
@@ -287,16 +292,16 @@ jobs:
           docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:${{ matrix.variant == 'full' && 'latest' || 'light' }}" \
             | grep -E "Platform|MediaType" | head
 
-  # DEDUPE GATE (split-data-image review) — the whole split is worth nothing if
-  # the mcp build RE-CREATES the data blob instead of referencing 3gpp-data's.
-  # Manifest-based (never buildx logs): for each platform of :latest, assert
-  #   1. the EXACT 3gpp-data blob digest appears in the image's layer list;
+  # DEDUPE GATE (split-data-image) — the whole split is worth nothing if the mcp
+  # build RE-CREATES the data blob instead of inheriting 3gpp-data's. Now that
+  # full is `FROM ${DATA_IMAGE}`, inheritance lists the base's layers verbatim,
+  # so this gate should PASS by construction. Manifest-based (never buildx logs):
+  # for EACH platform of :latest, assert
+  #   1. THAT ARCH's exact 3gpp-data data blob appears in the image's layer list;
   #   2. it is the ONLY layer > 1 GiB (no accidental second giant blob);
-  #   3. the io.kodflow.3gpp.data.digest label equals the digest consumed.
-  # If this gate fails: COPY --link re-materialised the layer — switch the
-  # Dockerfile to per-arch `FROM 3gpp-data` inheritance (layers referenced by
-  # digest, guaranteed) and build per-arch data images (documented fallback,
-  # plan split-data-image §9).
+  #   3. the io.kodflow.3gpp.data.digest label equals the index digest consumed.
+  # If this gate fails: the Dockerfile stopped inheriting via FROM (e.g. someone
+  # reintroduced a COPY of the data) — restore `FROM ${DATA_IMAGE}` for full.
   gate:
     needs: [resolve, manifest]
     if: ${{ github.event.inputs.push != 'false' }}
@@ -311,7 +316,8 @@ jobs:
       - name: Assert the mcp image references the exact 3gpp-data blob
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          DATA_LAYER: ${{ needs.resolve.outputs.data_layer }}
+          DATA_LAYER_AMD64: ${{ needs.resolve.outputs.data_layer_amd64 }}
+          DATA_LAYER_ARM64: ${{ needs.resolve.outputs.data_layer_arm64 }}
           DATA_DIGEST: ${{ needs.resolve.outputs.data_digest }}
         run: |
           set -euo pipefail
@@ -320,22 +326,26 @@ jobs:
           retry bash -c 'printf %s "$GHCR_PAT" | crane auth login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
           REF="ghcr.io/${{ github.repository_owner }}/3gpp-mcp:latest"
           fail=0
-          for p in linux/amd64 linux/arm64; do
-            d="$(crane manifest "$REF" | jq -r --arg p "$p" '.manifests[] | select((.platform.os + "/" + .platform.architecture) == $p) | .digest')"
-            test -n "$d" || { echo "::error::no $p manifest on $REF"; fail=1; continue; }
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) want="$DATA_LAYER_AMD64" ;;
+              arm64) want="$DATA_LAYER_ARM64" ;;
+            esac
+            d="$(crane manifest "$REF" | jq -r --arg a "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest')"
+            test -n "$d" || { echo "::error::no linux/$arch manifest on $REF"; fail=1; continue; }
             m="$(crane manifest "ghcr.io/${{ github.repository_owner }}/3gpp-mcp@$d")"
-            echo "--- $p ($d) layers:"; printf '%s' "$m" | jq -r '.layers[] | (.size|tostring) + "  " + .digest'
-            printf '%s' "$m" | jq -e --arg l "$DATA_LAYER" '.layers[] | select(.digest == $l)' >/dev/null \
-              || { echo "::error::$p does NOT reference the 3gpp-data blob $DATA_LAYER — COPY --link re-materialised the layer (see fallback in the workflow header of this job)"; fail=1; }
+            echo "--- linux/$arch ($d) expects data blob $want; layers:"; printf '%s' "$m" | jq -r '.layers[] | (.size|tostring) + "  " + .digest'
+            printf '%s' "$m" | jq -e --arg l "$want" '.layers[] | select(.digest == $l)' >/dev/null \
+              || { echo "::error::linux/$arch does NOT reference the 3gpp-data blob $want — full stopped inheriting via FROM (a COPY of the data was reintroduced?)"; fail=1; }
             big="$(printf '%s' "$m" | jq '[.layers[] | select(.size > 1073741824)] | length')"
             bigd="$(printf '%s' "$m" | jq -r '[.layers[] | select(.size > 1073741824)][0].digest // empty')"
-            { [ "$big" = "1" ] && [ "$bigd" = "$DATA_LAYER" ]; } \
-              || { echo "::error::$p has $big layer(s) >1GiB (first: ${bigd:-none}) — expected exactly the 3gpp-data blob"; fail=1; }
+            { [ "$big" = "1" ] && [ "$bigd" = "$want" ]; } \
+              || { echo "::error::linux/$arch has $big layer(s) >1GiB (first: ${bigd:-none}) — expected exactly the 3gpp-data blob"; fail=1; }
             cfgd="$(crane config "ghcr.io/${{ github.repository_owner }}/3gpp-mcp@$d" | jq -r '.config.Labels["io.kodflow.3gpp.data.digest"] // empty')"
             [ "$cfgd" = "$DATA_DIGEST" ] \
-              || { echo "::error::$p label io.kodflow.3gpp.data.digest=$cfgd != consumed $DATA_DIGEST"; fail=1; }
+              || { echo "::error::linux/$arch label io.kodflow.3gpp.data.digest=$cfgd != consumed $DATA_DIGEST"; fail=1; }
           done
-          [ "$fail" = 0 ] && echo "GATE OK: single shared data blob, correctly labeled, on both platforms"
+          [ "$fail" = 0 ] && echo "GATE OK: each platform inherits its arch's 3gpp-data blob, correctly labeled"
           exit "$fail"
       # ANTI-LEAK, fail-loud (the 3gpp-mcp package was found PUBLIC on 2026-06-11
       # with the verbatim corpus inside — repo-page badge audit): verify after

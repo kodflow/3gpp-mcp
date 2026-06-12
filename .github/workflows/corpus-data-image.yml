@@ -2,20 +2,19 @@ name: Corpus Data Image
 
 # =============================================================================
 # Bake the fused corpus (lexical DB + fp16 vectors + BGE-M3 fp16) into the
-# PURE-DATA image ghcr.io/<owner>/3gpp-data — the build-time base the 3gpp-mcp
-# full image inherits its ~22 GB data layer from (plan split-data-image,
-# follow-up of #125). Splitting data from code means a code-only mcp rebuild
-# pushes/pulls ~150 MB instead of ~15 GB.
+# data base image ghcr.io/<owner>/3gpp-data — the build-time base the 3gpp-mcp
+# full image inherits its ~14 GB data layer from via `FROM` (plan
+# split-data-image, follow-up of #125). Splitting data from code means a
+# code-only mcp rebuild pushes/pulls ~150 MB instead of ~15 GB.
 #
-# ONE bake (amd64 runner) — the content is arch-neutral (the arch-specific ORT
-# lives in the mcp layer). The image is then published as a MULTI-PLATFORM
-# manifest whose entries reference the SAME data blob (Dockerfile.data is
-# copy-only: no RUN, so buildx emits identical layers for both platforms; the
-# registry stores the blob once). A verify step asserts that property fail-loud.
-#
-# PR 1 (additive): manual dispatch only — the legacy corpus-image.yml full bake
-# stays authoritative until PR 2 switches the mcp build to consume this image.
-# PR 2 will add: workflow_run on "Corpus · Build" + chain into corpus-image.yml.
+# ONE bake (amd64 runner) — the fused DB content is arch-neutral. The data image
+# is then published as a MULTI-PLATFORM manifest. Because the base is debian
+# (FROM-inheritance needs a glibc userland), each platform carries its OWN data
+# layer (amd64 + arm64): that doubles THIS image's registry footprint vs the old
+# scratch single-blob, but it is what lets full INHERIT the data layer by digest
+# per arch (the COPY --link approach re-materialised the layer — the gate caught
+# it). Dockerfile.data is RUN-free, so the multi-platform build needs no QEMU.
+# A verify step asserts both platforms exist and each carries its big data layer.
 #
 # VISIBILITY: the push uses GHCR_PAT (never the CI token) and the Dockerfile
 # carries no org.opencontainers.image.source label, so the package is UNLINKED
@@ -304,10 +303,12 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
 
-      # ONE build, BOTH platforms: the Dockerfile is copy-only (no RUN), so no
-      # QEMU/emulation is involved and both platform manifests reference the
-      # SAME data blob (pushed once). provenance:false keeps plain manifests.
-      - name: Build + push 3gpp-data (multi-platform, same blob)
+      # ONE build, BOTH platforms: Dockerfile.data is RUN-free, so no QEMU is
+      # involved (the data COPY is host-side; only the arch-specific debian base
+      # differs). Each platform manifest carries its OWN data layer — full
+      # inherits the matching arch's layer via FROM. provenance:false keeps
+      # plain manifests so the per-arch indexes compose cleanly.
+      - name: Build + push 3gpp-data (multi-platform, per-arch data layer)
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
@@ -323,27 +324,28 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/3gpp-data:latest
             ghcr.io/${{ github.repository_owner }}/3gpp-data:${{ steps.bake.outputs.datetag }}
 
-      # FAIL-LOUD same-blob assertion: both platform entries of the pushed index
-      # must reference the SAME data layer digest. This property is what makes
-      # the whole split worthwhile (one blob on the registry, dedup on pull) —
-      # if it ever breaks, fix the build, do not ship a doubled registry.
-      - name: Verify multi-platform manifests share ONE data blob
+      # FAIL-LOUD multi-arch assertion: the pushed index must carry BOTH
+      # linux/amd64 and linux/arm64, and each platform's last layer (the data
+      # COPY) must be the big data blob (>1 GiB). Per-arch by design now (the mcp
+      # full image inherits the matching arch's layer via FROM); the previous
+      # single-blob property no longer applies.
+      - name: Verify multi-platform manifests each carry a data layer
         if: ${{ github.event.inputs.push != 'false' }}
         run: |
           set -euo pipefail
           REF="ghcr.io/${{ github.repository_owner }}/3gpp-data:latest"
           idx="$(docker buildx imagetools inspect "$REF" --raw)"
-          digests="$(printf '%s' "$idx" | jq -r '.manifests[] | select(.platform.os == "linux") | .digest')"
-          echo "platform manifests:"; printf '%s\n' "$digests"
-          layers=""
-          while IFS= read -r d; do
+          fail=0
+          for p in amd64 arm64; do
+            d="$(printf '%s' "$idx" | jq -r --arg a "$p" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest')"
+            test -n "$d" || { echo "::error::no linux/$p manifest on $REF"; fail=1; continue; }
             l="$(docker buildx imagetools inspect "$REF@$d" --raw | jq -r '.layers[-1].digest')"
-            echo "  $d -> data layer $l"
-            layers="$layers$l\n"
-          done <<< "$digests"
-          n="$(printf "$layers" | sort -u | grep -c . || true)"
-          [ "$n" = "1" ] || { echo "::error::platform manifests reference $n distinct data blobs — the same-blob property is broken"; exit 1; }
-          echo "OK: single shared data blob across platforms"
+            sz="$(docker buildx imagetools inspect "$REF@$d" --raw | jq -r '.layers[-1].size')"
+            echo "linux/$p -> data layer $l (${sz} bytes)"
+            [ "${sz:-0}" -gt 1073741824 ] || { echo "::error::linux/$p last layer is ${sz:-0} bytes (< 1 GiB) — data layer missing"; fail=1; }
+          done
+          [ "$fail" = 0 ] && echo "OK: both platforms carry a >1 GiB data layer"
+          exit "$fail"
 
       # ANTI-LEAK, fail-loud: the PAT push posture makes the package born
       # PRIVATE, but posture is not proof — verify after EVERY push, self-heal
