@@ -34,6 +34,8 @@ func TestMetaReleaseFromDirAndMultipart(t *testing.T) {
 		{"/x/convert/Rel-18/36521-1-i00.html", "36.521-1", "Rel-18", "18.0.0"}, // multi-part
 		{"/x/convert/Rel-8/24229-083700.html", "24.229", "Rel-8", "8.37.0"},    // 6-digit high-minor
 		{"/x/convert/Rel-99/23501-300.html", "23.501", "Rel-99", "3.0.0"},      // major 3 = Rel-99
+		{"/x/convert/GSM/0388-500.html", "03.88", "GSM", "5.0.0"},              // legacy GSM 4-digit (#129)
+		{"/x/convert/GSM/0408-700.html", "04.08", "GSM", "7.0.0"},              // legacy GSM 4-digit (#129)
 	}
 	for _, c := range cases {
 		ps, err := Parse(c.path, strings.NewReader(body))
