@@ -168,7 +168,8 @@ func TestSearchAPI(t *testing.T) {
 
 func mustClient(t *testing.T, st *store.Store) *client.Client {
 	t.Helper()
-	c, err := client.NewInProcessClient(New(st, "test", "", nil))
+	srv, _ := New(st, "test", "", nil)
+	c, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatal(err)
 	}
