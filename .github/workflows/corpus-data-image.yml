@@ -361,27 +361,45 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
 
-      # ONE build, BOTH platforms: Dockerfile.data is RUN-free, so no QEMU is
-      # involved (the data COPY is host-side; only the arch-specific debian base
-      # differs). Each platform manifest carries its OWN data layer — full
-      # inherits the matching arch's layer via FROM. provenance:false keeps
-      # plain manifests so the per-arch indexes compose cleanly.
-      - name: Build + push 3gpp-data (multi-platform, per-arch data layer)
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: Dockerfile.data
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event.inputs.push != 'false' }}
-          provenance: false
-          build-args: |
-            DATA_CREATED=${{ steps.bake.outputs.created }}
-            EMBED_IDENTITY=${{ steps.bake.outputs.embed_identity }}
-            DUCKDB_ROWS=${{ steps.bake.outputs.rows }}
-            SOURCE_CORPUS=${{ steps.bake.outputs.source_corpus }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/3gpp-data:latest
-            ghcr.io/${{ github.repository_owner }}/3gpp-data:${{ steps.bake.outputs.datetag }}
+      # DISK-SAFE per-arch build (ENOSPC fix): a single multi-platform build
+      # materialises BOTH arches' 14 GB compressed + ~22 GB uncompressed data
+      # layers AT ONCE (~70 GB peak) and killed the runner with ENOSPC. Instead
+      # build each arch SEQUENTIALLY, push it by digest, prune buildkit between
+      # arches (peak = ONE arch ≈ 36 GB, fits comfortably on either disk), then
+      # fuse the two digests into the multi-arch tags. Dockerfile.data is RUN-free
+      # → no QEMU; full inherits the matching arch's data layer via FROM.
+      - name: Build + push 3gpp-data per-arch (sequential, disk-safe) + fuse manifest
+        if: ${{ github.event.inputs.push != 'false' }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ github.repository_owner }}/3gpp-data"
+          digests=""
+          for arch in amd64 arm64; do
+            echo "=== build linux/$arch ==="; df -h / /mnt 2>/dev/null | tail -2
+            docker buildx build --platform "linux/$arch" \
+              -f Dockerfile.data \
+              --build-arg DATA_CREATED='${{ steps.bake.outputs.created }}' \
+              --build-arg EMBED_IDENTITY='${{ steps.bake.outputs.embed_identity }}' \
+              --build-arg DUCKDB_ROWS='${{ steps.bake.outputs.rows }}' \
+              --build-arg SOURCE_CORPUS='${{ steps.bake.outputs.source_corpus }}' \
+              --provenance=false \
+              --metadata-file "/tmp/meta-$arch.json" \
+              --output "type=image,name=$REPO,push-by-digest=true,name-canonical=true,push=true" \
+              .
+            d="$(jq -r '."containerimage.digest"' "/tmp/meta-$arch.json")"
+            test -n "$d" && [ "$d" != "null" ] || { echo "::error::no digest for linux/$arch"; exit 1; }
+            echo "linux/$arch -> $d"
+            digests="$digests $REPO@$d"
+            # Free the just-built layer before the next arch (it is safe on the
+            # registry now) so the peak stays at ONE arch's worth of storage.
+            docker buildx prune -af >/dev/null 2>&1 || true
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            -t "$REPO:latest" \
+            -t "$REPO:${{ steps.bake.outputs.datetag }}" \
+            $digests
+          echo "fused multi-arch:"; docker buildx imagetools inspect "$REPO:latest" | grep -E 'Platform|MediaType' | head
 
       # FAIL-LOUD multi-arch assertion: the pushed index must carry BOTH
       # linux/amd64 and linux/arm64, and each platform's last layer (the data
