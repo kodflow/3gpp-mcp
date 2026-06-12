@@ -152,3 +152,26 @@ func TestLegacyGSMSeries(t *testing.T) {
 		seen[s] = true
 	}
 }
+
+// TestSeriesInIndex locks the #129 convergence gate: --include-legacy-gsm must add
+// a legacy series ONLY while it is absent from the index. Once its 4-digit specs
+// are ingested (the parser fix), the series is present and must NOT be re-added —
+// otherwise discover re-selects it forever and the daily delta never reaches 0.
+func TestSeriesInIndex(t *testing.T) {
+	idx := map[string]string{
+		"23.501|Rel-18": "18.5.0",
+		"03.88|GSM":     "5.0.0", // legacy GSM now indexed
+	}
+	if !seriesInIndex(idx, "03") {
+		t.Error("series 03 is indexed (03.88|GSM) but seriesInIndex says no — would re-select forever")
+	}
+	if !seriesInIndex(idx, "23") {
+		t.Error("series 23 is indexed but seriesInIndex says no")
+	}
+	if seriesInIndex(idx, "04") {
+		t.Error("series 04 is NOT indexed but seriesInIndex says yes — would skip a needed build")
+	}
+	if seriesInIndex(map[string]string{}, "03") {
+		t.Error("empty index must report series 03 absent (so a fresh build still picks it up)")
+	}
+}

@@ -36,10 +36,14 @@ type ParsedSpec struct {
 // Shared with htmlparse's grammar (kept local so ooxml has no HTML dependency;
 // htmlparse is removed in the switch-over commit, resolving the duplication).
 var (
-	reNumeric   = regexp.MustCompile(`^([0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$`)
-	reAnnexSub  = regexp.MustCompile(`^([A-Z]\.[0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$`)
-	reAnnex     = regexp.MustCompile(`(?i)^Annex\s+([A-Z][0-9]*)\s*[:.)]?\s*(.*)$`)
-	reFileName  = regexp.MustCompile(`^([0-9]{5})-([0-9a-z]{3})(?:_.*)?$`)
+	reNumeric  = regexp.MustCompile(`^([0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$`)
+	reAnnexSub = regexp.MustCompile(`^([A-Z]\.[0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$`)
+	reAnnex    = regexp.MustCompile(`(?i)^Annex\s+([A-Z][0-9]*)\s*[:.)]?\s*(.*)$`)
+	// 4 or 5 digits: legacy GSM is 4 (0388 = GSM 03.88), modern is 5 (23501 = TS
+	// 23.501). 5-digit names still match {4,5} greedily, so modern parsing is
+	// unchanged — admits the previously-rejected 4-digit GSM (#129). Twin of the
+	// htmlparse regex; kept in lockstep.
+	reFileName  = regexp.MustCompile(`^([0-9]{4,5})-([0-9a-z]{3})(?:_.*)?$`)
 	reDate      = regexp.MustCompile(`\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{2})/(\d{4})\b`)
 	titleBoiler = regexp.MustCompile(`(?i)copyright|reproduc|notification|all rights|organizational partners|foreword|^3gpp t[sr]\b|^contents$|^scope$|^introduction$|^general$|trademark`)
 )
@@ -105,7 +109,7 @@ func (ps *ParsedSpec) metaFromFilename(path string) error {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	m := reFileName.FindStringSubmatch(base)
 	if m == nil {
-		return fmt.Errorf("filename %q is not <5digits>-<3code>", base)
+		return fmt.Errorf("filename %q is not <4-5 digits>-<3code>", base)
 	}
 	num, code := m[1], m[2]
 	specID := num[:2] + "." + num[2:]
