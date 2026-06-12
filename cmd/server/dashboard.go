@@ -228,6 +228,13 @@ func dashboardJSONHandler(get func() (dashStatic, *search.Engine, bool), c *metr
 // name ∈ {lexical, vector, hnsw, rerank}. It only turns a CAPABLE arm up/down.
 func toggleHandler(get func() (dashStatic, *search.Engine, bool), token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// State-changing endpoint: enforce POST (the documented contract). A GET with
+		// a valid token must not flip a toggle (CSRF-like / accidental pre-fetch).
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if !tokenOK(r, token) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return

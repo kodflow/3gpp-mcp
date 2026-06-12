@@ -452,6 +452,7 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 			SpecID: e.JustificationSpec, Release: rel, Version: ver,
 			Clause: e.JustificationClause,
 			URL:    url,
+			Stable: model.IsStableVersion(ver),
 		})
 	}
 	return jsonResult(map[string]any{
@@ -516,7 +517,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 				if url == "" {
 					url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(id) + "_series/" + id + "/"
 				}
-				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url})
+				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableVersion(ver)})
 			}
 		}
 	}
@@ -525,7 +526,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		"count": len(refs), "references": refs,
 		// Source-spec citation (where the references were found) + one citation per
 		// referenced spec, each with whatever provenance is resolvable.
-		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version)},
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version)},
 		"ref_citations": refCites,
 	})
 }
