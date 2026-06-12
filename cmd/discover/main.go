@@ -189,7 +189,16 @@ func main() {
 	// any embed floor → lexical-only, never vectorised).
 	if *includeLegacy {
 		for _, s := range legacyGSMSeries {
-			series[s] = true
+			// Add the legacy series ONLY when it is not yet in the index. The modern
+			// status report omits the 4-digit GSM specs, so deltaSeries can never
+			// surface them and an UNCONDITIONAL add re-selected the series on EVERY
+			// run forever — the #129 non-convergence (the 4-digit ingest fix lets them
+			// finally index; this stops re-flagging them once they have). Legacy GSM is
+			// frozen, so "build once, then leave" is correct; a deliberate re-index is a
+			// manual full rebuild.
+			if !seriesInIndex(have, s) {
+				series[s] = true
+			}
 		}
 	}
 
@@ -449,6 +458,19 @@ func splitKey(key string) (spec, release string) {
 		return key[:i], key[i+1:]
 	}
 	return key, ""
+}
+
+// seriesInIndex reports whether the index already holds at least one spec of the
+// 2-digit series (spec ids are "SS.NNN", so the series is spec[:2]). Used to make
+// the legacy-GSM inclusion converge: a series already indexed is not re-added.
+func seriesInIndex(idx map[string]string, series string) bool {
+	for key := range idx {
+		spec, _ := splitKey(key)
+		if len(spec) >= 2 && spec[:2] == series {
+			return true
+		}
+	}
+	return false
 }
 
 func loadIndex(path string) map[string]string {
