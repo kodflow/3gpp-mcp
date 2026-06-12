@@ -971,8 +971,12 @@ func (s *Store) ListReleases(ctx context.Context, specID string) ([]model.SpecVe
 	return out, rows.Err()
 }
 
-// LatestVersion returns the newest (release, version) of a spec using the same
-// ordering as ListReleases. ok is false when the spec is unknown.
+// LatestVersion returns the newest (release, version) of a spec, PREFERRING the
+// latest STABLE (published) version over a newer DRAFT. ListReleases is
+// newest-first, so the first stable entry is the latest stable; only when a spec
+// has no stable version at all (drafts only) do we fall back to the newest draft.
+// This is what makes get_spec default to stable content (CLAUDE.md §8 piège #8:
+// e.g. prefer 23.501 v19.x over a freshly-opened v2.0.0 draft of a later release).
 func (s *Store) LatestVersion(ctx context.Context, specID string) (release, version string, ok bool, err error) {
 	vs, err := s.ListReleases(ctx, specID)
 	if err != nil {
@@ -981,7 +985,12 @@ func (s *Store) LatestVersion(ctx context.Context, specID string) (release, vers
 	if len(vs) == 0 {
 		return "", "", false, nil
 	}
-	return vs[0].Release, vs[0].Version, true, nil
+	for _, v := range vs {
+		if model.IsStableVersion(v.Version) {
+			return v.Release, v.Version, true, nil
+		}
+	}
+	return vs[0].Release, vs[0].Version, true, nil // drafts-only spec: best available
 }
 
 // VersionForRelease returns the highest version of a spec within a release
@@ -996,12 +1005,21 @@ func (s *Store) VersionForRelease(ctx context.Context, specID, release string) (
 	if err != nil {
 		return "", false, err
 	}
+	// Prefer the highest STABLE version in the release; fall back to the highest
+	// version overall only when the release has drafts only (best available).
+	fallback, haveFallback := "", false
 	for _, v := range vs {
-		if v.Release == release {
-			return v.Version, true, nil // first match = highest version in that release
+		if v.Release != release {
+			continue
+		}
+		if model.IsStableVersion(v.Version) {
+			return v.Version, true, nil
+		}
+		if !haveFallback {
+			fallback, haveFallback = v.Version, true // first (highest) match in the release
 		}
 	}
-	return "", false, nil
+	return fallback, haveFallback, nil
 }
 
 // ResolveTerm returns glossary entries for a term (case-insensitive).

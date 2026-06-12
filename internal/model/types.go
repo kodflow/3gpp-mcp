@@ -91,6 +91,10 @@ type Citation struct {
 	Version string `json:"version"`
 	Clause  string `json:"clause"`
 	URL     string `json:"url"`
+	// Stable marks whether Version is a published (stable) version vs a draft
+	// (major 0/1/2). The server prioritises stable content; this lets a client see
+	// at a glance when a fragment is from a draft (CLAUDE.md §8 piège #8).
+	Stable bool `json:"stable"`
 }
 
 // Cite builds the citation for this clause.
@@ -101,6 +105,7 @@ func (c Clause) Cite() Citation {
 		Version: c.Version,
 		Clause:  c.ClausePath,
 		URL:     ArchiveURL(c.SpecID, c.Version),
+		Stable:  IsStableVersion(c.Version),
 	}
 }
 
