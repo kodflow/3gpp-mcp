@@ -43,23 +43,24 @@ Readiness: `GET /healthz` reports `503 {"status":"loading"}` while the corpus/ve
 load, then `200 {"status":"ready"}` — wait for `ready` before querying (a baked full
 image is ready almost instantly; light/first-run pulls the DB so loads longer).
 
-## Install the /3gpp skill (strict cited-answer format)
+## Install the /3gpp skill (strict cited answers + deep-research protocol)
 
-The MCP registration gives Claude the *tools*; the **/3gpp skill** pins the strict
-12-field cited-answer protocol on top. The skill is **embedded in the server binary**
-(single source, always version-matched) — install it FROM THE SERVER, never from the
-repository. Inside this repo it is already active (project-scope
-`.claude/commands/3gpp.md`); anywhere else, install it user-scope:
+The MCP registration gives Claude the *tools*; the **/3gpp skill** (a real SKILL.md
+with frontmatter) pins the cited-answer format AND the mandatory deep-research
+protocol on top (never answer from a single tool call). The skill is **embedded in
+the server binary** (single source, always version-matched) — install it FROM THE
+SERVER, never from the repository. Inside this repo it is already active
+(project-scope `.claude/skills/3gpp/SKILL.md`); anywhere else, install it user-scope:
 
 ```bash
-mkdir -p ~/.claude/commands
+mkdir -p ~/.claude/skills/3gpp
 # stdio install — the binary prints its own embedded skill:
-docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/commands/3gpp.md
+docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/skills/3gpp/SKILL.md
 # HTTP install — the running server serves the same bytes:
-curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/commands/3gpp.md
+curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md
 ```
 
-Restart the Claude Code instance afterwards: MCP registrations and `~/.claude/commands/`
+Restart the Claude Code instance afterwards: MCP registrations and `~/.claude/skills/`
 are both read at session start, so after the relaunch `claude mcp list` shows the server
 AND `/3gpp` appears in the skills list — nothing else to do.
 
@@ -67,7 +68,7 @@ AND `/3gpp` appears in the skills list — nothing else to do.
 
 ```bash
 claude mcp list           # expect: 3gpp — Connected
-ls ~/.claude/commands/3gpp.md             # skill present (user scope)
+ls ~/.claude/skills/3gpp/SKILL.md         # skill present (user scope)
 curl -fsS http://localhost:8765/healthz   # HTTP mode: {"status":"ready"}
 ```
 
