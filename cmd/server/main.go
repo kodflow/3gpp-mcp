@@ -46,7 +46,7 @@ func main() {
 		// Print the embedded /3gpp skill (the same bytes the HTTP landing serves at
 		// /skill/3gpp.md) so a stdio-only install can fetch it FROM THE BINARY —
 		// always version-matched, never from the repository:
-		//   docker run --rm <image> skill > ~/.claude/commands/3gpp.md
+		//   docker run --rm <image> skill > ~/.claude/skills/3gpp/SKILL.md
 		fmt.Print(skill3gpp)
 	case "version", "-v", "--version":
 		fmt.Println(Version)
