@@ -61,8 +61,21 @@ func newReranker() Reranker {
 	if err := onnxrt.Init(); err != nil {
 		return Disabled{}
 	}
+	// Override ORT's default ENABLE_ALL with ENABLE_BASIC: the extended
+	// SimplifiedLayerNormFusion throws on these transformer exports under
+	// onnxruntime 1.26 — the exact crash that disabled the embedder
+	// (internal/embed/embed_onnx.go). BASIC keeps the safe passes and skips the
+	// extended fusion, so the reranker session loads instead of degrading to off.
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return Disabled{}
+	}
+	defer func() { _ = opts.Destroy() }()
+	if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableBasic); err != nil {
+		return Disabled{}
+	}
 	sess, err := ort.NewDynamicAdvancedSession(modelPath,
-		[]string{"input_ids", "attention_mask"}, []string{"logits"}, nil)
+		[]string{"input_ids", "attention_mask"}, []string{"logits"}, opts)
 	if err != nil {
 		return Disabled{}
 	}

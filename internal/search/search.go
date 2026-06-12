@@ -10,6 +10,7 @@ import (
 	"context"
 	"regexp"
 	"sort"
+	"sync/atomic"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -72,17 +73,64 @@ func Classify(q string) Intent {
 
 // Engine ties the router to the store, the (optional) embedder, and the
 // (optional) reranker.
+//
+// The off*/rerankAll atomics are RUNTIME overrides (flipped live by the HTTP
+// dashboard, process-global since serve is one engine) so an operator can A/B the
+// retrieval arms and watch the latency impact without a redeploy. Zero value =
+// the normal default: lexical ON, vector ON, HNSW used (not forced exact-scan),
+// per-request rerank only. They only ever turn a CAPABLE arm down/up — they can't
+// conjure a vector arm with no embedder.
 type Engine struct {
 	st        *store.Store
 	emb       embed.Embedder
 	rr        rerank.Reranker
 	vecShards []string // Option B: attached sub-base aliases; empty = single-DB vectors
+
+	offLexical atomic.Bool // true → skip the BM25 arm
+	offVector  atomic.Bool // true → skip the vector arm
+	offHNSW    atomic.Bool // true → force exact-scan even when a frozen HNSW exists
+	rerankAll  atomic.Bool // true → cross-encoder rerank EVERY query (not just r.Rerank)
 }
 
 // New builds an Engine over a store, picking the embedder + reranker from the
 // environment (both default to disabled — degrade, never block).
 func New(st *store.Store) *Engine {
 	return &Engine{st: st, emb: embed.New(), rr: rerank.New()}
+}
+
+// SetLexical/SetVector/SetHNSW/SetRerank flip the runtime overrides (dashboard).
+func (e *Engine) SetLexical(on bool) { e.offLexical.Store(!on) }
+func (e *Engine) SetVector(on bool)  { e.offVector.Store(!on) }
+func (e *Engine) SetHNSW(on bool)    { e.offHNSW.Store(!on) }
+func (e *Engine) SetRerank(on bool)  { e.rerankAll.Store(on) }
+
+// State is a live snapshot of capabilities (what the engine CAN do) and the
+// current runtime toggles (what is ON right now) — the dashboard reads this.
+type State struct {
+	EmbedderEnabled bool   `json:"embedder_enabled"` // capability
+	FTSEnabled      bool   `json:"fts_enabled"`      // capability
+	HNSWFrozen      bool   `json:"hnsw_frozen"`      // capability (a frozen index exists)
+	RerankerEnabled bool   `json:"reranker_enabled"` // capability
+	LexicalOn       bool   `json:"lexical_on"`       // toggle
+	VectorOn        bool   `json:"vector_on"`        // toggle
+	HNSWOn          bool   `json:"hnsw_on"`          // toggle (false = forced exact-scan)
+	RerankOn        bool   `json:"rerank_on"`        // toggle (rerank every query)
+	EmbedderModelID string `json:"embedder_model_id"`
+}
+
+// State returns the live capability + toggle snapshot.
+func (e *Engine) State() State {
+	return State{
+		EmbedderEnabled: e.emb.Enabled(),
+		FTSEnabled:      e.st.FTSAvailable(),
+		HNSWFrozen:      e.st.VSSAvailable(),
+		RerankerEnabled: e.rr.Enabled(),
+		LexicalOn:       !e.offLexical.Load(),
+		VectorOn:        !e.offVector.Load(),
+		HNSWOn:          !e.offHNSW.Load(),
+		RerankOn:        e.rerankAll.Load(),
+		EmbedderModelID: e.emb.ModelID(),
+	}
 }
 
 // UseVectorShards routes the vector arm through the scatter-gather over these
@@ -100,24 +148,6 @@ func (e *Engine) EmbedderModelID() string { return e.emb.ModelID() }
 // RerankerEnabled reports whether the cross-encoder reranker is available.
 func (e *Engine) RerankerEnabled() bool { return e.rr.Enabled() }
 
-// Caps is a static snapshot of the engine's retrieval capabilities, taken once at
-// startup so a caller (e.g. the HTTP dashboard) can report them without holding a
-// live *Engine or reconstructing an embedder (the ORT session is ~GBs of RAM).
-type Caps struct {
-	EmbedderEnabled bool
-	EmbedderModelID string
-	RerankerEnabled bool
-}
-
-// Caps returns the engine's capability snapshot.
-func (e *Engine) Caps() Caps {
-	return Caps{
-		EmbedderEnabled: e.EmbedderEnabled(),
-		EmbedderModelID: e.EmbedderModelID(),
-		RerankerEnabled: e.RerankerEnabled(),
-	}
-}
-
 // Request parameterises a search. Mode selects which retrieval arms run:
 // "" / "hybrid" = lexical ⊕ vector, "lexical" = BM25 only, "semantic" = vector
 // only (degrades to lexical when no embedder/vectors — never returns nothing).
@@ -134,8 +164,8 @@ type Request struct {
 // degrades to lexical rather than returning nothing (degrade, never block).
 func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, error) {
 	topK := max(r.TopK, 10)
-	wantLex := r.Mode != "semantic"
-	wantVec := r.Mode != "lexical"
+	wantLex := r.Mode != "semantic" && !e.offLexical.Load()
+	wantVec := r.Mode != "lexical" && !e.offVector.Load()
 
 	var lists [][]model.SearchHit
 	if wantLex {
@@ -153,7 +183,7 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 			case len(e.vecShards) > 0:
 				// Option B: scatter-gather across the attached per-series sub-bases.
 				vhits, verr = e.st.SearchVectorsSharded(ctx, vecs[0], e.vecShards, r.Filter, topK)
-			case e.st.VSSAvailable():
+			case e.st.VSSAvailable() && !e.offHNSW.Load():
 				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // single-DB HNSW
 			default:
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
@@ -181,7 +211,7 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 
 	// Optional cross-encoder rerank: re-score a broad window of fused candidates
 	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order.
-	if r.Rerank && e.rr.Enabled() && len(hits) > 1 {
+	if (r.Rerank || e.rerankAll.Load()) && e.rr.Enabled() && len(hits) > 1 {
 		window := min(rerankWindow, len(hits))
 		if reordered, err := e.rerank(ctx, r.Text, hits[:window]); err == nil {
 			hits = append(reordered, hits[window:]...)
