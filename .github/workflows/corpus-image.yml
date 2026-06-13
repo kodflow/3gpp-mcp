@@ -64,6 +64,8 @@ jobs:
       data_digest: ${{ steps.r.outputs.data_digest }}
       data_layer_amd64: ${{ steps.r.outputs.data_layer_amd64 }}
       data_layer_arm64: ${{ steps.r.outputs.data_layer_arm64 }}
+      data_created: ${{ steps.r.outputs.data_created }}
+      source_corpus: ${{ steps.r.outputs.source_corpus }}
       ort_version: ${{ steps.r.outputs.ort_version }}
       ort_sha_amd64: ${{ steps.r.outputs.ort_sha_amd64 }}
       ort_sha_arm64: ${{ steps.r.outputs.ort_sha_arm64 }}
@@ -92,6 +94,13 @@ jobs:
           test -n "$PM_A" && test -n "$PM_R" || { echo "::error::3gpp-data:latest is not multi-arch (amd64=$PM_A arm64=$PM_R)"; exit 1; }
           DATA_LAYER_A="$(crane manifest "$REPO@$PM_A" | jq -r '.layers[-1].digest')"
           DATA_LAYER_R="$(crane manifest "$REPO@$PM_R" | jq -r '.layers[-1].digest')"
+          # Provenance labels baked into 3gpp-data — forwarded into the mcp image as
+          # build-args so `serve` surfaces them on /dashboard.json (WHICH data layer +
+          # when it was baked). Read from the amd64 platform config (both arches share
+          # the same corpus). Default "unknown" so a label-less legacy data image still
+          # builds (the value is diagnostic, not load-bearing).
+          DATA_CREATED="$(crane config "$REPO@$PM_A" | jq -r '.config.Labels["io.kodflow.3gpp.data.created"] // "unknown"')"
+          SOURCE_CORPUS="$(crane config "$REPO@$PM_A" | jq -r '.config.Labels["io.kodflow.3gpp.source.corpus"] // "unknown"')"
           # ORT pins single-sourced from scripts/fetch-model.sh (ort_pin_test keeps
           # them in lockstep with the Go DefaultORTVersion).
           ORT_V="$(grep -oE 'ORT_VERSION:-[0-9.]+' scripts/fetch-model.sh | head -1 | cut -d- -f2)"
@@ -103,6 +112,8 @@ jobs:
             echo "data_digest=$DATA_DIGEST"
             echo "data_layer_amd64=$DATA_LAYER_A"
             echo "data_layer_arm64=$DATA_LAYER_R"
+            echo "data_created=$DATA_CREATED"
+            echo "source_corpus=$SOURCE_CORPUS"
             echo "ort_version=$ORT_V"
             echo "ort_sha_amd64=$SHA_A"
             echo "ort_sha_arm64=$SHA_R"
@@ -221,6 +232,8 @@ jobs:
             VARIANT=${{ matrix.variant }}
             VERSION=${{ github.sha }}
             DATA_IMAGE=${{ needs.resolve.outputs.data_image }}
+            DATA_CREATED=${{ needs.resolve.outputs.data_created }}
+            SOURCE_CORPUS=${{ needs.resolve.outputs.source_corpus }}
             ORT_VERSION=${{ needs.resolve.outputs.ort_version }}
             ORT_SHA256_AMD64=${{ needs.resolve.outputs.ort_sha_amd64 }}
             ORT_SHA256_ARM64=${{ needs.resolve.outputs.ort_sha_arm64 }}
@@ -243,7 +256,7 @@ jobs:
 
   # Fuse the per-arch (amd64 + arm64) digests of each variant into the multi-arch tags.
   manifest:
-    needs: build
+    needs: [build, resolve]
     if: ${{ github.event.inputs.push != 'false' }}
     runs-on: ubuntu-latest
     permissions:
@@ -291,6 +304,31 @@ jobs:
         run: |
           docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:${{ matrix.variant == 'full' && 'latest' || 'light' }}" \
             | grep -E "Platform|MediaType" | head
+      # COORDINATION / DEPLOY SIGNAL — record exactly which mcp image was published
+      # and which (indexed) data layer it carries, plus the human action still
+      # required: prod must pull + restart. The build already PROVED this layer is
+      # fully indexed via the check-data inheritance guard, so the only remaining
+      # step to fix a degraded prod is the redeploy. ([[project_served_stale_data_layer]])
+      - name: Coordination summary (deploy signal)
+        if: ${{ matrix.variant == 'full' }}
+        run: |
+          set -euo pipefail
+          REPO=ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          DIG="$(docker buildx imagetools inspect "$REPO:latest" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+          {
+            echo "## 3gpp-mcp:full published — DEPLOY required"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| mcp image | \`$REPO:latest\` ($DIG) |"
+            echo "| inherited 3gpp-data digest | \`${{ needs.resolve.outputs.data_digest }}\` |"
+            echo "| data baked | ${{ needs.resolve.outputs.data_created }} |"
+            echo "| source corpus | \`${{ needs.resolve.outputs.source_corpus }}\` |"
+            echo ""
+            echo "The **check-data** inheritance guard already proved this image's data layer is fully indexed (FTS + frozen HNSW)."
+            echo "**Action**: on the labs host \`docker pull $REPO:latest\` then restart the container to serve this layer."
+            echo "Verify after restart: \`curl -s https://labs.making.codes/dashboard.json?token=… | jq '{hnsw_state,fts_index_present,data_image_created}'\` → expect \`hnsw_state:\"frozen\"\`, \`fts_index_present:true\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # DEDUPE GATE (split-data-image) — the whole split is worth nothing if the mcp
   # build RE-CREATES the data blob instead of inheriting 3gpp-data's. Now that
