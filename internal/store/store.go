@@ -34,9 +34,10 @@ const arraySep = "\x1f"
 
 // Store is a handle on a DuckDB database.
 type Store struct {
-	db           *sql.DB
-	ftsAvailable bool
-	vssAvailable bool
+	db              *sql.DB
+	ftsAvailable    bool
+	vssAvailable    bool
+	sparseAvailable bool
 }
 
 // Open opens (or creates) the DuckDB file at path and applies the schema.
