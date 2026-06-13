@@ -114,6 +114,13 @@ ARG ORT_VERSION=1.26.0
 ARG ORT_SHA256_AMD64
 ARG ORT_SHA256_ARM64
 ARG VARIANT=full
+# Provenance of the inherited data layer — corpus-image.yml passes the SAME values
+# it read from the 3gpp-data image labels (io.kodflow.3gpp.data.created / .source.corpus).
+# Baked into ENV (below) so `serve` can surface them on /dashboard.json: the operator
+# can then tell, by curl alone, WHICH data layer this image carries — the missing
+# signal behind the stale-data-layer incident ([[project_served_stale_data_layer]]).
+ARG DATA_CREATED=unknown
+ARG SOURCE_CORPUS=unknown
 LABEL org.opencontainers.image.variant="${VARIANT}"
 
 # Runtime libs (the data base is debian-slim — same pin as `base`, so this apt
@@ -137,6 +144,14 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Same extension bake as the `base` stage (full cannot share it: different FROM).
 RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.duckdb
 
+# INHERITANCE GUARD: fail the build if the data layer inherited FROM 3gpp-data is
+# NOT fully indexed (no FTS index, or vectors present without a frozen HNSW). This
+# is the structural fix for the stale-data-layer incident: an unindexed layer can
+# no longer ship silently — `docker build` of `full` errors out here instead of
+# producing a server that degrades to LIKE full-scan / exact-scan in production.
+# (light builds its own lexical DB and never reaches this stage.)
+RUN HOME=/home/mcp mcp-3gpp check-data --db /data/mcp-3gpp/3gpp.duckdb --require-fts --require-hnsw
+
 # ORT is the ONLY arch-specific piece, fetched from the Microsoft GitHub release
 # (never rate-limited us) and verified against the same sha256 pins as
 # scripts/fetch-model.sh — corpus-image.yml extracts and injects them so there
@@ -158,7 +173,9 @@ RUN set -eu; \
 
 ENV MCP3GPP_CACHE=/data/mcp-3gpp \
     MCP_TRANSPORT=stdio \
-    MCP_PORT=8765
+    MCP_PORT=8765 \
+    MCP3GPP_DATA_CREATED=${DATA_CREATED} \
+    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS}
 USER mcp:mcp
 WORKDIR /home/mcp
 

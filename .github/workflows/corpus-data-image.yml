@@ -82,16 +82,25 @@ jobs:
           TAG="${{ github.event.inputs.corpus_tag || 'latest' }}"
           force="${{ github.event.inputs.force }}"
           SRC="$(retry crane digest "ghcr.io/$OWN/3gpp-corpus:$TAG")"
-          # The source-corpus digest baked into the live data image (empty if the
-          # label predates this guard, which forces a one-time rebake to stamp it).
-          CUR="$(crane config "ghcr.io/$OWN/3gpp-data:latest" 2>/dev/null | jq -r '.config.Labels["io.kodflow.3gpp.source.corpus"] // empty' || true)"
+          # The labels baked into the live data image (empty when they predate this
+          # guard, which forces a one-time rebake to stamp them).
+          CFG="$(crane config "ghcr.io/$OWN/3gpp-data:latest" 2>/dev/null || true)"
+          CUR="$(printf '%s' "$CFG" | jq -r '.config.Labels["io.kodflow.3gpp.source.corpus"] // empty' 2>/dev/null || true)"
+          BAKED_RECIPE="$(printf '%s' "$CFG" | jq -r '.config.Labels["io.kodflow.3gpp.bake.recipe"] // empty' 2>/dev/null || true)"
+          # The CURRENT bake recipe (how the DB is built: fusion + FTS + frozen HNSW).
+          RECIPE="$(scripts/bake-recipe-hash.sh)"
           echo "source corpus=$SRC  baked-from=$CUR  force=$force"
-          if [ "$force" = "true" ] || [ -z "$CUR" ] || [ "$SRC" != "$CUR" ]; then
+          echo "bake recipe=$RECIPE  baked-recipe=$BAKED_RECIPE"
+          # Rebake when the corpus moved, the recipe changed (e.g. freeze-hnsw added),
+          # a label is missing, or forced. The recipe trigger is the structural fix
+          # for the stale-data-layer incident: changing HOW we bake now re-bakes even
+          # when the corpus content is identical ([[project_served_stale_data_layer]]).
+          if [ "$force" = "true" ] || [ -z "$CUR" ] || [ "$SRC" != "$CUR" ] || [ -z "$BAKED_RECIPE" ] || [ "$RECIPE" != "$BAKED_RECIPE" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::baking — corpus changed ($CUR → $SRC) or forced"
+            echo "::notice::baking — corpus ($CUR → $SRC) or recipe ($BAKED_RECIPE → $RECIPE) changed, or forced"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::source corpus unchanged ($SRC) — skipping bake (no 14 GB re-push)"
+            echo "::notice::corpus AND recipe unchanged ($SRC / $RECIPE) — skipping bake (no 14 GB re-push)"
           fi
   # Materialise the BGE-M3 model ONCE and hand it to the bake as a run artifact
   # (same prefetch as corpus-image.yml: models-release cache first, one pinned
@@ -411,6 +420,9 @@ jobs:
           REPO="ghcr.io/${{ github.repository_owner }}/3gpp-data"
           BASE="debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716"
           source scripts/lib/retry.sh
+          # Recipe hash stamped as a label so the change-guard can detect a bake-LOGIC
+          # change (not just a corpus-content change) and rebake accordingly.
+          RECIPE="$(scripts/bake-recipe-hash.sh)"
           # Stage the DB under its in-image path WITHOUT copying 33 GB: a rename on
           # the same filesystem is instant and uses no extra disk. The tar then
           # streams these paths verbatim into the layer (data/mcp-3gpp/… → /data/mcp-3gpp/).
@@ -431,6 +443,7 @@ jobs:
               --label io.kodflow.3gpp.embedding.identity="${{ steps.bake.outputs.embed_identity }}" \
               --label io.kodflow.3gpp.duckdb.rows="${{ steps.bake.outputs.rows }}" \
               --label io.kodflow.3gpp.source.corpus="${{ steps.bake.outputs.source_corpus }}" \
+              --label io.kodflow.3gpp.bake.recipe="$RECIPE" \
               -t "$REPO:stage-$arch"
             d="$(retry crane digest "$REPO:stage-$arch")"
             test -n "$d" || { echo "::error::no digest for linux/$arch"; exit 1; }
