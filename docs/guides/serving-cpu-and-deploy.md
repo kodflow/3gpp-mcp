@@ -111,11 +111,35 @@ From then on, any tracked-metric drop > tol fails the PR. (CI scores `lexical` o
 — it has no vectors; hybrid/rerank quality is validated locally with the ONNX build:
 `make bench EMBEDDER=onnx RERANKER=onnx`.)
 
-## Follow-up: the sparse arm (needs a re-embed — not a serve change)
+## The sparse arm (BGE-M3 learned-lexical)
 
-BGE-M3 also emits **sparse** (lexical-semantic) weights, excellent for 3GPP
-terminology (IE names, NF acronyms, spec ids). Activating a sparse arm is **not** a
-serve-side toggle: sparse vectors are **not in the baked DB**, so it requires
-regenerating embeddings across the corpus (a bake-pipeline change + a full
-re-embed) before the store/search can fuse dense + sparse + BM25. Track it as a
-dedicated bake variant; do not expect it from the current data layer.
+BGE-M3 also emits **sparse** (lexical-semantic) weights — learned per-term weights,
+excellent for 3GPP terminology (IE names, NF acronyms, spec ids) where dense vectors
+blur. The whole Go chain is implemented and tested: storage (`clause_sparse`
+inverted index + dot-product scorer), the embed seam (`SparseEmbedder` + the
+isolated onnx reader), the engine arm (fused into RRF, independent toggle), serve +
+dashboard pill, the population pass, and the overlay carry.
+
+It is **off by default** because the *current baked DB has no sparse postings* — the
+shipped ONNX model is dense-only. Activation is a one-time model export + a re-embed
+(not a code change):
+
+1. **Export the model with the sparse head** (offline, GPU box):
+   `python scripts/export-bge-m3-sparse.py --out data/models/bge-m3-sparse/model.onnx`
+   (emits `[sentence_embedding, sparse_weights]`; recipe = `Linear(1024,1)+ReLU`,
+   no normalization).
+2. **Register it**: add a `models.yaml` entry for that dir with
+   `sparse_output: sparse_weights` and make it active. The onnx backend's
+   `EmbedSparse` then builds its isolated session (the dense path is untouched).
+3. **Populate** the corpus sparse postings — GPU (the forward pass is the same cost
+   as dense, so CPU is not viable for 2.85 M clauses):
+   `mcp-3gpp` cmd-embed `--sparse-only` on the fused DB (canonical, needs no
+   merge/overlay changes), **or** per-shard then the overlay carries it by identity.
+   Resumable by construction.
+4. **Re-bake** the data image (the recipe-hash guard will trigger it) and
+   **redeploy**. The dashboard `Sparse` pill flips to `on`; queries fuse
+   BM25 + dense + sparse via RRF.
+
+Known gap: the per-lot **merge** path does not yet offset `clause_sparse.chunk_id`
+(it references `clauses.chunk_id`); use the `--sparse-only`-on-fused-DB path (above)
+until that offset threading lands.

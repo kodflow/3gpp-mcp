@@ -158,12 +158,13 @@ func TestOptionRows(t *testing.T) {
 		LexicalOn: true, VectorOn: true, HNSWOn: true, EmbedderModelID: "m1",
 	}
 	rows := optionRows(noHNSW, "m1")
-	if len(rows) != 5 {
-		t.Fatalf("len(rows)=%d, want 5", len(rows))
+	if len(rows) != 6 {
+		t.Fatalf("len(rows)=%d, want 6", len(rows))
 	}
 	for _, want := range []struct{ key, state, badge string }{
 		{"embedder", "on", "on"},
 		{"vector", "degraded", "exact-scan"},
+		{"sparse", "unavailable", "absent"},
 		{"hnsw", "unavailable", "non gelé"},
 		{"lexical", "on", "on"},
 		{"rerank", "unavailable", "n/a"},
