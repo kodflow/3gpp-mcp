@@ -7,7 +7,7 @@ import (
 
 func TestObserveAndSnapshot(t *testing.T) {
 	c := New()
-	base := time.Unix(1_000_000*60, 0) // a fixed start-of-minute
+	base := time.Unix(1_000_000*secPerHour, 0) // a fixed start-of-hour
 	c.now = func() time.Time { return base }
 
 	for i := 1; i <= 100; i++ {
@@ -34,22 +34,22 @@ func TestObserveAndSnapshot(t *testing.T) {
 	if s.P95Ms < 94 || s.P95Ms > 97 {
 		t.Errorf("p95=%.1f, want ~95", s.P95Ms)
 	}
-	if len(s.Series) != tsMinutes || s.WindowMin != tsMinutes {
-		t.Fatalf("series len=%d window=%d, want %d", len(s.Series), s.WindowMin, tsMinutes)
+	if len(s.Series) != tsHours || s.WindowHrs != tsHours {
+		t.Fatalf("series len=%d window=%d, want %d", len(s.Series), s.WindowHrs, tsHours)
 	}
-	// All 100 requests landed in the current (newest) minute.
+	// All 100 requests landed in the current (newest) hour.
 	last := s.Series[len(s.Series)-1]
 	if last.Count != 100 {
-		t.Errorf("newest minute count=%d, want 100", last.Count)
+		t.Errorf("newest hour count=%d, want 100", last.Count)
 	}
-	if last.T != base.Unix()/60*60 {
-		t.Errorf("newest minute t=%d, want %d", last.T, base.Unix()/60*60)
+	if last.T != base.Unix()/secPerHour*secPerHour {
+		t.Errorf("newest hour t=%d, want %d", last.T, base.Unix()/secPerHour*secPerHour)
 	}
 }
 
 func TestRingBoundsMemory(t *testing.T) {
 	c := New()
-	base := time.Unix(2_000_000*60, 0)
+	base := time.Unix(2_000_000*secPerHour, 0)
 	c.now = func() time.Time { return base }
 	// Push more than the ring capacity; latency slice must stay capped.
 	for i := 0; i < latRingCap+500; i++ {
@@ -66,22 +66,22 @@ func TestRingBoundsMemory(t *testing.T) {
 
 func TestTimeseriesRolls(t *testing.T) {
 	c := New()
-	cur := time.Unix(3_000_000*60, 0)
+	cur := time.Unix(3_000_000*secPerHour, 0)
 	c.now = func() time.Time { return cur }
-	c.Observe(time.Millisecond) // minute 0
-	cur = cur.Add(2 * time.Minute)
-	c.Observe(time.Millisecond) // minute +2
+	c.Observe(time.Millisecond) // hour 0
+	cur = cur.Add(2 * time.Hour)
+	c.Observe(time.Millisecond) // hour +2
 	c.Observe(time.Millisecond)
 	s := c.Snapshot()
 	last := s.Series[len(s.Series)-1]
 	if last.Count != 2 {
-		t.Errorf("current minute=%d, want 2", last.Count)
+		t.Errorf("current hour=%d, want 2", last.Count)
 	}
-	// minute -1 (the gap) must read zero, minute -2 must read the first request.
+	// hour -1 (the gap) must read zero, hour -2 must read the first request.
 	if got := s.Series[len(s.Series)-2].Count; got != 0 {
-		t.Errorf("gap minute=%d, want 0", got)
+		t.Errorf("gap hour=%d, want 0", got)
 	}
 	if got := s.Series[len(s.Series)-3].Count; got != 1 {
-		t.Errorf("minute -2=%d, want 1", got)
+		t.Errorf("hour -2=%d, want 1", got)
 	}
 }
