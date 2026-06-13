@@ -52,6 +52,21 @@ CREATE INDEX IF NOT EXISTS clauses_spec   ON clauses (spec_id);
 CREATE INDEX IF NOT EXISTS clauses_rel    ON clauses (release);
 CREATE INDEX IF NOT EXISTS clauses_path   ON clauses (spec_id, clause_path);
 
+-- BGE-M3 SPARSE (learned-lexical) weights: one row per (clause, vocab token id).
+-- The sparse arm scores a query's term weights against these as an inverted-index
+-- dot product (SQL GROUP BY on term_id) — DuckDB has no native sparse-vector index,
+-- so the term_id index below IS the inverted index. Populated only when a
+-- sparse-capable embedder runs; absent → the sparse arm is simply not offered
+-- (degrade, never block — CLAUDE.md §1). Weights are raw ReLU(linear) floats, never
+-- normalized; score(clause) = Σ query_weight · clause_weight over shared term_id.
+CREATE TABLE IF NOT EXISTS clause_sparse (
+    chunk_id  UBIGINT,
+    term_id   UINTEGER,   -- XLM-RoBERTa vocab token id (bge-m3 tokenizer)
+    weight    FLOAT,
+    PRIMARY KEY (chunk_id, term_id)
+);
+CREATE INDEX IF NOT EXISTS clause_sparse_term ON clause_sparse (term_id);
+
 CREATE TABLE IF NOT EXISTS changes (
     cr_number    VARCHAR,
     cr_revision  INTEGER,

@@ -80,6 +80,13 @@ type onnxEmbedder struct {
 	// across N CUDA devices (auto-detected). Embed shards its batches across them.
 	sessions  []*gpuSession
 	windowing string // "" = truncate at maxTokens (default); "mean_pool" = window long clauses + mean-pool (EMBED_WINDOWING)
+
+	// Lazy, ISOLATED sparse session (embed_onnx_sparse.go). Built on first
+	// EmbedSparse, separate from the dense `sessions` so the production dense path is
+	// never touched. nil/err when the active model has no sparse head.
+	sparseOnce sync.Once
+	sparseSess *gpuSession
+	sparseErr  error
 }
 
 // newEmbedder (onnx build) returns the BGE-M3 embedder, or Disabled{} if the
