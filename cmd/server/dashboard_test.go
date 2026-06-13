@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,38 @@ const testTok = "TESTtoken1234567890X" // 20 chars
 
 // loadingGetter stands in for the live getter before the corpus is ready.
 func loadingGetter() (dashStatic, *search.Engine, bool) { return dashStatic{}, nil, false }
+
+// TestDashboardProvenanceJSONContract pins the data-layer provenance keys the
+// operator curls to diagnose a stale inherited data layer. These keys are the
+// fix for the 23h-blind incident — they must not silently disappear.
+func TestDashboardProvenanceJSONContract(t *testing.T) {
+	out := dashboardData{dashStatic: dashStatic{
+		HNSWState:        "frozen",
+		FTSIndexPresent:  true,
+		DataImageCreated: "2026-06-12T17:00:00Z",
+		SourceCorpus:     "sha256:deadbeef",
+		DBPath:           "/data/mcp-3gpp/3gpp.duckdb",
+		DBSizeBytes:      22111 * 1024 * 1024,
+		DBMTimeUnix:      1749747600,
+	}}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"hnsw_state":"frozen"`,
+		`"fts_index_present":true`,
+		`"data_image_created":"2026-06-12T17:00:00Z"`,
+		`"source_corpus":"sha256:deadbeef"`,
+		`"db_path":"/data/mcp-3gpp/3gpp.duckdb"`,
+		`"db_size_bytes":`,
+		`"db_mtime_unix":`,
+	} {
+		if !strings.Contains(string(b), key) {
+			t.Errorf("dashboard.json missing provenance key %s\nin: %s", key, b)
+		}
+	}
+}
 
 func TestDashboardPageAuthGate(t *testing.T) {
 	page := dashboardPageHandler(testTok)

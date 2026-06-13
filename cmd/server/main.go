@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -25,6 +26,12 @@ import (
 )
 
 var Version = "dev"
+
+// servedDBPath is the resolved DuckDB file this process actually opened. It feeds
+// the dashboard provenance block (db_path/size/mtime) so an operator can tell, by
+// curl alone, WHICH data layer is being served — the missing signal behind the
+// stale-data-layer incident ([[project_served_stale_data_layer]]).
+var servedDBPath string
 
 func main() {
 	if len(os.Args) < 2 {
@@ -55,6 +62,17 @@ func main() {
 		// when an extension cannot be installed AND loaded.
 		if err := prefetchExtensions(); err != nil {
 			fmt.Fprintln(os.Stderr, "prefetch-extensions:", err)
+			os.Exit(1)
+		}
+	case "check-data":
+		// IMAGE-BUILD GUARD: assert the INHERITED data layer is fully indexed
+		// (FTS present; frozen HNSW when vectors exist). Run as a RUN step in the
+		// full image so a stale 3gpp-data digest FAILS the build instead of
+		// silently shipping a LIKE/exact-scan server (the stale-data-layer
+		// incident, [[project_served_stale_data_layer]]). cmd/validate stays the
+		// full promotion gate; this is the shipped binary self-checking at build.
+		if err := checkData(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "check-data:", err)
 			os.Exit(1)
 		}
 	case "version", "-v", "--version":
@@ -148,6 +166,7 @@ func serve(args []string) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	servedDBPath = effDB
 
 	// Best-effort: load the persisted BM25 index (built at ingest). We LOAD,
 	// never rebuild — rebuilding on a 700k-clause corpus would stall startup.
@@ -172,6 +191,12 @@ func serve(args []string) error {
 			}
 		}
 	}
+	// Loud guard: a DB that carries vectors but ships WITHOUT a frozen HNSW index —
+	// or without an FTS index — means a STALE/unindexed data layer is being served
+	// (the mcp image inherited an old 3gpp-data digest). The symptom is catastrophic
+	// (LIKE full-scan p99, exact-scan recall), so scream it at startup with the baked
+	// provenance rather than letting it hide behind a one-line "FTS unavailable".
+	warnIfDegradedDataLayer(ctx, st)
 
 	// Option B: if a vec-manifest lists per-series sub-bases, ATTACH them and route
 	// the vector arm through the scatter-gather. Best-effort: a bad manifest just
@@ -218,6 +243,7 @@ func serve(args []string) error {
 	if scope == "" {
 		scope = "latest"
 	}
+	logServeConfig(eng)
 	// stdio (default) is byte-identical to the historical behaviour. --http mounts
 	// the SAME *MCPServer on Streamable HTTP plus a copy-paste landing page; the
 	// engine is transport-agnostic, so nothing about retrieval changes.
@@ -234,6 +260,60 @@ func serve(args []string) error {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|skill|prefetch-extensions|version>\n", os.Args[0])
+}
+
+// logServeConfig prints ONE line summarising the retrieval/runtime knobs that
+// matter on a CPU-only box, so the deployed configuration is visible in the logs
+// (cores + GOMAXPROCS, ORT thread overrides, rerank window + always-on, query
+// embed cache). Reads the same env the engine/embedder read at construction.
+func logServeConfig(eng *search.Engine) {
+	st := eng.State()
+	fmt.Fprintf(os.Stderr,
+		"[3gpp-mcp] config: cpus=%d gomaxprocs=%d ort_intra=%s ort_inter=%s rerank_window=%s rerank_all=%v query_cache=%s embedder=%v reranker=%v\n",
+		runtime.NumCPU(), runtime.GOMAXPROCS(0),
+		envOrDash("ORT_INTRA_OP_THREADS"), envOrDash("ORT_INTER_OP_THREADS"),
+		envOrElse("RERANK_WINDOW", "20(default)"), st.RerankOn,
+		envOrElse("EMBED_QUERY_CACHE", "512(default)"), st.EmbedderEnabled, st.RerankerEnabled)
+}
+
+func envOrDash(k string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return "auto"
+}
+
+func envOrElse(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// warnIfDegradedDataLayer emits ONE conspicuous startup line when the served DB is
+// indexed-incomplete: no FTS index (→ LIKE full-scan, catastrophic p99) or vectors
+// present without a frozen HNSW (→ exact-scan, gutted recall). That state almost
+// always means the mcp image inherited a STALE 3gpp-data layer (an indexed image
+// can exist on the registry while an old one is served). We print the baked
+// provenance so the operator can compare digests and rebuild/redeploy. Best-effort,
+// never blocks serving (degrade, never block — CLAUDE.md §1).
+func warnIfDegradedDataLayer(ctx context.Context, st *store.Store) {
+	hasVectors := st.GetMeta(ctx, "embedding_model") != ""
+	hnswState := st.GetMeta(ctx, "hnsw_state")
+	ftsOK := st.FTSAvailable()
+	hnswDegraded := hasVectors && hnswState != "frozen"
+	if ftsOK && !hnswDegraded {
+		return // fully indexed — nothing to warn about
+	}
+	created := os.Getenv("MCP3GPP_DATA_CREATED")
+	corpus := os.Getenv("MCP3GPP_SOURCE_CORPUS")
+	fmt.Fprintf(os.Stderr,
+		"[3gpp-mcp] ⚠️  DEGRADED DATA LAYER — fts_index=%v hnsw_state=%q (vectors=%v). "+
+			"This served DB lacks frozen indexes: BM25 falls back to LIKE full-scan (catastrophic p99) "+
+			"and the vector arm to bounded exact-scan (reduced recall). Almost certainly a STALE inherited "+
+			"3gpp-data layer. Provenance: data_created=%q source_corpus=%q db=%s. "+
+			"Fix: rebuild mcp:full FROM an indexed 3gpp-data digest (validate --require-fts --require-hnsw) and restart.\n",
+		ftsOK, hnswState, hasVectors, created, corpus, servedDBPath)
 }
 
 // prefetchExtensions installs+loads the serve-side DuckDB extensions (fts, vss)
