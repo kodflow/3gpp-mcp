@@ -178,6 +178,11 @@ func serve(args []string) error {
 	if err := st.LoadVSS(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] HNSW unavailable, vector search uses exact scan: %v\n", err)
 	}
+	// Best-effort: mark the sparse (BGE-M3 learned-lexical) arm available iff the
+	// DB carries sparse postings. Absent → the engine simply doesn't offer it.
+	if err := st.LoadSparse(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] sparse arm unavailable: %v\n", err)
+	}
 	// Coherence guard: if this binary's embedder produces a DIFFERENT model than
 	// the one the DB's vectors/HNSW were built with, cosine scores would be
 	// silently wrong. Disable vector search (lexical still serves) and say why.

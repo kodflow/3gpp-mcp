@@ -101,11 +101,13 @@ func Classify(q string) Intent {
 type Engine struct {
 	st        *store.Store
 	emb       embed.Embedder
+	sp        embed.SparseEmbedder // non-nil when the embedder also produces sparse weights
 	rr        rerank.Reranker
 	vecShards []string // Option B: attached sub-base aliases; empty = single-DB vectors
 
 	offLexical atomic.Bool // true → skip the BM25 arm
-	offVector  atomic.Bool // true → skip the vector arm
+	offVector  atomic.Bool // true → skip the vector (dense) arm
+	offSparse  atomic.Bool // true → skip the sparse (learned-lexical) arm
 	offHNSW    atomic.Bool // true → force exact-scan even when a frozen HNSW exists
 	rerankAll  atomic.Bool // true → cross-encoder rerank EVERY query (not just r.Rerank)
 }
@@ -116,10 +118,16 @@ type Engine struct {
 // and RERANK_ALL=1 turns on always-rerank at startup so the deploy can ship the
 // reranker on every query without a per-request flag.
 func New(st *store.Store) *Engine {
+	base := embed.New()
 	e := &Engine{
 		st:  st,
-		emb: withQueryCache(embed.New(), queryCacheSize()),
+		emb: withQueryCache(base, queryCacheSize()),
 		rr:  rerank.New(),
+	}
+	// Sparse capability comes from the SAME model (BGE-M3 emits dense + sparse). We
+	// assert the BASE embedder (the cache wrapper only fronts the dense path).
+	if sp, ok := base.(embed.SparseEmbedder); ok {
+		e.sp = sp
 	}
 	if v := strings.ToLower(os.Getenv("RERANK_ALL")); v == "1" || v == "true" || v == "on" {
 		e.rerankAll.Store(true)
@@ -130,6 +138,7 @@ func New(st *store.Store) *Engine {
 // SetLexical/SetVector/SetHNSW/SetRerank flip the runtime overrides (dashboard).
 func (e *Engine) SetLexical(on bool) { e.offLexical.Store(!on) }
 func (e *Engine) SetVector(on bool)  { e.offVector.Store(!on) }
+func (e *Engine) SetSparse(on bool)  { e.offSparse.Store(!on) }
 func (e *Engine) SetHNSW(on bool)    { e.offHNSW.Store(!on) }
 func (e *Engine) SetRerank(on bool)  { e.rerankAll.Store(on) }
 
@@ -139,9 +148,11 @@ type State struct {
 	EmbedderEnabled bool   `json:"embedder_enabled"` // capability
 	FTSEnabled      bool   `json:"fts_enabled"`      // capability
 	HNSWFrozen      bool   `json:"hnsw_frozen"`      // capability (a frozen index exists)
+	SparseEnabled   bool   `json:"sparse_enabled"`   // capability (sparse embedder + clause_sparse populated)
 	RerankerEnabled bool   `json:"reranker_enabled"` // capability
 	LexicalOn       bool   `json:"lexical_on"`       // toggle
 	VectorOn        bool   `json:"vector_on"`        // toggle
+	SparseOn        bool   `json:"sparse_on"`        // toggle (sparse arm)
 	HNSWOn          bool   `json:"hnsw_on"`          // toggle (false = forced exact-scan)
 	RerankOn        bool   `json:"rerank_on"`        // toggle (rerank every query)
 	EmbedderModelID string `json:"embedder_model_id"`
@@ -153,9 +164,11 @@ func (e *Engine) State() State {
 		EmbedderEnabled: e.emb.Enabled(),
 		FTSEnabled:      e.st.FTSAvailable(),
 		HNSWFrozen:      e.st.VSSAvailable(),
+		SparseEnabled:   e.sp != nil && e.st.SparseAvailable(),
 		RerankerEnabled: e.rr.Enabled(),
 		LexicalOn:       !e.offLexical.Load(),
 		VectorOn:        !e.offVector.Load(),
+		SparseOn:        !e.offSparse.Load(),
 		HNSWOn:          !e.offHNSW.Load(),
 		RerankOn:        e.rerankAll.Load(),
 		EmbedderModelID: e.emb.ModelID(),
@@ -224,6 +237,17 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 			}
 			if verr == nil && len(vhits) > 0 {
 				lists = append(lists, vhits)
+			}
+		}
+	}
+	// Sparse (learned-lexical) arm: same gating as the dense arm (any non-"lexical"
+	// mode), independent toggle. Best-effort — embed/score failure just omits the
+	// list (degrade, never block). Fuses into the same RRF as BM25 + dense.
+	wantSparse := r.Mode != "lexical" && !e.offSparse.Load() && e.sp != nil && e.st.SparseAvailable()
+	if wantSparse {
+		if svecs, err := e.sp.EmbedSparse(ctx, []string{r.Text}); err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
+			if shits, serr := e.st.SearchSparse(ctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
+				lists = append(lists, shits)
 			}
 		}
 	}

@@ -36,7 +36,13 @@ type ModelSpec struct {
 	TokenizerRevision string   `yaml:"tokenizer_revision"` // tokenizer revision (identity)
 	TokenizerDir      string   `yaml:"tokenizer_dir"`      // optional; defaults to Dir
 	Inputs            []string `yaml:"inputs"`             // ONNX input node names [ids, mask]
-	Output            string   `yaml:"output"`             // ONNX output node name
+	Output            string   `yaml:"output"`             // ONNX output node name (dense, sentence_embedding)
+	// SparseOutput is the ONNX node name of the BGE-M3 learned-lexical head
+	// ([batch, seq] per-position ReLU weights). Empty (the default for the current
+	// dense-only export) ⇒ the onnx backend does NOT advertise a sparse arm. Set it
+	// (e.g. "sparse_weights") only for a model exported WITH the sparse head
+	// (scripts/export-bge-m3-sparse.py) — then EmbedSparse lights up.
+	SparseOutput string `yaml:"sparse_output"`
 }
 
 // registryFile is the YAML shape: a set of models + which one is active.

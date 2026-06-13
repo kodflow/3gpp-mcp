@@ -243,6 +243,23 @@ func optionRows(s search.State, dbModel string) []capOption {
 		}
 	}
 
+	// Sparse (BGE-M3 learned-lexical) — capability = a sparse-capable embedder AND
+	// sparse postings in the served DB. Complements BM25 with learned term weights.
+	sp := capOption{Key: "sparse", Label: "Sparse (lexical-sem.)", Toggle: true, ToggleOn: s.SparseOn}
+	switch {
+	case !s.SparseEnabled:
+		sp.State, sp.Badge = "unavailable", "absent"
+		sp.Reason = "Aucune embedding sparse dans la base (ou binaire/modèle sans tête sparse) : bras non offert."
+		sp.Fix = "Ré-embedder avec un modèle BGE-M3 exporté avec la tête sparse (scripts/export-bge-m3-sparse.py)."
+	case !s.SparseOn:
+		sp.State, sp.Badge = "off", "off"
+		sp.Reason = "Bras sparse coupé à chaud (toggle opérateur)."
+		sp.Fix = "Cliquer la pastille pour le réactiver."
+	default:
+		sp.State, sp.Badge = "on", "on"
+		sp.Reason = "Poids lexicaux appris (BGE-M3) fusionnés au BM25 + dense via RRF."
+	}
+
 	// HNSW — the frozen index is a property of the served DB; the toggle only
 	// forces exact-scan for A/B.
 	hnsw := capOption{Key: "hnsw", Label: "HNSW", Toggle: true, ToggleOn: s.HNSWOn}
@@ -294,7 +311,7 @@ func optionRows(s search.State, dbModel string) []capOption {
 		rr.Reason = "Cross-encoder re-classe la fenêtre des 20 meilleurs candidats sur chaque requête (+latence)."
 	}
 
-	return []capOption{emb, vec, hnsw, lex, rr}
+	return []capOption{emb, vec, sp, hnsw, lex, rr}
 }
 
 // tokenOK accepts the dashboard token from ?token=, the dash_token cookie, or a
@@ -401,6 +418,8 @@ func toggleHandler(get func() (dashStatic, *search.Engine, bool), token string) 
 			eng.SetLexical(on)
 		case "vector":
 			eng.SetVector(on)
+		case "sparse":
+			eng.SetSparse(on)
 		case "hnsw":
 			eng.SetHNSW(on)
 		case "rerank":

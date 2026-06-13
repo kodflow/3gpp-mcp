@@ -38,20 +38,22 @@ var Version = "dev"
 
 func main() {
 	var (
-		dbPath    = flag.String("db", "data/3gpp.duckdb", "existing DuckDB snapshot to embed in place")
-		embFlr    = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-19); empty = all. Lexical coverage is unaffected.")
-		series    = flag.String("series", "", "embed ONLY this 2-digit series (e.g. 23); empty = all. For per-series Kaggle shards.")
-		embRels   = flag.String("embed-releases", "", "embed ONLY clauses in this comma-separated SET of exact release labels (e.g. \"Rel-19,Rel-16,Rel-15\"); empty = all. For balanced per-RELEASE-lot Kaggle shards. AND-combined with --series/--embed-floor; selection-only (does NOT change EmbedIdentity).")
-		limit     = flag.Int("limit", 0, "cap the work-list to N clauses (bounded session; resumes next run). 0 = no limit.")
-		order     = flag.String("order", "recent", "work-list order: recent (newest release first) | chunk (chunk_id order)")
-		resume    = flag.Bool("resume", false, "fast resume: embed ONLY never-embedded clauses (skip the Go hash re-check). Pair with --limit for bounded sessions.")
-		ckptEvery = flag.Int("checkpoint-every", 0, "CHECKPOINT the DB every N embedded clauses for crash-resumable durability. 0 = only at end.")
-		progEvery = flag.Int("progress-every", 256, "log a live progress line (count + cl/s) every N embedded clauses; 0 = silent until the end.")
-		logFile   = flag.String("log-file", "", "also append progress + start/end markers to this file (tail -f friendly when embedding on a remote GPU)")
-		countNull = flag.Bool("count-null-at-floor", false, "read-only: print null-at-floor (+series) and exit WITHOUT embedding (completeness oracle for the driver)")
-		reqSem    = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1)")
-		report    = flag.String("report", "text", "end-of-run summary: text | json")
-		noHNSW    = flag.Bool("no-hnsw", false, "skip the HNSW build/freeze (e.g. when embedding a per-series shard that will be merged first)")
+		dbPath      = flag.String("db", "data/3gpp.duckdb", "existing DuckDB snapshot to embed in place")
+		embFlr      = flag.String("embed-floor", "", "embed ONLY clauses at/above this release (e.g. Rel-19); empty = all. Lexical coverage is unaffected.")
+		series      = flag.String("series", "", "embed ONLY this 2-digit series (e.g. 23); empty = all. For per-series Kaggle shards.")
+		embRels     = flag.String("embed-releases", "", "embed ONLY clauses in this comma-separated SET of exact release labels (e.g. \"Rel-19,Rel-16,Rel-15\"); empty = all. For balanced per-RELEASE-lot Kaggle shards. AND-combined with --series/--embed-floor; selection-only (does NOT change EmbedIdentity).")
+		limit       = flag.Int("limit", 0, "cap the work-list to N clauses (bounded session; resumes next run). 0 = no limit.")
+		order       = flag.String("order", "recent", "work-list order: recent (newest release first) | chunk (chunk_id order)")
+		resume      = flag.Bool("resume", false, "fast resume: embed ONLY never-embedded clauses (skip the Go hash re-check). Pair with --limit for bounded sessions.")
+		ckptEvery   = flag.Int("checkpoint-every", 0, "CHECKPOINT the DB every N embedded clauses for crash-resumable durability. 0 = only at end.")
+		progEvery   = flag.Int("progress-every", 256, "log a live progress line (count + cl/s) every N embedded clauses; 0 = silent until the end.")
+		logFile     = flag.String("log-file", "", "also append progress + start/end markers to this file (tail -f friendly when embedding on a remote GPU)")
+		countNull   = flag.Bool("count-null-at-floor", false, "read-only: print null-at-floor (+series) and exit WITHOUT embedding (completeness oracle for the driver)")
+		reqSem      = flag.Bool("require-semantic", false, "fail (exit 1) if the embedder is not enabled (also honours SEMANTIC_REQUIRED=1)")
+		report      = flag.String("report", "text", "end-of-run summary: text | json")
+		noHNSW      = flag.Bool("no-hnsw", false, "skip the HNSW build/freeze (e.g. when embedding a per-series shard that will be merged first)")
+		sparseOnly  = flag.Bool("sparse-only", false, "populate ONLY the BGE-M3 sparse (learned-lexical) postings (clause_sparse) for clauses missing them; needs a sparse-capable embedder. Resumable; --limit caps the batch.")
+		sparseBatch = flag.Int("sparse-batch", 256, "clauses per EmbedSparse batch for --sparse-only")
 	)
 	flag.Parse()
 
@@ -78,6 +80,24 @@ func main() {
 	if _, err := os.Stat(*dbPath); err != nil {
 		fmt.Fprintf(os.Stderr, "embed: --db %s: %v\n", *dbPath, err)
 		os.Exit(1)
+	}
+
+	// --sparse-only: a dedicated, resumable pass that fills clause_sparse and exits.
+	// Kept separate from the dense path so the proven dense embed is never touched.
+	if *sparseOnly {
+		sp, ok := e.(embed.SparseEmbedder)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "embed --sparse-only: the active embedder has no sparse head "+
+				"(need a -tags onnx build with a sparse-exported model, or EMBEDDER=local) — nothing to do")
+			os.Exit(1)
+		}
+		n, err := runSparse(context.Background(), *dbPath, sp, *sparseBatch, *limit, os.Stderr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sparse embed failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("sparse embed done: %d clause(s) populated (model=%s)\n", n, e.ModelID())
+		return
 	}
 
 	start := time.Now()
@@ -316,6 +336,73 @@ func run(ctx context.Context, dbPath string, e embed.Embedder, cfg embedConfig) 
 			rep.Embedded, rep.Skipped, rep.NullAtFloor, rep.HNSW, time.Since(embStart).Round(time.Second))
 	}
 	return rep, nil
+}
+
+// runSparse populates clause_sparse for clauses missing it, in batches, until the
+// work-list drains or --limit is reached. Resumable by construction: each batch
+// re-queries "clauses with no sparse posting", so a killed session resumes from the
+// gap on the next run. Idempotent (SetSparse replaces a clause's terms).
+func runSparse(ctx context.Context, dbPath string, sp embed.SparseEmbedder, batch, limit int, w io.Writer) (int, error) {
+	db, err := store.Open(dbPath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	if batch <= 0 {
+		batch = 256
+	}
+	done := 0
+	for {
+		want := batch
+		if limit > 0 && limit-done < want {
+			want = limit - done
+		}
+		if want <= 0 {
+			break
+		}
+		rows, err := db.ClausesMissingSparse(ctx, want)
+		if err != nil {
+			return done, err
+		}
+		var ids []uint64
+		var texts []string
+		for rows.Next() {
+			var id uint64
+			var h, t string
+			if err := rows.Scan(&id, &h, &t); err != nil {
+				_ = rows.Close()
+				return done, err
+			}
+			ids = append(ids, id)
+			texts = append(texts, embed.EmbedText(h, t))
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return done, err
+		}
+		_ = rows.Close()
+		if len(ids) == 0 {
+			break
+		}
+		vecs, err := sp.EmbedSparse(ctx, texts)
+		if err != nil {
+			return done, fmt.Errorf("embed sparse: %w", err)
+		}
+		if len(vecs) != len(ids) {
+			return done, fmt.Errorf("sparse embedder returned %d vecs for %d clauses", len(vecs), len(ids))
+		}
+		for i, id := range ids {
+			if err := db.SetSparse(ctx, id, vecs[i]); err != nil {
+				return done, err
+			}
+		}
+		done += len(ids)
+		_, _ = fmt.Fprintf(w, "sparse: %d populated\n", done)
+		if len(ids) < want {
+			break // work-list drained
+		}
+	}
+	return done, nil
 }
 
 // runCountNull is the read-only completeness probe behind --count-null-at-floor:
