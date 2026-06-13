@@ -35,25 +35,26 @@ var Version = "dev"
 
 func main() {
 	var (
-		dbPath       = flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot to validate")
-		pendingZero  = flag.Bool("pending-zero", false, "fail unless EVERY clause has an embedding (null_embeddings==0)")
-		requireFTS   = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
-		requireHNSW  = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
-		embeddingDim = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
-		minClauses   = flag.Int("min-clauses", 0, "if >0, fail unless clause count >= this (anti-shrink guard)")
-		expRels      = flag.String("expected-releases", "", "comma-separated set; fail unless the DB's releases == this set exactly")
-		expIdentity  = flag.String("expected-embed-identity", "", "fail unless schema_meta embedding_model == this (EmbedIdentity)")
-		zstPath      = flag.String("zst", "", "compressed artifact whose sha256 is checked against --sha")
-		shaPath      = flag.String("sha", "", "sha256 sidecar for --zst (format: '<hex>  <name>')")
-		repoVis      = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
-		forbidFull   = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
-		maxEmptyMeta = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
-		report       = flag.String("report", "text", "text | json")
+		dbPath        = flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot to validate")
+		pendingZero   = flag.Bool("pending-zero", false, "fail unless EVERY clause has an embedding (null_embeddings==0)")
+		requireFTS    = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
+		requireHNSW   = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
+		requireSparse = flag.Bool("require-sparse", false, "fail unless the sparse (clause_sparse) postings are populated (sparse-enabled bakes only)")
+		embeddingDim  = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
+		minClauses    = flag.Int("min-clauses", 0, "if >0, fail unless clause count >= this (anti-shrink guard)")
+		expRels       = flag.String("expected-releases", "", "comma-separated set; fail unless the DB's releases == this set exactly")
+		expIdentity   = flag.String("expected-embed-identity", "", "fail unless schema_meta embedding_model == this (EmbedIdentity)")
+		zstPath       = flag.String("zst", "", "compressed artifact whose sha256 is checked against --sha")
+		shaPath       = flag.String("sha", "", "sha256 sidecar for --zst (format: '<hex>  <name>')")
+		repoVis       = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
+		forbidFull    = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
+		maxEmptyMeta  = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
+		report        = flag.String("report", "text", "text | json")
 	)
 	flag.Parse()
 
 	res := runChecks(context.Background(), checkCfg{
-		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW,
+		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW, requireSparse: *requireSparse,
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
@@ -80,6 +81,7 @@ func main() {
 type checkCfg struct {
 	db                                         string
 	pendingZero, requireFTS, requireHNSW       bool
+	requireSparse                              bool
 	embeddingDim, minClauses                   int
 	expectedReleases                           []string
 	expectedIdentity, zst, sha, repoVisibility string
@@ -183,6 +185,13 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	if cfg.requireFTS {
 		_ = db.LoadFTS(ctx)
 		res.add("require-fts", db.FTSAvailable(), "fts_available=%v", db.FTSAvailable())
+	}
+
+	// require-sparse — the sparse (learned-lexical) arm: clause_sparse populated.
+	// Only set on a sparse-enabled bake; off by default (dense-only DBs pass).
+	if cfg.requireSparse {
+		_ = db.LoadSparse(ctx)
+		res.add("require-sparse", db.SparseAvailable(), "sparse_available=%v", db.SparseAvailable())
 	}
 
 	// catalog coverage: specs that have indexed clauses but no catalog title/WG

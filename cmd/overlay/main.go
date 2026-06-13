@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"os"
@@ -143,6 +144,18 @@ func run(ctx context.Context, base string, vecs []string, catFrom, embedModelFla
 		}
 		n, _ := res.RowsAffected()
 		fmt.Fprintf(os.Stderr, "[overlay] %s: %d vectors written\n", v, n)
+
+		// Carry the shard's SPARSE postings, re-keyed from the shard's chunk_id to
+		// the base's chunk_id via the SAME natural-identity match as the dense column
+		// (chunk_ids are unstable across republishes). Additive + idempotent
+		// (ON CONFLICT updates the weight). Best-effort: a shard with no/empty
+		// clause_sparse simply contributes nothing (older dense-only shards).
+		if sn, err := overlaySparse(ctx, sqldb, alias); err != nil {
+			return fmt.Errorf("overlay sparse %s: %w", v, err)
+		} else if sn > 0 {
+			fmt.Fprintf(os.Stderr, "[overlay] %s: %d sparse postings carried\n", v, sn)
+		}
+
 		if _, err := sqldb.ExecContext(ctx, "DETACH "+alias); err != nil {
 			return fmt.Errorf("detach %s: %w", alias, err)
 		}
@@ -165,4 +178,44 @@ func run(ctx context.Context, base string, vecs []string, catFrom, embedModelFla
 	_ = sqldb.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&after)
 	fmt.Fprintf(os.Stderr, "[overlay] done: %d clauses vectorised (+%d). HNSW NOT built (freeze later).\n", after, after-before)
 	return nil
+}
+
+// overlaySparse carries an attached shard's clause_sparse postings onto the base,
+// re-keyed from the shard's chunk_id to the base's chunk_id by the SAME natural
+// identity used for the dense column (spec_id, release, clause_path, text) — never
+// the unstable chunk_id. Idempotent: a matched base clause's existing sparse rows
+// are deleted first, then the shard's are inserted. Returns the rows inserted.
+// Best-effort: a shard with no clause_sparse table or no rows contributes 0.
+func overlaySparse(ctx context.Context, sqldb *sql.DB, alias string) (int64, error) {
+	// Older shards may predate the table; tolerate its absence (→ 0, nil).
+	var present bool
+	if err := sqldb.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM "+alias+".clause_sparse)").Scan(&present); err != nil {
+		return 0, nil //nolint:nilerr // a missing/empty shard table is not an error
+	}
+	if !present {
+		return 0, nil
+	}
+	idMatch := `b.spec_id = s.spec_id AND b.release = s.release
+	            AND b.clause_path = s.clause_path AND b.text = s.text`
+	// Drop any existing base sparse rows for identity-matched clauses (idempotent
+	// re-overlay; a no-op on a fresh lexical base).
+	if _, err := sqldb.ExecContext(ctx,
+		`DELETE FROM clause_sparse WHERE chunk_id IN (
+		   SELECT b.chunk_id FROM `+alias+`.clauses s
+		   JOIN clauses b ON `+idMatch+`
+		   WHERE EXISTS (SELECT 1 FROM `+alias+`.clause_sparse ss WHERE ss.chunk_id = s.chunk_id))`); err != nil {
+		return 0, err
+	}
+	res, err := sqldb.ExecContext(ctx,
+		`INSERT INTO clause_sparse (chunk_id, term_id, weight)
+		 SELECT b.chunk_id, ss.term_id, ss.weight
+		 FROM `+alias+`.clause_sparse ss
+		 JOIN `+alias+`.clauses s ON s.chunk_id = ss.chunk_id
+		 JOIN clauses b ON `+idMatch)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
