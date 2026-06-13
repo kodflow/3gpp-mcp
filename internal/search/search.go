@@ -8,8 +8,11 @@ package search
 
 import (
 	"context"
+	"os"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
@@ -18,9 +21,24 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
-// rerankWindow is how many fused candidates the cross-encoder re-scores before
-// the engine narrows to TopK (axis #7: retrieve broad → rerank → return narrow).
+// rerankWindow is the DEFAULT number of fused candidates the cross-encoder
+// re-scores before the engine narrows to TopK (axis #7: retrieve broad → rerank →
+// return narrow). Overridable via RERANK_WINDOW: on a CPU-only box each reranked
+// candidate is a cross-encoder forward pass, so the window is the rerank
+// latency/quality dial — widen it for recall, narrow it to protect p99.
 const rerankWindow = 20
+
+// rerankWindowFor returns the effective rerank window: RERANK_WINDOW when set to a
+// positive int (clamped to a sane ceiling so a fat-fingered value can't turn the
+// reranker into a full-corpus cross-encoder), else the default.
+func rerankWindowFor() int {
+	if v := os.Getenv("RERANK_WINDOW"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return min(n, 200)
+		}
+	}
+	return rerankWindow
+}
 
 // vecCandidateN bounds the BM25 candidate pool the no-HNSW vector fallback scores
 // exactly (so it stays O(N), never a full-corpus cosine scan).
@@ -93,9 +111,20 @@ type Engine struct {
 }
 
 // New builds an Engine over a store, picking the embedder + reranker from the
-// environment (both default to disabled — degrade, never block).
+// environment (both default to disabled — degrade, never block). The query
+// embedder is wrapped in a bounded LRU (serve repeats queries; zero quality loss),
+// and RERANK_ALL=1 turns on always-rerank at startup so the deploy can ship the
+// reranker on every query without a per-request flag.
 func New(st *store.Store) *Engine {
-	return &Engine{st: st, emb: embed.New(), rr: rerank.New()}
+	e := &Engine{
+		st:  st,
+		emb: withQueryCache(embed.New(), queryCacheSize()),
+		rr:  rerank.New(),
+	}
+	if v := strings.ToLower(os.Getenv("RERANK_ALL")); v == "1" || v == "true" || v == "on" {
+		e.rerankAll.Store(true)
+	}
+	return e
 }
 
 // SetLexical/SetVector/SetHNSW/SetRerank flip the runtime overrides (dashboard).
@@ -212,7 +241,7 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// Optional cross-encoder rerank: re-score a broad window of fused candidates
 	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order.
 	if (r.Rerank || e.rerankAll.Load()) && e.rr.Enabled() && len(hits) > 1 {
-		window := min(rerankWindow, len(hits))
+		window := min(rerankWindowFor(), len(hits))
 		if reordered, err := e.rerank(ctx, r.Text, hits[:window]); err == nil {
 			hits = append(reordered, hits[window:]...)
 		}
