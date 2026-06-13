@@ -877,6 +877,26 @@ func sessionOptionsFor(ep string, device int) (*ort.SessionOptions, error) {
 		}
 		log.Printf("embed: ONNX graph optimisation = ENABLE_ALL")
 	}
+	// CPU thread tuning. On a CPU-only serve box the BGE-M3 forward pass dominates
+	// per-query latency, and ORT's default thread counts can over- or
+	// under-subscribe the cores. ORT_INTRA_OP_THREADS sizes the per-operator
+	// parallelism (the primary single-query dial — set it to the physical core
+	// count); ORT_INTER_OP_THREADS sizes cross-operator parallelism. Both UNSET ⇒
+	// ORT's own defaults (behaviour unchanged), so this is purely opt-in tuning.
+	if n := envInt("ORT_INTRA_OP_THREADS", 0); n > 0 {
+		if err := opts.SetIntraOpNumThreads(n); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+		log.Printf("embed: ORT intra-op threads = %d", n)
+	}
+	if n := envInt("ORT_INTER_OP_THREADS", 0); n > 0 {
+		if err := opts.SetInterOpNumThreads(n); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+		log.Printf("embed: ORT inter-op threads = %d", n)
+	}
 	if ep == EPCUDA {
 		cuda, err := ort.NewCUDAProviderOptions()
 		if err != nil {

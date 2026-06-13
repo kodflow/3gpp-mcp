@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -46,6 +47,15 @@ func newDashToken() string {
 
 // dashStatic holds the per-serve constant facts (read-only DB): corpus counts +
 // build identity. Capabilities + toggles are LIVE (search.Engine.State), not here.
+//
+// The Provenance block answers the question that cost us a 23h-blind prod incident:
+// "which DATA LAYER is this binary actually serving, and was it indexed?" The mcp
+// image inherits its ~14 GB data layer FROM 3gpp-data by digest pinned at image
+// build time, so a correct (FTS+HNSW) data image can exist on the registry while a
+// stale, unindexed layer is still being served. Surfacing the baked data labels
+// (created date + the source-corpus digest) next to the live hnsw_state / fts
+// presence + the served DB file's mtime makes "stale data layer" a 5-second curl
+// diagnosis instead of a CI-archaeology dig. See [[project_served_stale_data_layer]].
 type dashStatic struct {
 	Version         string `json:"version"`
 	Baseline        string `json:"baseline"`
@@ -56,6 +66,15 @@ type dashStatic struct {
 	Versions        int    `json:"versions"`
 	APIOperations   int    `json:"api_operations"`
 	StartedUnix     int64  `json:"started_unix"`
+
+	// Provenance of the served data layer (the new "is my DB stale?" signal).
+	HNSWState        string `json:"hnsw_state"`                   // raw schema_meta value: "frozen" | "building" | "" (none)
+	FTSIndexPresent  bool   `json:"fts_index_present"`            // a persisted BM25 index exists in the served DB
+	DataImageCreated string `json:"data_image_created,omitempty"` // io.kodflow.3gpp.data.created, baked into the image
+	SourceCorpus     string `json:"source_corpus,omitempty"`      // 3gpp-corpus digest the data was baked from
+	DBPath           string `json:"db_path,omitempty"`            // served DuckDB file
+	DBSizeBytes      int64  `json:"db_size_bytes,omitempty"`      // size on disk (a tiny DB = lexical-only build)
+	DBMTimeUnix      int64  `json:"db_mtime_unix,omitempty"`      // when the served DB file was written
 }
 
 // buildDashStatic computes the corpus snapshot from the store (once, at readiness).
@@ -66,6 +85,18 @@ func buildDashStatic(st *store.Store, version, baseline string, started time.Tim
 		Baseline:       baseline,
 		EmbeddingModel: st.GetMeta(ctx, "embedding_model"),
 		StartedUnix:    started.Unix(),
+		// Data-layer provenance: live index state + the labels baked into the image.
+		HNSWState:        st.GetMeta(ctx, "hnsw_state"),
+		FTSIndexPresent:  st.FTSAvailable(),
+		DataImageCreated: os.Getenv("MCP3GPP_DATA_CREATED"),
+		SourceCorpus:     os.Getenv("MCP3GPP_SOURCE_CORPUS"),
+		DBPath:           servedDBPath,
+	}
+	if servedDBPath != "" {
+		if fi, err := os.Stat(servedDBPath); err == nil {
+			d.DBSizeBytes = fi.Size()
+			d.DBMTimeUnix = fi.ModTime().Unix()
+		}
 	}
 	if n, err := st.CountClauses(ctx); err == nil {
 		d.TotalClauses = n
@@ -455,6 +486,7 @@ const dashboardHTML = `<!doctype html>
 <header>
   <h1>3gpp-mcp</h1>
   <span class="sub" id="sub">dashboard</span>
+  <span class="sub" id="clock" style="margin-left:auto;font-variant-numeric:tabular-nums"></span>
 </header>
 <div class="wrap">
   <div class="pills" id="pills"></div>
@@ -504,8 +536,8 @@ const dashboardHTML = `<!doctype html>
     <div class="card"><h3>CPU</h3><div class="big" id="cpu">–</div></div>
   </div>
 
-  <h2>Requêtes / minute (60 dernières min)</h2>
-  <div class="card span3"><svg class="chart" id="rpm" preserveAspectRatio="none"></svg></div>
+  <h2>Requêtes / heure (24 dernières heures)</h2>
+  <div class="card span3"><svg class="chart" id="rpm"></svg></div>
 
   <h2>Distribution de latence</h2>
   <div class="card span3"><div class="lat" id="latbars"></div></div>
@@ -541,13 +573,28 @@ async function tog(name,on){
   try{await fetch('/dashboard/toggle?name='+name+'&on='+on,{method:'POST',cache:'no-store'});}catch(e){}
   tick();
 }
+// Localised hour label / full timestamp for a unix start-of-hour (Europe/Paris).
+function hourLabel(t){return new Date(t*1000).toLocaleString(LOC,{timeZone:TZ,hour:'2-digit',hour12:false}).replace(/\D*$/,'')+'h';}
+function hourFull(t){return new Date(t*1000).toLocaleString(LOC,{timeZone:TZ,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function drawRpm(series){
-  const svg=$('rpm'),W=1000,H=160,pad=6;svg.setAttribute('viewBox','0 0 '+W+' '+H);
-  const max=Math.max(1,...series.map(p=>p.count));const n=series.length;const bw=(W-2*pad)/n;
-  let s='<line class="axis" x1="'+pad+'" y1="'+(H-pad)+'" x2="'+(W-pad)+'" y2="'+(H-pad)+'"/>';
-  series.forEach((p,i)=>{const h=(H-2*pad)*(p.count/max);const x=pad+i*bw;const y=H-pad-h;
-    s+='<rect class="bar" x="'+(x+1)+'" y="'+y+'" width="'+Math.max(1,bw-2)+'" height="'+Math.max(0,h)+'"><title>'+
-      p.count+' req</title></rect>';});
+  const svg=$('rpm'),W=1000,H=160,padX=10,padT=16,padB=22;svg.setAttribute('viewBox','0 0 '+W+' '+H);
+  const n=series.length||1;const max=Math.max(1,...series.map(p=>p.count));
+  const baseY=H-padB,plotH=H-padT-padB,bw=(W-2*padX)/n;
+  // axis + max gridline so the scale is readable even when bars are short.
+  let s='<line class="axis" x1="'+padX+'" y1="'+baseY+'" x2="'+(W-padX)+'" y2="'+baseY+'"/>'+
+    '<line class="axis" x1="'+padX+'" y1="'+padT+'" x2="'+(W-padX)+'" y2="'+padT+'" stroke-dasharray="2 4" opacity=".5"/>'+
+    '<text x="'+padX+'" y="'+(padT-4)+'" fill="#8aa0b3" font-size="10">max '+fmt(max)+' req/h</text>';
+  const total=series.reduce((a,p)=>a+(p.count||0),0);
+  series.forEach((p,i)=>{
+    const h=plotH*(p.count/max);const x=padX+i*bw;const y=baseY-h;
+    s+='<rect class="bar" x="'+(x+1)+'" y="'+y+'" width="'+Math.max(1,bw-2)+'" height="'+Math.max(0,h)+'">'+
+      '<title>'+esc(hourFull(p.t))+' · '+fmt(p.count)+' req</title></rect>';
+    // Label every 3rd hour (and the newest) so 24 ticks don't crowd.
+    if(i%3===0||i===n-1){
+      s+='<text x="'+(x+bw/2)+'" y="'+(H-7)+'" fill="#8aa0b3" font-size="10" text-anchor="middle">'+esc(hourLabel(p.t))+'</text>';
+    }
+  });
+  if(total===0){s+='<text x="'+(W/2)+'" y="'+(baseY-plotH/2)+'" fill="#8aa0b3" font-size="12" text-anchor="middle">aucune requête sur les 24 dernières heures</text>';}
   svg.innerHTML=s;
 }
 function drawLat(m){
@@ -579,7 +626,7 @@ async function tick(){
     $('p50').innerHTML=ms(m.p50_ms)+'<small> ms</small>';
     $('p95').innerHTML=ms(m.p95_ms)+'<small> ms</small>';
     $('p99').innerHTML=ms(m.p99_ms)+'<small> ms</small>';
-    $('up').textContent=dur(d.uptime_sec);
+    $('up').innerHTML=dur(d.uptime_sec)+(d.started_unix?' <small>depuis '+esc(new Date(d.started_unix*1000).toLocaleString(LOC,{timeZone:TZ,day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}))+'</small>':'');
     $('heap').innerHTML=ms(p.heap_mb)+'<small> Mo</small>';
     $('sys').innerHTML=ms(p.sys_mb)+'<small> Mo</small>';
     $('gor').textContent=fmt(p.goroutines);
@@ -591,6 +638,9 @@ async function tick(){
   }catch(e){$('foot').textContent='erreur de requête : '+e;}
   setTimeout(tick,REFRESH_MS);
 }
+// Live wall-clock in the header (per-second), independent of the data refresh.
+function clock(){const e=$('clock');if(e)e.textContent='🕐 '+new Date().toLocaleString(LOC,{timeZone:TZ,weekday:'short',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+clock();setInterval(clock,1000);
 tick();
 </script>
 </body></html>`
