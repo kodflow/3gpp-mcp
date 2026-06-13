@@ -12,11 +12,29 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
+
+// ClausesMissingSparse streams (chunk_id, heading, text) for clauses that have
+// text but NO sparse posting yet, oldest chunk first, capped at limit (0 = all).
+// The absence predicate makes the sparse population pass RESUMABLE by construction:
+// re-running simply continues with whatever is still missing (already-populated
+// clauses are skipped), so a session killed mid-run loses no work.
+func (s *Store) ClausesMissingSparse(ctx context.Context, limit int) (*sql.Rows, error) {
+	q := `SELECT chunk_id, heading, text FROM clauses c
+	      WHERE text <> '' AND NOT EXISTS (SELECT 1 FROM clause_sparse cs WHERE cs.chunk_id = c.chunk_id)
+	      ORDER BY chunk_id`
+	var args []any
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	return s.db.QueryContext(ctx, q, args...)
+}
 
 // SparseAvailable reports whether a sparse arm can serve (clause_sparse is
 // populated). Set by LoadSparse at serve time; false on a dense-only / lexical DB.
