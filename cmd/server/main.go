@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -242,6 +243,7 @@ func serve(args []string) error {
 	if scope == "" {
 		scope = "latest"
 	}
+	logServeConfig(eng)
 	// stdio (default) is byte-identical to the historical behaviour. --http mounts
 	// the SAME *MCPServer on Streamable HTTP plus a copy-paste landing page; the
 	// engine is transport-agnostic, so nothing about retrieval changes.
@@ -258,6 +260,34 @@ func serve(args []string) error {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <serve|bootstrap|skill|prefetch-extensions|version>\n", os.Args[0])
+}
+
+// logServeConfig prints ONE line summarising the retrieval/runtime knobs that
+// matter on a CPU-only box, so the deployed configuration is visible in the logs
+// (cores + GOMAXPROCS, ORT thread overrides, rerank window + always-on, query
+// embed cache). Reads the same env the engine/embedder read at construction.
+func logServeConfig(eng *search.Engine) {
+	st := eng.State()
+	fmt.Fprintf(os.Stderr,
+		"[3gpp-mcp] config: cpus=%d gomaxprocs=%d ort_intra=%s ort_inter=%s rerank_window=%s rerank_all=%v query_cache=%s embedder=%v reranker=%v\n",
+		runtime.NumCPU(), runtime.GOMAXPROCS(0),
+		envOrDash("ORT_INTRA_OP_THREADS"), envOrDash("ORT_INTER_OP_THREADS"),
+		envOrElse("RERANK_WINDOW", "20(default)"), st.RerankOn,
+		envOrElse("EMBED_QUERY_CACHE", "512(default)"), st.EmbedderEnabled, st.RerankerEnabled)
+}
+
+func envOrDash(k string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return "auto"
+}
+
+func envOrElse(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }
 
 // warnIfDegradedDataLayer emits ONE conspicuous startup line when the served DB is
