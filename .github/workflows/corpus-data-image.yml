@@ -434,8 +434,21 @@ jobs:
             bdig="$(retry crane digest --platform "linux/$arch" "$BASE")"
             # Stream the data layer: no intermediate tarball, no buildx, no /tmp blob.
             # --owner/--group mirror Dockerfile.data's COPY --chown=10001:10001.
-            tar -C data-stage --owner=10001 --group=10001 -cf - data \
-              | retry crane append -b "debian:bookworm-slim@$bdig" -f - -t "$REPO:stage-$arch"
+            # RETRY-SAFE: the WHOLE tar|crane pipe is retried so each attempt
+            # re-streams a FRESH tar. The earlier `tar | retry crane` consumed stdin on
+            # the first attempt, so a transient GHCR 504 made the retry push a 23-byte
+            # EMPTY layer (Verify caught it, but only after :latest had moved — run
+            # 27483215599). Re-streaming (no intermediate file) keeps it disk-safe.
+            pushed=0
+            for attempt in 1 2 3 4 5; do
+              if tar -C data-stage --owner=10001 --group=10001 -cf - data \
+                   | crane append -b "debian:bookworm-slim@$bdig" -f - -t "$REPO:stage-$arch"; then
+                pushed=1; break
+              fi
+              echo "::warning::data layer push linux/$arch attempt $attempt failed — re-streaming in 10s"
+              sleep 10
+            done
+            [ "$pushed" = 1 ] || { echo "::error::data layer push linux/$arch failed after 5 attempts"; exit 1; }
             # LABELs (metadata-only re-push to the same tag; mirrors Dockerfile.data).
             retry crane mutate "$REPO:stage-$arch" \
               --label org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp16) base for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
