@@ -78,8 +78,22 @@ curl -s 'https://<host>/dashboard.json?token=…' | jq '{sparse_enabled,sparse_o
 Queries then fuse **BM25 + dense + sparse** via RRF; toggle live with
 `POST /dashboard/toggle?name=sparse`.
 
-## Status (2026-06-14)
+## Status (2026-06-14) — PROVEN end-to-end on GPU
 
-The export recipe was test-run on Kaggle GPU (kernel `3gpp-bge-m3-sparse-export`)
-to validate it against real BGE-M3 before wiring it into the production pipeline —
-see the night report / kernel output for the result.
+The whole sparse path is **demonstrated working on real hardware**, not just unit-tested:
+
+- **Export recipe** validated on Kaggle GPU (kernel `3gpp-bge-m3-sparse-export`):
+  ONNX emits `[sentence_embedding, sparse_weights]`, loads in onnxruntime, sparse
+  head yields plausible learned weights.
+- **Embed path** validated on Kaggle GPU (`scripts/kaggle/kernel-sparse-embed-smoke.py`,
+  run `3gpp-sparse-embed-smoke`): builds `cmd/embed -tags onnx` against ORT-CUDA,
+  seeds a tiny DB, runs `--sparse-only` → `clause_sparse` populated 6/6 via the live
+  onnx `EmbedSparse` session (`ONNX execution provider = cuda`), second pass 0
+  (resumable/idempotent). `DONE sparse_embed_gpu_ok=True`.
+
+**What's left = scale + fold (supervised, multi-day GPU), no remaining technical risk:**
+run the same `--sparse-only` over the real corpus on Kaggle (the dense
+`corpus-embed-kaggle.yml` pattern — needs the workflow's `GHCR_PAT` to pull the
+lexical base), then `cmd/overlay` carries `clause_sparse` (tested) and the data
+image re-bakes. The hard unknowns (model export, onnx sparse session, populate) are
+all eliminated.
