@@ -77,6 +77,25 @@ vendor/
 *.exe
 *.test
 *.out
+# Stray cmd binaries built at the repo root by `go build ./cmd/<name>/` (the real
+# build target is bin/mcp-3gpp via the Makefile). Ignoring the names keeps an
+# accidental `go build ./cmd/overlay/` out of git (it slipped into #161 once).
+/overlay
+/merge
+/server
+/ingest
+/embed
+/embedid
+/discover
+/validate
+/bench
+/dbcount
+/split
+/freeze-hnsw
+/ingest-catalog
+/ingest-openapi
+/li-audit
+/export-delta
 
 # Rust
 target/
