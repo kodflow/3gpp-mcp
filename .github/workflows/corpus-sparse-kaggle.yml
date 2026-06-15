@@ -101,7 +101,7 @@ jobs:
           name: 3gpp-sparse
           path: |
             out/sparse-index.json
-            out/clause_sparse.parquet
+            out/sparse-shard.duckdb
           if-no-files-found: ignore
           retention-days: 7
 
@@ -115,8 +115,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # update the `latest` release asset
+      packages: write # push the 3gpp-sparse channel
     env:
       GH_TOKEN: ${{ github.token }}
+      ORAS_VERSION: "1.2.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -132,3 +134,33 @@ jobs:
           test -f out/sparse-index.json || { echo "::error::no sparse-index.json to publish"; exit 1; }
           echo "publishing sparse-index: $(cat out/sparse-index.json)"
           retry gh release upload latest out/sparse-index.json --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Push the sparse shard to GHCR 3gpp-sparse (the bake folds it via cmd/overlay)
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          test -f out/sparse-shard.duckdb || { echo "::notice::no sparse-shard.duckdb in output — channel left untouched"; exit 0; }
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends zstd
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
+          retry bash -c 'echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin'
+          REF="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-sparse:latest"
+          mkdir -p sparse && cp out/sparse-index.json sparse/
+          zstd -19 -T0 -f out/sparse-shard.duckdb -o sparse/sparse-shard.duckdb.zst
+          cd sparse
+          retry oras push "$REF" \
+            --artifact-type application/vnd.kodflow.3gpp-sparse.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            sparse-index.json:application/json sparse-shard.duckdb.zst:application/zstd
+      - name: Assert 3gpp-sparse is PRIVATE (verbatim clause text in the shard)
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::notice::GHCR_PAT absent — skipping visibility check"; exit 0; }
+          vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-sparse" --jq '.visibility' 2>/dev/null || echo absent)"
+          echo "3gpp-sparse visibility: $vis"
+          if [ "$vis" = "public" ]; then
+            gh api -X PATCH "/user/packages/container/3gpp-sparse/visibility" -f visibility=private >/dev/null 2>&1 || true
+            vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-sparse" --jq '.visibility' 2>/dev/null || echo absent)"
+          fi
+          [ "$vis" != "public" ] || { echo "::error::3gpp-sparse is public (clause text). Make it private."; exit 1; }

@@ -166,13 +166,23 @@ try:
     sm = sh('duckdb "%s" -noheader -list "SELECT value FROM schema_meta WHERE key=\'sparse_model\';"' % DB).stdout.strip()
     with open(WORK + "/sparse-index.json", "w") as sf:
         sf.write('{"sparse_model":"%s"}\n' % sm)
-    # Compact overlay the bake folds via cmd/overlay overlaySparse: just clause_sparse
-    # keyed by the clause natural identity (spec/release/version/clause_path).
-    sh('duckdb "%s" "COPY (SELECT c.spec_id, c.release, c.version, c.clause_path, '
-       'cs.term_id, cs.weight FROM clause_sparse cs JOIN clauses c USING (chunk_id)) '
-       'TO \'%s/clause_sparse.parquet\' (FORMAT parquet);"' % (DB, WORK))
-    res("DONE sparse_model=%s rows=%s parquet=%s" % (
-        sm, populated, os.path.exists(WORK + "/clause_sparse.parquet")))
+    # Compact FOLDABLE shard: cmd/overlay overlaySparse re-keys clause_sparse onto the
+    # base by NATURAL IDENTITY (spec_id, release, clause_path, text), so the shard must
+    # carry clauses(chunk_id + identity cols + text) AND clause_sparse(chunk_id, ...).
+    # We export ONLY clauses that have sparse rows + their postings — no embeddings, no
+    # HNSW, no catalogue — so the artifact stays a fraction of the full DB.
+    SHARD = WORK + "/sparse-shard.duckdb"
+    shard_sql = (
+        "ATTACH '%s' AS f (READ_ONLY); "
+        "CREATE TABLE clauses AS SELECT chunk_id, spec_id, release, version, clause_path, text "
+        "FROM f.clauses WHERE chunk_id IN (SELECT chunk_id FROM f.clause_sparse); "
+        "CREATE TABLE clause_sparse AS SELECT chunk_id, term_id, weight FROM f.clause_sparse;"
+    ) % DB
+    if sh('duckdb "%s" "%s"' % (SHARD, shard_sql)).returncode != 0:
+        res("fail shard_export")
+        sys.exit(1)
+    res("DONE sparse_model=%s rows=%s shard=%s" % (
+        sm, populated, os.path.exists(SHARD)))
     sys.exit(0)
 except Exception as e:
     import traceback
