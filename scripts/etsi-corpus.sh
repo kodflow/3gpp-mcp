@@ -59,7 +59,13 @@ while IFS=$'\t' read -r id url version; do
 		continue
 	fi
 	pdf="$(mktemp --suffix=.pdf)"
-	if ! retry curl -fsSL -o "$pdf" "$url"; then
+	# ETSI's /deliver CDN WAF 403s a bare curl User-Agent from datacenter IPs (GitHub
+	# Actions): discover-etsi works on the same runner ONLY because it sends a browser
+	# UA. Mirror that here (+ Accept/timeout) or every PDF download fails in CI.
+	if ! retry curl -fsSL --connect-timeout 20 --max-time 180 \
+		-A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+		-H "Accept: application/pdf,*/*" \
+		-o "$pdf" "$url"; then
 		echo "::warning::download failed: $url"
 		rm -f "$pdf"
 		fail=$((fail + 1))
