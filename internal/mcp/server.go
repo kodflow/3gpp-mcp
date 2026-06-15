@@ -486,6 +486,13 @@ func docTypeDefault(specType string) string {
 
 var reSpecRef = regexp.MustCompile(`\bT[SR]\s?(\d\d\.\d{3})\b`)
 
+// reEtsiRef catches ETSI deliverable mentions ("ETSI TS 103 221-1", "TS 103 280")
+// that the 3GPP miner cannot see — the LI X1/X2/X3 base specs 33.128 profiles. The
+// id shape (1NN NNN[-P], space-separated) is disjoint from 3GPP's dotted NN.NNN, so
+// the two miners never overlap. Matched ids are cited as a pointer to the ETSI
+// deliver archive (model.EtsiDeliverURL), never ingested (cite-or-silent, §1).
+var reEtsiRef = regexp.MustCompile(`(?:ETSI\s+)?T[SR]\s?(1\d{2}\s?\d{3}(?:-\d+)?)\b`)
+
 func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	specID, err := r.RequireString("spec_id")
 	if err != nil {
@@ -506,8 +513,15 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	// citation (issue #7). A reference not in the corpus still gets spec_id + a
 	// spec-directory URL (cite-or-silent never drops the pointer).
 	refCites := make([]model.Citation, 0)
+	// ETSI references are mined in a SEPARATE pass / separate result keys so the 3GPP
+	// `references`/`ref_citations` stay byte-identical for existing consumers. ETSI
+	// ids (1NN NNN[-P]) are cited as a pointer to the deliver archive (no ingestion).
+	etsiSeen := map[string]bool{}
+	etsiRefs := make([]string, 0)
+	etsiCites := make([]model.Citation, 0)
 	for _, c := range clauses {
-		for _, m := range reSpecRef.FindAllStringSubmatch(c.Heading+" "+c.Text, -1) {
+		hay := c.Heading + " " + c.Text
+		for _, m := range reSpecRef.FindAllStringSubmatch(hay, -1) {
 			id := m[1]
 			if id != specID && !seen[id] {
 				seen[id] = true
@@ -520,6 +534,18 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableVersion(ver)})
 			}
 		}
+		for _, m := range reEtsiRef.FindAllStringSubmatch(hay, -1) {
+			id, ok := model.NormalizeEtsiID(m[1])
+			if !ok || etsiSeen[id] {
+				continue
+			}
+			etsiSeen[id] = true
+			etsiRefs = append(etsiRefs, id)
+			// Version is unknown from a bare mention, so cite the deliver folder
+			// pointer (EtsiDeliverURL with empty version). SpecID keeps the "ETSI TS"
+			// prefix so the citation is unambiguous against 3GPP ids.
+			etsiCites = append(etsiCites, model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")})
+		}
 	}
 	return jsonResult(map[string]any{
 		"spec_id": specID, "release": release, "version": version,
@@ -528,6 +554,9 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		// referenced spec, each with whatever provenance is resolvable.
 		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version)},
 		"ref_citations": refCites,
+		// ETSI cross-references (separate keys; absent-as-empty, never null).
+		"etsi_references":    etsiRefs,
+		"etsi_ref_citations": etsiCites,
 	})
 }
 
