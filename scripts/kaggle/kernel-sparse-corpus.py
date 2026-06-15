@@ -17,15 +17,23 @@ import re
 import subprocess
 import sys
 
+# /kaggle/working is COMMITTED as the kernel output (and re-downloaded by the
+# workflow). Keep it TINY — only RESULT.txt + sparse-index.json + sparse-shard.duckdb
+# live here. All heavy intermediates (the multi-GB pulled base DB, the ~2 GB model,
+# ORT, the cloned src) go to /tmp, which Kaggle does NOT commit — otherwise the
+# output download is multi-GB and breaks with IncompleteRead (the failure that hid
+# every RESULT marker).
 WORK = "/kaggle/working"
+TMP = "/tmp/work"
 REPO = "https://github.com/kodflow/3gpp-mcp"
 BRANCH = os.environ.get("BRANCH", "main")
 OWNER = os.environ.get("GHCR_OWNER", "kodflow")
 GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
 ORT_VERSION = "1.26.0"
 CRANE_VER = "v0.20.2"
-DB = WORK + "/3gpp.duckdb"
-MDIR = WORK + "/model"
+DB = TMP + "/3gpp.duckdb"
+MDIR = TMP + "/model"
+os.makedirs(TMP, exist_ok=True)
 
 if not re.match(r"^[A-Za-z0-9._-]+$", OWNER):
     print("RESULT fail bad_owner=%s" % OWNER, flush=True)
@@ -103,8 +111,8 @@ try:
     sh("curl -fsSL --retry 5 -o /tmp/ort.tgz "
        "https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-linux-x64-gpu-%s.tgz"
        % (ORT_VERSION, ORT_VERSION), check=True)
-    sh("mkdir -p %s/ort && tar -C %s/ort --strip-components=1 -xzf /tmp/ort.tgz" % (WORK, WORK), check=True)
-    libs = glob.glob("%s/ort/**/libonnxruntime.so*" % WORK, recursive=True)
+    sh("mkdir -p %s/ort && tar -C %s/ort --strip-components=1 -xzf /tmp/ort.tgz" % (TMP, TMP), check=True)
+    libs = glob.glob("%s/ort/**/libonnxruntime.so*" % TMP, recursive=True)
     ORT_LIB = sorted(libs, key=len)[0]
     ORT_DIR = os.path.dirname(ORT_LIB)
 
@@ -125,7 +133,7 @@ try:
         sys.exit(0)
 
     # --- 4. Build the onnx embed binary + a sparse-active registry -----------
-    src = WORK + "/src"
+    src = TMP + "/src"
     if sh('git clone --depth 1 -b %s %s %s' % (BRANCH, REPO, src)).returncode != 0:
         res("fail clone")
         sys.exit(0)
@@ -133,11 +141,11 @@ try:
     benv["CGO_ENABLED"] = "1"
     benv["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
     benv["LD_LIBRARY_PATH"] = ORT_DIR + ":" + benv.get("LD_LIBRARY_PATH", "")
-    b = sh('cd %s && go build -tags onnx -o %s/embed ./cmd/embed' % (src, WORK), env=benv)
+    b = sh('cd %s && go build -tags onnx -o %s/embed ./cmd/embed' % (src, TMP), env=benv)
     if b.returncode != 0:
         res("fail build_embed " + (b.stderr or "")[-400:])
         sys.exit(0)
-    with open(WORK + "/models.yaml", "w") as mf:
+    with open(TMP + "/models.yaml", "w") as mf:
         mf.write(
             "active: bge-m3-sparse\nmodels:\n"
             "  - name: bge-m3-sparse\n    family: bge-m3\n    dir: %s\n"
@@ -148,10 +156,10 @@ try:
 
     # --- 5. Run --sparse-only over the corpus (additive; resumable) ----------
     eenv = benv.copy()
-    eenv["EMBED_MODELS_CONFIG"] = WORK + "/models.yaml"
+    eenv["EMBED_MODELS_CONFIG"] = TMP + "/models.yaml"
     eenv["EMBED_MODEL"] = "bge-m3-sparse"
     eenv["ORT_EP"] = "cuda"
-    r = sh('%s/embed --db %s --sparse-only --sparse-batch 256' % (WORK, DB), env=eenv)
+    r = sh('%s/embed --db %s --sparse-only --sparse-batch 256' % (TMP, DB), env=eenv)
     print("EMBED STDOUT:", (r.stdout or "")[-600:], flush=True)
     print("EMBED STDERR:", (r.stderr or "")[-600:], flush=True)
     if r.returncode != 0:
@@ -161,7 +169,7 @@ try:
     res("clause_sparse_rows=%s" % populated)
 
     # --- 6. Emit the sparse identity + a compact clause_sparse dump ----------
-    sh('%s/embed --db %s --sparse-only' % (WORK, DB), env=eenv)  # 2nd pass: 0 new (converged) + re-stamps
+    sh('%s/embed --db %s --sparse-only' % (TMP, DB), env=eenv)  # 2nd pass: 0 new (converged) + re-stamps
     # The stamped sparse_model is the published identity; read it back for the index.
     sm = sh('duckdb "%s" -noheader -list "SELECT value FROM schema_meta WHERE key=\'sparse_model\';"' % DB).stdout.strip()
     with open(WORK + "/sparse-index.json", "w") as sf:

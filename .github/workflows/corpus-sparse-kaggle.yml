@@ -90,7 +90,12 @@ jobs:
             sleep 30
           done
           mkdir -p out
-          kaggle kernels output "$slug" -p out || true
+          # Retry the output pull: a large committed output can break mid-download
+          # (IncompleteRead). The kernel keeps /kaggle/working tiny, but retry anyway.
+          for a in 1 2 3 4; do
+            kaggle kernels output "$slug" -p out && break
+            echo "output pull attempt $a failed — retrying"; sleep 15
+          done
           echo "=== output files ==="; ls -la out || true
           # Kaggle does NOT commit /kaggle/working on an ERROR'd kernel, so RESULT.txt
           # may be absent — but the kernel LOG (stdout/stderr) is always retrievable and
