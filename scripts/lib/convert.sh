@@ -89,6 +89,11 @@ convert_pdf() {
   {
     printf '<html><body>\n'
     sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$txt" | awk '
+      # Table-of-contents lines ("3.1   Definitions ......... 9") and page running-
+      # headers are NAVIGATION, not clauses: a dot-leader run (….N) duplicates the
+      # real heading deeper in the document and would create a bogus, body-less clause
+      # that pollutes retrieval. Drop any line carrying a 3+ dot leader entirely.
+      /\.\.\.+/ { next }
       /^[[:space:]]*[0-9]+(\.[0-9]+)*[[:space:]]+[^[:space:]].*/ {
         line=$0; sub(/^[[:space:]]+/, "", line)
         n=line; sub(/[[:space:]].*$/, "", n)           # the clause number
