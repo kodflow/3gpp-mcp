@@ -144,13 +144,17 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Same extension bake as the `base` stage (full cannot share it: different FROM).
 RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.duckdb
 
-# INHERITANCE GUARD: fail the build if the data layer inherited FROM 3gpp-data is
-# NOT fully indexed (no FTS index, or vectors present without a frozen HNSW). This
-# is the structural fix for the stale-data-layer incident: an unindexed layer can
-# no longer ship silently — `docker build` of `full` errors out here instead of
-# producing a server that degrades to LIKE full-scan / exact-scan in production.
-# (light builds its own lexical DB and never reaches this stage.)
-RUN HOME=/home/mcp mcp-3gpp check-data --db /data/mcp-3gpp/3gpp.duckdb --require-fts --require-hnsw
+# INHERITANCE GUARD: fail the build if the data layer inherited FROM 3gpp-data does
+# NOT meet the data-completeness contract. The DEFAULT is the historical FTS+HNSW
+# subset so a local/standalone build is unaffected; CI passes the FULL contract via
+# --build-arg DATA_CONTRACT_FLAGS="$(scripts/data-contract.sh)" (adds dense-embed
+# convergence + sparse + … with the right --embed-floor). This is the structural fix
+# for the stale/half-baked-data-layer incident: an incomplete layer can no longer
+# ship silently — `docker build` of `full` errors out here instead of producing a
+# server that degrades to LIKE full-scan / exact-scan (or silently lacks sparse) in
+# production. (light builds its own lexical DB and never reaches this stage.)
+ARG DATA_CONTRACT_FLAGS="--require-fts --require-hnsw"
+RUN HOME=/home/mcp mcp-3gpp check-data --db /data/mcp-3gpp/3gpp.duckdb ${DATA_CONTRACT_FLAGS}
 
 # ORT is the ONLY arch-specific piece, fetched from the Microsoft GitHub release
 # (never rate-limited us) and verified against the same sha256 pins as

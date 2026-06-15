@@ -71,6 +71,20 @@ func TestValidateGate(t *testing.T) {
 		t.Errorf("pending-zero on embedded DB should PASS, got %+v", res.Checks)
 	}
 
+	// require-embed-complete: floor-aware dense convergence. No floor → counts ALL
+	// NULL (un-embedded fails, fully embedded passes). A high floor excludes the
+	// seed releases entirely, so below-floor NULLs are NOT a failure (the property
+	// that distinguishes it from the global pending-zero).
+	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), requireEmbedComplete: true}); res.OK {
+		t.Error("require-embed-complete on un-embedded DB (no floor) should FAIL, got OK")
+	}
+	if res = runChecks(ctx, checkCfg{db: seedDB(t, true), requireEmbedComplete: true}); !res.OK {
+		t.Errorf("require-embed-complete on fully embedded DB should PASS, got %+v", res.Checks)
+	}
+	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), requireEmbedComplete: true, embedFloor: "Rel-20"}); !res.OK {
+		t.Errorf("require-embed-complete at floor Rel-20 should PASS (all seed clauses are below floor → not counted), got %+v", res.Checks)
+	}
+
 	// min-clauses below the floor fails (#8).
 	if res = runChecks(ctx, checkCfg{db: seedDB(t, false), minClauses: 999}); res.OK {
 		t.Error("min-clauses 999 on a 3-clause DB should FAIL, got OK")
