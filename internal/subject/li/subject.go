@@ -72,10 +72,14 @@ func (s *Subject) Purge(ctx context.Context, db *store.Store, sid, release, _ st
 func (*Subject) Tools(db *store.Store, baseline string) []subject.ToolRegistration {
 	return []subject.ToolRegistration{{
 		Tool: mcp.NewTool("li_events",
-			mcp.WithDescription("Lawful-Interception events a NE/NF reports over LI_X2 to the MDF2 "+
-				"(TS 33.128, events-only), scoped to the baseline release, with a later-release annex."),
-			mcp.WithString("nf", mcp.Required(), mcp.Description("NE/NF, e.g. AMF, SMF, UPF, UDM, SMSF, MME, SGW, PGW")),
+			mcp.WithDescription("Lawful-Interception coverage from TS 33.128. With no 'nf': the full INVENTORY "+
+				"of every NE/NF impacted over LI_X1/LI_X2/LI_X3 (core 5GC/EPC + all clause-7 services: NEF, "+
+				"SCEF/IWK-SCEF, AKMA, LMF, EES, charging function, MCData/PTC/RCS/MMS, …), grouped by interface. "+
+				"With 'nf': that NE/NF's events (xIRI over LI_X2 / xCC over LI_X3), scoped to the baseline release "+
+				"with a later-release annex. Authoritative ASN.1 registry where present, else literal-prose mining."),
+			mcp.WithString("nf", mcp.Description("NE/NF, e.g. AMF, SMF, UPF, NEF, SCEF, AAnF, LMF, MME, charging function. Omit (or '*'/'all') for the full X1/X2/X3 inventory.")),
 			mcp.WithString("release", mcp.Description("override the baseline (e.g. Rel-18)")),
+			mcp.WithString("interface", mcp.Description("with no 'nf', filter the inventory to one interface: LI_X1, LI_X2 or LI_X3")),
 		),
 		Handler: func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return liEvents(ctx, db, baseline, r)
@@ -101,10 +105,7 @@ func (*Subject) EnrichTerm(ctx context.Context, db *store.Store, term, baseline 
 }
 
 func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	nf, err := r.RequireString("nf")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
+	nf := strings.TrimSpace(r.GetString("nf", ""))
 	avail, ordered, err := db.ClauseAvailability(ctx, specID, "6")
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("li_events failed", err), nil
@@ -113,8 +114,33 @@ func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallT
 	if release == "" && len(ordered) > 0 {
 		release = ordered[len(ordered)-1]
 	}
+
+	// Inventory mode (no NF): list EVERY NE/NF impacted over X1/X2/X3, grouped by
+	// interface — the comprehensive "who is touched" view across clauses 6+7.
+	if nf == "" || nf == "*" || strings.EqualFold(nf, "all") {
+		return liInventory(ctx, db, release, strings.TrimSpace(r.GetString("interface", "")))
+	}
+
 	if HasEvents(ctx, db, release) {
-		return liEventsAuthoritative(ctx, db, release, nf, ordered)
+		if res, ok := liEventsAuthoritativeIfAny(ctx, db, release, nf, ordered); ok {
+			return res, nil
+		}
+		// Authoritative registry has nothing for this NF (e.g. a clause-7 service NF
+		// absent from the ASN.1 core) — fall through to the prose miner.
+	}
+
+	// Prose-miner fallback over the WHOLE spec (clauses 6+7) so NEF/SCEF/AKMA/… work.
+	if version, _, _ := db.VersionForRelease(ctx, specID, release); version != "" {
+		if clauses, cerr := db.GetClauses(ctx, specID, version, ""); cerr == nil {
+			if evs := POIEventsForNF(clauses, nf); len(evs) > 0 {
+				return jsonResult(map[string]any{
+					"nf": nf, "spec_id": specID, "release": release, "version": version,
+					"source": "33.128/prose", "count": len(evs), "events": evs,
+					"note":      "Mined from the canonical POI prose (clause 6/7). xIRI→LI_X2, xCC→LI_X3; every POI is also tasked over LI_X1.",
+					"citations": poiCitations(evs),
+				})
+			}
+		}
 	}
 
 	view := NFEventCatalog(avail, ordered, release, nf)
@@ -138,10 +164,12 @@ func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallT
 	})
 }
 
-func liEventsAuthoritative(ctx context.Context, db *store.Store, release, nf string, ordered []string) (*mcp.CallToolResult, error) {
+// liEventsAuthoritativeIfAny renders the ASN.1-registry events for nf. ok=false when
+// the registry holds nothing for this NF (the caller then tries the prose miner).
+func liEventsAuthoritativeIfAny(ctx context.Context, db *store.Store, release, nf string, ordered []string) (*mcp.CallToolResult, bool) {
 	evs, err := GetEvents(ctx, db, nf, release, "")
 	if err != nil {
-		return mcp.NewToolResultErrorFromErr("li_events failed", err), nil
+		return mcp.NewToolResultErrorFromErr("li_events failed", err), true
 	}
 	baseNames := map[string]bool{}
 	for _, e := range evs {
@@ -169,8 +197,7 @@ func liEventsAuthoritative(ctx context.Context, db *store.Store, release, nf str
 		}
 	}
 	if len(evs) == 0 && len(addedLater) == 0 {
-		return mcp.NewToolResultError("no LI events for NF '" + nf +
-			"' in TS 33.128 " + release + " (try AMF, SMF, UPF, UDM, NEF, MME, SGW)"), nil
+		return nil, false // not in the ASN.1 core — let the caller try the prose miner
 	}
 	byIface := map[string]int{}
 	clauseSet := map[string]bool{}
@@ -192,7 +219,7 @@ func liEventsAuthoritative(ctx context.Context, db *store.Store, release, nf str
 			URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version),
 		})
 	}
-	return jsonResult(map[string]any{
+	res, _ := jsonResult(map[string]any{
 		"nf": nf, "spec_id": specID, "release": release, "version": version,
 		"module_version": moduleVersion, "source": "asn1",
 		"count": len(evs), "by_interface": byIface, "events": evs,
@@ -200,6 +227,76 @@ func liEventsAuthoritative(ctx context.Context, db *store.Store, release, nf str
 		"note":                    "Authoritative: parsed from TS 33.128 " + moduleVersion + " (TS33128Payloads.asn). Baseline = frozen expected state for " + release + ".",
 		"citations":               cites,
 	})
+	return res, true
+}
+
+// liInventory lists every NE/NF impacted over X1/X2/X3, grouped by interface — the
+// comprehensive footprint mined from the whole TS 33.128 (clauses 6+7). ifaceFilter
+// (LI_X1/LI_X2/LI_X3, optional) narrows it to NFs touched by that interface.
+func liInventory(ctx context.Context, db *store.Store, release, ifaceFilter string) (*mcp.CallToolResult, error) {
+	version, _, _ := db.VersionForRelease(ctx, specID, release)
+	if version == "" {
+		return mcp.NewToolResultError("no indexed version of TS 33.128 for release '" + release + "'"), nil
+	}
+	clauses, err := db.GetClauses(ctx, specID, version, "")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("li_events inventory failed", err), nil
+	}
+	inv := NFInventory(clauses)
+	want := strings.ToUpper(strings.ReplaceAll(ifaceFilter, "LI", "LI_"))
+	want = strings.ReplaceAll(want, "LI__", "LI_")
+	byIface := map[string][]string{"LI_X1": {}, "LI_X2": {}, "LI_X3": {}}
+	kept := make([]NFImpact, 0, len(inv))
+	cites := make([]model.Citation, 0, len(inv))
+	for _, im := range inv {
+		if want != "" {
+			match := false
+			for _, x := range im.Interfaces {
+				if x == want {
+					match = true
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		kept = append(kept, im)
+		cites = append(cites, im.Citation)
+		for _, x := range im.Interfaces {
+			byIface[x] = append(byIface[x], im.NF)
+		}
+	}
+	if len(kept) == 0 {
+		return mcp.NewToolResultError("no NE/NF impacted" + ifaceLabel(want) + " found in TS 33.128 " + release), nil
+	}
+	return jsonResult(map[string]any{
+		"spec_id": specID, "release": release, "version": version,
+		"mode": "inventory", "interface_filter": want,
+		"count": len(kept), "by_interface": byIface, "nfs": kept,
+		"note":      "Every NE/NF TS 33.128 impacts over LI_X1 (provisioning/tasking) / LI_X2 (xIRI) / LI_X3 (xCC), across the core 5GC/EPC NFs AND the clause-7 services. Pass nf=<name> for one NF's events.",
+		"citations": cites,
+	})
+}
+
+func ifaceLabel(iface string) string {
+	if iface == "" {
+		return ""
+	}
+	return " over " + iface
+}
+
+// poiCitations collects the distinct clause citations of a mined event list.
+func poiCitations(evs []Event) []model.Citation {
+	seen := map[string]bool{}
+	out := make([]model.Citation, 0, len(evs))
+	for _, e := range evs {
+		if seen[e.Citation.Clause] {
+			continue
+		}
+		seen[e.Citation.Clause] = true
+		out = append(out, e.Citation)
+	}
+	return out
 }
 
 func jsonResult(v any) (*mcp.CallToolResult, error) {
