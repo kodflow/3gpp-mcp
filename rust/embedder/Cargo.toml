@@ -1,0 +1,31 @@
+[package]
+name = "embedder"
+version = "0.1.0"
+edition = "2021"
+description = "Optimised Rust BGE-M3 embedder for the 3GPP/ETSI corpus (dense; sparse in P4)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "embedder"
+path = "src/main.rs"
+
+[dependencies]
+# fastembed wraps ONNX Runtime + HF tokenizers and ships a dedicated BGE-M3 path
+# (dense 1024 + sparse + ColBERT in one pass). We use the dense arm in P3 and add
+# the sparse arm in P4 — keeping BGE-M3 as the single unified backbone.
+fastembed = "4"
+# Pure compute, NO DuckDB dependency: the embedder reads a JSONL work-list and
+# writes a JSONL vector file. Go (which owns the correct DuckDB version) does all
+# DB read/write — this sidesteps DuckDB storage-format compatibility entirely and
+# keeps the Kaggle binary tiny (model + tokenizer only, no bundled C++ engine).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

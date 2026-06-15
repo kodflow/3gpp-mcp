@@ -1,0 +1,73 @@
+# =============================================================================
+#  Rust embedder · CI   — compile + lint + test the rust/embedder crate
+# =============================================================================
+#  The optimised BGE-M3 embedder (rust/embedder) is offline campaign tooling: it
+#  reads a JSONL work-list (exported by `go run ./cmd/embed-io --export-worklist`),
+#  embeds with fastembed/ONNX Runtime, and writes a JSONL vector file that
+#  `cmd/embed-io --import-vectors` loads into the DuckDB. This workflow guards the
+#  crate's build/lint/test so a Rust change can't silently break the campaign path.
+#  It does NOT run a full embed (no model/GPU here) — that happens on Kaggle.
+# =============================================================================
+name: Rust embedder · CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/embedder/**"
+      - ".github/workflows/rust-embedder.yml"
+  pull_request:
+    paths:
+      - "rust/embedder/**"
+      - ".github/workflows/rust-embedder.yml"
+
+concurrency:
+  group: rust-embedder-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust/embedder
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+
+      # Cache the registry + the heavy ort/onnxruntime build artifacts.
+      - name: Cache cargo
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/embedder/target
+          key: rust-embedder-${{ runner.os }}-${{ hashFiles('rust/embedder/Cargo.toml') }}
+          restore-keys: |
+            rust-embedder-${{ runner.os }}-
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Release build (the artifact the Kaggle kernel runs)
+        run: cargo build --release
