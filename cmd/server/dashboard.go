@@ -12,6 +12,7 @@ package main
 // Three routes: /dashboard, /dashboard.json, POST /dashboard/toggle.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -138,12 +140,95 @@ func readProc() procStats {
 	}
 }
 
-// metricsMiddleware records each request's wall-clock latency into the collector.
+// maxParseBody bounds how many bytes of a POST body we buffer to extract the
+// JSON-RPC method/tool/query for the request feed. A tools/call message is tiny;
+// the cap just guards against a pathological payload. The FULL body is always
+// preserved for the downstream handler (only the parse is bounded).
+const maxParseBody = 256 << 10 // 256 KiB
+
+// statusRecorder wraps the ResponseWriter to capture the status code while
+// delegating Flush so the MCP Streamable-HTTP SSE path keeps working.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status, s.wrote = code, true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.status, s.wrote = http.StatusOK, true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the underlying writer (real net/http writers are Flushers),
+// so mcp-go's CanStream()/SSE upgrade still functions through the wrapper.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// parseRPCBrief extracts a JSON-RPC method and, for tools/call, the MCP tool name
+// and its "query" argument from a request body. Best-effort: anything it can't
+// parse yields empty strings (the feed still shows the timing + HTTP method).
+func parseRPCBrief(body []byte) (rpcMethod, tool, query string) {
+	var msg struct {
+		Method string `json:"method"`
+		Params struct {
+			Name      string `json:"name"`
+			Arguments struct {
+				Query string `json:"query"`
+			} `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return "", "", ""
+	}
+	return msg.Method, msg.Params.Name, msg.Params.Arguments.Query
+}
+
+// metricsMiddleware times each /mcp request and feeds the dashboard. It Observes
+// latency into the percentiles ONLY for POST (request/response) calls: a GET is
+// the long-lived SSE pull stream whose lifetime = the whole MCP session, so
+// folding it into the percentiles made p95/p99 report session duration, not
+// request latency (the "120 s" artefact). Every request — POST and GET — is still
+// Recorded into the per-request feed (the GET tagged as such) so it stays visible.
 func metricsMiddleware(c *metrics.Collector, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rpcMethod, tool, query string
+		if r.Method == http.MethodPost && r.Body != nil {
+			// Buffer up to maxParseBody for parsing, but preserve the FULL body for
+			// the handler by chaining the buffered prefix with any unread remainder.
+			buf, _ := io.ReadAll(io.LimitReader(r.Body, maxParseBody))
+			rest := r.Body
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), rest))
+			rpcMethod, tool, query = parseRPCBrief(buf)
+		}
+
+		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		c.Observe(time.Since(start))
+		next.ServeHTTP(sr, r)
+		dur := time.Since(start)
+
+		if r.Method == http.MethodPost {
+			c.Observe(dur)
+		}
+		c.Record(metrics.ReqLog{
+			Method: r.Method,
+			RPC:    rpcMethod,
+			Tool:   tool,
+			Query:  query,
+			DurMs:  float64(dur) / float64(time.Millisecond),
+			Status: sr.status,
+		})
 	})
 }
 
@@ -305,10 +390,10 @@ func optionRows(s search.State, dbModel string) []capOption {
 	case !s.RerankOn:
 		rr.State, rr.Badge = "degraded", "à la demande"
 		rr.Reason = "Disponible — appliqué seulement quand la requête passe rerank=true."
-		rr.Fix = "Cliquer pour re-classer TOUTES les requêtes (fenêtre top-20, +latence)."
+		rr.Fix = "Cliquer pour re-classer TOUTES les requêtes (fenêtre des meilleurs candidats, +latence)."
 	default:
 		rr.State, rr.Badge = "on", "toutes les requêtes"
-		rr.Reason = "Cross-encoder re-classe la fenêtre des 20 meilleurs candidats sur chaque requête (+latence)."
+		rr.Reason = "Cross-encoder re-classe la fenêtre des meilleurs candidats sur chaque requête (+latence)."
 	}
 
 	return []capOption{emb, vec, sp, hnsw, lex, rr}
@@ -386,6 +471,34 @@ func dashboardJSONHandler(get func() (dashStatic, *search.Engine, bool), c *metr
 			Metrics:    c.Snapshot(),
 			UptimeSec:  now.Unix() - corpus.StartedUnix,
 			NowUnix:    now.Unix(),
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}
+}
+
+// requestsJSONHandler serves the recent-request feed (token-gated):
+// GET /dashboard/requests.json?limit=N → {"requests":[…newest first…],"now_unix":…}.
+// limit defaults to 100 and is clamped to the ring capacity by the collector.
+func requestsJSONHandler(c *metrics.Collector, token string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if !tokenOK(r, token) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"unauthorized — pass ?token=… (see container logs)"}`+"\n")
+			return
+		}
+		limit := 100
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		out := struct {
+			Requests []metrics.ReqLog `json:"requests"`
+			NowUnix  int64            `json:"now_unix"`
+		}{
+			Requests: c.Recent(limit),
+			NowUnix:  time.Now().Unix(),
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	}
@@ -501,6 +614,19 @@ const dashboardHTML = `<!doctype html>
   footer{color:var(--mut);font-size:.78rem;margin-top:1.4rem}
   a{color:var(--accent)}
   h2{font-size:.95rem;color:var(--mut);margin:1.6rem 0 .7rem;font-weight:600}
+  .ctl{display:flex;gap:.5rem;align-items:center;margin:.2rem 0 .6rem;color:var(--mut);font-size:.8rem}
+  .ctl select{background:var(--card);color:var(--ink);border:1px solid var(--line);
+              border-radius:6px;padding:.2rem .4rem;font:inherit}
+  .reqwrap{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:auto;max-height:560px}
+  table.reqs{width:100%;border-collapse:collapse;font-size:.8rem}
+  table.reqs th,table.reqs td{padding:.4rem .6rem;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+  table.reqs th{position:sticky;top:0;background:var(--card);color:var(--mut);font-weight:600;
+                text-transform:uppercase;letter-spacing:.5px;font-size:.68rem;z-index:1}
+  table.reqs td.q{white-space:normal;max-width:520px;color:var(--ink)}
+  table.reqs tr.stream td{color:var(--mut);opacity:.7}
+  td.d{font-variant-numeric:tabular-nums;text-align:right}
+  td.d.ok{color:var(--ok)}td.d.warn{color:var(--warn)}td.d.bad{color:var(--off)}
+  .tool{color:var(--accent)}
 </style></head><body>
 <header>
   <h1>3gpp-mcp</h1>
@@ -560,6 +686,24 @@ const dashboardHTML = `<!doctype html>
 
   <h2>Distribution de latence</h2>
   <div class="card span3"><div class="lat" id="latbars"></div></div>
+
+  <h2>Requêtes récentes</h2>
+  <div class="ctl">
+    <label>Afficher
+      <select id="reqlimit">
+        <option value="100">100 dernières</option>
+        <option value="1000">1 000 dernières</option>
+        <option value="10000">10 000 dernières</option>
+      </select>
+    </label>
+    <span id="reqcount"></span>
+  </div>
+  <div class="reqwrap">
+    <table class="reqs">
+      <thead><tr><th>Heure</th><th>Méthode</th><th>Outil</th><th>Requête</th><th>Durée</th><th>Statut</th></tr></thead>
+      <tbody id="reqbody"><tr><td colspan="6" style="color:var(--mut)">…</td></tr></tbody>
+    </table>
+  </div>
 
   <footer id="foot">connexion…</footer>
 </div>
@@ -622,6 +766,37 @@ function drawLat(m){
   $('latbars').innerHTML=rows.map(r=>{const h=Math.max(3,110*((r[1]||0)/max));
     return '<div class="b" style="height:'+h+'px"><span>'+ms(r[1])+'</span><em>'+r[0]+'</em></div>';}).join('');
 }
+// Recent-request feed: a duration is colourised (green <1s, orange 1-10s, red
+// >10s) so a slow call stands out; GET rows are the long-lived SSE streams.
+function durCell(msVal){
+  const v=msVal==null?0:msVal;
+  const cls=v<1000?'ok':(v<10000?'warn':'bad');
+  const txt=v<1000?Math.round(v)+' ms':(v/1000).toFixed(v<10000?2:1)+' s';
+  return '<td class="d '+cls+'">'+txt+'</td>';
+}
+function hms(t){return t?new Date(t*1000).toLocaleTimeString(LOC,{timeZone:TZ}):'–';}
+async function loadReqs(){
+  const lim=$('reqlimit').value||100;
+  try{
+    const r=await fetch('/dashboard/requests.json?limit='+lim,{cache:'no-store'});
+    if(!r.ok){return;}
+    const d=await r.json();
+    const rows=d.requests||[];
+    $('reqcount').textContent=rows.length?(rows.length+' affichées'):'';
+    if(!rows.length){$('reqbody').innerHTML='<tr><td colspan="6" style="color:var(--mut)">aucune requête enregistrée</td></tr>';return;}
+    $('reqbody').innerHTML=rows.map(q=>{
+      const stream=q.method==='GET';
+      const tool=q.tool?('<span class="tool">'+esc(q.tool)+'</span>'):esc(q.rpc||'');
+      return '<tr'+(stream?' class="stream"':'')+'>'+
+        '<td>'+hms(q.t)+'</td>'+
+        '<td>'+esc(q.method)+'</td>'+
+        '<td>'+tool+'</td>'+
+        '<td class="q">'+(esc(q.query)||'<span style="color:var(--mut)">—</span>')+'</td>'+
+        durCell(q.dur_ms)+
+        '<td>'+(q.status||'')+'</td></tr>';
+    }).join('');
+  }catch(e){}
+}
 async function tick(){
   try{
     const r=await fetch('/dashboard.json',{cache:'no-store'});
@@ -653,6 +828,7 @@ async function tick(){
     $('cpu').textContent=fmt(p.num_cpu);
     if(m.series)drawRpm(m.series);
     drawLat(m);
+    loadReqs();
     $('foot').textContent='mis à jour '+new Date().toLocaleTimeString(LOC,{timeZone:TZ})+' · '+(m.samples||0)+' échantillons de latence · rafraîchissement '+(REFRESH_MS/1000)+'s';
   }catch(e){$('foot').textContent='erreur de requête : '+e;}
   setTimeout(tick,REFRESH_MS);
@@ -660,6 +836,7 @@ async function tick(){
 // Live wall-clock in the header (per-second), independent of the data refresh.
 function clock(){const e=$('clock');if(e)e.textContent='🕐 '+new Date().toLocaleString(LOC,{timeZone:TZ,weekday:'short',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 clock();setInterval(clock,1000);
+$('reqlimit').addEventListener('change',loadReqs);
 tick();
 </script>
 </body></html>`

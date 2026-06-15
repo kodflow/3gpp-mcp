@@ -202,6 +202,7 @@ func serve(args []string) error {
 	// (LIKE full-scan p99, exact-scan recall), so scream it at startup with the baked
 	// provenance rather than letting it hide behind a one-line "FTS unavailable".
 	warnIfDegradedDataLayer(ctx, st)
+	warnIfSparseMissing(ctx, st)
 
 	// Option B: if a vec-manifest lists per-series sub-bases, ATTACH them and route
 	// the vector arm through the scatter-gather. Best-effort: a bad manifest just
@@ -274,10 +275,11 @@ func usage() {
 func logServeConfig(eng *search.Engine) {
 	st := eng.State()
 	fmt.Fprintf(os.Stderr,
-		"[3gpp-mcp] config: cpus=%d gomaxprocs=%d ort_intra=%s ort_inter=%s rerank_window=%s rerank_all=%v query_cache=%s embedder=%v reranker=%v\n",
+		"[3gpp-mcp] config: cpus=%d gomaxprocs=%d ort_intra=%s ort_inter=%s rerank_window=%s rerank_all=%v search_budget=%s query_cache=%s embedder=%v reranker=%v\n",
 		runtime.NumCPU(), runtime.GOMAXPROCS(0),
 		envOrDash("ORT_INTRA_OP_THREADS"), envOrDash("ORT_INTER_OP_THREADS"),
-		envOrElse("RERANK_WINDOW", "20(default)"), st.RerankOn,
+		envOrElse("RERANK_WINDOW", "12(default)"), st.RerankOn,
+		envOrElse("SEARCH_BUDGET", "20s(default)"),
 		envOrElse("EMBED_QUERY_CACHE", "512(default)"), st.EmbedderEnabled, st.RerankerEnabled)
 }
 
@@ -319,6 +321,32 @@ func warnIfDegradedDataLayer(ctx context.Context, st *store.Store) {
 			"3gpp-data layer. Provenance: data_created=%q source_corpus=%q db=%s. "+
 			"Fix: rebuild mcp:full FROM an indexed 3gpp-data digest (validate --require-fts --require-hnsw) and restart.\n",
 		ftsOK, hnswState, hasVectors, created, corpus, servedDBPath)
+}
+
+// warnIfSparseMissing makes the sparse gap VISIBLE at startup. When this build is
+// sparse-capable (the active model declares a sparse head) but the served DB has no
+// sparse postings — or carries a sparse layer built by a DIFFERENT sparse model —
+// the sparse arm silently never serves. The fix is an ADDITIVE pass that never
+// touches the (already-computed) dense vectors: `embed --sparse-only` on the fused
+// DB, then re-bake. We scream it once with the exact command rather than letting it
+// hide behind the dashboard's "Sparse: absent" pill. Best-effort; never blocks.
+func warnIfSparseMissing(ctx context.Context, st *store.Store) {
+	if !embed.SparseCapable() {
+		return // dense-only build: nothing to expect
+	}
+	want := embed.SparseModelID()
+	got := st.GetMeta(ctx, "sparse_model")
+	switch {
+	case !st.SparseAvailable():
+		fmt.Fprintf(os.Stderr,
+			"[3gpp-mcp] ⚠️  SPARSE MISSING — this build is sparse-capable (model %q) but the served DB has NO "+
+				"sparse postings (clause_sparse empty). The learned-lexical arm will not serve. Fix (additive, does "+
+				"NOT touch dense vectors): `embed --db <fused.duckdb> --sparse-only` then re-bake.\n", want)
+	case want != "" && got != want:
+		fmt.Fprintf(os.Stderr,
+			"[3gpp-mcp] ⚠️  SPARSE STALE — DB sparse_model=%q but this build expects %q. Re-run "+
+				"`embed --db <fused.duckdb> --sparse-only` (additive) and re-bake to refresh.\n", got, want)
+	}
 }
 
 // prefetchExtensions installs+loads the serve-side DuckDB extensions (fts, vss)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -215,6 +216,95 @@ func TestOptionRows(t *testing.T) {
 		if o := get(rows, key); o.State != "off" {
 			t.Errorf("%s state = %s, want off", key, o.State)
 		}
+	}
+}
+
+func TestParseRPCBrief(t *testing.T) {
+	cases := []struct {
+		name, body, rpc, tool, query string
+	}{
+		{"tools/call", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_spec","arguments":{"query":"AMF registration","top_k":10}}}`, "tools/call", "search_spec", "AMF registration"},
+		{"initialize", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2.0"}}`, "initialize", "", ""},
+		{"no-query-arg", `{"method":"tools/call","params":{"name":"list_specs","arguments":{"series":"23"}}}`, "tools/call", "list_specs", ""},
+		{"garbage", `not json`, "", "", ""},
+		{"empty", ``, "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rpc, tool, query := parseRPCBrief([]byte(c.body))
+			if rpc != c.rpc || tool != c.tool || query != c.query {
+				t.Errorf("parseRPCBrief = (%q,%q,%q), want (%q,%q,%q)", rpc, tool, query, c.rpc, c.tool, c.query)
+			}
+		})
+	}
+}
+
+func TestRequestsJSONAuthAndShape(t *testing.T) {
+	c := metrics.New()
+	for i := 0; i < 5; i++ {
+		c.Record(metrics.ReqLog{Method: "POST", RPC: "tools/call", Tool: "search_spec", Query: "q", DurMs: float64(i), Status: 200})
+	}
+	h := requestsJSONHandler(c, testTok)
+
+	// No token → 401.
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/dashboard/requests.json", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-token status=%d, want 401", rec.Code)
+	}
+
+	// Valid token + limit honoured; newest-first; shape carries the feed keys.
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/dashboard/requests.json?token="+testTok+"&limit=3", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var out struct {
+		Requests []metrics.ReqLog `json:"requests"`
+		NowUnix  int64            `json:"now_unix"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, rec.Body.String())
+	}
+	if len(out.Requests) != 3 {
+		t.Fatalf("limit not honoured: got %d, want 3", len(out.Requests))
+	}
+	if out.Requests[0].DurMs != 4 { // newest first
+		t.Errorf("not newest-first: first DurMs=%.0f, want 4", out.Requests[0].DurMs)
+	}
+	for _, key := range []string{`"method":"POST"`, `"tool":"search_spec"`, `"dur_ms":`, `"status":200`, `"now_unix":`} {
+		if !strings.Contains(rec.Body.String(), key) {
+			t.Errorf("requests.json missing key %s", key)
+		}
+	}
+}
+
+// TestMetricsMiddlewareObservesPostOnly: a GET (the long-lived SSE stream) is
+// Recorded into the feed but NOT folded into the latency percentiles, while a
+// POST is both Observed and Recorded.
+func TestMetricsMiddlewareObservesPostOnly(t *testing.T) {
+	c := metrics.New()
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	mw := metricsMiddleware(c, next)
+
+	// A GET (SSE pull) — recorded, not observed.
+	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if s := c.Snapshot(); s.Total != 0 {
+		t.Errorf("GET observed into percentiles: total=%d, want 0", s.Total)
+	}
+
+	// A POST tools/call — observed AND recorded with the parsed tool+query.
+	body := `{"method":"tools/call","params":{"name":"search_spec","arguments":{"query":"hello"}}}`
+	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body)))
+	if s := c.Snapshot(); s.Total != 1 {
+		t.Errorf("POST not observed: total=%d, want 1", s.Total)
+	}
+	feed := c.Recent(10)
+	if len(feed) != 2 {
+		t.Fatalf("feed len=%d, want 2 (GET + POST)", len(feed))
+	}
+	if feed[0].Tool != "search_spec" || feed[0].Query != "hello" || feed[0].Method != "POST" {
+		t.Errorf("POST feed entry = %+v, want tool=search_spec query=hello method=POST", feed[0])
 	}
 }
 

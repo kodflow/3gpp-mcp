@@ -402,6 +402,15 @@ func runSparse(ctx context.Context, dbPath string, sp embed.SparseEmbedder, batc
 			break // work-list drained
 		}
 	}
+	// Stamp the sparse layer identity so the bake/serve can tell WHICH sparse model
+	// the DB carries (and whether it is the expected one). Best-effort: a meta write
+	// failure must not lose the populated postings. The marker is what makes the
+	// pipeline able to DETECT a missing/stale sparse layer without a full re-embed.
+	if id := sp.SparseModelID(); id != "" {
+		if err := db.SetMeta("sparse_model", id); err != nil {
+			_, _ = fmt.Fprintf(w, "sparse: warning: could not stamp sparse_model meta: %v\n", err)
+		}
+	}
 	return done, nil
 }
 

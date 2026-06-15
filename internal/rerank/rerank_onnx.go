@@ -86,9 +86,16 @@ func (*onnxReranker) Enabled() bool { return true }
 
 // Score runs the cross-encoder on each (query, passage) pair in padded batches
 // and returns sigmoid(logit) ∈ [0,1] — higher = more relevant.
-func (r *onnxReranker) Score(_ context.Context, query string, passages []string) ([]float64, error) {
+func (r *onnxReranker) Score(ctx context.Context, query string, passages []string) ([]float64, error) {
 	out := make([]float64, len(passages))
 	for start := 0; start < len(passages); start += rrBatch {
+		// Honour the per-request budget between batches: an in-flight ONNX Run is a
+		// blocking CGO call we cannot preempt, but checking the deadline here bounds
+		// the reranker to at most one extra batch past expiry. On cancellation we
+		// return the error so Engine.rerank keeps the RRF order (degrade, never block).
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := start + rrBatch
 		if end > len(passages) {
 			end = len(passages)

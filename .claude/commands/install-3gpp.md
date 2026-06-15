@@ -17,7 +17,23 @@ exact citations. Two transports — pick one.
 > FULL stdio with `--rm` re-decompresses every run. Mount a **named volume** so the
 > one-time decompression persists: `-v 3gpp-mcp-data:/data`.
 
-## Option A — stdio (local, recommended)
+## Option A — HTTP hébergé (labs.making.codes, recommandé, zéro install)
+
+The fastest path: point Claude at the always-on hosted server. No Docker, no GHCR
+auth, no local data layer — the corpus + vectors live on the server.
+
+```bash
+claude mcp add --transport http 3gpp https://labs.making.codes/mcp
+```
+
+> The repo's project `.mcp.json` already ships this HTTP transport, so teammates who
+> open the repo get the server on workspace-trust with nothing to run. This skill is
+> for a user-scope install or an explicit re-add. The `/mcp` data plane is open (no
+> token); only the `/dashboard*` admin routes are token-gated.
+
+Readiness: `GET https://labs.making.codes/healthz` → `{"status":"ready"}`.
+
+## Option B — stdio (local Docker)
 
 ```bash
 docker pull ghcr.io/kodflow/3gpp-mcp:latest                       # full (semantic)
@@ -27,11 +43,7 @@ claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data \
 # claude mcp add 3gpp -- docker run -i --rm ghcr.io/kodflow/3gpp-mcp:light serve
 ```
 
-> The repo already ships a project `.mcp.json` (stdio) — teammates who open the repo
-> get the server on workspace-trust, no command needed. This skill is for a user-scope
-> install or an explicit re-add.
-
-## Option B — HTTP (a shared/long-running server)
+## Option C — HTTP (a self-hosted shared/long-running server)
 
 ```bash
 docker run -d --name 3gpp-mcp -p 8765:8765 -e MCP_TRANSPORT=http \
@@ -54,10 +66,12 @@ SERVER, never from the repository. Inside this repo it is already active
 
 ```bash
 mkdir -p ~/.claude/skills/3gpp
-# stdio install — the binary prints its own embedded skill:
-docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/skills/3gpp/SKILL.md
-# HTTP install — the running server serves the same bytes:
-curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md
+# hosted (Option A) — the labs server serves the version-matched skill:
+curl -fsSL https://labs.making.codes/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md
+# stdio (Option B) — the binary prints its own embedded skill:
+# docker run --rm ghcr.io/kodflow/3gpp-mcp:latest skill > ~/.claude/skills/3gpp/SKILL.md
+# self-hosted HTTP (Option C) — the running server serves the same bytes:
+# curl -fsSL http://localhost:8765/skill/3gpp.md -o ~/.claude/skills/3gpp/SKILL.md
 ```
 
 Restart the Claude Code instance afterwards: MCP registrations and `~/.claude/skills/`
@@ -68,8 +82,9 @@ AND `/3gpp` appears in the skills list — nothing else to do.
 
 ```bash
 claude mcp list           # expect: 3gpp — Connected
-ls ~/.claude/skills/3gpp/SKILL.md         # skill present (user scope)
-curl -fsS http://localhost:8765/healthz   # HTTP mode: {"status":"ready"}
+ls ~/.claude/skills/3gpp/SKILL.md              # skill present (user scope)
+curl -fsS https://labs.making.codes/healthz    # hosted: {"status":"ready"}
+# self-hosted HTTP: curl -fsS http://localhost:8765/healthz
 ```
 
 Then ask Claude to call `server_info` — it reports which retrieval modes are active

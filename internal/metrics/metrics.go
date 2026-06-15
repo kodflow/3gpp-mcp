@@ -22,7 +22,24 @@ const (
 	latRingCap = 4096 // recent latency samples kept for percentile estimation
 	tsHours    = 24   // rolling window of per-hour request counts (last 24h)
 	secPerHour = 3600
+	recentCap  = 10000 // recent per-request log entries kept for the dashboard feed
+	queryMax   = 200   // a logged query is truncated to this many runes (bounded memory)
 )
+
+// ReqLog is one entry of the recent-request feed: what arrived (HTTP method,
+// JSON-RPC method, MCP tool, query text) and how long it took. It powers the
+// dashboard's live "recent requests" table — the per-request timer the operator
+// needs to SEE which call is slow (vs the aggregate percentiles, which can't
+// attribute a tail latency to a specific query).
+type ReqLog struct {
+	T      int64   `json:"t"`      // unix seconds when the request completed
+	Method string  `json:"method"` // HTTP method ("POST" | "GET")
+	RPC    string  `json:"rpc"`    // JSON-RPC method ("tools/call", "initialize", …); "" if not parsed
+	Tool   string  `json:"tool"`   // MCP tool name for tools/call ("search_spec", …); "" otherwise
+	Query  string  `json:"query"`  // the query argument (truncated); "" when absent
+	DurMs  float64 `json:"dur_ms"` // wall-clock handling time in milliseconds
+	Status int     `json:"status"` // HTTP status code written to the client
+}
 
 // Collector accumulates request counts and latencies. The zero value is not
 // usable — call New.
@@ -33,12 +50,20 @@ type Collector struct {
 	latNext  int             // next overwrite index once the ring is full
 	bucket   [tsHours]uint64 // per-hour request counts, indexed by hour % tsHours
 	bucketHr [tsHours]int64  // the hour (unix/3600) each bucket currently holds; -1 = empty
-	now      func() time.Time
+
+	recent     []ReqLog // ring of recent per-request log entries (the feed)
+	recentNext int      // next overwrite index once the ring is full
+
+	now func() time.Time
 }
 
 // New returns an empty collector.
 func New() *Collector {
-	c := &Collector{lat: make([]float64, 0, latRingCap), now: time.Now}
+	c := &Collector{
+		lat:    make([]float64, 0, latRingCap),
+		recent: make([]ReqLog, 0, recentCap),
+		now:    time.Now,
+	}
 	for i := range c.bucketHr {
 		c.bucketHr[i] = -1
 	}
@@ -64,6 +89,71 @@ func (c *Collector) Observe(d time.Duration) {
 	}
 	c.bucket[idx]++
 	c.mu.Unlock()
+}
+
+// Record appends one entry to the recent-request feed (a bounded ring of the last
+// recentCap requests). The query is truncated to queryMax runes so a pathological
+// payload can't blow up memory; T is stamped from the collector's clock if unset.
+// Record is independent of Observe: the middleware Observes only request/response
+// latencies (POST) into the percentiles, but Records every request (incl. the
+// long-lived SSE GET stream) into the feed so the operator still sees it.
+func (c *Collector) Record(e ReqLog) {
+	e.Query = truncateRunes(e.Query, queryMax)
+	c.mu.Lock()
+	if e.T == 0 {
+		e.T = c.now().Unix()
+	}
+	if len(c.recent) < recentCap {
+		c.recent = append(c.recent, e)
+	} else {
+		c.recent[c.recentNext] = e
+		c.recentNext = (c.recentNext + 1) % recentCap
+	}
+	c.mu.Unlock()
+}
+
+// Recent returns up to limit of the most recent log entries, NEWEST FIRST. limit
+// is clamped to [1, recentCap]; a non-positive limit defaults to 100.
+func (c *Collector) Recent(limit int) []ReqLog {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > recentCap {
+		limit = recentCap
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.recent)
+	if n == 0 {
+		return nil
+	}
+	if limit > n {
+		limit = n
+	}
+	out := make([]ReqLog, 0, limit)
+	// Walk backwards from the most recently written slot. Before the ring fills,
+	// the newest entry is at len-1; once full, it is at recentNext-1 (mod cap).
+	start := n - 1
+	if n == recentCap {
+		start = (c.recentNext - 1 + recentCap) % recentCap
+	}
+	for i := 0; i < limit; i++ {
+		out = append(out, c.recent[(start-i+recentCap)%recentCap])
+	}
+	return out
+}
+
+// truncateRunes caps s to at most max runes (rune-safe so a multibyte char is
+// never cut mid-sequence), appending an ellipsis when it had to cut.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 // Point is one hour of the request timeseries: T is the unix start-of-hour.

@@ -131,6 +131,33 @@ func (p EmbedParts) Identity() string {
 // EmbedIdentity is a convenience wrapper over the parts struct.
 func EmbedIdentity(p EmbedParts) string { return p.Identity() }
 
+// SparseParts are the inputs that define the BGE-M3 learned-lexical (sparse)
+// postings. It is DELIBERATELY separate from EmbedParts/EmbedIdentity: the sparse
+// arm is an ADDITIVE pass over the same clauses, so a sparse model/head change must
+// trigger a sparse-only re-pass WITHOUT invalidating the (expensive, already-done)
+// dense vectors. Folding sparse into EmbedIdentity would force a full dense
+// re-embed — exactly what we must avoid (the dense BGE-M3 is already computed).
+type SparseParts struct {
+	ModelID           string // sparse model family, e.g. "bge-m3"
+	ModelRevision     string // pinned weights revision
+	TokenizerRevision string
+	SparseOutput      string // ONNX sparse head node, e.g. "sparse_weights"; empty ⇒ no sparse head
+}
+
+// Identity is the canonical sparse re-pass gate. It is EMPTY when SparseOutput is
+// empty (the model has no sparse head ⇒ no sparse arm to produce), so callers can
+// treat "" as "not sparse-capable". A change to the sparse model/revision/head flips
+// it, so the bake can detect a stale/missing sparse layer and re-run --sparse-only.
+func (p SparseParts) Identity() string {
+	if p.SparseOutput == "" {
+		return ""
+	}
+	return digest12("sparse-v1", p.ModelID, p.ModelRevision, p.TokenizerRevision, p.SparseOutput)
+}
+
+// SparseIdentity is a convenience wrapper over the parts struct.
+func SparseIdentity(p SparseParts) string { return p.Identity() }
+
 // BuildIndex is the published identity manifest (plan PR-3): merge writes it
 // alongside corpus-index.json / subject-index.json, and discover compares all
 // three identities to decide whether a refresh is forced even when no spec
