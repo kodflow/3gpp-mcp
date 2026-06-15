@@ -16,12 +16,28 @@ package embed
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 
 	ort "github.com/yalue/onnxruntime_go"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
+
+// maxSparseSeq bounds the per-run sequence length of the sparse pass. BGE-M3's
+// self-attention is O(seq²): a single ~7.4k-token 3GPP clause needs a ~3.5 GB
+// attention buffer (16 heads × 7376² × 4 B) and OOMs a 16 GB T4. We WINDOW longer
+// clauses into ≤maxSparseSeq chunks and merge their term weights (max per token id),
+// so no term is lost and memory stays ~16 MB/run. Override via SPARSE_MAX_SEQ.
+func maxSparseSeq() int {
+	if v := os.Getenv("SPARSE_MAX_SEQ"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 16 {
+			return n
+		}
+	}
+	return 512
+}
 
 // initSparse builds the isolated sparse session once. e.sparseErr stays non-nil
 // when the active model has no sparse head (the common, dense-only case).
@@ -66,6 +82,7 @@ func (e *onnxEmbedder) EmbedSparse(_ context.Context, texts []string) ([]model.S
 	}
 	out := make([]model.SparseVec, len(texts))
 	tok := e.toks[0]
+	win := maxSparseSeq()
 	for i, t := range texts {
 		ids, err := e.encodeIDs(tok, t)
 		if err != nil {
@@ -75,42 +92,66 @@ func (e *onnxEmbedder) EmbedSparse(_ context.Context, texts []string) ([]model.S
 			out[i] = model.SparseVec{}
 			continue
 		}
-		ids64 := make([]int64, len(ids))
-		mask := make([]int64, len(ids))
-		idsU := make([]uint32, len(ids))
-		for j, id := range ids {
-			ids64[j], mask[j], idsU[j] = int64(id), 1, uint32(id) //nolint:gosec // vocab ids are small, non-negative
-		}
-		shape := ort.NewShape(1, int64(len(ids)))
-		idsT, err := ort.NewTensor(shape, ids64)
-		if err != nil {
-			return nil, err
-		}
-		maskT, err := ort.NewTensor(shape, mask)
-		if err != nil {
-			_ = idsT.Destroy()
-			return nil, err
-		}
-		// Dynamic output: a nil Value tells the binding to allocate the [1, seq]
-		// result tensor; we read + destroy it per text.
-		outVals := []ort.Value{nil}
-		e.sparseSess.mu.Lock()
-		err = e.sparseSess.session.Run([]ort.Value{idsT, maskT}, outVals)
-		e.sparseSess.mu.Unlock()
-		_ = idsT.Destroy()
-		_ = maskT.Destroy()
-		if err != nil {
-			return nil, fmt.Errorf("sparse run: %w", err)
-		}
-		wt, ok := outVals[0].(*ort.Tensor[float32])
-		if !ok {
-			if outVals[0] != nil {
-				_ = outVals[0].Destroy()
+		// Window long clauses into ≤win-token chunks and merge term weights (max per
+		// token id) so a single huge clause never builds an O(seq²) attention buffer.
+		merged := model.SparseVec{}
+		for start := 0; start < len(ids); start += win {
+			end := start + win
+			if end > len(ids) {
+				end = len(ids)
 			}
-			return nil, fmt.Errorf("sparse output is not float32")
+			sv, err := e.runSparseChunk(ids[start:end])
+			if err != nil {
+				return nil, err
+			}
+			for id, w := range sv {
+				if w > merged[id] {
+					merged[id] = w
+				}
+			}
 		}
-		out[i] = toSparse(idsU, wt.GetData(), nil)
-		_ = wt.Destroy()
+		out[i] = merged
 	}
 	return out, nil
+}
+
+// runSparseChunk runs the sparse session on ONE ≤win-token id window and returns the
+// deduped term→weight map (specials + non-positive dropped via toSparse).
+func (e *onnxEmbedder) runSparseChunk(ids []int) (model.SparseVec, error) {
+	ids64 := make([]int64, len(ids))
+	mask := make([]int64, len(ids))
+	idsU := make([]uint32, len(ids))
+	for j, id := range ids {
+		ids64[j], mask[j], idsU[j] = int64(id), 1, uint32(id) //nolint:gosec // vocab ids are small, non-negative
+	}
+	shape := ort.NewShape(1, int64(len(ids)))
+	idsT, err := ort.NewTensor(shape, ids64)
+	if err != nil {
+		return nil, err
+	}
+	maskT, err := ort.NewTensor(shape, mask)
+	if err != nil {
+		_ = idsT.Destroy()
+		return nil, err
+	}
+	// Dynamic output: a nil Value tells the binding to allocate the [1, seq] tensor.
+	outVals := []ort.Value{nil}
+	e.sparseSess.mu.Lock()
+	err = e.sparseSess.session.Run([]ort.Value{idsT, maskT}, outVals)
+	e.sparseSess.mu.Unlock()
+	_ = idsT.Destroy()
+	_ = maskT.Destroy()
+	if err != nil {
+		return nil, fmt.Errorf("sparse run: %w", err)
+	}
+	wt, ok := outVals[0].(*ort.Tensor[float32])
+	if !ok {
+		if outVals[0] != nil {
+			_ = outVals[0].Destroy()
+		}
+		return nil, fmt.Errorf("sparse output is not float32")
+	}
+	sv := toSparse(idsU, wt.GetData(), nil)
+	_ = wt.Destroy()
+	return sv, nil
 }
