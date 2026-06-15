@@ -74,6 +74,15 @@ func main() {
 	for _, id := range failed {
 		fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
 	}
+	// Loud, machine-greppable resolution summary on stderr. A green-but-empty run
+	// (the absolute-href bug fixed here) MUST be visible, not silent.
+	fmt.Fprintf(os.Stderr, "discover-etsi: resolved %d/%d scoped spec(s)\n", len(site), len(specs))
+	// If NOTHING resolved, exit non-zero so CI fails fast instead of publishing an
+	// empty corpus — a total resolution failure is a crawler regression, not "no work".
+	if len(site) == 0 && len(specs) > 0 {
+		fmt.Fprintln(os.Stderr, "discover-etsi: FATAL resolved 0 specs — crawl/version-resolution broken (not an empty delta)")
+		os.Exit(1)
+	}
 
 	index := loadIndex(*indexPath)
 	changed := etsicat.Diff(site, index)
