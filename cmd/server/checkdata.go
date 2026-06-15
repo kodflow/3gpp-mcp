@@ -20,6 +20,8 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/kodflow/3gpp-mcp/internal/embed"
+	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -31,6 +33,12 @@ func checkData(args []string) error {
 	dbPath := fs.String("db", "/data/mcp-3gpp/3gpp.duckdb", "DuckDB snapshot to verify")
 	requireFTS := fs.Bool("require-fts", true, "fail if the BM25 FTS index is absent")
 	requireHNSW := fs.Bool("require-hnsw", true, "fail if the DB carries vectors but its HNSW index is not frozen")
+	// Extended contract (off by default so a code-only build with the default dense
+	// contract is unaffected; the data-completeness gate passes these via scripts/
+	// data-contract.sh). Mirror cmd/validate exactly so both gates agree.
+	requireEmbed := fs.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence)")
+	embedFloor := fs.String("embed-floor", "", "release floor for --require-embed-complete; empty = all releases")
+	requireSparse := fs.Bool("require-sparse", false, "fail unless clause_sparse is populated and sparse_model matches this build's sparse identity")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -51,10 +59,39 @@ func checkData(args []string) error {
 	hnswState := st.GetMeta(ctx, "hnsw_state")
 	hnswFrozen := hnswState == "frozen"
 
+	// Dense convergence (floor-aware, like cmd/embed --count-null-at-floor): no clause
+	// at/above the floor still NULL. Below-floor/legacy clauses are intentionally NULL.
+	nullAtFloor := -1
+	if *requireEmbed {
+		floorOrd := 0
+		if *embedFloor != "" {
+			if o, ok := model.ReleaseOrdinal(*embedFloor); ok {
+				floorOrd = o
+			} else {
+				return fmt.Errorf("unparseable --embed-floor %q", *embedFloor)
+			}
+		}
+		if n, err := st.CountNullAtFloor(ctx, floorOrd, ""); err != nil {
+			return fmt.Errorf("count null at floor: %w", err)
+		} else {
+			nullAtFloor = n
+		}
+	}
+
+	// Sparse arm: populated AND the stamped sparse_model matches this build's sparse
+	// identity (a stale sparse layer fails, mirroring cmd/validate --require-sparse).
+	sparseOK, sparseModel, wantSparse := true, "", ""
+	if *requireSparse {
+		_ = st.LoadSparse(ctx)
+		wantSparse = embed.SparseModelID() // "" when this build has no sparse head
+		sparseModel = st.GetMeta(ctx, "sparse_model")
+		sparseOK = st.SparseAvailable() && (wantSparse == "" || sparseModel == wantSparse)
+	}
+
 	// Report the full picture first (so a failing build log shows every signal at
 	// once, not just the first tripwire).
-	fmt.Printf("check-data: db=%s fts_index=%v vectors=%v hnsw_state=%q\n",
-		*dbPath, ftsOK, hasVectors, hnswState)
+	fmt.Printf("check-data: db=%s fts_index=%v vectors=%v hnsw_state=%q null_at_floor=%d sparse_model=%q\n",
+		*dbPath, ftsOK, hasVectors, hnswState, nullAtFloor, sparseModel)
 
 	if *requireFTS && !ftsOK {
 		return fmt.Errorf("FTS index absent (LoadFTS: %v) — server would fall back to LIKE full-scan; "+
@@ -64,6 +101,14 @@ func checkData(args []string) error {
 		return fmt.Errorf("vectors present but hnsw_state=%q (want \"frozen\") — vector arm would degrade to "+
 			"bounded exact-scan; run cmd/freeze-hnsw as the final bake step", hnswState)
 	}
-	fmt.Println("check-data: OK — data layer is fully indexed")
+	if *requireEmbed && nullAtFloor != 0 {
+		return fmt.Errorf("dense incomplete: %d clause(s) at/above floor %q still lack a vector — "+
+			"the embed campaign has not converged; do not promote this data layer", nullAtFloor, *embedFloor)
+	}
+	if *requireSparse && !sparseOK {
+		return fmt.Errorf("sparse incomplete/stale: sparse_available=%v sparse_model=%q expected=%q — "+
+			"run the sparse campaign to convergence before promoting", st.SparseAvailable(), sparseModel, wantSparse)
+	}
+	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil
 }
