@@ -117,6 +117,8 @@ jobs:
           path: |
             out/sparse-index.json
             out/sparse-shard.duckdb
+            out/RESULT.txt
+            out/*.log
           if-no-files-found: ignore
           retention-days: 7
 
