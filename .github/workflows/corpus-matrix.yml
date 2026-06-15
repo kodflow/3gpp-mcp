@@ -241,6 +241,8 @@ jobs:
       floor: ${{ steps.set.outputs.floor }}
       full: ${{ steps.set.outputs.full }}
       publish: ${{ steps.set.outputs.publish }}
+      sparse_needed: ${{ steps.set.outputs.sparse_needed }}
+      sparse_id: ${{ steps.set.outputs.sparse_id }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -324,6 +326,20 @@ jobs:
           echo "matrix=$matrix  floor=$floor  full=$full  publish=$publish (scope='$scope')"
           if [ "${{ github.event.inputs.publish_to_latest }}" = "true" ] && [ "$publish" != "true" ]; then
             echo "::notice::publish_to_latest=true was IGNORED — this is a scoped/PR run (scope='$scope'); latest is only written by a whole-corpus run. Outputs go to artifacts."
+          fi
+
+          # ---- Sparse self-heal signal (independent of the dense matrix) ----------
+          # Decide whether the SPARSE (learned-lexical) layer must be (re)produced:
+          # compare the expected sparse identity (the FAMILY in the SPARSE_EMBED_MODEL
+          # repo var, default bge-m3, resolved via the registry) against the published
+          # sparse-index.json on `latest`. Empty expected (the active model has no
+          # sparse head — today's dense-only default) => sparse_needed=false, so the
+          # dispatch-sparse job below stays DORMANT until a sparse-exported model is
+          # made active. This NEVER triggers a dense re-embed (separate identity).
+          gh release download latest --repo "$GITHUB_REPOSITORY" -p sparse-index.json -D . 2>/dev/null || true
+          sparse_model="${{ vars.SPARSE_EMBED_MODEL || 'bge-m3' }}"
+          if ! CGO_ENABLED=0 go run ./cmd/discover --sparse-check --sparse-model "$sparse_model" --sparse-index sparse-index.json >> "$GITHUB_OUTPUT"; then
+            { echo "sparse_needed=false"; echo "sparse_id="; } >> "$GITHUB_OUTPUT"
           fi
 
   # ---- 1b. model bundle (embed only): fetch BGE-M3 + ORT from HuggingFace ONCE
@@ -1320,6 +1336,45 @@ jobs:
             -f series_list="$series" \
             -f embed_floor="${FLOOR:-Rel-99}" \
             -f precision=fp16 \
+            -f publish=true
+
+  # ---- 5b. dispatch-sparse: produce the SPARSE (learned-lexical) layer when the
+  # published sparse-index differs from what this build expects (discover
+  # --sparse-check). Sparse is CORPUS-GLOBAL and ADDITIVE: it runs an `embed
+  # --sparse-only` pass over the fused DB's clauses (heading+text only) and NEVER
+  # recomputes the dense vectors. Mirrors dispatch-embed but is its OWN signal, so it
+  # fires even on a push with an empty dense matrix (the "code merged, sparse still
+  # missing" case). DORMANT by default: gated on AUTO_SPARSE_ON_BUILD=='true' (no
+  # surprise GPU spend) and on sparse_needed (false until a sparse-exported model is
+  # active). always() so a SKIPPED merge (empty matrix) does not block it.
+  dispatch-sparse:
+    needs: [discover, merge]
+    if: >-
+      always() &&
+      needs.discover.result == 'success' &&
+      (needs.merge.result == 'success' || needs.merge.result == 'skipped') &&
+      needs.discover.outputs.publish == 'true' &&
+      needs.discover.outputs.sparse_needed == 'true' &&
+      github.event.inputs.embed != 'true' &&
+      vars.AUTO_SPARSE_ON_BUILD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # dispatch the sparse workflow
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FLOOR: ${{ needs.discover.outputs.floor }}
+      SPARSE_ID: ${{ needs.discover.outputs.sparse_id }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Dispatch GPU sparse-only pass (fused DB; additive, no dense re-embed)
+        run: |
+          source scripts/lib/retry.sh
+          echo "dispatching sparse-only campaign (expected sparse_id=$SPARSE_ID, floor=${FLOOR:-Rel-99})"
+          retry gh workflow run corpus-sparse-kaggle.yml \
+            -f embed_floor="${FLOOR:-Rel-99}" \
             -f publish=true
 
   # ---- 6. retention: keep the last 7 dated corpus images + rolling shard tags ---

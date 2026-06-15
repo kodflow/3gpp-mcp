@@ -1,0 +1,134 @@
+# =============================================================================
+#  Corpus · Sparse (Kaggle GPU)   — ADDITIVE learned-lexical pass, NO dense re-embed
+# =============================================================================
+#  WHAT it does    Produces the BGE-M3 SPARSE (learned-lexical) layer for the whole
+#                  corpus: exports the dense+sparse model, pulls the private lexical
+#                  base, runs `cmd/embed --sparse-only` on Kaggle GPU (fills
+#                  clause_sparse from heading+text — the dense `embedding` column is
+#                  NEVER touched), then publishes sparse-index.json to `latest` so the
+#                  self-heal signal (discover --sparse-check) CONVERGES, plus a compact
+#                  clause_sparse overlay artifact the data-image bake folds in.
+#
+#  WHEN it runs    MANUAL (workflow_dispatch) OR auto-dispatched by corpus-matrix's
+#                  `dispatch-sparse` job when the published sparse layer differs from
+#                  what the build expects AND repo var AUTO_SPARSE_ON_BUILD=='true'.
+#
+#  ⚠ UNVALIDATED   Like the dense Kaggle campaign, a real run needs a phone-verified
+#                  Kaggle account (GPU + Internet), KAGGLE_API_TOKEN + KAGGLE_USERNAME,
+#                  and a GHCR read token (GHCR_READ_PAT / GHCR_PAT) for the private base
+#                  pull. Dormant by default (dispatch-sparse is gated off). The corpus
+#                  sparse pass is single-session here; a box-out re-dispatches (the
+#                  kernel re-pulls and refills only clauses still missing sparse).
+# =============================================================================
+name: Corpus · Sparse (Kaggle GPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      embed_floor:
+        description: "Release floor (informational; sparse covers all clauses)."
+        required: false
+        default: "Rel-99"
+      publish:
+        description: "Publish sparse-index.json to `latest` (convergence) + the overlay artifact. Default true."
+        required: false
+        default: "true"
+
+concurrency:
+  group: corpus-sparse-kaggle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sparse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KAGGLE_USER: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      GHCR_OWNER: ${{ github.repository_owner }}
+      GHCR_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+      BRANCH: ${{ github.ref_name }}
+      EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Guard — secrets present
+        run: |
+          [ -n "$KAGGLE_API_TOKEN" ] || { echo "::error::KAGGLE_API_TOKEN not set (Settings → API → Generate New Token)."; exit 1; }
+          [ -n "$KAGGLE_USER" ]      || { echo "::error::KAGGLE_USERNAME not set (repo variable or secret) — namespaces the kernel slug."; exit 1; }
+          [ -n "$GHCR_PAT" ]         || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private lexical base."; exit 1; }
+      - name: Install kaggle CLI (pin 2.2.0 — access-token auth)
+        run: |
+          pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
+          kaggle --version
+      - name: Stage + run kernel-sparse-corpus.py (GPU, single session, resumable)
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/sparse-kernel"; mkdir -p "$dir"
+          slug="${KAGGLE_USER}/3gpp-sparse-corpus"
+          # Generated kernel = env prepend (GHCR token reaches crane; kernel stays
+          # is_private:true so the token is never exposed) + the committed kernel body.
+          {
+            echo "import os"
+            echo "os.environ.setdefault('GHCR_OWNER', '${GHCR_OWNER}')"
+            echo "os.environ.setdefault('GHCR_PAT', '${GHCR_PAT}')"
+            echo "os.environ.setdefault('BRANCH', '${BRANCH}')"
+            echo "os.environ.setdefault('EMBED_FLOOR', '${EMBED_FLOOR:-Rel-99}')"
+            cat scripts/kaggle/kernel-sparse-corpus.py
+          } > "$dir/kernel.py"
+          printf '{\n "id": "%s",\n "title": "3gpp sparse corpus",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": [],\n "competition_sources": [],\n "kernel_sources": []\n}\n' "$slug" > "$dir/kernel-metadata.json"
+          kaggle kernels push -p "$dir" --accelerator NvidiaTeslaT4
+          # Poll until terminal (the CLI exit code is unreliable; parse the status string).
+          for _ in $(seq 1 660); do
+            st="$(kaggle kernels status "$slug" 2>&1 || true)"
+            case "$st" in
+              *complete*|*COMPLETE*) echo "kernel complete"; break ;;
+              *error*|*ERROR*|*cancel*|*CANCEL*) echo "::warning::kernel ended: $st"; break ;;
+            esac
+            sleep 30
+          done
+          mkdir -p out
+          kaggle kernels output "$slug" -p out || true
+          echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt)"
+          test -f out/sparse-index.json || { echo "::error::kernel produced no sparse-index.json (see RESULT above)"; exit 1; }
+          echo "sparse-index: $(cat out/sparse-index.json)"
+      - name: Upload sparse overlay + index
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: 3gpp-sparse
+          path: |
+            out/sparse-index.json
+            out/clause_sparse.parquet
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---- publish-sparse: update sparse-index.json on `latest` so discover
+  # --sparse-check CONVERGES (otherwise dispatch-sparse re-fires every build). The
+  # clause_sparse overlay artifact is what the data-image bake folds via cmd/overlay
+  # overlaySparse. ----------------------------------------------------------------
+  publish-sparse:
+    needs: sparse
+    if: github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # update the `latest` release asset
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: 3gpp-sparse
+          path: out
+      - name: Publish sparse-index.json to `latest` (convergence)
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          test -f out/sparse-index.json || { echo "::error::no sparse-index.json to publish"; exit 1; }
+          echo "publishing sparse-index: $(cat out/sparse-index.json)"
+          retry gh release upload latest out/sparse-index.json --repo "$GITHUB_REPOSITORY" --clobber

@@ -22,7 +22,7 @@ C'est ce marqueur qui rend l'absence/obsolescence **détectable** (avant, rien n
 | **serve** | `warnIfSparseMissing` (cmd/server/main.go) : si le binaire est sparse-capable mais `clause_sparse` vide → **log d'alerte** avec la commande exacte ; si `sparse_model` ≠ attendu → **alerte « stale »**. |
 | **dashboard** | pastille « Sparse » + cause/fix (déjà présent). |
 | **validate** | `--require-sparse` est **identity-aware** : échoue si `clause_sparse` vide **ou** si `sparse_model` ≠ identité attendue du build. Gate de promotion du bake. |
-| **bake (self-heal)** | comparer `cmd/embedid --sparse` (attendu) au `sparse_model` du DB fusionné ; s'ils diffèrent → lancer la passe sparse-only GPU avant de baker. |
+| **CI trigger (câblé)** | `corpus-matrix.yml` job `discover` exécute `cmd/discover --sparse-check` (attendu via `SPARSE_EMBED_MODEL` vs `sparse-index.json` sur `latest`) → sort `sparse_needed`. Le job `dispatch-sparse` (gated `AUTO_SPARSE_ON_BUILD` + `sparse_needed`, dormant par défaut) déclenche `corpus-sparse-kaggle.yml`, qui lance la passe GPU `--sparse-only` puis **publie `sparse-index.json`** sur `latest` (convergence : le trigger ne re-fire plus). |
 
 ## Procédure d'activation (one-time, puis idempotente)
 
@@ -65,8 +65,12 @@ lots résumables, (4) pousse `clause_sparse` (overlay), que le bake fusionne.
 
 ## Pourquoi ce n'était pas déjà le cas (résumé)
 
-Trois trous (cf. diagnostic) : (1) aucune identité/ marqueur sparse → indétectable ;
-(2) pas d'export du modèle sparse en CI ; (3) aucun job n'appelait `--sparse-only`. Les
-points (1) et la détection sont désormais corrigés côté code ; le point (2) a un gate
-`WITH_SPARSE` ; il reste à câbler le job GPU corpus-scale + le self-heal du bake et à
-exécuter la production (compute GPU multi-sessions).
+Trois trous (cf. diagnostic) : (1) aucune identité/marqueur sparse → indétectable ;
+(2) pas d'export du modèle sparse en CI ; (3) aucun job n'appelait `--sparse-only`.
+**Tous câblés maintenant** : (1) identité + marqueur + détection (`discover
+--sparse-check`) ; (2) gate `WITH_SPARSE` (export) + modèle activable via registre ;
+(3) job `dispatch-sparse` → `corpus-sparse-kaggle.yml` (passe `--sparse-only` GPU +
+publication `sparse-index.json` pour la convergence). **Reste l'opérationnel** : rendre
+le modèle sparse actif, activer `AUTO_SPARSE_ON_BUILD`, exécuter la prod GPU
+(multi-sessions), et **folder l'overlay `clause_sparse` au bake** (`cmd/overlay`
+`overlaySparse`) dans l'image data — la seule pièce non encore connectée.

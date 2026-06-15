@@ -69,7 +69,17 @@ func main() {
 	seriesFilter := flag.String("series", "", "with --emit-worklist: restrict to these 2-digit series (space/comma separated, e.g. '23 33'); empty = all")
 	absentPath := flag.String("absent-index", "", "absent-index.json (spec|rel -> version 3GPP lists but never published as a downloadable file). A key absent at the SAME version is treated as ACCOUNTED (not re-flagged) — this is what lets the perpetual residue reach 0 actionable drift. A higher site version re-flags it (maybe now published). Accepts a COMMA-SEPARATED list of files (e.g. the genuine-absent ledger + the draft ledger), merged with the highest version winning.")
 	emitDrafts := flag.Bool("emit-draft-ledger", false, "instead of the matrix, print absent-index-format JSON for every status-report key at a DRAFT version (major < 3) and an in-scope release. Merge into --absent-index so v0/v1/v2 drafts 3GPP never publishes stop re-flagging as missing, without excluding them from --emit-worklist.")
+	sparseCheck := flag.Bool("sparse-check", false, "instead of the matrix, decide whether the SPARSE (learned-lexical) layer must be (re)produced: compare the expected sparse identity (--sparse-model resolved via the registry) against the published --sparse-index, and print 'sparse_needed=<bool>' + 'sparse_id=<id>' (GITHUB_OUTPUT-ready). Sparse is corpus-global (produced by an additive --sparse-only pass on the fused DB), so it is a separate signal from the per-series matrix — and it NEVER triggers a dense re-embed.")
+	sparseModel := flag.String("sparse-model", "bge-m3", "with --sparse-check: the embedder FAMILY whose sparse identity is expected (resolved via embed.ResolveSparseID; empty when the active model has no sparse head)")
+	sparseIndexPath := flag.String("sparse-index", "", "with --sparse-check: sparse-index.json ({\"sparse_model\":\"<id>\"}) published alongside the data layer; empty/missing => the published sparse id is treated as absent")
 	flag.Parse()
+
+	// Sparse self-heal signal (separate from the series matrix): is the published
+	// sparse layer the one this build would produce? Offline + CGO-free.
+	if *sparseCheck {
+		emitSparseCheck(*sparseModel, *sparseIndexPath)
+		return
+	}
 
 	site, err := fetchStatus(*statusURL)
 	if err != nil {
@@ -564,6 +574,51 @@ func loadBuildIndex(path string) model.BuildIndex {
 	}
 	_ = json.Unmarshal(b, &bi)
 	return bi
+}
+
+// emitSparseCheck prints the sparse self-heal decision in GITHUB_OUTPUT form:
+//
+//	sparse_needed=<bool>
+//	sparse_id=<expected-sparse-identity>
+//
+// expected = embed.ResolveSparseID(family) ("" when the active model has no sparse
+// head ⇒ not capable ⇒ never needed). published = the sparse_model recorded in the
+// data layer's sparse-index.json. The pass is additive (--sparse-only on the fused
+// DB), so this is independent of the dense per-series matrix and never re-embeds dense.
+func emitSparseCheck(family, sparseIndexPath string) {
+	expected := embed.ResolveSparseID(family)
+	published := loadSparseModelID(sparseIndexPath)
+	needed := sparseNeeded(expected, published)
+	fmt.Printf("sparse_needed=%t\n", needed)
+	fmt.Printf("sparse_id=%s\n", expected)
+	fmt.Fprintf(os.Stderr, "sparse-check: family=%s expected=%q published=%q -> needed=%t\n",
+		family, expected, published, needed)
+}
+
+// sparseNeeded reports whether a sparse-only pass should run: only when this build
+// is sparse-capable (expected != "") AND the published layer differs from it. A
+// non-capable build (dense-only, expected=="") is NEVER "needed" — there is no
+// sparse model to produce. Same value published as already-expected ⇒ converged.
+func sparseNeeded(expected, published string) bool {
+	return expected != "" && expected != published
+}
+
+// loadSparseModelID reads the published sparse identity from sparse-index.json
+// ({"sparse_model":"<id>"}). Missing/unreadable/malformed => "" (treated as absent,
+// so a first-ever publish or a legacy data layer self-heals by producing sparse).
+func loadSparseModelID(path string) string {
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var m struct {
+		SparseModel string `json:"sparse_model"`
+	}
+	_ = json.Unmarshal(b, &m)
+	return m.SparseModel
 }
 
 // major returns the leading integer of "Rel-19" or "19.6.0" (0 on parse error).
