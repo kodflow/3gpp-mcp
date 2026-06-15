@@ -16,9 +16,11 @@
 #  ⚠ UNVALIDATED   Like the dense Kaggle campaign, a real run needs a phone-verified
 #                  Kaggle account (GPU + Internet), KAGGLE_API_TOKEN + KAGGLE_USERNAME,
 #                  and a GHCR read token (GHCR_READ_PAT / GHCR_PAT) for the private base
-#                  pull. Dormant by default (dispatch-sparse is gated off). The corpus
-#                  sparse pass is single-session here; a box-out re-dispatches (the
-#                  kernel re-pulls and refills only clauses still missing sparse).
+#                  pull. Dormant by default (dispatch-sparse is gated off). Each run
+#                  is a BOUNDED slice (embed_limit, fits under Kaggle's 12 h cap): the
+#                  kernel pulls the previously published 3gpp-sparse shard, overlays it,
+#                  embeds only the remaining gap, then republishes the CUMULATIVE shard.
+#                  Re-dispatch until RESULT shows clause_sparse_rows == clauses_total.
 # =============================================================================
 name: Corpus · Sparse (Kaggle GPU)
 
@@ -30,9 +32,9 @@ on:
         required: false
         default: "Rel-99"
       embed_limit:
-        description: "Cap the sparse pass to N clauses (fast end-to-end validation). 0 = full corpus."
+        description: "Clauses to embed THIS session (bounded slice fitting under the 12 h cap; the kernel resumes from the published shard). Re-dispatch until converged. 0 = whole remaining gap."
         required: false
-        default: "0"
+        default: "80000"
       publish:
         description: "Publish sparse-index.json to `latest` (convergence) + the overlay artifact. Default true."
         required: false
