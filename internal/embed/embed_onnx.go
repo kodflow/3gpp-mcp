@@ -890,12 +890,22 @@ func sessionOptionsFor(ep string, device int) (*ort.SessionOptions, error) {
 	// parallelism (the primary single-query dial — set it to the physical core
 	// count); ORT_INTER_OP_THREADS sizes cross-operator parallelism. Both UNSET ⇒
 	// ORT's own defaults (behaviour unchanged), so this is purely opt-in tuning.
-	if n := envInt("ORT_INTRA_OP_THREADS", 0); n > 0 {
-		if err := opts.SetIntraOpNumThreads(n); err != nil {
+	// Intra-op threads = the primary single-query latency dial. On the CPU-only serve
+	// box (no GPU on the VM) the BGE-M3 forward pass is the per-query floor, so DEFAULT
+	// it to all logical cores when the operator hasn't pinned it — ORT's own default
+	// can under-subscribe (physical cores only / 1), leaving a 8-vCPU box idle. An
+	// explicit ORT_INTRA_OP_THREADS still wins; on CUDA we leave ORT's default (the GPU
+	// does the work). 0/negative env ⇒ the core-count default on CPU.
+	intra := envInt("ORT_INTRA_OP_THREADS", 0)
+	if intra <= 0 && ep == EPCPU {
+		intra = runtime.NumCPU()
+	}
+	if intra > 0 {
+		if err := opts.SetIntraOpNumThreads(intra); err != nil {
 			_ = opts.Destroy()
 			return nil, err
 		}
-		log.Printf("embed: ORT intra-op threads = %d", n)
+		log.Printf("embed: ORT intra-op threads = %d", intra)
 	}
 	if n := envInt("ORT_INTER_OP_THREADS", 0); n > 0 {
 		if err := opts.SetInterOpNumThreads(n); err != nil {
