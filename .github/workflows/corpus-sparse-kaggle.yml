@@ -91,8 +91,13 @@ jobs:
           done
           mkdir -p out
           kaggle kernels output "$slug" -p out || true
-          echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt)"
-          test -f out/sparse-index.json || { echo "::error::kernel produced no sparse-index.json (see RESULT above)"; exit 1; }
+          echo "=== output files ==="; ls -la out || true
+          # Kaggle does NOT commit /kaggle/working on an ERROR'd kernel, so RESULT.txt
+          # may be absent — but the kernel LOG (stdout/stderr) is always retrievable and
+          # is the actual error. Print it so a failed run is debuggable from CI alone.
+          echo "=== KERNEL LOG (tail) ==="; tail -n 120 out/*.log 2>/dev/null || echo "(no .log pulled)"
+          echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt — see log above)"
+          test -f out/sparse-index.json || { echo "::error::kernel produced no sparse-index.json (see log above)"; exit 1; }
           echo "sparse-index: $(cat out/sparse-index.json)"
       - name: Upload sparse overlay + index
         if: always()
