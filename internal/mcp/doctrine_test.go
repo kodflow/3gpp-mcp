@@ -31,7 +31,7 @@ func clientWithTR(t *testing.T) (*client.Client, context.Context) {
 	_ = st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS"})
 	_ = st.UpsertVersion(model.SpecVersion{SpecID: "23.501", Release: "Rel-19", Version: "19.5.0"})
 	_ = st.InsertClauses([]model.Clause{
-		{ChunkID: 1, SpecID: "33.128", Release: "Rel-19", Version: "19.6.0", ClausePath: "6.1", Heading: "Scope", Text: "see TS 23.501 and TR 33.926"},
+		{ChunkID: 1, SpecID: "33.128", Release: "Rel-19", Version: "19.6.0", ClausePath: "6.1", Heading: "Scope", Text: "see TS 23.501 and TR 33.926, profiling ETSI TS 103 221-1 and TS 103 280"},
 	})
 	_ = st.InsertEvolutions([]model.Evolution{
 		{FromTerm: "MME", ToTerm: "AMF", EvolutionType: "SPLIT", JustificationSpec: "23.501", JustificationClause: "4.2", Confidence: 0.9},
@@ -145,5 +145,55 @@ func TestCrossRefsCitationsResolved(t *testing.T) {
 	}
 	if !found23 {
 		t.Errorf("expected a ref citation for the indexed 23.501 reference, got %+v", cites)
+	}
+}
+
+// TestCrossRefsEtsiPointer pins Phase A: ETSI references in a 3GPP clause are mined
+// in a SEPARATE result key and cited as a pointer to the ETSI deliver archive
+// (cite-or-silent), while the 3GPP refs are untouched and no ETSI id leaks into them.
+func TestCrossRefsEtsiPointer(t *testing.T) {
+	c, ctx := clientWithTR(t)
+	out := call(t, c, ctx, "find_cross_references", map[string]any{"spec_id": "33.128"})
+
+	// 3GPP references must NOT contain the ETSI ids.
+	b3, _ := json.Marshal(out["references"])
+	var refs3 []string
+	_ = json.Unmarshal(b3, &refs3)
+	for _, r := range refs3 {
+		if r == "103 221-1" || r == "103 280" {
+			t.Errorf("ETSI id %q leaked into 3GPP references %v", r, refs3)
+		}
+	}
+
+	b, _ := json.Marshal(out["etsi_references"])
+	var etsi []string
+	_ = json.Unmarshal(b, &etsi)
+	want := map[string]bool{"103 221-1": false, "103 280": false}
+	for _, id := range etsi {
+		if _, ok := want[id]; ok {
+			want[id] = true
+		}
+	}
+	for id, seen := range want {
+		if !seen {
+			t.Errorf("expected etsi_references to contain %q, got %v", id, etsi)
+		}
+	}
+
+	bc, _ := json.Marshal(out["etsi_ref_citations"])
+	var cites []model.Citation
+	_ = json.Unmarshal(bc, &cites)
+	var found bool
+	for _, cit := range cites {
+		if cit.SpecID == "ETSI TS 103 221-1" {
+			found = true
+			want := "https://www.etsi.org/deliver/etsi_ts/103200_103299/10322101/"
+			if cit.URL != want {
+				t.Errorf("ETSI 103 221-1 citation url = %q, want %q (version-less deliver folder)", cit.URL, want)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected an etsi_ref_citation for 103 221-1, got %+v", cites)
 	}
 }
