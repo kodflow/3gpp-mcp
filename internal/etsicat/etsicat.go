@@ -132,6 +132,52 @@ func Diff(site, index map[string]string) []string {
 	return changed
 }
 
+// Fetcher fetches a URL and returns its body. Injected so the crawl is unit-testable
+// with fixtures (no network) — the CLI passes an http.Get-backed implementation.
+type Fetcher func(url string) (io.ReadCloser, error)
+
+// ResolveLatest fetches a spec's deliver directory and returns its latest PUBLISHED
+// version string ("1.21.1"). ok is false (no error) when the spec dir has no published
+// version (drafts only / empty) — the caller skips it. A fetch/parse error is returned
+// so the CLI can retry (the resume mechanic), never silently drop a spec.
+func ResolveLatest(fetch Fetcher, id string) (version string, ok bool, err error) {
+	dir := model.EtsiDeliverURL(id, "") // version-less ⇒ the spec's directory URL
+	if dir == "" {
+		return "", false, nil // not an ETSI-shaped id
+	}
+	body, err := fetch(dir)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = body.Close() }()
+	links, err := ExtractLinks(body)
+	if err != nil {
+		return "", false, err
+	}
+	v, found := LatestPublished(links)
+	if !found {
+		return "", false, nil
+	}
+	return v.String(), true, nil
+}
+
+// BuildSite resolves the latest published version of every id, returning the live
+// "site" map (id -> version) plus the ids that errored (for the caller to retry/report).
+// Ids with no published version are simply omitted (cite-or-silent).
+func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []string) {
+	site = make(map[string]string, len(ids))
+	for _, id := range ids {
+		v, ok, err := ResolveLatest(fetch, id)
+		switch {
+		case err != nil:
+			failed = append(failed, id)
+		case ok:
+			site[id] = v
+		}
+	}
+	return site, failed
+}
+
 // newer reports whether ETSI version a is strictly newer than b (major/minor/edit).
 // An unparseable b is treated as oldest (so a wins → re-fetch).
 func newer(a, b string) bool {
