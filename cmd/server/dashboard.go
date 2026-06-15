@@ -30,6 +30,32 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
+// dashAuthOpen is the sentinel token meaning "dashboard auth disabled"
+// (DASHBOARD_TOKEN=off): tokenOK short-circuits to true. It carries NUL bytes so it
+// can never equal a real configured token nor a value arriving in a request — and
+// since "open" lets everyone through anyway, there is no security differential even
+// if it somehow were supplied.
+const dashAuthOpen = "\x00dashboard-auth-disabled\x00"
+
+// resolveDashToken decides the dashboard auth token from the DASHBOARD_TOKEN env:
+//   - "off"/"none"/"disabled"/"false"/"0" (case-insensitive) → auth DISABLED (open);
+//   - any other non-empty value                              → that FIXED token
+//     (stable across redeploys, so it never has to be re-fetched from the logs);
+//   - unset/empty                                            → a fresh random token.
+//
+// Returns (token, authOff, fixed) so the caller can log the right startup line.
+func resolveDashToken() (token string, authOff, fixed bool) {
+	v := strings.TrimSpace(os.Getenv("DASHBOARD_TOKEN"))
+	switch strings.ToLower(v) {
+	case "":
+		return newDashToken(), false, false
+	case "off", "none", "disabled", "false", "0":
+		return dashAuthOpen, true, false
+	default:
+		return v, false, true
+	}
+}
+
 // newDashToken returns a random 20-char alphanumeric token (crypto/rand).
 func newDashToken() string {
 	const n = 20
@@ -402,6 +428,9 @@ func optionRows(s search.State, dbModel string) []capOption {
 // tokenOK accepts the dashboard token from ?token=, the dash_token cookie, or a
 // Bearer header. Constant-time compare. An empty configured token rejects all.
 func tokenOK(r *http.Request, token string) bool {
+	if token == dashAuthOpen { // DASHBOARD_TOKEN=off → dashboard is open
+		return true
+	}
 	if token == "" {
 		return false
 	}

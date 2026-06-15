@@ -151,10 +151,18 @@ func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.St
 	)
 	coll := metrics.New()
 	started := time.Now()
-	// Dashboard auth: a random per-start token, printed to the container logs.
-	// Without it no dashboard call passes (the /mcp data plane stays open).
-	dashToken := newDashToken()
-	fmt.Fprintf(os.Stderr, "[3gpp-mcp] dashboard token: %s  (open /dashboard?token=%s)\n", dashToken, dashToken)
+	// Dashboard auth: token from DASHBOARD_TOKEN (off → open; fixed → stable across
+	// redeploys; unset → a fresh random per-start token printed to the logs). Without
+	// a valid token no dashboard call passes (the /mcp data plane stays open).
+	dashToken, dashAuthOff, dashFixed := resolveDashToken()
+	switch {
+	case dashAuthOff:
+		fmt.Fprintln(os.Stderr, "[3gpp-mcp] dashboard AUTH DISABLED (DASHBOARD_TOKEN=off) — /dashboard is OPEN")
+	case dashFixed:
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] dashboard token: %s  (fixed via DASHBOARD_TOKEN; open /dashboard?token=%s)\n", dashToken, dashToken)
+	default:
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] dashboard token: %s  (open /dashboard?token=%s)\n", dashToken, dashToken)
+	}
 	// getLive hands the dashboard handlers the corpus snapshot + the LIVE engine
 	// (for capabilities + runtime toggles) under the read lock.
 	getLive := func() (dashStatic, *search.Engine, bool) {
