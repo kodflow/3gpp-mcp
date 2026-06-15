@@ -29,7 +29,7 @@ MDIR = WORK + "/model"
 
 if not re.match(r"^[A-Za-z0-9._-]+$", OWNER):
     print("RESULT fail bad_owner=%s" % OWNER, flush=True)
-    sys.exit(1)
+    sys.exit(0)
 
 
 def sh(c, env=None, check=False):
@@ -52,13 +52,13 @@ def res(m):
 try:
     if not GHCR_PAT:
         res("fail ghcr_pat_missing")
-        sys.exit(1)
+        sys.exit(0)
 
     # --- 1. Export the dense+sparse model (validated recipe) ------------------
     pi = sh("pip -q install FlagEmbedding onnx onnxruntime onnxscript")
     if pi.returncode != 0:
         res("fail pip_install " + (pi.stderr or pi.stdout or "")[-300:])
-        sys.exit(1)
+        sys.exit(0)
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -115,20 +115,20 @@ try:
     sh('tar -xzf /tmp/crane.tgz -C /tmp crane', check=True)
     if sh('printf %%s "$GHCR_PAT" | /tmp/crane auth login ghcr.io -u "%s" --password-stdin' % OWNER).returncode != 0:
         res("fail ghcr_login")
-        sys.exit(1)
+        sys.exit(0)
     img = "ghcr.io/%s/3gpp-corpus:latest" % OWNER
     if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, WORK)).returncode != 0:
         res("fail ghcr_export " + img)
-        sys.exit(1)
+        sys.exit(0)
     if not os.path.isfile(DB):
         res("fail ghcr_no_db")
-        sys.exit(1)
+        sys.exit(0)
 
     # --- 4. Build the onnx embed binary + a sparse-active registry -----------
     src = WORK + "/src"
     if sh('git clone --depth 1 -b %s %s %s' % (BRANCH, REPO, src)).returncode != 0:
         res("fail clone")
-        sys.exit(1)
+        sys.exit(0)
     benv = os.environ.copy()
     benv["CGO_ENABLED"] = "1"
     benv["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
@@ -136,7 +136,7 @@ try:
     b = sh('cd %s && go build -tags onnx -o %s/embed ./cmd/embed' % (src, WORK), env=benv)
     if b.returncode != 0:
         res("fail build_embed " + (b.stderr or "")[-400:])
-        sys.exit(1)
+        sys.exit(0)
     with open(WORK + "/models.yaml", "w") as mf:
         mf.write(
             "active: bge-m3-sparse\nmodels:\n"
@@ -156,7 +156,7 @@ try:
     print("EMBED STDERR:", (r.stderr or "")[-600:], flush=True)
     if r.returncode != 0:
         res("fail sparse_only rc=%d" % r.returncode)
-        sys.exit(1)
+        sys.exit(0)
     populated = sh('duckdb "%s" -noheader -list "SELECT count(*) FROM clause_sparse;"' % DB).stdout.strip()
     res("clause_sparse_rows=%s" % populated)
 
@@ -180,7 +180,7 @@ try:
     ) % DB
     if sh('duckdb "%s" "%s"' % (SHARD, shard_sql)).returncode != 0:
         res("fail shard_export")
-        sys.exit(1)
+        sys.exit(0)
     res("DONE sparse_model=%s rows=%s shard=%s" % (
         sm, populated, os.path.exists(SHARD)))
     sys.exit(0)
@@ -188,4 +188,4 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     res("fail exception=%s %s" % (type(e).__name__, str(e)[:200]))
-    sys.exit(1)
+    sys.exit(0)
