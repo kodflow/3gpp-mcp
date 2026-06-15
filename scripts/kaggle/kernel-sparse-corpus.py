@@ -35,6 +35,10 @@ CRANE_VER = "v0.20.2"
 # the whole chain (kernel → shard → GHCR publish → bake) without the multi-hour full
 # corpus run. 0 = full corpus.
 LIMIT = os.environ.get("EMBED_LIMIT", "0").strip()
+# Real 3GPP clauses run up to 8192 tokens, so the sparse head's [batch, seq] tensor
+# is memory-hungry: batch 256 OOM'd a T4 (a single Add node wanted 3.5 GB). Memory is
+# linear in batch, so a small batch keeps it well within 16 GB. Override via SPARSE_BATCH.
+SPARSE_BATCH = os.environ.get("SPARSE_BATCH", "16").strip() or "16"
 DB = TMP + "/3gpp.duckdb"
 MDIR = TMP + "/model"
 os.makedirs(TMP, exist_ok=True)
@@ -164,7 +168,7 @@ try:
     eenv["EMBED_MODEL"] = "bge-m3-sparse"
     eenv["ORT_EP"] = "cuda"
     lim = (" --limit %s" % LIMIT) if (LIMIT and LIMIT != "0") else ""
-    r = sh('%s/embed --db %s --sparse-only --sparse-batch 256%s' % (TMP, DB, lim), env=eenv)
+    r = sh('%s/embed --db %s --sparse-only --sparse-batch %s%s' % (TMP, DB, SPARSE_BATCH, lim), env=eenv)
     print("EMBED STDOUT:", (r.stdout or "")[-600:], flush=True)
     print("EMBED STDERR:", (r.stderr or "")[-600:], flush=True)
     if r.returncode != 0:
@@ -174,7 +178,7 @@ try:
     res("clause_sparse_rows=%s" % populated)
 
     # --- 6. Emit the sparse identity + a compact clause_sparse dump ----------
-    sh('%s/embed --db %s --sparse-only' % (TMP, DB), env=eenv)  # 2nd pass: 0 new (converged) + re-stamps
+    sh('%s/embed --db %s --sparse-only --sparse-batch %s' % (TMP, DB, SPARSE_BATCH), env=eenv)  # 2nd pass: 0 new (converged) + re-stamps
     # The stamped sparse_model is the published identity; read it back for the index.
     sm = sh('duckdb "%s" -noheader -list "SELECT value FROM schema_meta WHERE key=\'sparse_model\';"' % DB).stdout.strip()
     with open(WORK + "/sparse-index.json", "w") as sf:
