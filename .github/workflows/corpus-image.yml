@@ -221,7 +221,14 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh
-          retry bash -c "curl -fsSL 'https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz' | sudo tar -xz -C /usr/local/bin crane"
+          # Arch-aware asset (this leg runs on a NATIVE arm64 runner too): the x86_64
+          # binary exits 126 on arm64. go-containerregistry assets use x86_64 / arm64.
+          case "${{ matrix.arch }}" in
+            amd64) crane_arch=x86_64 ;;
+            arm64) crane_arch=arm64 ;;
+            *) echo "::error::unsupported arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          retry bash -c "curl -fsSL 'https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_${crane_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin crane"
           crane version
 
       # not hard-fail on a transient Docker Hub timeout (the exact class of break
