@@ -30,7 +30,12 @@ def res(m):
 
 try:
     # --- 1. Export the dense+sparse model (validated recipe) ------------------
-    sh("pip -q install FlagEmbedding onnx onnxruntime onnxscript 2>&1 | tail -2")
+    # No `| tail`: piping the install through tail masked a failed pip step. The
+    # import right after surfaces a broken install, but keep pip's own errors visible.
+    pi = sh("pip -q install FlagEmbedding onnx onnxruntime onnxscript")
+    if pi.returncode != 0:
+        res("fail pip_install " + (pi.stderr or pi.stdout or "")[-300:])
+        sys.exit(1)
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
