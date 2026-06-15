@@ -54,6 +54,34 @@ _soffice_html() {
   return 1
 }
 
+# convert_pdf <pdf> <target_html> [label] — ETSI deliverables are PUBLISHED as
+# digital (text-layer) PDFs. LibreOffice extracts that text layer to HTML — this is
+# TEXT EXTRACTION, not OCR (CLAUDE.md §13's no-OCR lock is preserved): a SCANNED,
+# image-only PDF yields ~no text and is FAILED here, never OCR'd. Same CONV_STATUS
+# contract as convert_doc (clean|fail). The ETSI provenance header is prepended by the
+# caller (scripts/etsi-corpus.sh), which knows the id+version from the work-list.
+# Env: ETSI_MIN_TEXT (default 200) — min visible chars for a PDF to count as digital.
+: "${ETSI_MIN_TEXT:=200}"
+convert_pdf() {
+  local pdf="$1" target="$2" label="${3:-$2}" produced visible
+  mkdir -p "$(dirname "$target")"
+  export CONV_STATUS=fail
+  # NB: no `local` on this line, or we'd capture local's rc, not soffice's.
+  if ! produced="$(_soffice_html "$pdf")"; then
+    return 1
+  fi
+  # Text-layer guard: strip tags and whitespace, count the remaining visible chars.
+  # A digital PDF carries the clause text; a scan carries only <img> → near-zero.
+  visible="$(sed -e 's/<[^>]*>//g' "$produced" | tr -d '[:space:]' | wc -c | tr -dc '0-9')"
+  if [ "${visible:-0}" -lt "$ETSI_MIN_TEXT" ]; then
+    rm -rf "$(dirname "$produced")" 2>/dev/null || true
+    echo "convert_pdf: $label has no text layer (${visible:-0} chars) — REFUSING (no OCR)" >&2
+    return 1   # scanned/image-only PDF: fail honest, never OCR
+  fi
+  mv -f "$produced" "$target"; rm -rf "$(dirname "$produced")"
+  CONV_STATUS=clean; return 0
+}
+
 convert_doc() {
   local inner="$1" target="$2" label="${3:-$2}"
   local base produced work tmp n_emf

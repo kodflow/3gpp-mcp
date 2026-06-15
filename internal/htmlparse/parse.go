@@ -12,6 +12,7 @@
 package htmlparse
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,11 @@ var (
 	// (from the status-report-driven worklist), not the version-major.
 	reReleaseDir = regexp.MustCompile(`^(Rel-[0-9]+|GSM|Phase[0-9]+)$`)
 	reDate       = regexp.MustCompile(`\b(\d{4})-(\d{2})-(\d{2})\b|\b(\d{2})/(\d{4})\b`)
+	// ETSI provenance header (prepended by scripts/etsi-corpus.sh): ETSI deliverables
+	// have no 3GPP "<num>-<code>" filename, so the SDO/id/version travel in the HTML
+	// itself, e.g. "<!-- ETSI-SPEC: 103 221-1 | 1.21.1 -->". This is what lets the SAME
+	// htmlparse → ingest path serve both corpora (the user's "process identique").
+	reEtsiHeader = regexp.MustCompile(`<!--\s*ETSI-SPEC:\s*([0-9][0-9 ]+[0-9](?:-[0-9]+)?)\s*\|\s*([0-9]+\.[0-9]+\.[0-9]+)\s*-->`)
 )
 
 // ParseFile parses the HTML spec at path (…/convert/<Rel>/<num>-<code>.html).
@@ -67,13 +73,23 @@ func ParseFile(path string) (*ParsedSpec, error) {
 	return Parse(path, f)
 }
 
-// Parse reads HTML from r; path is used only to derive spec id / version.
+// Parse reads HTML from r; path is used only to derive spec id / version (3GPP path),
+// UNLESS the HTML carries an ETSI provenance header, in which case the id/version come
+// from there (ETSI deliverables have no 3GPP "<num>-<code>" filename).
 func Parse(path string, r io.Reader) (*ParsedSpec, error) {
 	ps := &ParsedSpec{}
-	if err := ps.metaFromFilename(path); err != nil {
-		return nil, err
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read html %s: %w", path, err)
 	}
-	root, err := html.Parse(r)
+	// ETSI provenance header wins over the 3GPP filename derivation (process identique:
+	// same parser, the SDO/id/version just arrive in the body for ETSI).
+	if !ps.metaFromETSIHeader(raw) {
+		if err := ps.metaFromFilename(path); err != nil {
+			return nil, err
+		}
+	}
+	root, err := html.Parse(bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("parse html %s: %w", path, err)
 	}
@@ -124,6 +140,33 @@ func (ps *ParsedSpec) metaFromFilename(path string) error {
 		DocxURL: model.ArchiveURL(specID, version),
 	}
 	return nil
+}
+
+// metaFromETSIHeader fills the Spec/Version from an ETSI provenance comment in the
+// HTML body ("<!-- ETSI-SPEC: 103 221-1 | 1.21.1 -->"), returning true when present.
+// ETSI has no 3GPP "<num>-<code>" filename, so the id/version travel in the body; the
+// release bucket is the constant "ETSI" (ETSI versions are V<maj>.<min>.<ed>, not
+// Rel-NN), and the citation URL is the deterministic deliver-archive PDF.
+func (ps *ParsedSpec) metaFromETSIHeader(raw []byte) bool {
+	m := reEtsiHeader.FindSubmatch(raw)
+	if m == nil {
+		return false
+	}
+	id := reWS.ReplaceAllString(strings.TrimSpace(string(m[1])), " ")
+	version := string(m[2])
+	ps.Spec = model.Spec{
+		SpecID:       "ETSI TS " + id,
+		Series:       "ETSI",
+		DocType:      "TS",
+		WorkingGroup: "ETSI",
+	}
+	ps.Version = model.SpecVersion{
+		SpecID:  "ETSI TS " + id,
+		Release: "ETSI",
+		Version: version,
+		DocxURL: model.EtsiDeliverURL(id, version),
+	}
+	return true
 }
 
 // walker accumulates clauses while traversing the DOM in document order.
