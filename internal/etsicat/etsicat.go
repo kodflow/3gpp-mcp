@@ -30,10 +30,15 @@ import (
 // Draft/approval milestones (20/30/…) are NOT citable and are skipped.
 const PublishedMilestone = 60
 
-// ExtractLinks returns the href targets of every <a> in a directory-listing page,
-// in document order, with the parent ("../", "..") and absolute/query links dropped.
-// It is intentionally agnostic to the exact autoindex style (Apache, nginx, the ETSI
-// portal): it only reads anchors, so a layout change never silently drops entries.
+// ExtractLinks returns the CHILD NAME of every <a> in a directory-listing page, in
+// document order. The real ETSI portal renders version sub-directories as ABSOLUTE
+// hrefs ("/deliver/etsi_ts/103200_103299/10322101/01.21.01_60/"), while a plain
+// Apache/nginx autoindex renders them RELATIVE ("01.21.01_60/"). To be agnostic to
+// both, every href is reduced to its last path segment (the child name) rather than
+// dropped when absolute — dropping absolute hrefs was the bug that made the live
+// crawl resolve zero versions (the parent range dir reduces to "103200_103299", which
+// simply fails ParseVersionDir, so it is harmless). Sort headers ("?C=N"), anchors,
+// and external scheme URLs are still dropped.
 func ExtractLinks(r io.Reader) ([]string, error) {
 	doc, err := html.Parse(r)
 	if err != nil {
@@ -48,13 +53,14 @@ func ExtractLinks(r io.Reader) ([]string, error) {
 					continue
 				}
 				h := strings.TrimSpace(a.Val)
-				// Skip parent links, anchors, queries, and absolute URLs (sort headers
-				// in autoindex are "?C=N;O=D"); we only want child names.
+				// Skip parent links, anchors, queries, and external (scheme) URLs.
 				if h == "" || h == "../" || h == ".." || strings.HasPrefix(h, "?") ||
-					strings.HasPrefix(h, "#") || strings.Contains(h, "://") || strings.HasPrefix(h, "/") {
+					strings.HasPrefix(h, "#") || strings.Contains(h, "://") {
 					continue
 				}
-				out = append(out, h)
+				if name := lastSegment(h); name != "" {
+					out = append(out, name)
+				}
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -63,6 +69,21 @@ func ExtractLinks(r io.Reader) ([]string, error) {
 	}
 	walk(doc)
 	return out, nil
+}
+
+// lastSegment reduces a directory-listing href to its final path component, so an
+// absolute portal href and a relative autoindex name both yield the same child name:
+//
+//	"/deliver/etsi_ts/103200_103299/10322101/01.21.01_60/" -> "01.21.01_60"
+//	"01.21.01_60/"                                          -> "01.21.01_60"
+//
+// A trailing slash is trimmed first so the basename is the directory name, not "".
+func lastSegment(href string) string {
+	h := strings.TrimSuffix(href, "/")
+	if i := strings.LastIndex(h, "/"); i >= 0 {
+		h = h[i+1:]
+	}
+	return h
 }
 
 // reVersionDir matches an ETSI version sub-directory "VV.VV.VV_NN" (trailing slash
