@@ -31,6 +31,10 @@ OWNER = os.environ.get("GHCR_OWNER", "kodflow")
 GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
 ORT_VERSION = "1.26.0"
 CRANE_VER = "v0.20.2"
+# EMBED_LIMIT>0 caps the sparse pass to N clauses — a fast end-to-end validation of
+# the whole chain (kernel → shard → GHCR publish → bake) without the multi-hour full
+# corpus run. 0 = full corpus.
+LIMIT = os.environ.get("EMBED_LIMIT", "0").strip()
 DB = TMP + "/3gpp.duckdb"
 MDIR = TMP + "/model"
 os.makedirs(TMP, exist_ok=True)
@@ -125,7 +129,7 @@ try:
         res("fail ghcr_login")
         sys.exit(0)
     img = "ghcr.io/%s/3gpp-corpus:latest" % OWNER
-    if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, WORK)).returncode != 0:
+    if sh('/tmp/crane export "%s" - | tar -xC "%s" 3gpp.duckdb' % (img, TMP)).returncode != 0:
         res("fail ghcr_export " + img)
         sys.exit(0)
     if not os.path.isfile(DB):
@@ -159,7 +163,8 @@ try:
     eenv["EMBED_MODELS_CONFIG"] = TMP + "/models.yaml"
     eenv["EMBED_MODEL"] = "bge-m3-sparse"
     eenv["ORT_EP"] = "cuda"
-    r = sh('%s/embed --db %s --sparse-only --sparse-batch 256' % (TMP, DB), env=eenv)
+    lim = (" --limit %s" % LIMIT) if (LIMIT and LIMIT != "0") else ""
+    r = sh('%s/embed --db %s --sparse-only --sparse-batch 256%s' % (TMP, DB, lim), env=eenv)
     print("EMBED STDOUT:", (r.stdout or "")[-600:], flush=True)
     print("EMBED STDERR:", (r.stderr or "")[-600:], flush=True)
     if r.returncode != 0:
