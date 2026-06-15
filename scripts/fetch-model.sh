@@ -8,6 +8,7 @@
 #
 # Usage:   scripts/fetch-model.sh                  # embedder only (BGE-M3 + ORT)
 #          WITH_RERANKER=1 scripts/fetch-model.sh  # + cross-encoder (see A3)
+#          WITH_SPARSE=1   scripts/fetch-model.sh  # + learned-lexical (sparse) head
 # Then:    make build-onnx
 #          make ingest-onnx ARGS="--spec 33.128"
 #
@@ -15,6 +16,7 @@
 #   ORT_VERSION   ONNX Runtime version  (default 1.26.0 — matches onnxruntime_go v1.30.x / API 25)
 #   MODELS        target dir            (default <repo>/data/models)
 #   WITH_RERANKER fetch the reranker    (default 0; source resolved in A3)
+#   WITH_SPARSE   export/fetch the BGE-M3 sparse head (default 0; SPARSE_ONNX_URL optional)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS="${MODELS:-$ROOT/data/models}"
@@ -139,6 +141,37 @@ if [[ "${WITH_FP16:-0}" == "1" ]]; then
   # tokenizer is precision-independent; the registry's bge-m3-fp16 entry points its
   # tokenizer_dir at the fp32 dir, so no separate tokenizer fetch is required.
   echo "  fp16 ready: EMBED_MODEL=bge-m3-fp16 (validate with TestFP16GateVsFP32 before any bulk run)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. (optional) BGE-M3 export WITH the learned-lexical (sparse) head — model
+#    "bge-m3-sparse" in the embed registry (declares sparse_output). This is the
+#    one model prerequisite that lights up the production sparse arm. BAAI ships no
+#    sparse ONNX, so it is produced by scripts/export-bge-m3-sparse.py (torch +
+#    FlagEmbedding) OR fetched from an operator-supplied, validated URL. Activating
+#    it is ADDITIVE: it only triggers an `embed --sparse-only` pass over existing
+#    clauses — the dense vectors are never recomputed.
+# ---------------------------------------------------------------------------
+if [[ "${WITH_SPARSE:-0}" == "1" ]]; then
+  SP_DIR="$MODELS/bge-m3-sparse"
+  mkdir -p "$SP_DIR"
+  if [[ -n "${SPARSE_ONNX_URL:-}" ]]; then
+    echo "→ bge-m3-sparse ONNX (operator-supplied, must expose [sentence_embedding, sparse_weights])"
+    dl "$SPARSE_ONNX_URL" "$SP_DIR/model.onnx"
+    [[ -n "${SPARSE_DATA_URL:-}" ]] && dl "$SPARSE_DATA_URL" "$SP_DIR/model.onnx_data"
+  elif command -v python3 >/dev/null 2>&1; then
+    echo "→ exporting bge-m3-sparse with scripts/export-bge-m3-sparse.py (torch + FlagEmbedding required)"
+    python3 "$ROOT/scripts/export-bge-m3-sparse.py" --out "$SP_DIR/model.onnx"
+  else
+    echo "WITH_SPARSE=1 but neither SPARSE_ONNX_URL nor python3 is available." >&2
+    echo "  Supply SPARSE_ONNX_URL=<...model.onnx> [SPARSE_DATA_URL=<...model.onnx_data>] WITH_SPARSE=1 $0" >&2
+    echo "  or run scripts/export-bge-m3-sparse.py on a box with torch+FlagEmbedding." >&2
+    exit 2
+  fi
+  # The tokenizer is precision/head-independent; the registry's bge-m3-sparse entry
+  # points its tokenizer_dir at the dense bge-m3 dir, so no separate fetch is needed.
+  echo "  sparse model ready. Make it active (models.yaml: sparse_output: sparse_weights),"
+  echo "  then populate ADDITIVELY (no dense re-embed): embed --db <fused.duckdb> --sparse-only"
 fi
 
 echo "✓ models ready in $MODELS"
