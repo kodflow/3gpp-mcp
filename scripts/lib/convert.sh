@@ -55,31 +55,56 @@ _soffice_html() {
 }
 
 # convert_pdf <pdf> <target_html> [label] — ETSI deliverables are PUBLISHED as
-# digital (text-layer) PDFs. LibreOffice extracts that text layer to HTML — this is
-# TEXT EXTRACTION, not OCR (CLAUDE.md §13's no-OCR lock is preserved): a SCANNED,
-# image-only PDF yields ~no text and is FAILED here, never OCR'd. Same CONV_STATUS
-# contract as convert_doc (clean|fail). The ETSI provenance header is prepended by the
-# caller (scripts/etsi-corpus.sh), which knows the id+version from the work-list.
+# digital (text-layer) PDFs. We extract the TEXT LAYER with poppler's pdftotext —
+# NOT OCR (CLAUDE.md §13's no-OCR lock is preserved): a SCANNED, image-only PDF yields
+# ~no text and is FAILED here, never OCR'd. (LibreOffice/Draw is the WRONG tool for
+# PDF — it rasterises pages; poppler reads the embedded text.) The flat text is then
+# wrapped into the minimal HTML htmlparse expects: lines that begin with a clause
+# number ("6.2.3 Title" / "Annex A …") become <h1>"<num>\t<title>"</h1> so the SAME
+# clause-aware chunker that handles 3GPP HTML also chunks ETSI; other lines become <p>.
+# Same CONV_STATUS contract as convert_doc (clean|fail). The ETSI provenance header is
+# prepended by the caller (scripts/etsi-corpus.sh).
 # Env: ETSI_MIN_TEXT (default 200) — min visible chars for a PDF to count as digital.
 : "${ETSI_MIN_TEXT:=200}"
 convert_pdf() {
-  local pdf="$1" target="$2" label="${3:-$2}" produced visible
+  local pdf="$1" target="$2" label="${3:-$2}" txt visible
   mkdir -p "$(dirname "$target")"
   export CONV_STATUS=fail
-  # NB: no `local` on this line, or we'd capture local's rc, not soffice's.
-  if ! produced="$(_soffice_html "$pdf")"; then
-    return 1
+  command -v pdftotext >/dev/null 2>&1 || { echo "convert_pdf: pdftotext (poppler-utils) missing" >&2; return 1; }
+  txt="$(mktemp)"
+  # -layout keeps the visual column order; -enc UTF-8 for clause text. No OCR option
+  # is ever passed — pdftotext only reads an existing text layer.
+  if ! pdftotext -layout -enc UTF-8 "$pdf" "$txt" 2>/dev/null; then
+    rm -f "$txt"; return 1
   fi
-  # Text-layer guard: strip tags and whitespace, count the remaining visible chars.
-  # A digital PDF carries the clause text; a scan carries only <img> → near-zero.
-  visible="$(sed -e 's/<[^>]*>//g' "$produced" | tr -d '[:space:]' | wc -c | tr -dc '0-9')"
+  visible="$(tr -d '[:space:]' <"$txt" | wc -c | tr -dc '0-9')"
   if [ "${visible:-0}" -lt "$ETSI_MIN_TEXT" ]; then
-    rm -rf "$(dirname "$produced")" 2>/dev/null || true
+    rm -f "$txt"
     echo "convert_pdf: $label has no text layer (${visible:-0} chars) — REFUSING (no OCR)" >&2
-    return 1   # scanned/image-only PDF: fail honest, never OCR
+    return 1 # scanned/image-only PDF: fail honest, never OCR
   fi
-  mv -f "$produced" "$target"; rm -rf "$(dirname "$produced")"
-  CONV_STATUS=clean; return 0
+  # Flat text -> minimal HTML. awk wraps clause-number / Annex lines as <h1> with a TAB
+  # between number and title (the "<num>\t<title>" shape htmlparse's heading regex
+  # expects); everything else is a <p>. HTML-escape &,<,> first.
+  {
+    printf '<html><body>\n'
+    sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$txt" | awk '
+      /^[[:space:]]*[0-9]+(\.[0-9]+)*[[:space:]]+[^[:space:]].*/ {
+        line=$0; sub(/^[[:space:]]+/, "", line)
+        n=line; sub(/[[:space:]].*$/, "", n)           # the clause number
+        t=line; sub(/^[^[:space:]]+[[:space:]]+/, "", t) # the title
+        printf "<h1>%s\t%s</h1>\n", n, t; next
+      }
+      /^[[:space:]]*Annex[[:space:]]+[A-Z][0-9]*/ {
+        line=$0; sub(/^[[:space:]]+/, "", line); printf "<h1>%s</h1>\n", line; next
+      }
+      /[^[:space:]]/ { line=$0; sub(/^[[:space:]]+/, "", line); printf "<p>%s</p>\n", line }
+    '
+    printf '</body></html>\n'
+  } >"$target"
+  rm -f "$txt"
+  CONV_STATUS=clean
+  return 0
 }
 
 convert_doc() {
