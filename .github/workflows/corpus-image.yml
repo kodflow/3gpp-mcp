@@ -308,7 +308,10 @@ jobs:
           echo "rebase: original=$orig"
           echo "        old_base=$oldb"
           echo "        new_base=$newb"
-          retry crane rebase --original "$orig" --old_base "$oldb" --new_base "$newb" -t "$dst"
+          # The original image is a POSITIONAL arg (crane >=0.20 deprecated --original
+          # and its cobra Args validator requires >=1 positional: passing --original
+          # alone fails with "requires at least 1 arg(s), only received 0").
+          retry crane rebase "$orig" --old_base "$oldb" --new_base "$newb" -t "$dst"
           # Stamp the consumed 3gpp-data digest (the gate asserts this label).
           retry crane mutate "$dst" --label io.kodflow.3gpp.data.digest="$DATA_DIGEST" -t "$dst"
           reb="$(retry crane digest "$dst")"
