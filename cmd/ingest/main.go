@@ -31,6 +31,7 @@ func main() {
 		series  = flag.String("series", "", "series filter, comma-separated (e.g. 23,33)")
 		spec    = flag.String("spec", "", "spec-id filter, comma-separated (e.g. 33.128,33.127)")
 		parser  = flag.String("parser", "html", "spec parser: html (LibreOffice) | ooxml (direct .docx)")
+		etsi    = flag.Bool("etsi", false, "ETSI corpus mode: derive id/version from the in-body ETSI provenance header (not the 3GPP filename); the series/release filters do not apply")
 		fts     = flag.Bool("fts", true, "build the BM25 FTS index after load")
 		quiet   = flag.Bool("quiet", false, "suppress per-spec progress")
 		count   = flag.Bool("count-only", false, "Phase-0: open -out read-only, print clause embedded/null counts by series as JSON, then exit")
@@ -61,6 +62,7 @@ func main() {
 		Releases:   splitCSV(*release),
 		Series:     splitCSV(*series),
 		SpecIDs:    splitCSV(*spec),
+		ETSI:       *etsi,
 		EnableFTS:  *fts,
 		EmbedFloor: *embFlr,
 		Embedder:   embed.New(),

@@ -67,6 +67,7 @@ type Options struct {
 	Releases   []string // optional: keep only these releases ("Rel-19"); empty = all
 	Series     []string // optional: keep only these series ("33"); empty = all
 	SpecIDs    []string // optional: keep only these spec ids ("33.128"); empty = all
+	ETSI       bool     // ETSI corpus: ids/versions come from the in-body ETSI provenance header (htmlparse), not the 3GPP filename; the series/release filters do not apply.
 	EnableFTS  bool     // build the BM25 index after load
 	EmbedFloor string   // optional: embed ONLY clauses at/above this release ("Rel-15"); empty = embed all. Lexical coverage is unaffected — every clause is still ingested.
 	Embedder   embed.Embedder
@@ -150,23 +151,43 @@ func Run(ctx context.Context, dbPath string, opt Options) (Stats, error) {
 		return st, err
 	}
 	var jobs []ingestJob
-	relSet, serSet, specSet := set(opt.Releases), set(opt.Series), set(opt.SpecIDs)
-	for _, p := range files {
-		base := strings.TrimSuffix(filepath.Base(p), ext)
-		specID, num, release, version, ok := classifyFile(base)
-		if !ok {
-			continue
+	if opt.ETSI {
+		// ETSI mode: the id/version do NOT come from the filename (ETSI deliverables
+		// have no 3GPP "<num>-<code>" name) — htmlparse reads them from the in-body
+		// ETSI provenance header. Build one job per HTML by parsing it for that header;
+		// the 3GPP series/release filters do not apply. (The main loop re-parses; the
+		// ETSI corpus is small, so the double parse is negligible.)
+		for _, p := range files {
+			ps, perr := parse(p)
+			if perr != nil {
+				logf("skip %s: %v", p, perr)
+				continue
+			}
+			if ps.Spec.SpecID == "" {
+				logf("skip %s: no ETSI provenance header", p)
+				continue
+			}
+			jobs = append(jobs, ingestJob{p, ps.Spec.SpecID, ps.Version.Release, ps.Version.Version})
 		}
-		if len(relSet) > 0 && !relSet[release] {
-			continue
+	} else {
+		relSet, serSet, specSet := set(opt.Releases), set(opt.Series), set(opt.SpecIDs)
+		for _, p := range files {
+			base := strings.TrimSuffix(filepath.Base(p), ext)
+			specID, num, release, version, ok := classifyFile(base)
+			if !ok {
+				continue
+			}
+			if len(relSet) > 0 && !relSet[release] {
+				continue
+			}
+			if len(serSet) > 0 && !serSet[num[:2]] {
+				continue
+			}
+			if len(specSet) > 0 && !specSet[specID] && !specSet[num] {
+				continue
+			}
+			jobs = append(jobs, ingestJob{p, specID, release, version})
 		}
-		if len(serSet) > 0 && !serSet[num[:2]] {
-			continue
-		}
-		if len(specSet) > 0 && !specSet[specID] && !specSet[num] {
-			continue
-		}
-		jobs = append(jobs, ingestJob{p, specID, release, version})
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].path < jobs[j].path })
 
