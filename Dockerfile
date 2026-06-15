@@ -189,6 +189,43 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["serve"]
 
+# ---- fulltop: the SMALL top layers of the full image, on the SAME debian base
+# as 3gpp-data, WITHOUT the ~22 GB data layer. CI builds THIS (cheap, ~200 MB, no
+# ENOSPC) then `crane rebase`s it onto 3gpp-data@digest — the data layer is then
+# referenced by digest and NEVER materialised in buildkit (the ENOSPC that killed
+# `FROM ${DATA_IMAGE}` full builds on stock runners). It is `full` minus the
+# FROM-data inheritance and minus the in-image check-data guard: the data-
+# completeness contract is enforced at the data bake (cmd/validate) and asserted by
+# corpus-image via the io.kodflow.3gpp.data.contract label on 3gpp-data — no need to
+# re-read the 22 GB DB at image-build time. base already carries the apt runtime,
+# the mcp user, the (onnx, when BUILD_TAGS=onnx) binary, the entrypoint, the
+# prefetched extensions, ENV/USER/HEALTHCHECK; fulltop adds only the arch-native ORT
+# + provenance ENV. crane rebase keeps THIS image's config (entrypoint/env/user).
+FROM base AS fulltop
+ARG TARGETARCH
+ARG ORT_VERSION=1.26.0
+ARG ORT_SHA256_AMD64
+ARG ORT_SHA256_ARM64
+ARG DATA_CREATED=unknown
+ARG SOURCE_CORPUS=unknown
+USER root
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) pkg="onnxruntime-linux-x64-${ORT_VERSION}";     sha="${ORT_SHA256_AMD64}" ;; \
+      arm64) pkg="onnxruntime-linux-aarch64-${ORT_VERSION}"; sha="${ORT_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    test -n "${sha}"; \
+    wget -q -O /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"; \
+    echo "${sha}  /tmp/ort.tgz" | sha256sum -c -; \
+    install -d -o mcp -g mcp /data/mcp-3gpp/models /data/mcp-3gpp/models/onnxruntime; \
+    tar -C /data/mcp-3gpp/models/onnxruntime --strip-components=1 -xzf /tmp/ort.tgz; \
+    chown -R mcp:mcp /data/mcp-3gpp/models/onnxruntime; \
+    rm /tmp/ort.tgz
+ENV MCP3GPP_DATA_CREATED=${DATA_CREATED} \
+    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS}
+USER mcp:mcp
+
 # ---- light: lexical DB.zst baked from the build context ----------------------
 # LAST stage on purpose: a bare `docker build .` (CI image-smoke, casual local
 # builds) defaults to the final stage, and light is the only target that builds
