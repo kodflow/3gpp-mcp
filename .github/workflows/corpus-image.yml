@@ -62,9 +62,12 @@ jobs:
     outputs:
       data_image: ${{ steps.r.outputs.data_image }}
       data_digest: ${{ steps.r.outputs.data_digest }}
+      data_manifest_amd64: ${{ steps.r.outputs.data_manifest_amd64 }}
+      data_manifest_arm64: ${{ steps.r.outputs.data_manifest_arm64 }}
       data_layer_amd64: ${{ steps.r.outputs.data_layer_amd64 }}
       data_layer_arm64: ${{ steps.r.outputs.data_layer_arm64 }}
       data_created: ${{ steps.r.outputs.data_created }}
+      data_contract: ${{ steps.r.outputs.data_contract }}
       source_corpus: ${{ steps.r.outputs.source_corpus }}
       ort_version: ${{ steps.r.outputs.ort_version }}
       ort_sha_amd64: ${{ steps.r.outputs.ort_sha_amd64 }}
@@ -101,6 +104,23 @@ jobs:
           # builds (the value is diagnostic, not load-bearing).
           DATA_CREATED="$(crane config "$REPO@$PM_A" | jq -r '.config.Labels["io.kodflow.3gpp.data.created"] // "unknown"')"
           SOURCE_CORPUS="$(crane config "$REPO@$PM_A" | jq -r '.config.Labels["io.kodflow.3gpp.source.corpus"] // "unknown"')"
+          # COMPLETENESS GATE (label-based, NO 22 GB read): the data bake stamps
+          # io.kodflow.3gpp.data.contract with the level it PASSED (cmd/validate). The
+          # mcp image must only be built on a layer that meets the level this repo
+          # currently requires (vars.DATA_CONTRACT, default dense). A legacy data image
+          # with no label, or a level below the requirement, fails here — the cheap
+          # equivalent of the old in-image check-data guard, minus materialising the DB.
+          DATA_CONTRACT="$(crane config "$REPO@$PM_A" | jq -r '.config.Labels["io.kodflow.3gpp.data.contract"] // ""')"
+          WANT_CONTRACT="${{ vars.DATA_CONTRACT || 'dense' }}"
+          if [ -z "$DATA_CONTRACT" ]; then
+            # TRANSITION: a 3gpp-data image baked before the contract label existed.
+            # Don't block (the bake still enforced FTS/HNSW; the label-gate activates
+            # once the data image is re-baked with corpus-data-image's stamp). Warn loud.
+            echo "::warning::3gpp-data carries NO io.kodflow.3gpp.data.contract label (legacy bake) — proceeding; the completeness gate enforces once the data image is re-baked."
+          elif [ "$DATA_CONTRACT" != "$WANT_CONTRACT" ]; then
+            echo "::error::3gpp-data contract label='$DATA_CONTRACT' != required '$WANT_CONTRACT' — the data layer is not at the required completeness level (re-bake the data image, or lower vars.DATA_CONTRACT). Refusing to build the mcp image on an under-complete layer."
+            exit 1
+          fi
           # ORT pins single-sourced from scripts/fetch-model.sh (ort_pin_test keeps
           # them in lockstep with the Go DefaultORTVersion).
           ORT_V="$(grep -oE 'ORT_VERSION:-[0-9.]+' scripts/fetch-model.sh | head -1 | cut -d- -f2)"
@@ -110,9 +130,12 @@ jobs:
           {
             echo "data_image=$REPO@$DATA_DIGEST"
             echo "data_digest=$DATA_DIGEST"
+            echo "data_manifest_amd64=$PM_A"
+            echo "data_manifest_arm64=$PM_R"
             echo "data_layer_amd64=$DATA_LAYER_A"
             echo "data_layer_arm64=$DATA_LAYER_R"
             echo "data_created=$DATA_CREATED"
+            echo "data_contract=$DATA_CONTRACT"
             echo "source_corpus=$SOURCE_CORPUS"
             echo "ort_version=$ORT_V"
             echo "ort_sha_amd64=$SHA_A"
@@ -186,41 +209,20 @@ jobs:
           rm -f image-data/3gpp.duckdb
           du -sh image-data/* 2>/dev/null || true
 
-      # DISK: the `full` build inherits the ~14 GB data layer via `FROM ${DATA_IMAGE}`,
-      # which buildkit pulls into Docker's data-root. On the stock amd64 runner that
-      # ENOSPC-kills the agent ("No space left on device") — intermittently, depending
-      # on the runner's free space. Reclaim the hosted toolcache cruft and relocate
-      # Docker's data-root to the big ephemeral /mnt disk BEFORE buildkit starts, the
-      # same proven recipe corpus-data-image.yml uses for its bake. Full variant only
-      # (light bakes a small lexical zst and never pulls the data layer). Guarded no-op
-      # when /mnt is absent/small.
-      - name: Free disk + relocate Docker to /mnt (full inherits a ~14 GB data layer)
+      # crane: the `full` image is assembled by REBASE, not by `FROM ${DATA_IMAGE}`.
+      # We build only the small top layers (target: fulltop, ~200 MB) then crane-rebase
+      # them onto 3gpp-data@digest — the ~22 GB data layer is referenced by digest and
+      # NEVER materialised in buildkit (that materialisation is what ENOSPC-killed the
+      # old full build on stock runners, even with Docker on /mnt). crane streams blobs
+      # by reference (cross-repo mount within GHCR), so a full build is now ~light-sized
+      # on disk. Install it on the full leg only.
+      - name: Install crane (rebase the full image onto the data layer, disk-safe)
         if: matrix.variant == 'full'
         run: |
           set -euo pipefail
-          echo "disk before:"; df -h / /mnt 2>/dev/null | tail -2 || true
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift \
-            /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/local/lib/node_modules /opt/microsoft 2>/dev/null || true
-          sudo docker image prune -af 2>/dev/null || true
-          sudo apt-get clean 2>/dev/null || true
-          free_mnt=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
-          if [ "${free_mnt:-0}" -ge 40 ]; then
-            sudo systemctl stop docker
-            sudo mkdir -p /mnt/docker /etc/docker
-            if [ -s /etc/docker/daemon.json ]; then
-              sudo jq '. + {"data-root":"/mnt/docker"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
-              sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
-            else
-              echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
-            fi
-            sudo systemctl start docker
-            docker info --format 'docker data-root: {{.DockerRootDir}}'
-          else
-            echo "/mnt absent or <40GB free (${free_mnt:-0}GB) — keeping the default data-root"
-          fi
-          echo "disk after:"; df -h / /mnt 2>/dev/null | tail -2 || true
+          source scripts/lib/retry.sh
+          retry bash -c "curl -fsSL 'https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz' | sudo tar -xz -C /usr/local/bin crane"
+          crane version
 
       # not hard-fail on a transient Docker Hub timeout (the exact class of break
       # that killed the scheduled corpus build). build-push then finds it cached.
@@ -250,41 +252,24 @@ jobs:
           labels: |
             org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in (PRIVATE)
             io.kodflow.3gpp.data.digest=${{ needs.resolve.outputs.data_digest }}
-      # Data-completeness contract for the full-stage check-data guard. On a CODE push
-      # we publish :edge and must NEVER move :latest, so the guard stays LENIENT
-      # (FTS+HNSW) — a code change is never blocked by data-campaign convergence. On
-      # the latest-moving paths (post-data-bake workflow_run / manual dispatch) we
-      # enforce the FULL contract (dense-complete + sparse + … per scripts/
-      # data-contract.sh), so :latest can only sit on a complete data layer.
-      - name: Resolve data-completeness contract flags
-        id: contract
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
-            flags="--require-fts --require-hnsw"
-          else
-            flags="$(DATA_CONTRACT='${{ vars.DATA_CONTRACT }}' DATA_EMBED_FLOOR='${{ vars.DATA_EMBED_FLOOR }}' bash scripts/data-contract.sh)"
-          fi
-          echo "flags=$flags" | tee -a "$GITHUB_OUTPUT"
       # Build the SINGLE-arch image and push it BY DIGEST (no tags here — the `manifest`
       # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
       # the per-arch push a plain manifest so `imagetools` composes it cleanly.
-      # target = the variant: `light` bakes image-data/ (zst), `full` inherits the
-      # ~14 GB data layer from 3gpp-data@digest via `FROM ${DATA_IMAGE}` (the
-      # arch-native leg picks the matching platform's data layer).
+      # target: `light` bakes image-data/ (zst); `full` builds the SMALL `fulltop` stage
+      # (FROM the shared debian base, NO data layer) — the data layer is grafted on by
+      # the crane rebase step below, never materialised in buildkit (disk-safe).
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         id: build
         with:
           context: .
           file: Dockerfile
-          target: ${{ matrix.variant }}
+          target: ${{ matrix.variant == 'full' && 'fulltop' || matrix.variant }}
           platforms: linux/${{ matrix.arch }}
           build-args: |
             BUILD_TAGS=${{ matrix.build_tags }}
             VARIANT=${{ matrix.variant }}
             VERSION=${{ github.sha }}
             DATA_IMAGE=${{ needs.resolve.outputs.data_image }}
-            DATA_CONTRACT_FLAGS=${{ steps.contract.outputs.flags }}
             DATA_CREATED=${{ needs.resolve.outputs.data_created }}
             SOURCE_CORPUS=${{ needs.resolve.outputs.source_corpus }}
             ORT_VERSION=${{ needs.resolve.outputs.ort_version }}
@@ -293,11 +278,52 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/3gpp-mcp,push-by-digest=true,name-canonical=true,push=${{ github.event.inputs.push != 'false' }}
+
+      # REBASE (full only): graft the just-built fulltop layers onto 3gpp-data@<arch>
+      # by reference. crane streams blobs (cross-repo mount in GHCR) — the ~22 GB data
+      # layer is NEVER pulled/extracted locally, so this is disk-safe on a stock runner.
+      # Both fulltop and 3gpp-data share the SAME pinned debian base, so old_base→new_base
+      # is a clean swap. The consumed data digest is stamped as a label (the gate asserts
+      # it). The rebased per-arch digest replaces the fulltop digest for the manifest job.
+      - name: Rebase full onto 3gpp-data (crane, disk-safe)
+        id: rebase
+        if: ${{ matrix.variant == 'full' && github.event.inputs.push != 'false' }}
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          DATA_REPO: ghcr.io/${{ github.repository_owner }}/3gpp-data
+          NEW_BASE_DIGEST: ${{ matrix.arch == 'amd64' && needs.resolve.outputs.data_manifest_amd64 || needs.resolve.outputs.data_manifest_arm64 }}
+          DATA_DIGEST: ${{ needs.resolve.outputs.data_digest }}
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          deb="$(grep -oE 'debian:bookworm-slim@sha256:[0-9a-f]+' Dockerfile | head -1)"
+          test -n "$deb" || { echo "::error::could not read the debian base pin from Dockerfile"; exit 1; }
+          oldb="debian:bookworm-slim@$(retry crane digest --platform linux/${{ matrix.arch }} "$deb")"
+          orig="$REPO@${{ steps.build.outputs.digest }}"
+          newb="$DATA_REPO@$NEW_BASE_DIGEST"
+          # Fixed per-arch staging tag (overwritten each run; the docker-image
+          # concurrency group serialises runs). The manifest job references the
+          # rebased image BY DIGEST, so this tag is just a transient handle.
+          dst="$REPO:reb-staging-${{ matrix.arch }}"
+          echo "rebase: original=$orig"
+          echo "        old_base=$oldb"
+          echo "        new_base=$newb"
+          retry crane rebase --original "$orig" --old_base "$oldb" --new_base "$newb" -t "$dst"
+          # Stamp the consumed 3gpp-data digest (the gate asserts this label).
+          retry crane mutate "$dst" --label io.kodflow.3gpp.data.digest="$DATA_DIGEST" -t "$dst"
+          reb="$(retry crane digest "$dst")"
+          echo "rebased $orig -> $reb (data $NEW_BASE_DIGEST)"
+          echo "digest=$reb" | tee -a "$GITHUB_OUTPUT"
+
       - name: Export digest for the manifest job
         if: ${{ github.event.inputs.push != 'false' }}
         run: |
           mkdir -p /tmp/digests
-          d='${{ steps.build.outputs.digest }}'
+          if [ "${{ matrix.variant }}" = "full" ]; then
+            d='${{ steps.rebase.outputs.digest }}'   # the rebased (data-bearing) image
+          else
+            d='${{ steps.build.outputs.digest }}'
+          fi
           touch "/tmp/digests/${d#sha256:}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ github.event.inputs.push != 'false' }}

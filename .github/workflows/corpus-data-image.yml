@@ -393,6 +393,10 @@ jobs:
             echo "created=$(date -u +%FT%TZ)"
             echo "datetag=$(date -u +%F)"
             echo "source_corpus=${SRC_CORPUS:-unknown}"
+            # The data-completeness contract level this layer PASSED (cmd/validate just
+            # ran it). Stamped as a label below so the mcp image can assert completeness
+            # by LABEL — no need to re-read the ~22 GB DB at image-build time.
+            echo "contract=${{ vars.DATA_CONTRACT || 'dense' }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Disk before image build (visibility)
@@ -470,6 +474,7 @@ jobs:
               --label io.kodflow.3gpp.duckdb.rows="${{ steps.bake.outputs.rows }}" \
               --label io.kodflow.3gpp.source.corpus="${{ steps.bake.outputs.source_corpus }}" \
               --label io.kodflow.3gpp.bake.recipe="$RECIPE" \
+              --label io.kodflow.3gpp.data.contract="${{ steps.bake.outputs.contract }}" \
               -t "$REPO:stage-$arch"
             d="$(retry crane digest "$REPO:stage-$arch")"
             test -n "$d" || { echo "::error::no digest for linux/$arch"; exit 1; }
