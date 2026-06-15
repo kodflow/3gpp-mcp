@@ -24,7 +24,8 @@ func TestExtractLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Parent, sort-header (?C=...) must be dropped; the four version dirs kept.
-	want := map[string]bool{"01.01.01_60/": true, "01.21.01_60/": true, "01.22.00_30/": true, "01.04.01_60/": true}
+	// ExtractLinks now returns the child NAME (trailing slash stripped).
+	want := map[string]bool{"01.01.01_60": true, "01.21.01_60": true, "01.22.00_30": true, "01.04.01_60": true}
 	if len(got) != len(want) {
 		t.Fatalf("links=%v, want the %d version dirs only", got, len(want))
 	}
@@ -32,6 +33,40 @@ func TestExtractLinks(t *testing.T) {
 		if !want[l] {
 			t.Errorf("unexpected link %q (parent/sort header should be filtered)", l)
 		}
+	}
+}
+
+// the REAL etsi.org portal renders version subdirs as ABSOLUTE hrefs, not relative
+// names. Dropping absolute hrefs (the original bug) made the live crawl resolve zero
+// versions ⇒ empty work-list ⇒ 0 clauses. ExtractLinks must reduce each absolute href
+// to its child name so LatestPublished can pick the newest milestone-60 version.
+const portalListing = `<html><body>
+<a HREF="/deliver/etsi_ts/103200_103299/">Parent</a>
+<a HREF="/deliver/etsi_ts/103200_103299/10322101/01.01.01_60/">01.01.01_60</a>
+<a HREF="/deliver/etsi_ts/103200_103299/10322101/01.21.01_60/">01.21.01_60</a>
+<a HREF="/deliver/etsi_ts/103200_103299/10322101/01.22.00_30/">01.22.00_30</a>
+</body></html>`
+
+func TestExtractLinksAbsolutePortalHrefs(t *testing.T) {
+	got, err := ExtractLinks(strings.NewReader(portalListing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The parent range dir reduces to "103200_103299" (harmless: fails ParseVersionDir);
+	// the three version dirs reduce to their names.
+	want := map[string]bool{"103200_103299": true, "01.01.01_60": true, "01.21.01_60": true, "01.22.00_30": true}
+	if len(got) != len(want) {
+		t.Fatalf("links=%v, want %d entries (range dir + 3 version dirs)", got, len(want))
+	}
+	for _, l := range got {
+		if !want[l] {
+			t.Errorf("unexpected child name %q", l)
+		}
+	}
+	// And end-to-end: the latest PUBLISHED version is 1.21.1 (the _30 draft is skipped).
+	v, ok := LatestPublished(got)
+	if !ok || v.String() != "1.21.1" {
+		t.Fatalf("LatestPublished=%v ok=%v, want 1.21.1", v.String(), ok)
 	}
 }
 
