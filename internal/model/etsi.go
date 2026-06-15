@@ -91,6 +91,13 @@ func EtsiDeliverURL(id, version string) string {
 	return fmt.Sprintf("%s/%s/ts_%sv%sp.pdf", base, verFolder, token, verToken)
 }
 
+// ParseEtsiVersion splits an ETSI version "V1.21.1" / "1.21.1" into its three numeric
+// parts (exported for the ETSI discover/diff in internal/etsicat). ok is false unless
+// exactly three components parse.
+func ParseEtsiVersion(version string) (major, minor, editorial int, ok bool) {
+	return parseEtsiVersion(version)
+}
+
 // parseEtsiVersion splits an ETSI version "V1.21.1" / "1.21.1" into its three
 // numeric parts. ok is false unless exactly three components parse, so a partial or
 // 3GPP-style version never produces a wrong deliver URL.
