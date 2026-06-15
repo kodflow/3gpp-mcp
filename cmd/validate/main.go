@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
+	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -41,6 +42,8 @@ func main() {
 		requireFTS    = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
 		requireHNSW   = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
 		requireSparse = flag.Bool("require-sparse", false, "fail unless the sparse (clause_sparse) postings are populated (sparse-enabled bakes only)")
+		requireEmbed  = flag.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence; floor-aware, unlike --pending-zero)")
+		embedFloor    = flag.String("embed-floor", "", "release floor for --require-embed-complete (e.g. Rel-99); empty = all releases. Below-floor/legacy clauses are intentionally NULL and never counted.")
 		embeddingDim  = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
 		minClauses    = flag.Int("min-clauses", 0, "if >0, fail unless clause count >= this (anti-shrink guard)")
 		expRels       = flag.String("expected-releases", "", "comma-separated set; fail unless the DB's releases == this set exactly")
@@ -56,6 +59,7 @@ func main() {
 
 	res := runChecks(context.Background(), checkCfg{
 		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW, requireSparse: *requireSparse,
+		requireEmbedComplete: *requireEmbed, embedFloor: *embedFloor,
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
@@ -83,6 +87,8 @@ type checkCfg struct {
 	db                                         string
 	pendingZero, requireFTS, requireHNSW       bool
 	requireSparse                              bool
+	requireEmbedComplete                       bool
+	embedFloor                                 string
 	embeddingDim, minClauses                   int
 	expectedReleases                           []string
 	expectedIdentity, zst, sha, repoVisibility string
@@ -161,6 +167,26 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 			res.add("pending-zero", false, "count null embeddings: %v", err)
 		} else {
 			res.add("pending-zero", n == 0, "null_embeddings=%d", n)
+		}
+	}
+
+	// require-embed-complete (dense convergence): no clause at/above the floor still
+	// NULL. Floor-aware via the SAME oracle cmd/embed uses (CountNullAtFloor), so
+	// intentionally-skipped below-floor/legacy clauses never count as a failure — the
+	// right "dense is done" signal for a floored corpus (unlike global pending-zero).
+	if cfg.requireEmbedComplete {
+		floorOrd := 0
+		if cfg.embedFloor != "" {
+			if o, ok := model.ReleaseOrdinal(cfg.embedFloor); ok {
+				floorOrd = o
+			} else {
+				res.add("require-embed-complete", false, "unparseable --embed-floor %q", cfg.embedFloor)
+			}
+		}
+		if n, err := db.CountNullAtFloor(ctx, floorOrd, ""); err != nil {
+			res.add("require-embed-complete", false, "count null at floor: %v", err)
+		} else {
+			res.add("require-embed-complete", n == 0, "null_at_floor=%d (floor=%q)", n, cfg.embedFloor)
 		}
 	}
 

@@ -214,6 +214,22 @@ jobs:
           labels: |
             org.opencontainers.image.description=3GPP MCP server with the corpus DB baked in (PRIVATE)
             io.kodflow.3gpp.data.digest=${{ needs.resolve.outputs.data_digest }}
+      # Data-completeness contract for the full-stage check-data guard. On a CODE push
+      # we publish :edge and must NEVER move :latest, so the guard stays LENIENT
+      # (FTS+HNSW) — a code change is never blocked by data-campaign convergence. On
+      # the latest-moving paths (post-data-bake workflow_run / manual dispatch) we
+      # enforce the FULL contract (dense-complete + sparse + … per scripts/
+      # data-contract.sh), so :latest can only sit on a complete data layer.
+      - name: Resolve data-completeness contract flags
+        id: contract
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            flags="--require-fts --require-hnsw"
+          else
+            flags="$(DATA_CONTRACT='${{ vars.DATA_CONTRACT }}' DATA_EMBED_FLOOR='${{ vars.DATA_EMBED_FLOOR }}' bash scripts/data-contract.sh)"
+          fi
+          echo "flags=$flags" | tee -a "$GITHUB_OUTPUT"
       # Build the SINGLE-arch image and push it BY DIGEST (no tags here — the `manifest`
       # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
       # the per-arch push a plain manifest so `imagetools` composes it cleanly.
@@ -232,6 +248,7 @@ jobs:
             VARIANT=${{ matrix.variant }}
             VERSION=${{ github.sha }}
             DATA_IMAGE=${{ needs.resolve.outputs.data_image }}
+            DATA_CONTRACT_FLAGS=${{ steps.contract.outputs.flags }}
             DATA_CREATED=${{ needs.resolve.outputs.data_created }}
             SOURCE_CORPUS=${{ needs.resolve.outputs.source_corpus }}
             ORT_VERSION=${{ needs.resolve.outputs.ort_version }}
@@ -265,12 +282,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Tag discipline: a CODE push publishes ONLY the *-edge tag (never moves the
+          # pullable moving tag), so a code change can never put :latest on top of a
+          # stale/incomplete data layer. The moving tags (light / latest / full) move
+          # only on the latest-publishing paths (post-data-bake workflow_run / manual
+          # dispatch). enable= is resolved at matrix-expansion time from github.event.
           - variant: light
-            tag_lines: type=raw,value=light
+            tag_lines: |
+              type=raw,value=light,enable=${{ github.event_name != 'push' }}
+              type=raw,value=light-edge,enable=${{ github.event_name == 'push' }}
           - variant: full
             tag_lines: |
-              type=raw,value=latest
-              type=raw,value=full
+              type=raw,value=latest,enable=${{ github.event_name != 'push' }}
+              type=raw,value=full,enable=${{ github.event_name != 'push' }}
+              type=raw,value=edge,enable=${{ github.event_name == 'push' }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -302,7 +327,15 @@ jobs:
           docker buildx imagetools create $tags $(printf "${REPO}@sha256:%s " *)
       - name: Verify multi-arch
         run: |
-          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:${{ matrix.variant == 'full' && 'latest' || 'light' }}" \
+          set -euo pipefail
+          # Inspect the tag actually published this run: moving tag on the latest paths,
+          # the *-edge tag on a code push (tag discipline).
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${{ matrix.variant == 'full' && 'edge' || 'light-edge' }}"
+          else
+            tag="${{ matrix.variant == 'full' && 'latest' || 'light' }}"
+          fi
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:$tag" \
             | grep -E "Platform|MediaType" | head
       # COORDINATION / DEPLOY SIGNAL — record exactly which mcp image was published
       # and which (indexed) data layer it carries, plus the human action still
@@ -314,9 +347,25 @@ jobs:
         run: |
           set -euo pipefail
           REPO=ghcr.io/${{ github.repository_owner }}/3gpp-mcp
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # CODE push: only :edge moved. :latest (the pullable prod tag) is UNCHANGED
+            # and still sits on the last COMPLETE data layer — no redeploy implied.
+            DIG="$(docker buildx imagetools inspect "$REPO:edge" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+            {
+              echo "## 3gpp-mcp:edge published (code change) — :latest UNCHANGED"
+              echo ""
+              echo "| field | value |"
+              echo "|---|---|"
+              echo "| edge image | \`$REPO:edge\` ($DIG) |"
+              echo "| guard | lenient (FTS+HNSW) — code push does not enforce the full data contract |"
+              echo ""
+              echo "The pullable \`:latest\` was NOT moved. It only advances after a COMPLETE data bake (workflow_run path). No redeploy required for this code change."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           DIG="$(docker buildx imagetools inspect "$REPO:latest" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
           {
-            echo "## 3gpp-mcp:full published — DEPLOY required"
+            echo "## 3gpp-mcp:full published on a COMPLETE data layer — DEPLOY required"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
@@ -325,7 +374,7 @@ jobs:
             echo "| data baked | ${{ needs.resolve.outputs.data_created }} |"
             echo "| source corpus | \`${{ needs.resolve.outputs.source_corpus }}\` |"
             echo ""
-            echo "The **check-data** inheritance guard already proved this image's data layer is fully indexed (FTS + frozen HNSW)."
+            echo "The **check-data** guard proved this image's data layer meets the completeness contract (FTS + frozen HNSW + dense-complete + contract level)."
             echo "**Action**: on the labs host \`docker pull $REPO:latest\` then restart the container to serve this layer."
             echo "Verify after restart: \`curl -s https://labs.making.codes/dashboard.json?token=… | jq '{hnsw_state,fts_index_present,data_image_created}'\` → expect \`hnsw_state:\"frozen\"\`, \`fts_index_present:true\`."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -362,7 +411,13 @@ jobs:
           source scripts/lib/retry.sh
           retry bash -c "curl -fsSL 'https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz' | sudo tar -xz -C /usr/local/bin crane"
           retry bash -c 'printf %s "$GHCR_PAT" | crane auth login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
-          REF="ghcr.io/${{ github.repository_owner }}/3gpp-mcp:latest"
+          # Assert against the tag actually published this run (tag discipline): the
+          # moving :latest on the latest paths, :edge on a code push.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            REF="ghcr.io/${{ github.repository_owner }}/3gpp-mcp:edge"
+          else
+            REF="ghcr.io/${{ github.repository_owner }}/3gpp-mcp:latest"
+          fi
           fail=0
           for arch in amd64 arm64; do
             case "$arch" in

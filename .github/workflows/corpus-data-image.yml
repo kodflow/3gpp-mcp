@@ -369,6 +369,19 @@ jobs:
           CGO_ENABLED=1 go run ./cmd/freeze-hnsw --db image-data/3gpp.duckdb
           sudo swapoff /mnt/hnsw-swap 2>/dev/null || true; sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
           echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
+          # AUTHORITATIVE COMPLETENESS GATE — the data layer is now final (fused +
+          # compacted + frozen). Assert the FULL contract BEFORE anything is pushed, so
+          # 3gpp-data:latest can NEVER move onto an incomplete layer (dense not
+          # converged at floor, or — once DATA_CONTRACT=dense+sparse — sparse missing/
+          # stale). A failure here fails the bake job → no push → :latest unchanged.
+          # Single source of truth shared with the mcp image guard (scripts/data-contract.sh).
+          CONTRACT_FLAGS="$(DATA_CONTRACT='${{ vars.DATA_CONTRACT }}' DATA_EMBED_FLOOR="${{ vars.DATA_EMBED_FLOOR || 'Rel-99' }}" bash scripts/data-contract.sh)"
+          echo "data-completeness contract: $CONTRACT_FLAGS"
+          # shellcheck disable=SC2086
+          # NOTE: when DATA_CONTRACT includes sparse, build with -tags onnx so
+          # --require-sparse is identity-aware (the bake job already links ORT); the
+          # default dense contract needs no ONNX, matching the validate calls above.
+          CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb $CONTRACT_FLAGS --min-clauses 1
           go clean -cache -testcache -modcache 2>/dev/null || true
           rm -rf /tmp/dk /tmp/duckdb.zip /mnt/compact-scratch 2>/dev/null || true
           du -sh image-data image-data/* 2>/dev/null || true
