@@ -64,6 +64,65 @@ func TestRingBoundsMemory(t *testing.T) {
 	}
 }
 
+func TestRecentNewestFirstAndClamp(t *testing.T) {
+	c := New()
+	base := time.Unix(4_000_000*secPerHour, 0)
+	c.now = func() time.Time { return base }
+	for i := 0; i < 5; i++ {
+		c.Record(ReqLog{Method: "POST", Tool: "search_spec", Query: "q", DurMs: float64(i)})
+	}
+	// Default limit when non-positive.
+	if got := c.Recent(0); len(got) != 5 {
+		t.Fatalf("Recent(0) len=%d, want 5 (default)", len(got))
+	}
+	got := c.Recent(3)
+	if len(got) != 3 {
+		t.Fatalf("Recent(3) len=%d, want 3", len(got))
+	}
+	// Newest first: the last Recorded (DurMs=4) must come first.
+	if got[0].DurMs != 4 || got[1].DurMs != 3 || got[2].DurMs != 2 {
+		t.Errorf("order=%v, want newest-first [4 3 2]", []float64{got[0].DurMs, got[1].DurMs, got[2].DurMs})
+	}
+	// T is stamped from the clock when zero.
+	if got[0].T != base.Unix() {
+		t.Errorf("T=%d, want %d (stamped from clock)", got[0].T, base.Unix())
+	}
+}
+
+func TestRecentRingEvictsOldest(t *testing.T) {
+	c := New()
+	base := time.Unix(5_000_000*secPerHour, 0)
+	c.now = func() time.Time { return base }
+	// Overfill the ring; only the last recentCap entries survive, newest first.
+	for i := 0; i < recentCap+10; i++ {
+		c.Record(ReqLog{Method: "POST", DurMs: float64(i)})
+	}
+	got := c.Recent(recentCap + 100) // clamp to recentCap
+	if len(got) != recentCap {
+		t.Fatalf("len=%d, want %d (ring bounded)", len(got), recentCap)
+	}
+	// Newest is the last Recorded (recentCap+9); oldest survivor is index 10.
+	if got[0].DurMs != float64(recentCap+9) {
+		t.Errorf("newest=%.0f, want %d", got[0].DurMs, recentCap+9)
+	}
+	if got[len(got)-1].DurMs != 10 {
+		t.Errorf("oldest survivor=%.0f, want 10", got[len(got)-1].DurMs)
+	}
+}
+
+func TestRecordTruncatesQuery(t *testing.T) {
+	c := New()
+	long := make([]rune, queryMax+50)
+	for i := range long {
+		long[i] = 'é' // multibyte, to exercise rune-safety
+	}
+	c.Record(ReqLog{Query: string(long)})
+	got := c.Recent(1)
+	if len([]rune(got[0].Query)) != queryMax+1 { // +1 for the ellipsis
+		t.Errorf("query rune len=%d, want %d (truncated + ellipsis)", len([]rune(got[0].Query)), queryMax+1)
+	}
+}
+
 func TestTimeseriesRolls(t *testing.T) {
 	c := New()
 	cur := time.Unix(3_000_000*secPerHour, 0)

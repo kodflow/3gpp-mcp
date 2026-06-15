@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -26,7 +27,7 @@ import (
 // return narrow). Overridable via RERANK_WINDOW: on a CPU-only box each reranked
 // candidate is a cross-encoder forward pass, so the window is the rerank
 // latency/quality dial — widen it for recall, narrow it to protect p99.
-const rerankWindow = 20
+const rerankWindow = 12
 
 // rerankWindowFor returns the effective rerank window: RERANK_WINDOW when set to a
 // positive int (clamped to a sane ceiling so a fat-fingered value can't turn the
@@ -38,6 +39,31 @@ func rerankWindowFor() int {
 		}
 	}
 	return rerankWindow
+}
+
+// defaultSearchBudget caps the wall-clock a single query may spend across all
+// arms. On a CPU-only box each ONNX pass (query embed, cross-encoder rerank) is
+// multi-second and the ORT session is mutex-serialised, so a burst of concurrent
+// queries can queue into the minute range and hit the edge proxy timeout. The
+// budget makes a query DEGRADE (return the fusion it already has) instead of
+// running unbounded — degrade, never block (CLAUDE.md §1).
+const defaultSearchBudget = 20 * time.Second
+
+// searchBudgetFor returns the per-request budget: SEARCH_BUDGET when set (a Go
+// duration like "8s" or a bare integer of seconds), else the default. A value of
+// "0" (or negative) disables the budget entirely.
+func searchBudgetFor() time.Duration {
+	v := os.Getenv("SEARCH_BUDGET")
+	if v == "" {
+		return defaultSearchBudget
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
+	}
+	return defaultSearchBudget
 }
 
 // vecCandidateN bounds the BM25 candidate pool the no-HNSW vector fallback scores
@@ -205,6 +231,18 @@ type Request struct {
 // r.Mode. Each arm is best-effort; a "semantic" request with no usable vectors
 // degrades to lexical rather than returning nothing (degrade, never block).
 func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, error) {
+	// Per-request time budget: cap the wall-clock the EXPENSIVE arms (CPU query
+	// embed, sparse, cross-encoder rerank) may spend, so a slow pass under
+	// concurrency degrades to whatever it has rather than running to the edge
+	// timeout. The cheap lexical arm always runs on the caller's ctx so an
+	// already-expired budget still returns BM25 results (degrade, never block).
+	bctx := ctx
+	if budget := searchBudgetFor(); budget > 0 {
+		var cancel context.CancelFunc
+		bctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
 	topK := max(r.TopK, 10)
 	wantLex := r.Mode != "semantic" && !e.offLexical.Load()
 	wantVec := r.Mode != "lexical" && !e.offVector.Load()
@@ -217,22 +255,22 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		}
 		lists = append(lists, lex)
 	}
-	if wantVec && e.emb.Enabled() {
-		if vecs, err := e.emb.Embed(ctx, []string{r.Text}); err == nil && len(vecs) == 1 {
+	if wantVec && e.emb.Enabled() && bctx.Err() == nil {
+		if vecs, err := e.emb.Embed(bctx, []string{r.Text}); err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
 			switch {
 			case len(e.vecShards) > 0:
 				// Option B: scatter-gather across the attached per-series sub-bases.
-				vhits, verr = e.st.SearchVectorsSharded(ctx, vecs[0], e.vecShards, r.Filter, topK)
+				vhits, verr = e.st.SearchVectorsSharded(bctx, vecs[0], e.vecShards, r.Filter, topK)
 			case e.st.VSSAvailable() && !e.offHNSW.Load():
-				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // single-DB HNSW
+				vhits, verr = e.st.SearchVectors(bctx, vecs[0], r.Filter, topK) // single-DB HNSW
 			default:
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
 				// never a full-corpus scan.
-				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
+				cand, cerr := e.st.SearchClauses(bctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
 				if cerr == nil {
-					vhits, verr = e.st.SearchVectorsAmong(ctx, vecs[0], chunkIDsOf(cand), topK)
+					vhits, verr = e.st.SearchVectorsAmong(bctx, vecs[0], chunkIDsOf(cand), topK)
 				}
 			}
 			if verr == nil && len(vhits) > 0 {
@@ -243,10 +281,10 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// Sparse (learned-lexical) arm: same gating as the dense arm (any non-"lexical"
 	// mode), independent toggle. Best-effort — embed/score failure just omits the
 	// list (degrade, never block). Fuses into the same RRF as BM25 + dense.
-	wantSparse := r.Mode != "lexical" && !e.offSparse.Load() && e.sp != nil && e.st.SparseAvailable()
+	wantSparse := r.Mode != "lexical" && !e.offSparse.Load() && e.sp != nil && e.st.SparseAvailable() && bctx.Err() == nil
 	if wantSparse {
-		if svecs, err := e.sp.EmbedSparse(ctx, []string{r.Text}); err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
-			if shits, serr := e.st.SearchSparse(ctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
+		if svecs, err := e.sp.EmbedSparse(bctx, []string{r.Text}); err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
+			if shits, serr := e.st.SearchSparse(bctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
 				lists = append(lists, shits)
 			}
 		}
@@ -264,9 +302,9 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 
 	// Optional cross-encoder rerank: re-score a broad window of fused candidates
 	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order.
-	if (r.Rerank || e.rerankAll.Load()) && e.rr.Enabled() && len(hits) > 1 {
+	if (r.Rerank || e.rerankAll.Load()) && e.rr.Enabled() && len(hits) > 1 && bctx.Err() == nil {
 		window := min(rerankWindowFor(), len(hits))
-		if reordered, err := e.rerank(ctx, r.Text, hits[:window]); err == nil {
+		if reordered, err := e.rerank(bctx, r.Text, hits[:window]); err == nil {
 			hits = append(reordered, hits[window:]...)
 		}
 	}

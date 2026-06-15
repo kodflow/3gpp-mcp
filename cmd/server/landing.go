@@ -223,6 +223,7 @@ func startEarlyHTTP(addr string) (markReady func(*mcpserver.MCPServer, *store.St
 	// The page serves from the first instant; the data reports loading until ready.
 	mux.HandleFunc("/dashboard", dashboardPageHandler(dashToken))
 	mux.HandleFunc("/dashboard.json", dashboardJSONHandler(getLive, coll, dashToken))
+	mux.HandleFunc("/dashboard/requests.json", requestsJSONHandler(coll, dashToken))
 	mux.HandleFunc("/dashboard/toggle", toggleHandler(getLive, dashToken))
 	mux.HandleFunc("/", landingHandler)
 

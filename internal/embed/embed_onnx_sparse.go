@@ -54,6 +54,11 @@ func (e *onnxEmbedder) initSparse() {
 // (max per token id; specials + non-positive dropped) — identical post-processing
 // to FlagEmbedding. Returns an error (engine degrades to dense+BM25) when the model
 // has no sparse head.
+// SparseModelID returns the active model's sparse identity (the registry-derived
+// digest, "" when no sparse head) so a --sparse-only run stamps the DB with the
+// exact sparse layer it produced.
+func (*onnxEmbedder) SparseModelID() string { return SparseModelID() }
+
 func (e *onnxEmbedder) EmbedSparse(_ context.Context, texts []string) ([]model.SparseVec, error) {
 	e.initSparse()
 	if e.sparseErr != nil {
