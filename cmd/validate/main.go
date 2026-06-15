@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -187,11 +188,17 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		res.add("require-fts", db.FTSAvailable(), "fts_available=%v", db.FTSAvailable())
 	}
 
-	// require-sparse — the sparse (learned-lexical) arm: clause_sparse populated.
-	// Only set on a sparse-enabled bake; off by default (dense-only DBs pass).
+	// require-sparse — the sparse (learned-lexical) arm: clause_sparse populated AND
+	// the stamped sparse layer matches the build's expected sparse identity (so a
+	// STALE sparse layer — built with an older sparse model — fails the bake gate,
+	// just like the dense embedding_model coherence guard). Only set on a
+	// sparse-enabled bake; off by default (dense-only DBs pass).
 	if cfg.requireSparse {
 		_ = db.LoadSparse(ctx)
-		res.add("require-sparse", db.SparseAvailable(), "sparse_available=%v", db.SparseAvailable())
+		want := embed.SparseModelID() // "" when this build has no sparse head
+		got := db.GetMeta(ctx, "sparse_model")
+		ok := db.SparseAvailable() && (want == "" || got == want)
+		res.add("require-sparse", ok, "sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
 	}
 
 	// catalog coverage: specs that have indexed clauses but no catalog title/WG

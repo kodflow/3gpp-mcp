@@ -63,6 +63,47 @@ func BGEEmbedParts() model.EmbedParts {
 // serve and forced to re-embed by discover, never scored against a fresh query.
 func bgeModelID() string { return model.EmbedIdentity(BGEEmbedParts()) }
 
+// BGESparseParts is the canonical SparseParts for the ACTIVE registry model. It is
+// non-empty only when that model declares a sparse head (sparse_output), so
+// SparseModelID() returns "" for the current dense-only export and a stable digest
+// once a sparse-exported model is made active.
+func BGESparseParts() model.SparseParts {
+	m := ActiveModel()
+	return model.SparseParts{
+		ModelID:           m.Family,
+		ModelRevision:     m.Revision,
+		TokenizerRevision: m.TokenizerRevision,
+		SparseOutput:      m.SparseOutput,
+	}
+}
+
+// SparseModelID is the canonical sparse identity for the active registry model
+// ("" when the model has no sparse head). It is what gets stamped into DB meta
+// (sparse_model) by `embed --sparse-only` and compared at bake/serve time, so a
+// sparse model swap is detected and re-run WITHOUT touching the dense vectors.
+// CGO-free (reads the registry), so discover / embedid / the onnx backend agree.
+func SparseModelID() string { return model.SparseIdentity(BGESparseParts()) }
+
+// SparseCapable reports whether the ACTIVE model declares a sparse head — i.e.
+// whether this build can produce/serve sparse postings at all. False for the
+// current dense-only export.
+func SparseCapable() bool { return ActiveModel().SparseOutput != "" }
+
+// ResolveSparseID maps an embedder FAMILY to the sparse identity that family would
+// stamp ("" when not sparse-capable). Mirrors ResolveModelID for the sparse arm so
+// the bake's self-heal check ("is the served sparse layer the expected one?") is
+// single-sourced with what the embedder writes.
+func ResolveSparseID(family string) string {
+	switch family {
+	case "bge-m3", "bge_m3", "bgem3":
+		return SparseModelID()
+	case "local", "hash", "hash-local":
+		return Local{}.SparseModelID()
+	default:
+		return ""
+	}
+}
+
 // ResolveModelID maps an embedder FAMILY name (as passed by CI, e.g. EMBEDDER /
 // the discover --embed-model flag) to the canonical ModelID() that backend would
 // report. CGO-free: discover (no ONNX) needs the BGE-M3 identity to compare the

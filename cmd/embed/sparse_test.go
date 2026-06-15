@@ -46,6 +46,11 @@ func TestRunSparsePopulatesAndResumes(t *testing.T) {
 	if err := st2.LoadSparse(ctx); err != nil || !st2.SparseAvailable() {
 		t.Fatalf("sparse not available after population (err=%v)", err)
 	}
+	// The sparse layer identity must be stamped so the bake/serve can detect which
+	// sparse model the DB carries (and whether it is missing/stale).
+	if got := st2.GetMeta(ctx, "sparse_model"); got != (embed.Local{}).SparseModelID() {
+		t.Errorf("sparse_model meta=%q, want %q", got, (embed.Local{}).SparseModelID())
+	}
 
 	// Resumability: a second pass finds nothing missing.
 	n2, err := runSparse(ctx, dbPath, embed.Local{}, 8, 0, &buf)
