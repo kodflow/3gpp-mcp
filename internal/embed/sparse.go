@@ -21,6 +21,10 @@ type SparseEmbedder interface {
 	// EmbedSparse returns one post-processed sparse vector per input text
 	// (token_id → weight, specials + non-positive dropped, max per id).
 	EmbedSparse(ctx context.Context, texts []string) ([]model.SparseVec, error)
+	// SparseModelID is the identity of the sparse arm this embedder produces. It is
+	// stamped into DB meta (sparse_model) when `--sparse-only` completes so the bake
+	// and serve can tell which sparse layer (if any) the DB carries.
+	SparseModelID() string
 }
 
 // xlmrSpecialTokens are the BGE-M3 (XLM-RoBERTa) special token ids dropped from
@@ -78,6 +82,11 @@ func (Local) EmbedSparse(_ context.Context, texts []string) ([]model.SparseVec, 
 	}
 	return out, nil
 }
+
+// SparseModelID identifies Local's deterministic sparse arm (distinct from its
+// dense "hash-local"), so a DB populated under EMBEDDER=local carries a meaningful,
+// stable sparse_model marker in tests.
+func (Local) SparseModelID() string { return "hash-local-sparse" }
 
 func sqrt32(x float32) float32 {
 	if x <= 0 {
