@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -315,5 +316,61 @@ func TestEmptyTokenRejectsEverything(t *testing.T) {
 	page(rec, httptest.NewRequest(http.MethodGet, "/dashboard?token=", nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("empty-token page status=%d, want 401 (fail-closed)", rec.Code)
+	}
+}
+
+func TestResolveDashToken(t *testing.T) {
+	cases := []struct {
+		env             string
+		set             bool
+		wantAuthOff     bool
+		wantFixed       bool
+		wantTokenIsEnv  bool // token must equal env verbatim (fixed mode)
+		wantTokenRandom bool // token must be a fresh random (unset mode)
+	}{
+		{set: false, wantTokenRandom: true},
+		{env: "", set: true, wantTokenRandom: true},
+		{env: "off", set: true, wantAuthOff: true},
+		{env: "OFF", set: true, wantAuthOff: true},
+		{env: "none", set: true, wantAuthOff: true},
+		{env: "disabled", set: true, wantAuthOff: true},
+		{env: "0", set: true, wantAuthOff: true},
+		{env: "my-stable-token", set: true, wantFixed: true, wantTokenIsEnv: true},
+	}
+	for _, c := range cases {
+		if c.set {
+			t.Setenv("DASHBOARD_TOKEN", c.env)
+		} else {
+			_ = os.Unsetenv("DASHBOARD_TOKEN")
+		}
+		tok, authOff, fixed := resolveDashToken()
+		if authOff != c.wantAuthOff || fixed != c.wantFixed {
+			t.Errorf("resolveDashToken(%q) authOff=%v fixed=%v, want authOff=%v fixed=%v", c.env, authOff, fixed, c.wantAuthOff, c.wantFixed)
+		}
+		if c.wantAuthOff && tok != dashAuthOpen {
+			t.Errorf("resolveDashToken(%q) token=%q, want dashAuthOpen sentinel", c.env, tok)
+		}
+		if c.wantTokenIsEnv && tok != c.env {
+			t.Errorf("resolveDashToken(%q) token=%q, want verbatim env", c.env, tok)
+		}
+		if c.wantTokenRandom && len(tok) != 20 {
+			t.Errorf("resolveDashToken(%q) token len=%d, want 20 (random)", c.env, len(tok))
+		}
+	}
+}
+
+func TestAuthDisabledOpensDashboard(t *testing.T) {
+	// DASHBOARD_TOKEN=off → resolveDashToken yields the open sentinel → every endpoint
+	// passes WITHOUT a token (the operator's "stop re-fetching the token" knob).
+	t.Setenv("DASHBOARD_TOKEN", "off")
+	tok, authOff, _ := resolveDashToken()
+	if !authOff {
+		t.Fatal("expected authOff=true for DASHBOARD_TOKEN=off")
+	}
+	page := dashboardPageHandler(tok)
+	rec := httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil)) // no ?token=
+	if rec.Code != http.StatusOK {
+		t.Errorf("auth-off page status=%d, want 200 (open, no token)", rec.Code)
 	}
 }
