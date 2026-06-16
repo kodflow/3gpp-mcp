@@ -67,6 +67,10 @@ func TestSplitETSIFederation(t *testing.T) {
 	if got := call(t, c, ctx, "list_releases", map[string]any{"spec_id": "ETSI TS 103 280"}); got["count"].(float64) < 1 {
 		t.Errorf("list_releases(ETSI TS 103 280) found nothing")
 	}
+	// search_spec federates: an ETSI-only term surfaces the ETSI clause via the union.
+	if got := call(t, c, ctx, "search_spec", map[string]any{"query": "dictionary common LI parameters"}); got["count"].(float64) < 1 {
+		t.Errorf("search_spec union found no ETSI hit")
+	}
 	// list_specs unions both corpora.
 	got := call(t, c, ctx, "list_specs", map[string]any{})
 	specs, _ := got["specs"].([]any)

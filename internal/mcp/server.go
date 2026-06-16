@@ -51,7 +51,11 @@ func New(st *store.Store, version, baseline string, vecShards []string, etsi *st
 				"pinned to the baseline release; get_spec also reports new_in_baseline "+
 				"(vs previous release) and added_in_later_releases (annex)."),
 	)
-	h := &handlers{st: st, etsi: etsi, eng: eng, reg: registry.Default(), baseline: baseline, version: version}
+	var etsiEng *search.Engine
+	if etsi != nil {
+		etsiEng = search.New(etsi) // its own single-DB FTS/HNSW; no 3GPP vec shards
+	}
+	h := &handlers{st: st, etsi: etsi, eng: eng, etsiEng: etsiEng, reg: registry.Default(), baseline: baseline, version: version}
 
 	s.AddTool(mcp.NewTool("search_spec",
 		mcp.WithDescription("Hybrid lexical retrieval over clauses, with citations."),
@@ -149,6 +153,7 @@ type handlers struct {
 	st       *store.Store
 	etsi     *store.Store // optional SECOND store over etsi.duckdb (split, not merged); nil = 3GPP only
 	eng      *search.Engine
+	etsiEng  *search.Engine // search engine over the ETSI store; nil = 3GPP only
 	reg      *subject.Registry
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
@@ -258,10 +263,29 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	// Over-fetch the page window + 1 to detect "more exists" without a count.
-	hits, err := h.eng.Search(ctx, search.Request{
-		Text: q, Filter: filter, TopK: offset + pageSize + 1,
-		Mode: r.GetString("mode", ""), Rerank: r.GetBool("rerank", false),
-	})
+	mode, rerank := r.GetString("mode", ""), r.GetBool("rerank", false)
+	want := offset + pageSize + 1
+	etsiScoped := strings.HasPrefix(filter.SpecID, "ETSI ")
+	var hits []model.SearchHit
+	if h.etsiEng != nil && etsiScoped {
+		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
+		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
+		ef := filter
+		ef.Release = ""
+		hits, err = h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank})
+	} else {
+		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
+		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
+		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
+		// by id. The release filter is cleared for ETSI (its own release space).
+		if err == nil && h.etsiEng != nil && filter.SpecID == "" && filter.Series == "" {
+			ef := filter
+			ef.Release = ""
+			if eh, eerr := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank}); eerr == nil && len(eh) > 0 {
+				hits = search.RRF(60, hits, eh)
+			}
+		}
+	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("search failed", err), nil
 	}
