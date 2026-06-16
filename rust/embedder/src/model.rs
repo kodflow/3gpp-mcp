@@ -16,7 +16,10 @@ use ndarray::{Array2, Ix2, Ix3};
 use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
+
+/// BGE-M3 max sequence length (its position-embedding table is 8194 = 8192 + 2 special).
+const MAX_TOKENS: usize = 8192;
 
 /// Bge wraps a committed ORT session + tokenizer for repeated batch embedding.
 pub struct Bge {
@@ -39,8 +42,17 @@ impl Bge {
             .commit_from_file(model_onnx)
             .with_context(|| format!("commit onnx {model_onnx:?}"))?;
         let needs_token_type = session.inputs.iter().any(|i| i.name == "token_type_ids");
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(tokenizer_json).map_err(|e| anyhow!("load tokenizer: {e}"))?;
+        // TRUNCATE to BGE-M3's max (8192). Without this a long clause tokenises past the
+        // model's position-embedding table (8194) and the graph's Expand node fails:
+        // "left operand cannot broadcast … LeftShape {1,8194} RightShape {64,10493}".
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow!("set truncation: {e}"))?;
         Ok(Self {
             session,
             tokenizer,
