@@ -122,7 +122,10 @@ jobs:
           work="$(mktemp -d)"; cp data/etsi.duckdb "$work/etsi.duckdb"
           ( cd "$work" && tar -cf layer.tar etsi.duckdb )
           DATE="$(date -u +%F)"
-          retry crane append -b scratch -f "$work/layer.tar" -t "$REPO:$DATE"
+          # No -b: crane's empty base IS scratch. Passing "-b scratch" makes crane try
+          # to PULL docker.io/library/scratch (MANIFEST_UNKNOWN) — that 0-clause-publish
+          # failure even on a validated 2235-clause DB. Omitting --base = true FROM scratch.
+          retry crane append --oci-empty-base -f "$work/layer.tar" -t "$REPO:$DATE"
           retry crane tag "$REPO:$DATE" latest
           echo "published $REPO:$DATE (+ :latest)"
           # Anti-leak: etsi-corpus carries verbatim ETSI text → must be PRIVATE.
