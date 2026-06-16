@@ -75,6 +75,7 @@ SERIES = os.environ.get("SERIES", "21")
 RELEASES = os.environ.get("EMBED_RELEASES", "").strip()
 LOT = os.environ.get("LOT", "").strip()
 BATCH = os.environ.get("EMBED_BATCH", "64")
+LIMIT = os.environ.get("EMBED_LIMIT", "0")  # cap clauses this session (0 = all); for fast diag runs
 # BGE-M3 ONNX on HF (external-data export). Pinned commit for reproducibility.
 HF = os.environ.get(
     "BGE_HF",
@@ -91,6 +92,8 @@ if not re.match(r"^[A-Za-z0-9]{0,8}$", LOT):
     fail("bad_lot", "LOT=%s" % LOT)
 if not re.match(r"^\d{1,4}$", BATCH):
     fail("bad_batch", "EMBED_BATCH=%s" % BATCH)
+if not re.match(r"^\d{1,8}$", LIMIT):
+    fail("bad_limit", "EMBED_LIMIT=%s" % LIMIT)
 
 SHARD = ("lot%s" % LOT) if (RELEASES and LOT) else ("s%s" % SERIES)
 os.chdir(WORK)
@@ -287,8 +290,8 @@ say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 # LIVE into the Kaggle log — capturing them (the old sh()) buffered everything until the
 # end, hiding the progress bar. The embedder prints "PROGRESS done/total (%) rate eta"
 # every 2000 clauses.
-embcmd = '"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s' % (
-    EMBEDDER, WL, VECS, BGE16, ID, BATCH)
+embcmd = '"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s --limit %s --require-cuda' % (
+    EMBEDDER, WL, VECS, BGE16, ID, BATCH, LIMIT)
 try:
     emb_rc = subprocess.run(embcmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
 except subprocess.TimeoutExpired:

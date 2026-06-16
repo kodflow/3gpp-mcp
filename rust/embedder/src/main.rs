@@ -80,6 +80,12 @@ struct Args {
     /// Cap the work-list to N NEW clauses (0 = no cap). Bounded sessions resume next run.
     #[arg(long, default_value_t = 0)]
     limit: usize,
+
+    /// Hard-fail (with the ONNX Runtime error) if the CUDA execution provider can't be
+    /// registered, instead of silently falling back to CPU (~13 clause/s). Pass on a GPU
+    /// box so a misconfigured CUDA runtime is loud, not a 10x-slow CPU run.
+    #[arg(long, default_value_t = false)]
+    require_cuda: bool,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +106,17 @@ struct VecRecord {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Surface ort's logs (default WARN, ort=DEBUG): EP-registration failures — e.g. WHY
+    // the CUDA provider fell back to CPU — are logged via `tracing`; without a subscriber
+    // they vanish, which hid a silent CPU fallback (13 clause/s instead of GPU speed).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ort=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 
     // Resume ledger: chunk_ids already embedded in --out are skipped.
     let done =
@@ -145,6 +162,7 @@ fn main() -> Result<()> {
     let model = Bge::load(
         &args.model_dir.join(&args.onnx),
         &args.model_dir.join("tokenizer.json"),
+        args.require_cuda,
     )?;
 
     // Append to the output ledger so a resumed run extends it crash-safely.
