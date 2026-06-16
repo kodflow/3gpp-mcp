@@ -30,7 +30,11 @@ import (
 // vecShards (optional) are attached sub-base aliases from store.AttachShards —
 // when present, the vector arm runs the Option-B scatter-gather over them
 // instead of the single-DB HNSW.
-func New(st *store.Store, version, baseline string, vecShards []string) (*server.MCPServer, *search.Engine) {
+// etsi (optional) is a SECOND, independent store opened over etsi.duckdb — the
+// corpora stay SPLIT (3gpp.duckdb + etsi.duckdb), never merged. When present, the
+// handlers federate to it: get_spec / list_releases / get_changelog route a spec_id
+// beginning "ETSI " to the ETSI store, and list_specs unions both. nil = 3GPP only.
+func New(st *store.Store, version, baseline string, vecShards []string, etsi *store.Store) (*server.MCPServer, *search.Engine) {
 	eng := search.New(st)
 	eng.UseVectorShards(vecShards)
 	scope := "latest release"
@@ -47,7 +51,7 @@ func New(st *store.Store, version, baseline string, vecShards []string) (*server
 				"pinned to the baseline release; get_spec also reports new_in_baseline "+
 				"(vs previous release) and added_in_later_releases (annex)."),
 	)
-	h := &handlers{st: st, eng: eng, reg: registry.Default(), baseline: baseline, version: version}
+	h := &handlers{st: st, etsi: etsi, eng: eng, reg: registry.Default(), baseline: baseline, version: version}
 
 	s.AddTool(mcp.NewTool("search_spec",
 		mcp.WithDescription("Hybrid lexical retrieval over clauses, with citations."),
@@ -143,10 +147,21 @@ func New(st *store.Store, version, baseline string, vecShards []string) (*server
 
 type handlers struct {
 	st       *store.Store
+	etsi     *store.Store // optional SECOND store over etsi.duckdb (split, not merged); nil = 3GPP only
 	eng      *search.Engine
 	reg      *subject.Registry
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
+}
+
+// specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
+// goes to the attached ETSI store (when present), everything else to the 3GPP store.
+// This is how the two SPLIT indexes are federated without a merge.
+func (h *handlers) specStore(specID string) *store.Store {
+	if h.etsi != nil && strings.HasPrefix(specID, "ETSI ") {
+		return h.etsi
+	}
+	return h.st
 }
 
 // ---- response shapes ----------------------------------------------------
@@ -292,14 +307,15 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	clause := r.GetString("clause", "")
 	release := r.GetString("release", h.baseline) // default: the baseline norm
 	version := r.GetString("version", "")
+	st := h.specStore(specID) // route "ETSI …" ids to the attached ETSI store
 	if version == "" {
-		if v, ok, _ := h.st.VersionForRelease(ctx, specID, release); ok {
+		if v, ok, _ := st.VersionForRelease(ctx, specID, release); ok {
 			version = v
-		} else if _, v, ok, _ := h.st.LatestVersion(ctx, specID); ok {
+		} else if _, v, ok, _ := st.LatestVersion(ctx, specID); ok {
 			version, release = v, ""
 		}
 	}
-	clauses, err := h.st.GetClauses(ctx, specID, version, clause)
+	clauses, err := st.GetClauses(ctx, specID, version, clause)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("get_spec failed", err), nil
 	}
@@ -309,7 +325,7 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	// Release lineage per clause (present_in / introduced / last_seen / obsolete)
 	// so every fragment says where it lives across releases and whether it's gone.
 	full := r.GetBool("full", false)
-	lineage, _ := h.st.ClauseLineage(ctx, specID, clause)
+	lineage, _ := st.ClauseLineage(ctx, specID, clause)
 	out := make([]clauseOut, 0, len(clauses))
 	cites := make([]model.Citation, 0, len(clauses))
 	obsolete := 0
@@ -353,7 +369,7 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	// Release annex: what the baseline introduced vs the previous release, and
 	// what LATER releases add on top (surfaced so the user knows it exists).
 	if release != "" {
-		if avail, ordered, aerr := h.st.ClauseAvailability(ctx, specID, clause); aerr == nil {
+		if avail, ordered, aerr := st.ClauseAvailability(ctx, specID, clause); aerr == nil {
 			rv := releaseview.BuildReleaseView(specID, avail, ordered, release)
 			resp["note"] = rv.Note
 			resp["new_in_baseline"] = rv.NewInBaseline
@@ -369,7 +385,7 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	changes, err := h.st.GetChangelog(ctx, specID, r.GetString("from_release", ""), r.GetString("to_release", ""))
+	changes, err := h.specStore(specID).GetChangelog(ctx, specID, r.GetString("from_release", ""), r.GetString("to_release", ""))
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
 	}
@@ -394,7 +410,7 @@ func (h *handlers) listReleases(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	vs, err := h.st.ListReleases(ctx, specID)
+	vs, err := h.specStore(specID).ListReleases(ctx, specID)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("list_releases failed", err), nil
 	}
@@ -578,6 +594,19 @@ func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	rows := make([]specRow, len(specs))
 	for i, sp := range specs {
 		rows[i] = specRow{Spec: sp, HasAPI: apiSpecs[sp.SpecID]}
+	}
+	// Union the SPLIT ETSI index (when attached): ETSI specs live in their own
+	// release space ("ETSI"), so the 3GPP release filter never applies to them —
+	// pass series/WG/doc_type through but clear the release so they always surface.
+	if h.etsi != nil {
+		if es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
+			Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
+			DocType: docTypeDefault(r.GetString("spec_type", "")),
+		}); eerr == nil {
+			for _, sp := range es {
+				rows = append(rows, specRow{Spec: sp, HasAPI: false})
+			}
+		}
 	}
 	return jsonResult(map[string]any{"count": len(rows), "specs": rows})
 }
