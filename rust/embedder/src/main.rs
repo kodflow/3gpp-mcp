@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -154,13 +155,22 @@ fn main() -> Result<()> {
         .with_context(|| format!("open output {:?}", args.out))?;
     let mut w = BufWriter::new(out);
 
-    let pb = ProgressBar::new(items.len() as u64);
+    let total = items.len();
+    let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner} {pos}/{len} clauses ({percent}%) [{elapsed_precise}] eta {eta} {per_sec}",
         )
         .unwrap(),
     );
+    // indicatif's bar needs a TTY; Kaggle/CI logs are not. Emit a PLAIN progress LINE
+    // every PROGRESS_EVERY clauses too (count/total/%/rate/ETA) so progress is visible
+    // in captured non-TTY logs — this is the "progress bar" the campaign log shows.
+    const PROGRESS_EVERY: usize = 2000;
+    let start = Instant::now();
+    let mut done = 0usize;
+    let mut next_log = PROGRESS_EVERY;
+    eprintln!("PROGRESS 0/{total} (0%) starting…");
 
     for chunk in items.chunks(args.batch) {
         let texts: Vec<String> = chunk
@@ -196,8 +206,29 @@ fn main() -> Result<()> {
         // Flush per batch: the on-disk ledger is always a valid resume point.
         w.flush()?;
         pb.inc(chunk.len() as u64);
+        done += chunk.len();
+        if done >= next_log || done == total {
+            let secs = start.elapsed().as_secs_f64().max(0.001);
+            let rate = done as f64 / secs;
+            let pct = done * 100 / total.max(1);
+            let eta = if rate > 0.0 {
+                ((total - done) as f64 / rate) as u64
+            } else {
+                0
+            };
+            eprintln!(
+                "PROGRESS {done}/{total} ({pct}%) {rate:.1} clause/s eta {eta}s",
+                done = done,
+                total = total,
+                pct = pct,
+                rate = rate,
+                eta = eta
+            );
+            next_log = done + PROGRESS_EVERY;
+        }
     }
     pb.finish_with_message("done");
+    eprintln!("PROGRESS {total}/{total} (100%) done", total = total);
     eprintln!(
         "embedder: wrote {} vector(s) to {:?}",
         items.len(),
