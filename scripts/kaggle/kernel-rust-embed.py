@@ -217,6 +217,20 @@ bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
 if bc.returncode != 0:
     fail("cargo_build", (bc.stderr or "")[-200:])
 EMBEDDER = os.path.join(src, "rust/embedder/target/release/embedder")
+# ort's `download-binaries` fetches libonnxruntime.so at BUILD time into the ort-sys
+# OUT_DIR, but the release binary has no $ORIGIN RPATH, so at RUNTIME it can't find the
+# lib (error 127: "libonnxruntime.so: cannot open shared object file"). Locate the .so
+# anywhere under target/ and prepend its dir to LD_LIBRARY_PATH for the embedder run.
+_ortlibs = sorted(
+    glob.glob(os.path.join(src, "rust/embedder/target/release/**/libonnxruntime.so*"), recursive=True),
+    key=len,
+)
+if _ortlibs:
+    _libdir = os.path.dirname(_ortlibs[0])
+    os.environ["LD_LIBRARY_PATH"] = _libdir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    say("ort_lib=%s" % _ortlibs[0])
+else:
+    say("ort_lib=NONE (libonnxruntime.so not found under target/ — embed will fail)")
 
 # ---- export → embed → import ----------------------------------------------
 WL = os.path.join(WORK, "work.jsonl")
