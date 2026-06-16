@@ -102,7 +102,18 @@ jobs:
             echo "os.environ.setdefault('EMBED_LIMIT', '${EMBED_LIMIT:-0}')"
             cat scripts/kaggle/kernel-rust-embed.py
           } > "$dir/kernel.py"
-          printf '{\n "id": "%s",\n "title": "3gpp rust embed %s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": [],\n "competition_sources": [],\n "kernel_sources": []\n}\n' "$slug" "$shard" > "$dir/kernel-metadata.json"
+          # RESUME: if a prior shard dataset exists, MOUNT it so the kernel restores the
+          # partially-embedded DB and continues (export-worklist --resume → only the still
+          # -NULL clauses). First run = no dataset → fresh slice. Persistence is below.
+          RESUME_DS="${KAGGLE_USER}/3gpp-rust-embedded-${shard}"
+          ds_src=""
+          if kaggle datasets status "$RESUME_DS" >/dev/null 2>&1; then
+            ds_src="\"$RESUME_DS\""
+            echo "resume dataset present → mounting $RESUME_DS"
+          else
+            echo "no resume dataset yet ($RESUME_DS) → fresh slice"
+          fi
+          printf '{\n "id": "%s",\n "title": "3gpp rust embed %s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": [%s],\n "competition_sources": [],\n "kernel_sources": []\n}\n' "$slug" "$shard" "$ds_src" > "$dir/kernel-metadata.json"
           kaggle kernels push -p "$dir" --accelerator NvidiaTeslaT4
           # Let the NEW version enter "running" before polling: re-pushing an existing
           # slug leaves the PRIOR version's terminal status visible for a few seconds, so
@@ -133,6 +144,24 @@ jobs:
           echo "=== KERNEL LOG (tail) ==="; tail -n 120 out/*.log 2>/dev/null || echo "(no .log pulled)"
           echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt — see log above)"
           grep -q 'step=OK' out/RESULT.txt 2>/dev/null || { echo "::error::kernel did not reach step=OK (see log)"; exit 1; }
+          # PERSIST the embedded shard DB to the resume/output dataset (creds stay in CI,
+          # never in the kernel). This is BOTH the resume point for the next dispatch (the
+          # restored DB's still-NULL clauses are the remaining work) AND the consumable
+          # output the bake folds. The DB carries the fp16 vectors; vecs.jsonl is the
+          # per-session ledger only, so the DB alone is sufficient to resume.
+          db="$(find out -name '3gpp-embedded.duckdb' | head -1)"
+          if [ -n "$db" ] && [ -s "$db" ]; then
+            rm -rf state && mkdir -p state && cp "$db" state/3gpp-embedded.duckdb
+            printf '{"title":"3gpp rust embedded %s","id":"%s","licenses":[{"name":"CC0-1.0"}]}\n' "$shard" "$RESUME_DS" > state/dataset-metadata.json
+            if kaggle datasets status "$RESUME_DS" >/dev/null 2>&1; then
+              kaggle datasets version -p state -m "shard=$shard embedded" --dir-mode zip || echo "::warning::dataset version failed (resume not saved)"
+            else
+              kaggle datasets create -p state --dir-mode zip || echo "::warning::dataset create failed (resume not saved)"
+            fi
+            echo "persisted resume/output dataset: $RESUME_DS"
+          else
+            echo "::error::no embedded DB in kernel output — vectors NOT persisted (resume impossible)"; exit 1
+          fi
       - name: Upload RESULT + log
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
