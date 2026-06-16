@@ -52,6 +52,9 @@ baked_flags() {
   flags=""
   [ -f "$cache/3gpp.duckdb" ] && flags="-no-update"
   [ -f "$cache/vec/vec-manifest.json" ] && flags="$flags -vec-manifest $cache/vec/vec-manifest.json"
+  # SPLIT ETSI corpus (never merged): when the baked image carries etsi.duckdb beside
+  # 3gpp.duckdb, serve it alongside so get_spec/list_specs cover the ETSI LI suite.
+  [ -f "$cache/etsi.duckdb" ] && flags="$flags -etsi-db $cache/etsi.duckdb"
   printf '%s' "$flags"
 }
 
