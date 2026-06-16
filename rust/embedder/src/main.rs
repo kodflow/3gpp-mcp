@@ -173,6 +173,14 @@ fn main() -> Result<()> {
         .with_context(|| format!("open output {:?}", args.out))?;
     let mut w = BufWriter::new(out);
 
+    // Length-bucket the work-list: sort by text length so each fixed-size batch holds
+    // clauses of SIMILAR length. The work-list arrives in chunk_id order (random
+    // lengths), so without this every batch pads to its single longest clause (up to
+    // MAX_TOKENS) and wastes most of the GPU on padding — the dominant cost behind the
+    // ~17 clause/s. Sorting groups short clauses together (tiny pad) and isolates the
+    // few long ones. Output order is irrelevant — each record carries its chunk_id.
+    items.sort_by_key(|it| it.heading.len() + it.text.len());
+
     let total = items.len();
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
