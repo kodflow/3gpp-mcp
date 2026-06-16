@@ -113,6 +113,7 @@ func loadVecManifest(path string) ([]string, error) {
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dbPath := fs.String("db", "data/3gpp.duckdb", "DuckDB snapshot path")
+	etsiDB := fs.String("etsi-db", "", "optional ETSI corpus DuckDB (etsi.duckdb) served ALONGSIDE the 3GPP DB — kept SPLIT, not merged; get_spec/list_releases route 'ETSI …' ids here and list_specs unions it. Empty = 3GPP only.")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
 	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
@@ -244,7 +245,24 @@ func serve(args []string) error {
 		}
 	}
 
-	srv, eng := mcp.New(st, Version, *release, vecShards)
+	// Optional SPLIT ETSI corpus: a SECOND read-only store over etsi.duckdb, served
+	// ALONGSIDE the 3GPP DB (never merged). The handlers route "ETSI …" ids to it and
+	// union list_specs. Best-effort: a missing/bad etsi.duckdb degrades to 3GPP-only.
+	var etsiSt *store.Store
+	if *etsiDB != "" {
+		if es, eerr := store.OpenReadOnly(*etsiDB); eerr != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] --etsi-db %s unavailable, serving 3GPP only: %v\n", *etsiDB, eerr)
+		} else {
+			_ = es.LoadFTS(ctx)
+			_ = es.LoadVSS(ctx)
+			_ = es.LoadSparse(ctx)
+			etsiSt = es
+			defer func() { _ = etsiSt.Close() }()
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus attached (split, not merged): %s\n", *etsiDB)
+		}
+	}
+
+	srv, eng := mcp.New(st, Version, *release, vecShards, etsiSt)
 	scope := *release
 	if scope == "" {
 		scope = "latest"

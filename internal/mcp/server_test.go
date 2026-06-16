@@ -31,7 +31,7 @@ func newClient(t *testing.T) (*client.Client, context.Context) {
 	_ = st.InsertEvolutions([]model.Evolution{{FromTerm: "MME", ToTerm: "AMF", EvolutionType: "SPLIT", JustificationSpec: "23.501", Confidence: 0.9}})
 	_ = st.UpsertAcronym(model.Acronym{Term: "AMF", Expansion: "Access and Mobility Management Function", Domain: "5GC"})
 
-	srv, _ := New(st, "test", "", nil)
+	srv, _ := New(st, "test", "", nil, nil)
 	c, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatal(err)
