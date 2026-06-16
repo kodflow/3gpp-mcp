@@ -37,12 +37,18 @@ impl Bge {
     /// load commits the ONNX session (CUDA→CPU) and loads the tokenizer. `model_onnx`
     /// must sit next to its external-data file (model.onnx_data) — ORT finds it by the
     /// relative path baked into the graph.
-    pub fn load(model_onnx: &Path, tokenizer_json: &Path) -> Result<Self> {
+    pub fn load(model_onnx: &Path, tokenizer_json: &Path, require_cuda: bool) -> Result<Self> {
+        // CUDA first, CPU fallback. With require_cuda, the CUDA EP is set to
+        // error_on_failure so a misconfigured GPU runtime is a LOUD error (with ORT's
+        // reason) rather than a silent ~13 clause/s CPU run.
+        let cuda = CUDAExecutionProvider::default();
+        let cuda = if require_cuda {
+            cuda.build().error_on_failure()
+        } else {
+            cuda.build()
+        };
         let session = Session::builder()?
-            .with_execution_providers([
-                CUDAExecutionProvider::default().build(),
-                CPUExecutionProvider::default().build(),
-            ])?
+            .with_execution_providers([cuda, CPUExecutionProvider::default().build()])?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(model_onnx)
             .with_context(|| format!("commit onnx {model_onnx:?}"))?;
