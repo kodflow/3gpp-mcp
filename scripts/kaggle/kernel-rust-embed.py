@@ -283,13 +283,21 @@ if sh('/tmp/embed-io --db "%s" --export-worklist "%s" --resume' % (EMBEDDED_DB, 
     fail("export_worklist")
 say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
-# The embedder streams its own progress bar to stderr; tee it so the kernel log shows it.
-emb = sh('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s'
-         % (EMBEDDER, WL, VECS, BGE16, ID, BATCH), timeout=TIME_BUDGET)
-if emb.returncode != 0:
-    say("embedder_stderr=%s" % (emb.stderr or "")[-300:])
-    # Non-fatal on timeout: the vecs.jsonl ledger is a valid resume point; import what we have.
-    say("embedder_rc=%d (partial allowed — ledger resumes next run)" % emb.returncode)
+# Run the embedder with output INHERITED (not captured) so its PROGRESS lines stream
+# LIVE into the Kaggle log — capturing them (the old sh()) buffered everything until the
+# end, hiding the progress bar. The embedder prints "PROGRESS done/total (%) rate eta"
+# every 2000 clauses.
+embcmd = '"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s' % (
+    EMBEDDER, WL, VECS, BGE16, ID, BATCH)
+try:
+    emb_rc = subprocess.run(embcmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
+except subprocess.TimeoutExpired:
+    emb_rc = 124
+    say("embedder hit TIME_BUDGET — partial (ledger resumes next run)")
+if emb_rc != 0:
+    # Non-fatal: the vecs.jsonl ledger is a valid resume point; import what we have. The
+    # actual error already streamed live above.
+    say("embedder_rc=%d (partial allowed — ledger resumes next run; see live log above)" % emb_rc)
 vec_lines = sh('wc -l < "%s"' % VECS).stdout.strip() if os.path.isfile(VECS) else "0"
 say("vectors_written=%s" % vec_lines)
 
