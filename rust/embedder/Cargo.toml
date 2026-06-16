@@ -2,7 +2,7 @@
 name = "embedder"
 version = "0.1.0"
 edition = "2021"
-description = "Optimised Rust BGE-M3 embedder for the 3GPP/ETSI corpus (dense; sparse in P4)"
+description = "Optimised Rust BGE-M3 dense embedder for the 3GPP/ETSI corpus (ort + tokenizers)"
 license = "Apache-2.0"
 
 [[bin]]
@@ -10,14 +10,19 @@ name = "embedder"
 path = "src/main.rs"
 
 [dependencies]
-# fastembed wraps ONNX Runtime + HF tokenizers and ships a dedicated BGE-M3 path
-# (dense 1024 + sparse + ColBERT in one pass). We use the dense arm in P3 and add
-# the sparse arm in P4 — keeping BGE-M3 as the single unified backbone.
-fastembed = "4"
-# Pure compute, NO DuckDB dependency: the embedder reads a JSONL work-list and
-# writes a JSONL vector file. Go (which owns the correct DuckDB version) does all
-# DB read/write — this sidesteps DuckDB storage-format compatibility entirely and
-# keeps the Kaggle binary tiny (model + tokenizer only, no bundled C++ engine).
+# ort = ONNX Runtime bindings. fastembed 4.9.1 has no BGE-M3 (only BGE v1.5) and its
+# user-defined loader can't handle BGE-M3's >2GB external-data ONNX, so we drive ORT
+# directly: load model.onnx from a FILE path (ORT reads the model.onnx_data sibling
+# automatically), run the forward pass, CLS-pool, L2-normalise. The `cuda` feature +
+# download-binaries fetch the GPU-enabled runtime, so the SAME binary uses the GPU on
+# Kaggle (T4) and falls back to CPU elsewhere — letting Rust replace the Go GPU embed.
+ort = { version = "=2.0.0-rc.9", features = ["cuda", "ndarray", "download-binaries"] }
+ndarray = "0.16"
+# HF tokenizers (the BGE-M3 / XLM-RoBERTa tokenizer.json).
+tokenizers = "0.20"
+# NO DuckDB dependency: the embedder reads a JSONL work-list and writes a JSONL vector
+# file. Go (which owns the correct DuckDB version) does all DB read/write — this
+# sidesteps DuckDB storage-format compatibility entirely.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
