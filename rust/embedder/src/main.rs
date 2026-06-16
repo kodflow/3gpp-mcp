@@ -3,11 +3,11 @@
 //! ## Why Rust, and why JSONL in/out
 //!
 //! The embedding *compute* (ONNX Runtime + tokenisation) is the expensive,
-//! parallel, GPU-friendly part — that is what moves to Rust (fastembed). All
-//! DuckDB I/O stays in Go, which owns the exact DuckDB version that wrote the
-//! corpus. So this binary never opens the database: it reads a JSONL **work-list**
-//! and writes a JSONL **vector file**, and the Go side (`cmd/embed`) exports the
-//! work-list and imports the vectors. This decoupling removes any DuckDB
+//! parallel, GPU-friendly part — that is what moves to Rust (ort + tokenizers, see
+//! model.rs). All DuckDB I/O stays in Go, which owns the exact DuckDB version that
+//! wrote the corpus. So this binary never opens the database: it reads a JSONL
+//! **work-list** and writes a JSONL **vector file**, and the Go side (`cmd/embed-io`)
+//! exports the work-list and imports the vectors. This decoupling removes any DuckDB
 //! storage-format compatibility risk and makes the Kaggle binary tiny.
 //!
 //! ## Contract
@@ -27,6 +27,7 @@
 //! Go embedder's micro-granular resume. `--limit` caps a bounded session.
 
 mod hash;
+mod model;
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -35,11 +36,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use fastembed::{
-    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
-};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+
+use crate::model::Bge;
 
 /// BGE-M3 dense dimensionality (must match clauses.embedding FLOAT[1024]).
 const DENSE_DIM: usize = 1024;
@@ -58,7 +58,8 @@ struct Args {
     #[arg(long)]
     out: PathBuf,
 
-    /// Directory holding the BGE-M3 ONNX model + HF tokenizer files.
+    /// Directory holding the BGE-M3 files: the ONNX (--onnx) + its external data
+    /// (model.onnx_data, loaded automatically) + tokenizer.json.
     #[arg(long)]
     model_dir: PathBuf,
 
@@ -140,7 +141,10 @@ fn main() -> Result<()> {
         args.batch
     );
 
-    let model = load_model(&args.model_dir, &args.onnx)?;
+    let model = Bge::load(
+        &args.model_dir.join(&args.onnx),
+        &args.model_dir.join("tokenizer.json"),
+    )?;
 
     // Append to the output ledger so a resumed run extends it crash-safely.
     let out = OpenOptions::new()
@@ -163,10 +167,8 @@ fn main() -> Result<()> {
             .iter()
             .map(|it| hash::embed_text(&it.heading, &it.text))
             .collect();
-        // fastembed handles tokenisation, the ONNX forward pass and pooling.
-        let embeddings = model
-            .embed(texts.clone(), Some(chunk.len()))
-            .context("fastembed embed batch")?;
+        // ort tokenises, runs the forward pass, CLS-pools and L2-normalises per row.
+        let embeddings = model.embed_batch(&texts).context("embed batch")?;
         if embeddings.len() != chunk.len() {
             anyhow::bail!(
                 "embed returned {} vecs for {} inputs",
@@ -174,7 +176,7 @@ fn main() -> Result<()> {
                 chunk.len()
             );
         }
-        for (it, mut vec) in chunk.iter().zip(embeddings) {
+        for (it, vec) in chunk.iter().zip(embeddings) {
             if vec.len() != DENSE_DIM {
                 anyhow::bail!(
                     "clause {} got dim {}, want {}",
@@ -183,7 +185,6 @@ fn main() -> Result<()> {
                     DENSE_DIM
                 );
             }
-            l2_normalize(&mut vec);
             let rec = VecRecord {
                 chunk_id: it.chunk_id,
                 hash: hash::clause_hash(&it.heading, &it.text, &args.embed_identity),
@@ -227,57 +228,4 @@ fn load_done(out: &Path) -> Result<HashSet<u64>> {
         }
     }
     Ok(done)
-}
-
-/// load_model builds a fastembed TextEmbedding from the local BGE-M3 ONNX + tokenizer
-/// files, with CLS pooling (BGE-M3's dense head). Output is L2-normalised by us.
-fn load_model(dir: &Path, onnx: &str) -> Result<TextEmbedding> {
-    let read = |name: &str| -> Result<Vec<u8>> {
-        let p = dir.join(name);
-        std::fs::read(&p).with_context(|| format!("read model file {p:?}"))
-    };
-    let onnx_file = read(onnx)?;
-    let tokenizer_files = TokenizerFiles {
-        tokenizer_file: read("tokenizer.json")?,
-        config_file: read("config.json")?,
-        special_tokens_map_file: read("special_tokens_map.json")?,
-        tokenizer_config_file: read("tokenizer_config.json")?,
-    };
-    let model =
-        UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files).with_pooling(Pooling::Cls);
-    TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::default())
-        .context("init fastembed BGE-M3 from local files")
-}
-
-/// l2_normalize scales a vector to unit length in place (cosine-ready). A zero vector
-/// is left untouched (avoids NaN); fastembed BGE output is already near-unit, so this
-/// is idempotent and cheap.
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn l2_normalize_unit_length() {
-        let mut v = vec![3.0f32, 4.0];
-        l2_normalize(&mut v);
-        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((n - 1.0).abs() < 1e-6);
-        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
-    }
-
-    #[test]
-    fn l2_normalize_zero_is_safe() {
-        let mut v = vec![0.0f32, 0.0];
-        l2_normalize(&mut v);
-        assert_eq!(v, vec![0.0, 0.0]);
-    }
 }
