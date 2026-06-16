@@ -269,12 +269,23 @@ func liInventory(ctx context.Context, db *store.Store, release, ifaceFilter stri
 	if len(kept) == 0 {
 		return mcp.NewToolResultError("no NE/NF impacted" + ifaceLabel(want) + " found in TS 33.128 " + release), nil
 	}
+	// ETSI bridge (two SEPARATE sections, never conflated):
+	//   - cited_in_ts33128: ETSI ids the TS 33.128 text actually references (factual).
+	//   - mapping_curated:  the curated LI-interface → ETSI-deliverable correspondence.
+	etsiNorms := map[string]any{
+		"cited_in_ts33128": MineCitedETSI(clauses),
+		"mapping_curated":  CuratedETSILinks(want),
+		"note": "cited_in_ts33128 = ETSI ids mined verbatim from TS 33.128 (factual citations). " +
+			"mapping_curated = curated LI-interface→ETSI-deliverable correspondence (domain knowledge, " +
+			"NOT mined). When etsi.duckdb is attached, these ids resolve to the real ETSI clause via get_spec.",
+	}
 	return jsonResult(map[string]any{
 		"spec_id": specID, "release": release, "version": version,
 		"mode": "inventory", "interface_filter": want,
 		"count": len(kept), "by_interface": byIface, "nfs": kept,
-		"note":      "Every NE/NF TS 33.128 impacts over LI_X1 (provisioning/tasking) / LI_X2 (xIRI) / LI_X3 (xCC), across the core 5GC/EPC NFs AND the clause-7 services. Pass nf=<name> for one NF's events.",
-		"citations": cites,
+		"note":       "Every NE/NF TS 33.128 impacts over LI_X1 (provisioning/tasking) / LI_X2 (xIRI) / LI_X3 (xCC), across the core 5GC/EPC NFs AND the clause-7 services. Pass nf=<name> for one NF's events.",
+		"etsi_norms": etsiNorms,
+		"citations":  cites,
 	})
 }
 
