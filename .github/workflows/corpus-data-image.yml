@@ -218,6 +218,25 @@ jobs:
           docker rm "$cid" >/dev/null
           docker rmi "$img" >/dev/null 2>&1 || true   # DISK: the pulled copy is consumed
           test -s image-data/3gpp.duckdb
+          # 1b) SPLIT ETSI corpus — placed BESIDE 3gpp.duckdb (NEVER merged). The serve
+          #     entrypoint adds `-etsi-db $cache/etsi.duckdb` when this file is present,
+          #     so get_spec/list_specs cover the ETSI LI suite. Guarded + best-effort:
+          #     a missing etsi-corpus image just ships 3GPP only (no bake failure).
+          if [ "${FOLD_ETSI:-true}" != "false" ]; then
+            eimg="ghcr.io/${{ github.repository_owner }}/etsi-corpus:latest"
+            if retry docker pull "$eimg" >/dev/null 2>&1; then
+              ecid=$(docker create "$eimg" /noop)
+              if docker cp "$ecid:/etsi.duckdb" image-data/etsi.duckdb 2>/dev/null && [ -s image-data/etsi.duckdb ]; then
+                echo "ETSI corpus baked beside 3GPP (split): $(du -h image-data/etsi.duckdb | cut -f1)"
+              else
+                echo "::warning::etsi-corpus present but /etsi.duckdb missing — 3GPP only"
+              fi
+              docker rm "$ecid" >/dev/null 2>&1 || true
+              docker rmi "$eimg" >/dev/null 2>&1 || true
+            else
+              echo "::notice::etsi-corpus:latest not pullable — serving 3GPP only this bake"
+            fi
+          fi
           # 2a) BGE-M3 WITHOUT touching HuggingFace: run artifact, else restore-bge.sh.
           if [ -s bge-cache/bge-m3/model.onnx_data ]; then
             mkdir -p image-data/models
