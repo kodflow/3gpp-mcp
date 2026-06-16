@@ -206,13 +206,58 @@ for url, dest in (
             fail("model_dl", url)
 say("model_data_bytes=%d" % (os.path.getsize("%s/model.onnx_data" % BGE)))
 
+# ---- fp16 conversion (keep_io_types) — kernel-identical to corpus-data-image.yml.
+# fp16 is ~2-6x faster on T4 Tensor Cores AND halves attention memory; the served data
+# image bakes fp16, so the campaign MUST be fp16 for the EmbedIdentity to match (else
+# semantic is refused at serve). keep_io_types keeps fp32 IO so the Rust embedder reads
+# []f32 unchanged — only the weights become fp16.
+BGE16 = os.path.join(WORK, "bge-m3-fp16")
+os.makedirs(BGE16, exist_ok=True)
+sh("python3 -m pip install --quiet onnx onnxruntime sympy packaging")
+conv = os.path.join(WORK, "convfp16.py")
+with open(conv, "w") as f:
+    f.write(
+        "import onnx\n"
+        "from onnxruntime.transformers.onnx_model import OnnxModel\n"
+        "m = onnx.load('%s/model.onnx')\n"
+        "om = OnnxModel(m); om.convert_float_to_float16(keep_io_types=True)\n"
+        "onnx.save(om.model, '%s/model.onnx', save_as_external_data=True, "
+        "all_tensors_to_one_file=True, location='model.onnx_data')\n"
+        "print('fp16_saved')\n" % (BGE, BGE16)
+    )
+if sh("python3 %s" % conv).returncode != 0 or not os.path.isfile("%s/model.onnx_data" % BGE16):
+    fail("fp16_convert")
+sh("cp '%s/tokenizer.json' '%s/'" % (BGE, BGE16))
+# The fp16 model registry — fields MUST match corpus-data-image.yml's models.yaml so
+# cmd/embedid emits the SAME identity the served fp16 image expects (dir is irrelevant
+# to the identity — only family/precision/dim/normalization/revision are).
+MODELS_YAML = os.path.join(WORK, "models.yaml")
+with open(MODELS_YAML, "w") as f:
+    f.write(
+        "active: bge-m3-fp16\n"
+        "models:\n"
+        "  - name: bge-m3-fp16\n"
+        "    family: bge-m3\n"
+        "    dir: %s\n"
+        "    precision: fp16\n"
+        "    dim: 1024\n"
+        "    normalization: l2\n"
+        "    revision: 5617a9f\n"
+        "    tokenizer_revision: 5617a9f\n"
+        "    tokenizer_dir: %s\n"
+        "    inputs: [input_ids, attention_mask]\n"
+        "    output: sentence_embedding\n" % (BGE16, BGE16)
+    )
+EMBED_MODEL_ENV = {**os.environ, "EMBED_MODELS_CONFIG": MODELS_YAML}
+
 # ---- build the Go bridge + the Rust embedder -------------------------------
 if sh("CGO_ENABLED=1 go build -o /tmp/embed-io ./cmd/embed-io").returncode != 0:
     fail("build_embed_io")
-ID = sh("CGO_ENABLED=1 go run ./cmd/embedid").stdout.strip()
+# fp16 identity (EMBED_MODELS_CONFIG → cmd/embedid resolves the fp16 model).
+ID = sh("CGO_ENABLED=1 go run ./cmd/embedid", env=EMBED_MODEL_ENV).stdout.strip()
 if not re.match(r"^[0-9a-f]{6,}$", ID):
     fail("bad_identity", ID)
-say("embed_identity=%s" % ID)
+say("embed_identity=%s (fp16)" % ID)
 bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
 if bc.returncode != 0:
     fail("cargo_build", (bc.stderr or "")[-200:])
@@ -240,7 +285,7 @@ say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
 # The embedder streams its own progress bar to stderr; tee it so the kernel log shows it.
 emb = sh('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s'
-         % (EMBEDDER, WL, VECS, BGE, ID, BATCH), timeout=TIME_BUDGET)
+         % (EMBEDDER, WL, VECS, BGE16, ID, BATCH), timeout=TIME_BUDGET)
 if emb.returncode != 0:
     say("embedder_stderr=%s" % (emb.stderr or "")[-300:])
     # Non-fatal on timeout: the vecs.jsonl ledger is a valid resume point; import what we have.
