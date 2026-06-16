@@ -18,8 +18,13 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tokenizers::{Tokenizer, TruncationParams};
 
-/// BGE-M3 max sequence length (its position-embedding table is 8194 = 8192 + 2 special).
-const MAX_TOKENS: usize = 8192;
+/// Tokenizer truncation length. BGE-M3 supports 8192, but full self-attention at
+/// batch×seq² blows up GPU memory — batch=64 × 8192² × 16 heads = 256 GiB, far past a
+/// T4's 16 GB (the observed BFC OOM). 1024 keeps the attention buffer ~4 GB at batch 64
+/// and captures the discriminative head of a clause; the embedding_hash keys on the
+/// FULL text (not the truncated tokens), so tuning this never forces a re-embed.
+/// (A future token-budget batcher could restore 8192 for the rare long clause.)
+const MAX_TOKENS: usize = 1024;
 
 /// Bge wraps a committed ORT session + tokenizer for repeated batch embedding.
 pub struct Bge {
