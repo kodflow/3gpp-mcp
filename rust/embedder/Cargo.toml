@@ -18,6 +18,10 @@ path = "src/main.rs"
 # Kaggle (T4) and falls back to CPU elsewhere — letting Rust replace the Go GPU embed.
 ort = { version = "=2.0.0-rc.9", features = ["cuda", "ndarray", "download-binaries"] }
 ndarray = "0.16"
+# ort logs EP-registration failures (e.g. why CUDA fell back to CPU) via `tracing`;
+# without a subscriber those warnings are invisible — which hid a silent CPU fallback.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HF tokenizers (the BGE-M3 / XLM-RoBERTa tokenizer.json).
 tokenizers = "0.20"
 # NO DuckDB dependency: the embedder reads a JSONL work-list and writes a JSONL vector
