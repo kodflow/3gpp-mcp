@@ -112,7 +112,7 @@ struct WorkItem {
     text: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct VecRecord {
     chunk_id: u64,
     hash: String,
@@ -134,6 +134,15 @@ impl AsRef<[i64]> for Prepared {
     }
 }
 
+/// Resume is what a prior (partial) run left in the output ledger: the chunk_ids already
+/// embedded (skip them) and a content-hash → vector map (fill a not-yet-done clause whose
+/// text was already embedded under another chunk_id, instead of re-embedding it).
+#[derive(Default)]
+struct Resume {
+    done: HashSet<u64>,
+    by_hash: std::collections::HashMap<String, Vec<f32>>,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -147,23 +156,28 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
 
-    // Resume ledger: chunk_ids already embedded in --out are skipped.
-    let done =
+    // Resume ledger: chunk_ids already embedded in --out are skipped; their content hashes
+    // let us copy a not-yet-done duplicate's vector instead of re-embedding it.
+    let resume =
         load_done(&args.out).with_context(|| format!("scan resume ledger {:?}", args.out))?;
-    if !done.is_empty() {
+    if !resume.done.is_empty() {
         eprintln!(
-            "embedder: resume — {} clause(s) already in {:?}",
-            done.len(),
-            args.out
+            "embedder: resume — {} clause(s) already in {:?} ({} distinct vectors cached)",
+            resume.done.len(),
+            args.out,
+            resume.by_hash.len()
         );
     }
 
     // Read the work-list, skipping resumed/empty ids and honouring --limit. We keep the
     // metadata (chunk_id, hash) and the text to embed; the hash is computed now from the
-    // FULL heading+text (so a later Go re-embed gate is a no-op).
+    // FULL heading+text (so a later Go re-embed gate is a no-op). A clause whose hash is
+    // already in the resume cache (same text embedded under another chunk_id) is diverted
+    // to `to_copy` — written by copy, never sent to the GPU.
     let mut chunk_ids: Vec<u64> = Vec::new();
     let mut hashes: Vec<String> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
+    let mut to_copy: Vec<(u64, String)> = Vec::new();
     {
         let f =
             File::open(&args.r#in).with_context(|| format!("open work-list {:?}", args.r#in))?;
@@ -173,29 +187,54 @@ fn main() -> Result<()> {
                 continue;
             }
             let it: WorkItem = serde_json::from_str(&line).context("parse work-list line")?;
-            if done.contains(&it.chunk_id) || it.text.trim().is_empty() {
+            if resume.done.contains(&it.chunk_id) || it.text.trim().is_empty() {
+                continue;
+            }
+            let h = hash::clause_hash(&it.heading, &it.text, &args.embed_identity);
+            if resume.by_hash.contains_key(&h) {
+                to_copy.push((it.chunk_id, h));
                 continue;
             }
             chunk_ids.push(it.chunk_id);
-            hashes.push(hash::clause_hash(
-                &it.heading,
-                &it.text,
-                &args.embed_identity,
-            ));
+            hashes.push(h);
             texts.push(hash::embed_text(&it.heading, &it.text));
+            // --limit bounds GPU work; copies are free, so cap on embed items only.
             if args.limit > 0 && chunk_ids.len() >= args.limit {
                 break;
             }
         }
     }
+
+    // Open the output ledger up front and write the copied duplicates immediately — this
+    // also covers the all-duplicates case (no GPU work but vectors still produced).
+    let out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.out)
+        .with_context(|| format!("open output {:?}", args.out))?;
+    let mut w = BufWriter::new(out);
+    if !to_copy.is_empty() {
+        for (chunk_id, h) in &to_copy {
+            let vec = resume.by_hash.get(h).expect("hash present").clone();
+            serde_json::to_writer(
+                &mut w,
+                &VecRecord {
+                    chunk_id: *chunk_id,
+                    hash: h.clone(),
+                    vec,
+                },
+            )
+            .context("serialize copied vector")?;
+            w.write_all(b"\n")?;
+        }
+        w.flush()?;
+        eprintln!(
+            "embedder: copied {} duplicate clause(s) from the resume cache (no GPU)",
+            to_copy.len()
+        );
+    }
     if chunk_ids.is_empty() {
-        eprintln!("embedder: nothing to do (work-list empty or fully resumed)");
-        // Touch the output so a downstream import opens a real (possibly empty) file.
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&args.out)
-            .with_context(|| format!("touch output {:?}", args.out))?;
+        eprintln!("embedder: nothing to embed (work-list empty, fully resumed, or all duplicates)");
         return Ok(());
     }
     let total = chunk_ids.len();
@@ -295,14 +334,8 @@ fn main() -> Result<()> {
         mem.batch_for_len(1024)
     );
 
-    // Append to the output ledger so a resumed run extends it crash-safely.
-    let out = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&args.out)
-        .with_context(|| format!("open output {:?}", args.out))?;
-    let mut w = BufWriter::new(out);
-
+    // The output ledger writer `w` was opened up front (it already wrote any copied
+    // duplicates); the embed loop appends to it crash-safely.
     const PROGRESS_EVERY: usize = 2000;
     // Re-probe free VRAM every PROBE_EVERY batches: if headroom is left and no OOM hit
     // since the last probe, grow the batches (the calibration is deliberately conservative).
@@ -482,31 +515,80 @@ fn dedup_by_ids<'a>(rows: impl Iterator<Item = &'a [i64]>) -> Vec<Vec<usize>> {
 
 /// load_done returns the set of chunk_ids already present in the output ledger, so a
 /// resumed run skips them. A missing file yields an empty set (fresh run).
-fn load_done(out: &Path) -> Result<HashSet<u64>> {
-    let mut done = HashSet::new();
+fn load_done(out: &Path) -> Result<Resume> {
+    let mut r = Resume::default();
     let f = match File::open(out) {
         Ok(f) => f,
-        Err(_) => return Ok(done),
+        Err(_) => return Ok(r),
     };
     for line in BufReader::new(f).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        // Only the chunk_id is needed; parse leniently so a truncated final line never
-        // aborts resume — it is simply re-embedded.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+        // Parse leniently so a truncated final line (killed mid-write) never aborts
+        // resume — it is simply re-embedded. We record the chunk_id (skip already-done)
+        // AND, the first time we see a content hash, its vector — so a NOT-yet-done clause
+        // whose text was already embedded under another chunk_id (cross-run/cross-shard
+        // duplicate) is filled by copy instead of paying the GPU again.
+        if let Ok(rec) = serde_json::from_str::<VecRecord>(&line) {
+            r.done.insert(rec.chunk_id);
+            if !rec.hash.is_empty() && rec.vec.len() == DENSE_DIM {
+                r.by_hash.entry(rec.hash).or_insert(rec.vec);
+            }
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             if let Some(id) = v.get("chunk_id").and_then(|x| x.as_u64()) {
-                done.insert(id);
+                r.done.insert(id);
             }
         }
     }
-    Ok(done)
+    Ok(r)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::dedup_by_ids;
+    use super::{dedup_by_ids, load_done, DENSE_DIM};
+    use std::io::Write;
+
+    #[test]
+    fn load_done_collects_ids_and_caches_full_vectors() {
+        // A ledger with: a full-dim vector (→ done + by_hash), a wrong-dim vector
+        // (→ done only, never cached), and a chunk_id-only line (→ done only).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("embedder-resume-test-{}.jsonl", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let full = vec![0.0f32; DENSE_DIM];
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"chunk_id": 1, "hash": "h1", "vec": full})
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"chunk_id": 2, "hash": "h2", "vec": [0.5]})
+            )
+            .unwrap();
+            writeln!(f, "{}", serde_json::json!({"chunk_id": 3})).unwrap();
+        }
+        let r = load_done(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(r.done.contains(&1) && r.done.contains(&2) && r.done.contains(&3));
+        // Only the full-dim vector is cached for copy-dedup.
+        assert!(
+            r.by_hash.contains_key("h1"),
+            "full-dim vector should be cached"
+        );
+        assert!(
+            !r.by_hash.contains_key("h2"),
+            "wrong-dim vector must not be cached"
+        );
+        assert_eq!(r.by_hash.len(), 1);
+        assert_eq!(r.by_hash["h1"].len(), DENSE_DIM);
+    }
 
     #[test]
     fn dedup_groups_identical_id_rows_and_covers_all() {
