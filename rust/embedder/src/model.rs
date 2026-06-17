@@ -7,24 +7,32 @@
 //! last hidden state (BGE-M3's dense head) and L2-normalise.
 //!
 //! Execution providers are tried CUDA→CPU: ORT skips an EP that fails to register, so
-//! the same binary uses the GPU on Kaggle (T4) and falls back to CPU on CI/local.
+//! the same binary uses the GPU on Kaggle (T4) and falls back to CPU on CI/local. The
+//! CUDA arena uses `kSameAsRequested` so it grows by exactly what each batch needs
+//! instead of doubling (the log showed it leaping to 2 GB+ chunks), which both wastes
+//! VRAM and makes peak memory unpredictable for the dynamic batcher.
+//!
+//! ## Tokenise once, embed from ids
+//!
+//! `encode` returns the truncated token-id rows for a slice of texts; `embed_ids` runs
+//! a forward pass on pre-tokenised rows. Splitting the two lets `main.rs` tokenise the
+//! whole work-list once (to length-sort it and size batches by token budget) without
+//! re-tokenising at inference time.
 
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use ndarray::{Array2, Ix2, Ix3};
-use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider};
+use ndarray::{Array2, Axis, Ix2, Ix3};
+use ort::execution_providers::{ArenaExtendStrategy, CPUExecutionProvider, CUDAExecutionProvider};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tokenizers::{Tokenizer, TruncationParams};
 
 /// Tokenizer truncation length. BGE-M3 supports 8192, but full self-attention at
-/// batch×seq² blows up GPU memory — batch=64 × 8192² × 16 heads = 256 GiB, far past a
-/// T4's 16 GB (the observed BFC OOM). 1024 keeps the attention buffer ~4 GB at batch 64
-/// and captures the discriminative head of a clause; the embedding_hash keys on the
-/// FULL text (not the truncated tokens), so tuning this never forces a re-embed.
-/// (A future token-budget batcher could restore 8192 for the rare long clause.)
-const MAX_TOKENS: usize = 1024;
+/// batch×seq² blows up GPU memory; 1024 keeps the attention buffer bounded and captures
+/// the discriminative head of a clause. The embedding_hash keys on the FULL text (not
+/// the truncated tokens), so tuning this never forces a re-embed.
+pub const MAX_TOKENS: usize = 1024;
 
 /// Bge wraps a committed ORT session + tokenizer for repeated batch embedding.
 pub struct Bge {
@@ -38,10 +46,12 @@ impl Bge {
     /// must sit next to its external-data file (model.onnx_data) — ORT finds it by the
     /// relative path baked into the graph.
     pub fn load(model_onnx: &Path, tokenizer_json: &Path, require_cuda: bool) -> Result<Self> {
-        // CUDA first, CPU fallback. With require_cuda, the CUDA EP is set to
-        // error_on_failure so a misconfigured GPU runtime is a LOUD error (with ORT's
-        // reason) rather than a silent ~13 clause/s CPU run.
-        let cuda = CUDAExecutionProvider::default();
+        // CUDA first, CPU fallback. `kSameAsRequested` stops the arena from doubling
+        // (predictable peak for the dynamic batcher). With require_cuda the CUDA EP is
+        // set to error_on_failure so a misconfigured GPU runtime is a LOUD error rather
+        // than a silent ~13 clause/s CPU run.
+        let cuda = CUDAExecutionProvider::default()
+            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested);
         let cuda = if require_cuda {
             cuda.build().error_on_failure()
         } else {
@@ -55,9 +65,8 @@ impl Bge {
         let needs_token_type = session.inputs.iter().any(|i| i.name == "token_type_ids");
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_json).map_err(|e| anyhow!("load tokenizer: {e}"))?;
-        // TRUNCATE to BGE-M3's max (8192). Without this a long clause tokenises past the
-        // model's position-embedding table (8194) and the graph's Expand node fails:
-        // "left operand cannot broadcast … LeftShape {1,8194} RightShape {64,10493}".
+        // TRUNCATE to MAX_TOKENS so a long clause never tokenises past the model's
+        // position-embedding table (the Expand-node broadcast crash).
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: MAX_TOKENS,
@@ -71,26 +80,39 @@ impl Bge {
         })
     }
 
-    /// embed_batch returns one dense (L2-normalised) vector per input text.
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// encode tokenises a slice of texts (parallel, truncated to MAX_TOKENS) and returns
+    /// the token-id rows. Done once up front so the work-list can be length-sorted and
+    /// batched by token budget without re-tokenising at inference time.
+    pub fn encode(&self, texts: &[String]) -> Result<Vec<Vec<i64>>> {
         let encs = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow!("encode_batch: {e}"))?;
-        let bsz = encs.len();
-        let seq = encs
+        Ok(encs
             .iter()
-            .map(|e| e.get_ids().len())
+            .map(|e| e.get_ids().iter().map(|&id| id as i64).collect())
+            .collect())
+    }
+
+    /// embed_ids runs a forward pass on pre-tokenised id rows, padding to the batch's
+    /// longest row, and returns one dense (L2-normalised) vector per row. Generic over
+    /// the row type (`AsRef<[i64]>`) so the caller can pass its own records without
+    /// cloning the id vectors per batch.
+    pub fn embed_ids<R: AsRef<[i64]>>(&self, rows: &[R]) -> Result<Vec<Vec<f32>>> {
+        let bsz = rows.len();
+        let seq = rows
+            .iter()
+            .map(|r| r.as_ref().len())
             .max()
             .unwrap_or(1)
             .max(1);
 
         let mut ids = Array2::<i64>::zeros((bsz, seq));
         let mut mask = Array2::<i64>::zeros((bsz, seq));
-        for (i, e) in encs.iter().enumerate() {
-            for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
-                ids[[i, j]] = id as i64;
-                mask[[i, j]] = m as i64;
+        for (i, r) in rows.iter().enumerate() {
+            for (j, &id) in r.as_ref().iter().enumerate() {
+                ids[[i, j]] = id;
+                mask[[i, j]] = 1;
             }
         }
 
@@ -112,26 +134,20 @@ impl Bge {
         match shape.len() {
             // [batch, seq, hidden] → CLS token (index 0) is BGE-M3's dense head.
             3 => {
-                let hidden = shape[2];
                 let v = view.into_dimensionality::<Ix3>()?;
                 for i in 0..bsz {
-                    let mut row = vec![0f32; hidden];
-                    for (h, slot) in row.iter_mut().enumerate() {
-                        *slot = v[[i, 0, h]];
-                    }
+                    // CLS row = v[i, 0, ..]; copy the contiguous hidden vector at once.
+                    let mut row: Vec<f32> =
+                        v.index_axis(Axis(0), i).index_axis(Axis(0), 0).to_vec();
                     l2_normalize(&mut row);
                     out.push(row);
                 }
             }
             // [batch, hidden] → already pooled; just normalise.
             2 => {
-                let hidden = shape[1];
                 let v = view.into_dimensionality::<Ix2>()?;
                 for i in 0..bsz {
-                    let mut row = vec![0f32; hidden];
-                    for (h, slot) in row.iter_mut().enumerate() {
-                        *slot = v[[i, h]];
-                    }
+                    let mut row: Vec<f32> = v.index_axis(Axis(0), i).to_vec();
                     l2_normalize(&mut row);
                     out.push(row);
                 }
