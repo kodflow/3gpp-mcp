@@ -151,6 +151,14 @@ fn main() -> Result<()> {
     }
     if items.is_empty() {
         eprintln!("embedder: nothing to do (work-list empty or fully resumed)");
+        // Touch the output so a downstream `embed-io --import-vectors` opens a real
+        // (possibly empty) file instead of erroring on a missing path. create(true)+
+        // append never truncates an existing resume ledger.
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args.out)
+            .with_context(|| format!("touch output {:?}", args.out))?;
         return Ok(());
     }
     eprintln!(
