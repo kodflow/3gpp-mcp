@@ -227,11 +227,22 @@ fn main() -> Result<()> {
     }
     drop(texts);
 
-    // Length-bucket: sort by token count so each batch holds clauses of similar length
-    // (tiny padding) and the dynamic batcher can size by the batch's true sequence length.
-    prepared.sort_by_key(|p| p.ids.len());
-    let lens: Vec<usize> = prepared.iter().map(|p| p.ids.len()).collect();
+    // DEDUP identical model inputs. Clauses with the same (truncated) token-id sequence
+    // produce the SAME vector, and 3GPP reuses a clause verbatim across many releases, so
+    // the work-list is highly redundant. Group by id sequence, embed each DISTINCT input
+    // once, and fan the vector out to every chunk_id in the group. Pure win, zero quality
+    // loss — typically the dominant lever on a multi-release corpus.
+    let mut groups = dedup_by_ids(prepared.iter().map(|p| p.ids.as_slice()));
+    let distinct = groups.len();
+    // Length-bucket the DISTINCT inputs by representative token length so each batch holds
+    // similar-length sequences and the dynamic batcher sizes by true sequence length.
+    groups.sort_by_key(|g| prepared[g[0]].ids.len());
+    let lens: Vec<usize> = groups.iter().map(|g| prepared[g[0]].ids.len()).collect();
     log_distribution(&lens);
+    eprintln!(
+        "RESULT dedup clauses={total} distinct={distinct} factor={:.2}x (only distinct inputs hit the GPU)",
+        total as f64 / distinct.max(1) as f64
+    );
 
     // Size the memory model from the FREE VRAM measured after the model loaded (so the
     // weights are already accounted for). No GPU → fixed CPU-fallback batch. gpu_total is
@@ -304,33 +315,37 @@ fn main() -> Result<()> {
     eprintln!("PROGRESS 0/{total} (0%) starting…");
 
     let mut i = 0usize;
-    while i < total {
+    while i < distinct {
         let end = batch::batch_end(&lens, i, &mem);
-        let vecs = run_adaptive(&bge, &mut mem, &prepared[i..end])
-            .with_context(|| format!("embed batch [{i}, {end})"))?;
+        // Embed only the representative (first member) of each distinct group this batch.
+        let batch_ids: Vec<&[i64]> = groups[i..end]
+            .iter()
+            .map(|g| prepared[g[0]].ids.as_slice())
+            .collect();
+        let vecs = run_adaptive(&bge, &mut mem, &batch_ids)
+            .with_context(|| format!("embed distinct batch [{i}, {end})"))?;
         if vecs.len() != end - i {
             anyhow::bail!("embed returned {} vecs for {} inputs", vecs.len(), end - i);
         }
-        for (p, vec) in prepared[i..end].iter().zip(vecs) {
+        // Fan each distinct vector out to every chunk_id that shares its token sequence.
+        for (g, vec) in groups[i..end].iter().zip(vecs) {
             if vec.len() != DENSE_DIM {
-                anyhow::bail!(
-                    "clause {} got dim {}, want {}",
-                    p.chunk_id,
-                    vec.len(),
-                    DENSE_DIM
-                );
+                anyhow::bail!("distinct got dim {}, want {}", vec.len(), DENSE_DIM);
             }
-            let rec = VecRecord {
-                chunk_id: p.chunk_id,
-                hash: p.hash.clone(),
-                vec,
-            };
-            serde_json::to_writer(&mut w, &rec).context("serialize vector")?;
-            w.write_all(b"\n")?;
+            for &m in g {
+                let p = &prepared[m];
+                let rec = VecRecord {
+                    chunk_id: p.chunk_id,
+                    hash: p.hash.clone(),
+                    vec: vec.clone(),
+                };
+                serde_json::to_writer(&mut w, &rec).context("serialize vector")?;
+                w.write_all(b"\n")?;
+                done_n += 1;
+            }
         }
         // Flush per batch: the on-disk ledger is always a valid resume point.
         w.flush()?;
-        done_n += end - i;
         i = end;
 
         // Runtime VRAM autotune (GPU only): every PROBE_EVERY batches, if there's free
@@ -343,7 +358,7 @@ fn main() -> Result<()> {
             if let (Some(total_b), Some(g)) = (gpu_total, gpu::detect()) {
                 let oomed = mem.k_attn > k_at_window_start + 1e-9;
                 let headroom = (g.free_bytes as f64) > (total_b as f64) * 0.25;
-                if !oomed && headroom && i < total {
+                if !oomed && headroom && i < distinct {
                     mem.grow(0.85);
                     eprintln!(
                         "PROGRESS autotune grow — free {} MiB, k_attn now {:.0} (seq1024 batch {})",
@@ -377,7 +392,11 @@ fn main() -> Result<()> {
 /// run_adaptive embeds one batch, and on a CUDA out-of-memory shrinks the memory model
 /// (so every later batch is smaller too) and splits the batch in half, recursively, down
 /// to a single clause. A non-OOM error propagates unchanged.
-fn run_adaptive(bge: &Bge, mem: &mut MemModel, rows: &[Prepared]) -> Result<Vec<Vec<f32>>> {
+fn run_adaptive<R: AsRef<[i64]>>(
+    bge: &Bge,
+    mem: &mut MemModel,
+    rows: &[R],
+) -> Result<Vec<Vec<f32>>> {
     match bge.embed_ids(rows) {
         Ok(v) => Ok(v),
         Err(e) if is_oom(&e) => {
@@ -439,6 +458,28 @@ fn log_distribution(lens: &[usize]) {
     );
 }
 
+/// dedup_by_ids groups items by their token-id sequence. It returns one group per
+/// DISTINCT sequence, each group being the original indices that share it (group[0] is
+/// the representative to embed). Identical model inputs ⇒ identical vectors, so only the
+/// representatives need the GPU and the rest are filled by copying. The map borrows the
+/// id slices from the caller (no key clones).
+fn dedup_by_ids<'a>(rows: impl Iterator<Item = &'a [i64]>) -> Vec<Vec<usize>> {
+    let mut group_of: std::collections::HashMap<&'a [i64], usize> =
+        std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (idx, row) in rows.enumerate() {
+        match group_of.get(row) {
+            Some(&d) => groups[d].push(idx),
+            None => {
+                let d = groups.len();
+                group_of.insert(row, d);
+                groups.push(vec![idx]);
+            }
+        }
+    }
+    groups
+}
+
 /// load_done returns the set of chunk_ids already present in the output ledger, so a
 /// resumed run skips them. A missing file yields an empty set (fresh run).
 fn load_done(out: &Path) -> Result<HashSet<u64>> {
@@ -461,4 +502,35 @@ fn load_done(out: &Path) -> Result<HashSet<u64>> {
         }
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_by_ids;
+
+    #[test]
+    fn dedup_groups_identical_id_rows_and_covers_all() {
+        let a = vec![1i64, 2, 3];
+        let b = vec![9i64];
+        let rows = [a.clone(), b.clone(), a.clone(), a.clone(), b.clone()];
+        let groups = dedup_by_ids(rows.iter().map(|r| r.as_slice()));
+        // Two distinct sequences.
+        assert_eq!(groups.len(), 2);
+        // The [1,2,3] rows are indices 0,2,3; the [9] rows are 1,4.
+        let g_a = groups.iter().find(|g| g.contains(&0)).unwrap();
+        assert_eq!(g_a, &vec![0, 2, 3]);
+        let g_b = groups.iter().find(|g| g.contains(&1)).unwrap();
+        assert_eq!(g_b, &vec![1, 4]);
+        // Every original index appears exactly once across the groups.
+        let mut all: Vec<usize> = groups.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dedup_all_distinct_is_identity() {
+        let rows = [vec![1i64], vec![2], vec![3]];
+        let groups = dedup_by_ids(rows.iter().map(|r| r.as_slice()));
+        assert_eq!(groups, vec![vec![0], vec![1], vec![2]]);
+    }
 }
