@@ -60,6 +60,25 @@ def have(cmd):
     return shutil.which(cmd) is not None
 
 
+def srchash(src):
+    """Deterministic hash of the rust/embedder sources, so the cached build/model is
+    reused only while the code is unchanged. Returns '' on any error (cache disabled)."""
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        root = os.path.join(src, "rust/embedder")
+        files = sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True))
+        files += [os.path.join(root, "Cargo.toml"), os.path.join(root, "Cargo.lock")]
+        for p in files:
+            if os.path.isfile(p):
+                h.update(os.path.relpath(p, root).encode())
+                with open(p, "rb") as f:
+                    h.update(f.read())
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
 def duckdb_scalar(db, query):
     r = sh('duckdb "%s" -noheader -list "%s"' % (db, query))
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -196,41 +215,73 @@ say("sliced_clauses=%s" % sln)
 if not (sln.isdigit() and int(sln) >= 1):
     fail("empty_slice", "shard=%s" % SHARD)
 
+# ---- tool cache (FAIL-OPEN) -------------------------------------------------
+# Reuse the built embedder binary + libonnxruntime.so + the fp16 model across resume
+# passes of this shard, guarded by a hash of the rust/embedder sources (a code change
+# rebuilds). ANY failure here falls through to the normal download+build path below —
+# the cache can never block a run. Persisted once (on the build pass) into the per-shard
+# resume Dataset; restored on the next pass to skip ~10 min of cargo build + model fetch.
+CACHED_BIN = ""
+CACHED_LIBDIR = ""
+CACHED_MODEL = ""
+SRCHASH = srchash(src)
+try:
+    hits = sorted(glob.glob("/kaggle/input/**/embedder-cache/srchash.txt", recursive=True))
+    if SRCHASH and hits and open(hits[0]).read().strip() == SRCHASH:
+        cdir = os.path.dirname(hits[0])
+        cbin = os.path.join(cdir, "embedder")
+        cso = sorted(glob.glob(os.path.join(cdir, "libonnxruntime.so*")), key=len)
+        cmod = os.path.join(cdir, "bge-m3-fp16")
+        if os.path.isfile(cbin) and cso and os.path.isfile(os.path.join(cmod, "model.onnx_data")):
+            os.chmod(cbin, 0o755)
+            CACHED_BIN, CACHED_LIBDIR, CACHED_MODEL = cbin, os.path.dirname(cso[0]), cmod
+            say("toolcache=hit srchash=%s" % SRCHASH[:12])
+except Exception as e:
+    say("toolcache=error detail=%s" % str(e)[:80])
+if not CACHED_BIN:
+    say("toolcache=miss srchash=%s (build+fetch this run)" % (SRCHASH[:12] or "none"))
+
 # ---- BGE-M3 model files (external-data ONNX + tokenizer) -------------------
-BGE = os.path.join(WORK, "bge-m3")
-os.makedirs(BGE, exist_ok=True)
-for url, dest in (
-    ("%s/onnx/model.onnx" % HF, "%s/model.onnx" % BGE),
-    ("%s/onnx/model.onnx_data" % HF, "%s/model.onnx_data" % BGE),
-    ("%s/tokenizer.json" % HF, "%s/tokenizer.json" % BGE),
-):
-    if not os.path.isfile(dest):
-        if sh('curl -fSL --retry 5 -C - -A "Mozilla/5.0" "%s" -o "%s"' % (url, dest)).returncode != 0:
-            fail("model_dl", url)
-say("model_data_bytes=%d" % (os.path.getsize("%s/model.onnx_data" % BGE)))
+if CACHED_MODEL:
+    BGE16 = CACHED_MODEL
+    say("model=cached %s" % BGE16)
+else:
+    BGE = os.path.join(WORK, "bge-m3")
+    os.makedirs(BGE, exist_ok=True)
+    for url, dest in (
+        ("%s/onnx/model.onnx" % HF, "%s/model.onnx" % BGE),
+        ("%s/onnx/model.onnx_data" % HF, "%s/model.onnx_data" % BGE),
+        ("%s/tokenizer.json" % HF, "%s/tokenizer.json" % BGE),
+    ):
+        if not os.path.isfile(dest):
+            if sh('curl -fSL --retry 5 -C - -A "Mozilla/5.0" "%s" -o "%s"' % (url, dest)).returncode != 0:
+                fail("model_dl", url)
+    say("model_data_bytes=%d" % (os.path.getsize("%s/model.onnx_data" % BGE)))
 
 # ---- fp16 conversion (keep_io_types) — kernel-identical to corpus-data-image.yml.
 # fp16 is ~2-6x faster on T4 Tensor Cores AND halves attention memory; the served data
 # image bakes fp16, so the campaign MUST be fp16 for the EmbedIdentity to match (else
 # semantic is refused at serve). keep_io_types keeps fp32 IO so the Rust embedder reads
-# []f32 unchanged — only the weights become fp16.
-BGE16 = os.path.join(WORK, "bge-m3-fp16")
-os.makedirs(BGE16, exist_ok=True)
-sh("python3 -m pip install --quiet onnx onnxruntime sympy packaging")
-conv = os.path.join(WORK, "convfp16.py")
-with open(conv, "w") as f:
-    f.write(
-        "import onnx\n"
-        "from onnxruntime.transformers.onnx_model import OnnxModel\n"
-        "m = onnx.load('%s/model.onnx')\n"
-        "om = OnnxModel(m); om.convert_float_to_float16(keep_io_types=True)\n"
-        "onnx.save(om.model, '%s/model.onnx', save_as_external_data=True, "
-        "all_tensors_to_one_file=True, location='model.onnx_data')\n"
-        "print('fp16_saved')\n" % (BGE, BGE16)
-    )
-if sh("python3 %s" % conv).returncode != 0 or not os.path.isfile("%s/model.onnx_data" % BGE16):
-    fail("fp16_convert")
-sh("cp '%s/tokenizer.json' '%s/'" % (BGE, BGE16))
+# []f32 unchanged — only the weights become fp16. Skipped entirely when the toolcache
+# restored a ready fp16 model.
+if not CACHED_MODEL:
+    BGE16 = os.path.join(WORK, "bge-m3-fp16")
+    os.makedirs(BGE16, exist_ok=True)
+    sh("python3 -m pip install --quiet onnx onnxruntime sympy packaging")
+    conv = os.path.join(WORK, "convfp16.py")
+    with open(conv, "w") as f:
+        f.write(
+            "import onnx\n"
+            "from onnxruntime.transformers.onnx_model import OnnxModel\n"
+            "m = onnx.load('%s/model.onnx')\n"
+            "om = OnnxModel(m); om.convert_float_to_float16(keep_io_types=True)\n"
+            "onnx.save(om.model, '%s/model.onnx', save_as_external_data=True, "
+            "all_tensors_to_one_file=True, location='model.onnx_data')\n"
+            "print('fp16_saved')\n" % (BGE, BGE16)
+        )
+    if sh("python3 %s" % conv).returncode != 0 or not os.path.isfile("%s/model.onnx_data" % BGE16):
+        fail("fp16_convert")
+    sh("cp '%s/tokenizer.json' '%s/'" % (BGE, BGE16))
 # The fp16 model registry — fields MUST match corpus-data-image.yml's models.yaml so
 # cmd/embedid emits the SAME identity the served fp16 image expects (dir is irrelevant
 # to the identity — only family/precision/dim/normalization/revision are).
@@ -261,24 +312,30 @@ ID = sh("CGO_ENABLED=1 go run ./cmd/embedid", env=EMBED_MODEL_ENV).stdout.strip(
 if not re.match(r"^[0-9a-f]{6,}$", ID):
     fail("bad_identity", ID)
 say("embed_identity=%s (fp16)" % ID)
-bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
-if bc.returncode != 0:
-    fail("cargo_build", (bc.stderr or "")[-200:])
-EMBEDDER = os.path.join(src, "rust/embedder/target/release/embedder")
-# ort's `download-binaries` fetches libonnxruntime.so at BUILD time into the ort-sys
-# OUT_DIR, but the release binary has no $ORIGIN RPATH, so at RUNTIME it can't find the
-# lib (error 127: "libonnxruntime.so: cannot open shared object file"). Locate the .so
-# anywhere under target/ and prepend its dir to LD_LIBRARY_PATH for the embedder run.
-_ortlibs = sorted(
-    glob.glob(os.path.join(src, "rust/embedder/target/release/**/libonnxruntime.so*"), recursive=True),
-    key=len,
-)
-if _ortlibs:
-    _libdir = os.path.dirname(_ortlibs[0])
-    os.environ["LD_LIBRARY_PATH"] = _libdir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
-    say("ort_lib=%s" % _ortlibs[0])
+if CACHED_BIN:
+    # Toolcache hit: skip the ~5-10 min cargo build, run the cached binary + its .so.
+    EMBEDDER = CACHED_BIN
+    os.environ["LD_LIBRARY_PATH"] = CACHED_LIBDIR + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    say("cargo=cached ort_lib=%s/libonnxruntime.so" % CACHED_LIBDIR)
 else:
-    say("ort_lib=NONE (libonnxruntime.so not found under target/ — embed will fail)")
+    bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
+    if bc.returncode != 0:
+        fail("cargo_build", (bc.stderr or "")[-200:])
+    EMBEDDER = os.path.join(src, "rust/embedder/target/release/embedder")
+    # ort's `download-binaries` fetches libonnxruntime.so at BUILD time into the ort-sys
+    # OUT_DIR, but the release binary has no $ORIGIN RPATH, so at RUNTIME it can't find the
+    # lib (error 127: "libonnxruntime.so: cannot open shared object file"). Locate the .so
+    # anywhere under target/ and prepend its dir to LD_LIBRARY_PATH for the embedder run.
+    _ortlibs = sorted(
+        glob.glob(os.path.join(src, "rust/embedder/target/release/**/libonnxruntime.so*"), recursive=True),
+        key=len,
+    )
+    if _ortlibs:
+        _libdir = os.path.dirname(_ortlibs[0])
+        os.environ["LD_LIBRARY_PATH"] = _libdir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+        say("ort_lib=%s" % _ortlibs[0])
+    else:
+        say("ort_lib=NONE (libonnxruntime.so not found under target/ — embed will fail)")
 
 # ---- export → embed → import ----------------------------------------------
 WL = os.path.join(WORK, "work.jsonl")
@@ -325,6 +382,21 @@ if KU and KK and os.path.isfile(VECS):
         os.makedirs(out, exist_ok=True)
         shutil.copy(EMBEDDED_DB, "%s/3gpp-embedded.duckdb" % out)
         shutil.copy(VECS, "%s/vecs.jsonl" % out)
+        # Persist the toolcache ONCE (only on the build pass — a cache-hit run already has
+        # it, so don't re-upload). Fail-open: a copy error never fails the run.
+        if not CACHED_BIN and SRCHASH:
+            try:
+                cc = "%s/embedder-cache" % out
+                os.makedirs(cc, exist_ok=True)
+                shutil.copy(EMBEDDER, "%s/embedder" % cc)
+                libdir = os.environ.get("LD_LIBRARY_PATH", "").split(":")[0]
+                for so in glob.glob(os.path.join(libdir, "libonnxruntime.so*")):
+                    shutil.copy(so, cc)
+                shutil.copytree(BGE16, "%s/bge-m3-fp16" % cc, dirs_exist_ok=True)
+                open("%s/srchash.txt" % cc, "w").write(SRCHASH)
+                say("toolcache=persisted srchash=%s" % SRCHASH[:12])
+            except Exception as e:
+                say("toolcache_persist=skip detail=%s" % str(e)[:80])
         json.dump({"title": "3gpp-rust-embedded-%s" % SHARD, "id": DS, "licenses": [{"name": "CC0-1.0"}]},
                   open("%s/dataset-metadata.json" % out, "w"))
         if sh('kaggle datasets version -p "%s" -m "shard=%s null=%s" --dir-mode zip' % (out, SHARD, nul)).returncode == 0:
