@@ -45,12 +45,19 @@ impl Bge {
     /// load commits the ONNX session (CUDA→CPU) and loads the tokenizer. `model_onnx`
     /// must sit next to its external-data file (model.onnx_data) — ORT finds it by the
     /// relative path baked into the graph.
-    pub fn load(model_onnx: &Path, tokenizer_json: &Path, require_cuda: bool) -> Result<Self> {
+    pub fn load(
+        model_onnx: &Path,
+        tokenizer_json: &Path,
+        require_cuda: bool,
+        device_id: i32,
+    ) -> Result<Self> {
         // CUDA first, CPU fallback. `kSameAsRequested` stops the arena from doubling
-        // (predictable peak for the dynamic batcher). With require_cuda the CUDA EP is
+        // (predictable peak for the dynamic batcher). `device_id` selects the GPU so the
+        // multi-GPU launcher runs one process per card. With require_cuda the CUDA EP is
         // set to error_on_failure so a misconfigured GPU runtime is a LOUD error rather
         // than a silent ~13 clause/s CPU run.
         let cuda = CUDAExecutionProvider::default()
+            .with_device_id(device_id)
             .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested);
         let cuda = if require_cuda {
             cuda.build().error_on_failure()

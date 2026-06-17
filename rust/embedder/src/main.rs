@@ -101,6 +101,47 @@ struct Args {
     /// registered, instead of silently falling back to CPU (~13 clause/s).
     #[arg(long, default_value_t = false)]
     require_cuda: bool,
+
+    /// CUDA device id this process runs on. The kernel launches one process per GPU
+    /// (--device 0, 1, …) so an N-GPU box embeds N× in parallel.
+    #[arg(long, default_value_t = 0)]
+    device: i32,
+
+    /// This process's shard index in [0, shard-count). Combined with --shard-count it
+    /// makes each GPU process a DISJOINT slice of the work-list (sharded by a hash of the
+    /// clause text, so identical texts land in the same shard and the dedup is preserved).
+    #[arg(long, default_value_t = 0)]
+    shard_index: u64,
+
+    /// Number of shards (= number of GPUs). 1 = process the whole work-list (single GPU).
+    #[arg(long, default_value_t = 1)]
+    shard_count: u64,
+
+    /// Extra resume ledger(s) to treat as already-done (in addition to --out). The
+    /// multi-GPU launcher passes the merged ledger here so every per-GPU process skips
+    /// what any shard already embedded. Repeatable.
+    #[arg(long)]
+    resume_from: Vec<PathBuf>,
+}
+
+/// shard_of maps a clause content hash to a shard in [0, count). Deterministic and
+/// identical for identical text (the hash is text-derived), so every copy of a clause
+/// lands in the same shard — the dedup never splits across GPUs. count==0 is treated as 1.
+fn shard_of(hash: &str, count: u64) -> u64 {
+    if count <= 1 {
+        return 0;
+    }
+    // First 16 hex chars of the (sha-hex) hash as a u64; fall back to a byte FNV if the
+    // hash is shorter/non-hex so the function is total.
+    let v = u64::from_str_radix(hash.get(..16).unwrap_or(""), 16).unwrap_or_else(|_| {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in hash.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    });
+    v % count
 }
 
 #[derive(Deserialize)]
@@ -156,10 +197,25 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
 
-    // Resume ledger: chunk_ids already embedded in --out are skipped; their content hashes
-    // let us copy a not-yet-done duplicate's vector instead of re-embedding it.
-    let resume =
-        load_done(&args.out).with_context(|| format!("scan resume ledger {:?}", args.out))?;
+    let shard_count = args.shard_count.max(1);
+    if args.shard_index >= shard_count {
+        anyhow::bail!(
+            "--shard-index {} out of range for --shard-count {}",
+            args.shard_index,
+            shard_count
+        );
+    }
+    if shard_count > 1 {
+        eprintln!(
+            "RESULT shard index={} count={} device={}",
+            args.shard_index, shard_count, args.device
+        );
+    }
+
+    // Resume ledger: chunk_ids already embedded in --out (+ any --resume-from) are skipped;
+    // their content hashes let us copy a not-yet-done duplicate's vector without the GPU.
+    let resume = load_done(&args.out, &args.resume_from)
+        .with_context(|| format!("scan resume ledger {:?}", args.out))?;
     if !resume.done.is_empty() {
         eprintln!(
             "embedder: resume — {} clause(s) already in {:?} ({} distinct vectors cached)",
@@ -191,6 +247,12 @@ fn main() -> Result<()> {
                 continue;
             }
             let h = hash::clause_hash(&it.heading, &it.text, &args.embed_identity);
+            // Multi-GPU: this process only owns its shard of the work-list. Sharding by the
+            // text-derived hash keeps every copy of a clause in the SAME shard, so the dedup
+            // is never split across GPUs.
+            if shard_of(&h, shard_count) != args.shard_index {
+                continue;
+            }
             if resume.by_hash.contains_key(&h) {
                 to_copy.push((it.chunk_id, h));
                 continue;
@@ -244,6 +306,7 @@ fn main() -> Result<()> {
         &args.model_dir.join(&args.onnx),
         &args.model_dir.join("tokenizer.json"),
         args.require_cuda,
+        args.device,
     )?;
 
     // Tokenise the whole work-list once (windowed to bound transient memory). The ids let
@@ -513,24 +576,31 @@ fn dedup_by_ids<'a>(rows: impl Iterator<Item = &'a [i64]>) -> Vec<Vec<usize>> {
     groups
 }
 
-/// load_done returns the set of chunk_ids already present in the output ledger, so a
-/// resumed run skips them. A missing file yields an empty set (fresh run).
-fn load_done(out: &Path) -> Result<Resume> {
+/// load_done scans the output ledger plus any extra `--resume-from` ledgers (the
+/// multi-GPU launcher passes the merged ledger so every per-GPU process skips what any
+/// shard already embedded). A missing file is ignored (fresh run).
+fn load_done(out: &Path, extra: &[PathBuf]) -> Result<Resume> {
     let mut r = Resume::default();
-    let f = match File::open(out) {
+    scan_ledger(out, &mut r)?;
+    for p in extra {
+        scan_ledger(p, &mut r)?;
+    }
+    Ok(r)
+}
+
+/// scan_ledger folds one JSONL vector ledger into `r`: chunk_ids (skip already-done) and,
+/// the first time a content hash is seen, its vector (copy-fill a duplicate without GPU).
+fn scan_ledger(path: &Path, r: &mut Resume) -> Result<()> {
+    let f = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return Ok(r),
+        Err(_) => return Ok(()),
     };
     for line in BufReader::new(f).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        // Parse leniently so a truncated final line (killed mid-write) never aborts
-        // resume — it is simply re-embedded. We record the chunk_id (skip already-done)
-        // AND, the first time we see a content hash, its vector — so a NOT-yet-done clause
-        // whose text was already embedded under another chunk_id (cross-run/cross-shard
-        // duplicate) is filled by copy instead of paying the GPU again.
+        // Parse leniently so a truncated final line (killed mid-write) never aborts resume.
         if let Ok(rec) = serde_json::from_str::<VecRecord>(&line) {
             r.done.insert(rec.chunk_id);
             if !rec.hash.is_empty() && rec.vec.len() == DENSE_DIM {
@@ -542,13 +612,33 @@ fn load_done(out: &Path) -> Result<Resume> {
             }
         }
     }
-    Ok(r)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dedup_by_ids, load_done, DENSE_DIM};
+    use super::{dedup_by_ids, load_done, shard_of, DENSE_DIM};
     use std::io::Write;
+
+    #[test]
+    fn shard_of_is_deterministic_balanced_and_in_range() {
+        // count<=1 is always shard 0 (single-GPU path).
+        assert_eq!(shard_of("deadbeefdeadbeef", 1), 0);
+        // Deterministic + identical text (same hash) → same shard, so dedup never splits.
+        let h = "a1b2c3d4e5f600112233445566778899";
+        assert_eq!(shard_of(h, 4), shard_of(h, 4));
+        // In range, and a non-hex hash still resolves (FNV fallback).
+        for n in [2u64, 3, 8] {
+            assert!(shard_of(h, n) < n);
+            assert!(shard_of("not-hex-!", n) < n);
+        }
+        // Spread: 4096 distinct hashes hit every one of 8 shards.
+        let mut seen = [false; 8];
+        for i in 0..4096u64 {
+            seen[shard_of(&format!("{i:016x}"), 8) as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "all 8 shards should receive work");
+    }
 
     #[test]
     fn load_done_collects_ids_and_caches_full_vectors() {
@@ -573,7 +663,7 @@ mod tests {
             .unwrap();
             writeln!(f, "{}", serde_json::json!({"chunk_id": 3})).unwrap();
         }
-        let r = load_done(&path).unwrap();
+        let r = load_done(&path, &[]).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert!(r.done.contains(&1) && r.done.contains(&2) && r.done.contains(&3));
