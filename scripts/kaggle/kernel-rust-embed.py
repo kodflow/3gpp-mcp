@@ -307,7 +307,12 @@ say("vectors_written=%s" % vec_lines)
 if sh('/tmp/embed-io --db "%s" --import-vectors "%s" --embed-identity "%s" --build-hnsw'
       % (EMBEDDED_DB, VECS, ID)).returncode != 0:
     fail("import_vectors")
-nul = duckdb_scalar(EMBEDDED_DB, "SELECT count(*) FROM clauses WHERE embedding IS NULL;")
+# Count only EMBEDDABLE clauses still NULL. Heading-only / "void" / table-stripped
+# clauses have empty text and are skipped by the embedder (main.rs: text.trim()
+# .is_empty()) — counting them keeps null_after > 0 forever and complete=1 never
+# fires (mirrors store.CountNullAtFloor's embeddable-text predicate).
+nul = duckdb_scalar(EMBEDDED_DB,
+                    "SELECT count(*) FROM clauses WHERE embedding IS NULL AND length(trim(text)) > 0;")
 say("null_after=%s" % nul)
 
 # ---- version the partial DB + ledger back ----------------------------------
