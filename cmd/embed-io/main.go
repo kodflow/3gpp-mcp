@@ -40,6 +40,7 @@ func main() {
 		dbPath   = flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot")
 		exportWL = flag.String("export-worklist", "", "write the embedding work-list as JSONL to this path, then exit")
 		importV  = flag.String("import-vectors", "", "read a JSONL vector file (from rust/embedder) and write it into the DB, then exit")
+		backfill = flag.Bool("backfill-dupes", false, "copy existing vectors onto unembedded clauses with byte-identical (heading,text), then exit — shrinks the work-list (cross-release/series dedup)")
 		embedID  = flag.String("embed-identity", "", "the EmbedIdentity stamped into embedding_model meta on import (use `go run ./cmd/embedid`)")
 		buildHN  = flag.Bool("build-hnsw", false, "after import, (re)build and freeze the HNSW index")
 		// work-list selection (mirrors cmd/embed so export parity is exact)
@@ -54,6 +55,11 @@ func main() {
 	flag.Parse()
 
 	switch {
+	case *backfill:
+		if err := runBackfill(*dbPath); err != nil {
+			fmt.Fprintf(os.Stderr, "backfill-dupes: %v\n", err)
+			os.Exit(1)
+		}
 	case *exportWL != "":
 		if err := runExport(*dbPath, *exportWL, scanOpts{floor: *floor, series: *series, releases: splitCSV(*embRels), limit: *limit, order: *order, resume: *resume}); err != nil {
 			fmt.Fprintf(os.Stderr, "export-worklist: %v\n", err)
@@ -89,6 +95,24 @@ type vecRecord struct {
 	ChunkID uint64    `json:"chunk_id"`
 	Hash    string    `json:"hash"`
 	Vec     []float32 `json:"vec"`
+}
+
+// runBackfill opens the DB read-write and copies existing vectors onto unembedded
+// clauses with byte-identical (heading, text), so the work-list exported next skips
+// verbatim-repeated clauses (same spec across releases, shared boilerplate across specs)
+// instead of re-embedding them on the GPU. A no-op on a DB without vectors yet.
+func runBackfill(dbPath string) error {
+	db, err := store.Open(dbPath) // read-write
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	n, err := db.BackfillDuplicateEmbeddings(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "backfill-dupes: filled %d duplicate clause(s) from existing vectors\n", n)
+	return nil
 }
 
 // runExport streams the work-list (read-only) to JSONL, using the SAME EmbedScan as
