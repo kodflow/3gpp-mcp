@@ -234,9 +234,12 @@ fn main() -> Result<()> {
     log_distribution(&lens);
 
     // Size the memory model from the FREE VRAM measured after the model loaded (so the
-    // weights are already accounted for). No GPU → fixed CPU-fallback batch.
+    // weights are already accounted for). No GPU → fixed CPU-fallback batch. gpu_total is
+    // kept for the runtime VRAM probe that grows batches when headroom is left over.
+    let mut gpu_total: Option<u64> = None;
     let mut mem = match gpu::detect() {
         Some(g) => {
+            gpu_total = Some(g.total_bytes);
             let avail = (g.free_bytes as f64) * args.vram_fraction;
             eprintln!(
                 "RESULT gpu name={:?} total_mib={} free_mib={} avail_gib={:.2} fraction={} max_batch={}",
@@ -250,6 +253,9 @@ fn main() -> Result<()> {
             MemModel {
                 avail_bytes: avail,
                 k_attn: batch::K_ATTN_DEFAULT,
+                // Allow the runtime probe to grow batches up to ~3.3× the conservative
+                // calibration before the OOM backoff (the hard ceiling) kicks in.
+                min_k: batch::K_ATTN_DEFAULT * 0.3,
                 max_batch: args.max_batch,
             }
         }
@@ -259,10 +265,12 @@ fn main() -> Result<()> {
                 args.batch
             );
             // avail huge ⇒ batch_for_len always saturates to max_batch = --batch (the old
-            // fixed-batch behaviour) without risking inf arithmetic.
+            // fixed-batch behaviour) without risking inf arithmetic. min_k == k_attn so the
+            // (never-reached, CPU) growth path is a no-op.
             MemModel {
                 avail_bytes: 1.0e18,
                 k_attn: batch::K_ATTN_DEFAULT,
+                min_k: batch::K_ATTN_DEFAULT,
                 max_batch: args.batch.max(1),
             }
         }
@@ -285,9 +293,14 @@ fn main() -> Result<()> {
     let mut w = BufWriter::new(out);
 
     const PROGRESS_EVERY: usize = 2000;
+    // Re-probe free VRAM every PROBE_EVERY batches: if headroom is left and no OOM hit
+    // since the last probe, grow the batches (the calibration is deliberately conservative).
+    const PROBE_EVERY: usize = 64;
     let start = Instant::now();
     let mut done_n = 0usize;
     let mut next_log = PROGRESS_EVERY;
+    let mut batches_since_probe = 0usize;
+    let mut k_at_window_start = mem.k_attn;
     eprintln!("PROGRESS 0/{total} (0%) starting…");
 
     let mut i = 0usize;
@@ -319,6 +332,30 @@ fn main() -> Result<()> {
         w.flush()?;
         done_n += end - i;
         i = end;
+
+        // Runtime VRAM autotune (GPU only): every PROBE_EVERY batches, if there's free
+        // VRAM headroom AND no OOM shrank the model since the last probe, grow the
+        // batches. The OOM backoff (which raises k_attn) is the hard ceiling, so growth
+        // and shrink form a closed loop that converges on the real card's limit.
+        batches_since_probe += 1;
+        if batches_since_probe >= PROBE_EVERY {
+            batches_since_probe = 0;
+            if let (Some(total_b), Some(g)) = (gpu_total, gpu::detect()) {
+                let oomed = mem.k_attn > k_at_window_start + 1e-9;
+                let headroom = (g.free_bytes as f64) > (total_b as f64) * 0.25;
+                if !oomed && headroom && i < total {
+                    mem.grow(0.85);
+                    eprintln!(
+                        "PROGRESS autotune grow — free {} MiB, k_attn now {:.0} (seq1024 batch {})",
+                        g.free_bytes / (1024 * 1024),
+                        mem.k_attn,
+                        mem.batch_for_len(1024)
+                    );
+                }
+            }
+            k_at_window_start = mem.k_attn;
+        }
+
         if done_n >= next_log || done_n == total {
             let secs = start.elapsed().as_secs_f64().max(0.001);
             let rate = done_n as f64 / secs;
