@@ -84,6 +84,16 @@ def duckdb_scalar(db, query):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def gpu_count():
+    """Number of CUDA GPUs visible (Kaggle gives T4 x2; a rented box may give more).
+    Falls back to 1 on any error so the single-GPU path always works."""
+    r = sh("nvidia-smi -L")
+    if r.returncode != 0:
+        return 1
+    n = sum(1 for ln in r.stdout.splitlines() if ln.strip().startswith("GPU "))
+    return max(1, n)
+
+
 # ---- config ----------------------------------------------------------------
 OWNER = os.environ.get("GHCR_OWNER", "kodflow")
 GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
@@ -343,20 +353,51 @@ if sh('/tmp/embed-io --db "%s" --export-worklist "%s" --resume' % (EMBEDDED_DB, 
     fail("export_worklist")
 say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
-# Run the embedder with output INHERITED (not captured) so its PROGRESS lines stream
-# LIVE into the Kaggle log — capturing them (the old sh()) buffered everything until the
-# end, hiding the progress bar. The embedder prints "PROGRESS done/total (%) rate eta"
-# every 2000 clauses.
-embcmd = '"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s --limit %s --require-cuda' % (
-    EMBEDDER, WL, VECS, BGE16, ID, BATCH, LIMIT)
-try:
-    emb_rc = subprocess.run(embcmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
-except subprocess.TimeoutExpired:
-    emb_rc = 124
-    say("embedder hit TIME_BUDGET — partial (ledger resumes next run)")
+# Output is INHERITED (not captured) so PROGRESS lines stream LIVE into the Kaggle log.
+# MULTI-GPU: one embedder process per GPU, in PARALLEL. Each shards the work-list by a
+# hash of the clause text (--shard i/N) so the shards are disjoint AND every copy of a
+# clause stays in one shard (the dedup is never split). Each writes its own ledger
+# vecs.<i> and treats the merged VECS as already-done (--resume-from), then we fold the
+# shard ledgers back into VECS. N==1 runs the plain single-GPU path. Scales to any N.
+NGPU = gpu_count()
+say("gpus=%d" % NGPU)
+COMMON = '--model-dir "%s" --embed-identity "%s" --batch %s --limit %s --require-cuda' % (
+    BGE16, ID, BATCH, LIMIT)
+if NGPU <= 1:
+    cmd = '"%s" --in "%s" --out "%s" %s' % (EMBEDDER, WL, VECS, COMMON)
+    try:
+        emb_rc = subprocess.run(cmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
+    except subprocess.TimeoutExpired:
+        emb_rc = 124
+        say("embedder hit TIME_BUDGET — partial (ledger resumes next run)")
+else:
+    shard_outs = ["%s.%d" % (VECS, i) for i in range(NGPU)]
+    procs = []
+    for i in range(NGPU):
+        cmd = '"%s" --in "%s" --out "%s" --resume-from "%s" --device %d --shard-index %d --shard-count %d %s' % (
+            EMBEDDER, WL, shard_outs[i], VECS, i, i, NGPU, COMMON)
+        procs.append(subprocess.Popen(cmd, shell=True, env=os.environ))
+    deadline = time.time() + TIME_BUDGET
+    emb_rc = 0
+    for i, p in enumerate(procs):
+        try:
+            rc = p.wait(timeout=max(1, int(deadline - time.time())))
+            emb_rc = emb_rc or rc
+        except subprocess.TimeoutExpired:
+            p.kill()
+            emb_rc = 124
+            say("gpu %d shard hit TIME_BUDGET — partial (resumes next run)" % i)
+    # Fold each shard's new vectors into the canonical ledger (VECS already holds the prior
+    # merged ledger; the shards carry only this run's additions, so appending is correct).
+    with open(VECS, "a") as merged:
+        for vi in shard_outs:
+            if os.path.isfile(vi):
+                with open(vi) as f:
+                    shutil.copyfileobj(f, merged)
+                os.remove(vi)
+    say("multi_gpu merged %d shard ledgers" % NGPU)
 if emb_rc != 0:
-    # Non-fatal: the vecs.jsonl ledger is a valid resume point; import what we have. The
-    # actual error already streamed live above.
+    # Non-fatal: the vecs.jsonl ledger is a valid resume point; import what we have.
     say("embedder_rc=%d (partial allowed — ledger resumes next run; see live log above)" % emb_rc)
 vec_lines = sh('wc -l < "%s"' % VECS).stdout.strip() if os.path.isfile(VECS) else "0"
 say("vectors_written=%s" % vec_lines)
