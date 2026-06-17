@@ -172,3 +172,51 @@ func TestClausesNeedingEmbeddingReleaseSet(t *testing.T) {
 		t.Errorf("empty release set = %v, want all 4 rows", ids)
 	}
 }
+
+// TestEmptyTextClausesAreUnembeddable pins the convergence fix: heading-only / "void"
+// clauses (empty text) can never carry a dense vector, so the embedder skips them.
+// The work-list and every null-counter must agree — otherwise a per-series resume
+// re-selects the same empty-text rows forever and complete=1 never fires (the bug
+// that stalled the series-23 Kaggle campaign).
+func TestEmptyTextClausesAreUnembeddable(t *testing.T) {
+	ctx := context.Background()
+	s := newMem(t)
+	if err := s.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "1", Heading: "Scope", Text: "real body"},
+		{ChunkID: 2, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "2", Heading: "Void", Text: ""},
+		{ChunkID: 3, SpecID: "23.501", Release: "Rel-19", Version: "19.6.0", ClausePath: "3", Heading: "Reserved", Text: "   "},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Work-list (default AND resume) excludes the empty/whitespace-only clauses.
+	for _, scan := range []EmbedScan{{}, {ResumeOnly: true}} {
+		ids, _ := drainScan(t, s, scan)
+		if len(ids) != 1 || ids[0] != 1 {
+			t.Errorf("scan %+v work-list = %v, want only [1] (empty-text 2,3 excluded)", scan, ids)
+		}
+	}
+
+	// Counters: only chunk 1 is a genuine missing vector; 2 and 3 are NULL by design.
+	if n, err := s.CountNullEmbeddings(ctx); err != nil || n != 1 {
+		t.Errorf("CountNullEmbeddings = (%d,%v), want (1,nil) — empty-text NULLs must not count", n, err)
+	}
+	if n, err := s.CountNullAtFloor(ctx, 0, ""); err != nil || n != 1 {
+		t.Errorf("CountNullAtFloor = (%d,%v), want (1,nil)", n, err)
+	}
+
+	// After embedding the one real clause, the corpus is COMPLETE: every counter
+	// reaches zero even though chunks 2 and 3 remain NULL.
+	if err := s.SetEmbeddingWithHash(ctx, 1, make([]float32, 1024), "cafe"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountNullEmbeddings(ctx); n != 0 {
+		t.Errorf("CountNullEmbeddings after embedding real clause = %d, want 0 (convergence)", n)
+	}
+	if n, _ := s.CountNullAtFloor(ctx, 0, ""); n != 0 {
+		t.Errorf("CountNullAtFloor after embedding real clause = %d, want 0 (convergence)", n)
+	}
+	if ids, _ := drainScan(t, s, EmbedScan{ResumeOnly: true}); len(ids) != 0 {
+		t.Errorf("resume work-list after embedding = %v, want [] (no more work)", ids)
+	}
+}

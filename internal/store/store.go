@@ -614,12 +614,24 @@ type EmbedScan struct {
 	ResumeOnly bool
 }
 
+// embeddableTextSQL is the predicate for "this clause CAN carry a dense vector":
+// its text is non-empty after trimming. Heading-only / "void" / table-stripped
+// clauses (parse.go emits a clause for a bare heading) have empty text and are
+// skipped by the embedder itself (rust/embedder main.rs: text.trim().is_empty()).
+// Counting them as "needs embedding" makes resume re-select the same rows forever
+// and the completeness gate unreachable, so every needs-/lacks-embedding query
+// ANDs this in. parse.go stores TrimSpace'd text, so DuckDB trim() (spaces only)
+// matches the embedder's Unicode-whitespace trim in practice.
+const embeddableTextSQL = `length(trim(text)) > 0`
+
 // ClausesNeedingEmbedding streams the clauses that might need a vector. By default
-// every clause is surfaced and the caller's hash-compare (embed.Apply) decides
-// what to (re)embed — we keep the hash logic in one place (Go) so a model change,
-// invisible to SQL, still re-embeds. ResumeOnly narrows to never-embedded rows for
-// a fast resume. Rows are streamed in RECENT-RELEASE-FIRST order (the user-facing
-// priority) unless OldestFirst is set. The caller must drain the rows.
+// every clause with embeddable text is surfaced and the caller's hash-compare
+// (embed.Apply) decides what to (re)embed — we keep the hash logic in one place
+// (Go) so a model change, invisible to SQL, still re-embeds. ResumeOnly narrows to
+// never-embedded rows for a fast resume. Empty-text clauses are excluded in both
+// modes (the embedder cannot vectorise them). Rows are streamed in RECENT-RELEASE-
+// FIRST order (the user-facing priority) unless OldestFirst is set. The caller must
+// drain the rows.
 func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*sql.Rows, error) {
 	var b strings.Builder
 	b.WriteString(`SELECT chunk_id, heading, text, release, COALESCE(embedding_hash, '') FROM clauses`)
@@ -627,6 +639,9 @@ func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*s
 		conds []string
 		args  []any
 	)
+	// Empty-text clauses can never be vectorised — exclude them in every mode so a
+	// resume work-list converges to zero instead of re-selecting them each run.
+	conds = append(conds, embeddableTextSQL)
 	if scan.ResumeOnly {
 		conds = append(conds, `embedding IS NULL`)
 	}
@@ -1094,12 +1109,15 @@ func (s *Store) count(ctx context.Context, table string) (int, error) {
 	return n, err
 }
 
-// CountNullEmbeddings returns how many clauses have no embedding (the authoritative
-// post-ingest check that the embedder actually populated vectors — st.Vectors is
-// only a write-side flag).
+// CountNullEmbeddings returns how many EMBEDDABLE clauses have no embedding (the
+// authoritative post-ingest check that the embedder actually populated vectors —
+// st.Vectors is only a write-side flag). Empty-text clauses are excluded: they are
+// correctly NULL by design (the embedder skips them), so counting them would make
+// this never reach zero.
 func (s *Store) CountNullEmbeddings(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NULL`).Scan(&n)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM clauses WHERE embedding IS NULL AND `+embeddableTextSQL).Scan(&n)
 	return n, err
 }
 
@@ -1120,7 +1138,7 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 // other-series clauses as a failure.
 func (s *Store) CountNullAtFloor(ctx context.Context, floorOrd int, seriesPrefix string) (int, error) {
 	var b strings.Builder
-	b.WriteString(`SELECT count(*) FROM clauses WHERE embedding IS NULL`)
+	b.WriteString(`SELECT count(*) FROM clauses WHERE embedding IS NULL AND ` + embeddableTextSQL)
 	var args []any
 	if seriesPrefix != "" {
 		b.WriteString(` AND substr(spec_id, 1, 2) = ?`)
@@ -1144,7 +1162,7 @@ func (s *Store) CountNullAtFloor(ctx context.Context, floorOrd int, seriesPrefix
 func (s *Store) NullEmbeddingsByRelease(ctx context.Context) (map[string]int, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT COALESCE(release, '') AS release, count(*)
-		   FROM clauses WHERE embedding IS NULL GROUP BY release`)
+		   FROM clauses WHERE embedding IS NULL AND `+embeddableTextSQL+` GROUP BY release`)
 	if err != nil {
 		return nil, err
 	}
