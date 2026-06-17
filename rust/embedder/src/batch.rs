@@ -23,13 +23,20 @@
 /// Calibrated attention-memory constant (bytes per row·seq²-unit). See module docs.
 pub const K_ATTN_DEFAULT: f64 = 94.0;
 
-/// MemModel turns a VRAM budget into a per-length batch size.
+/// MemModel turns a VRAM budget into a per-length batch size. It is a small closed-loop
+/// controller: [`shrink`](MemModel::shrink) raises `k_attn` after an OOM (smaller
+/// batches), [`grow`](MemModel::grow) lowers it when VRAM headroom is left over (bigger
+/// batches), bounded by `min_k` so growth can't run away.
 #[derive(Debug, Clone)]
 pub struct MemModel {
     /// Activation budget in bytes: free VRAM × fraction − model weights.
     pub avail_bytes: f64,
-    /// Attention-memory constant; the OOM backoff raises it to shrink future batches.
+    /// Attention-memory constant; shrink raises it, grow lowers it.
     pub k_attn: f64,
+    /// Growth floor for `k_attn`: the calibration is conservative (the constant was
+    /// measured with the old doubling arena), so we allow growth down to this fraction
+    /// of the default before relying on the OOM backoff to find the real ceiling.
+    pub min_k: f64,
     /// Hard cap so tiny-sequence batches don't explode the linear-activation term.
     pub max_batch: usize,
 }
@@ -52,6 +59,15 @@ impl MemModel {
     pub fn shrink(&mut self, factor: f64) {
         if factor > 1.0 {
             self.k_attn *= factor;
+        }
+    }
+
+    /// grow lowers k_attn (factor < 1) so subsequent batches are larger — called when a
+    /// VRAM probe shows headroom left and no recent OOM. Floored at `min_k` so the
+    /// controller can't grow without bound; the OOM backoff is the hard ceiling.
+    pub fn grow(&mut self, factor: f64) {
+        if (0.0..1.0).contains(&factor) {
+            self.k_attn = (self.k_attn * factor).max(self.min_k);
         }
     }
 }
@@ -101,6 +117,7 @@ mod tests {
         MemModel {
             avail_bytes: avail,
             k_attn: K_ATTN_DEFAULT,
+            min_k: K_ATTN_DEFAULT * 0.3,
             max_batch,
         }
     }
@@ -177,5 +194,21 @@ mod tests {
             after < before,
             "shrink should lower batch: {after} !< {before}"
         );
+    }
+
+    #[test]
+    fn grow_raises_batches_but_is_floored_at_min_k() {
+        let mut m = model(11.0e9, 4096);
+        let before = m.batch_for_len(256);
+        m.grow(0.85);
+        assert!(
+            m.batch_for_len(256) >= before,
+            "grow should not lower the batch"
+        );
+        // Growing repeatedly can never push k_attn below min_k.
+        for _ in 0..100 {
+            m.grow(0.85);
+        }
+        assert!(m.k_attn >= m.min_k - 1e-9, "k_attn fell below min_k");
     }
 }
