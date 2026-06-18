@@ -39,6 +39,18 @@ mod tests {
     }
 
     #[test]
+    fn clause_hash_golden_cross_runtime() {
+        // The IDENTICAL constant is asserted by the Go test
+        // internal/embed TestClauseHashGoldenCrossRuntime. If both pass, the Go
+        // ClauseHash and Rust clause_hash agree byte-for-byte (modelID hashed RAW,
+        // no EmbedIdentity re-wrap on the Go side). This pins the Phase −1 fix.
+        assert_eq!(
+            clause_hash("6 X1", "body", "embedv1-deadbeef0000"),
+            "a2e0978ed24f247a"
+        );
+    }
+
+    #[test]
     fn clause_hash_is_16_hex_and_stable() {
         let a = clause_hash("h", "t", "id-1");
         assert_eq!(a.len(), 16);
