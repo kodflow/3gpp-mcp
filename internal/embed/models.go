@@ -86,12 +86,19 @@ func (m ModelSpec) windowingOrDefault() string {
 	return m.Windowing
 }
 
-// maxTokensOrDefault resolves the truncation length, defaulting to DefaultMaxTokens.
+// maxTokensOrDefault resolves the truncation length used in the EmbedIdentity.
+//
+// It is CLAMPED to DefaultMaxTokens: the Go ONNX runtime truncation is fixed at
+// DefaultMaxTokens (embed_onnx.go `maxTokens`), so a registry override like
+// max_tokens: 2048 would otherwise change the identity WITHOUT changing the actual
+// embedding behaviour — a silent identity/behaviour desync. Until a variable runtime
+// truncation is threaded end-to-end (paired with the mean_pool port, issue #208), the
+// identity must track what the embedder really does, not an aspirational config value.
 func (m ModelSpec) maxTokensOrDefault() int {
-	if m.MaxTokens <= 0 {
-		return DefaultMaxTokens
+	if m.MaxTokens == DefaultMaxTokens {
+		return m.MaxTokens
 	}
-	return m.MaxTokens
+	return DefaultMaxTokens
 }
 
 // hardcodedBGE is the last-resort default if even the embedded YAML fails to parse
