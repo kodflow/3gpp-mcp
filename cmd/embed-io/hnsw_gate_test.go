@@ -59,8 +59,12 @@ func TestImportBuildHNSWGatedOnCompleteness(t *testing.T) {
 	if err := st.Reset(ctx); err != nil {
 		t.Fatal(err)
 	}
-	_ = st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS"})
-	_ = st.UpsertVersion(model.SpecVersion{SpecID: "23.501", Release: "Rel-19", Version: "19.0.0"})
+	if err := st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertVersion(model.SpecVersion{SpecID: "23.501", Release: "Rel-19", Version: "19.0.0"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.InsertClauses([]model.Clause{
 		{ChunkID: 1, SpecID: "23.501", Release: "Rel-19", Version: "19.0.0", ClausePath: "1", Heading: "a", Text: "alpha"},
 		{ChunkID: 2, SpecID: "23.501", Release: "Rel-19", Version: "19.0.0", ClausePath: "2", Heading: "b", Text: "beta"},

@@ -372,8 +372,10 @@ def _load_gate_vecs(p):
                 v = r.get("vec")
                 if v and len(v) == 1024:
                     m[r["chunk_id"]] = v
-    except Exception:
-        pass
+    except Exception as e:
+        # Fail-open (the gate's own ok16/ok32/common checks catch a truly empty load),
+        # but log WHY so an operator can tell a parse/disk error from "no vectors".
+        say("fp16_gate vec-load error path=%s detail=%s" % (os.path.basename(p), str(e)[:120]))
     return m
 
 
