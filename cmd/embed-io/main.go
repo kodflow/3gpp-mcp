@@ -228,12 +228,28 @@ func runImport(dbPath, in, embedID string, batch int, buildHNSW bool) error {
 			return fmt.Errorf("stamp embedding_model: %w", err)
 		}
 	}
+	// Gate the (full, O(N)) HNSW build on completeness. In the resumable Kaggle loop
+	// --build-hnsw is passed on EVERY pass, but a PARTIAL pass would pay a full index
+	// rebuild that the next pass — and cmd/merge's authoritative global rebuild —
+	// just discard. Build + freeze only when no embeddable clause is left NULL (the
+	// final pass), matching the kernel's complete=1 (null_after==0) condition. A
+	// partial DB stays index-free and serve degrades to an exact scan (still correct).
+	built := false
 	if buildHNSW {
-		if err := db.BuildAndFreezeHNSW(ctx, embedID); err != nil {
-			return fmt.Errorf("build hnsw: %w", err)
+		n, err := db.CountNullEmbeddings(ctx)
+		if err != nil {
+			return fmt.Errorf("count null embeddings: %w", err)
+		}
+		if n > 0 {
+			fmt.Fprintf(os.Stderr, "import-vectors: %d embeddable clause(s) still NULL — skipping HNSW build (not the final pass)\n", n)
+		} else {
+			if err := db.BuildAndFreezeHNSW(ctx, embedID); err != nil {
+				return fmt.Errorf("build hnsw: %w", err)
+			}
+			built = true
 		}
 	}
-	fmt.Fprintf(os.Stderr, "import-vectors: wrote %d vector(s) (hnsw=%v)\n", total, buildHNSW)
+	fmt.Fprintf(os.Stderr, "import-vectors: wrote %d vector(s) (hnsw=%v)\n", total, built)
 	return nil
 }
 
