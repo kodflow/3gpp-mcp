@@ -17,14 +17,20 @@ pub struct GpuInfo {
     pub free_bytes: u64,
 }
 
-/// detect queries `nvidia-smi` for device 0's total+free VRAM (MiB) and name. Returns
-/// `None` on any failure so the caller can pick a CPU-safe default.
-pub fn detect() -> Option<GpuInfo> {
+/// detect queries `nvidia-smi` for the total+free VRAM (MiB) and name of the GPU at
+/// `device_id`. Returns `None` on any failure so the caller can pick a CPU-safe
+/// default. The device id MUST be threaded through (it was hardcoded to `--id=0`):
+/// the multi-GPU launcher runs one process per card with `--device i`, so a process
+/// on device 1 was sizing its batches from device 0's free VRAM — wrong card.
+pub fn detect(device_id: i32) -> Option<GpuInfo> {
+    // nvidia-smi --id accepts the CUDA device index; build it from the device this
+    // process actually runs on so the VRAM probe matches the card the work runs on.
+    let id_arg = format!("--id={device_id}");
     let out = Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.total,memory.free,name",
             "--format=csv,noheader,nounits",
-            "--id=0",
+            id_arg.as_str(),
         ])
         .output()
         .ok()?;
