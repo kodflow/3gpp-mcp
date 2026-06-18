@@ -47,11 +47,23 @@ use tokenizers::{Tokenizer, TruncationParams};
 // ⇒ clean re-embed). MUST be GPU-validated for Go↔Rust parity before any 31-series bake.
 pub const MAX_TOKENS: usize = 1024;
 
+/// DENSE_OUTPUT is the declared name of BGE-M3's dense (sentence-embedding) head —
+/// the value the Go model registry declares (`output: sentence_embedding`). We bind
+/// the dense output BY NAME, not by index 0: a dual-head export (dense +
+/// `sparse_weights`, see issue #208) has more than one output, and there is no
+/// guarantee the dense head is index 0 — reading `outputs[0]` blind would then
+/// silently return the wrong tensor. Falls back to index 0 only when no output
+/// carries this name (a pooled-less export).
+const DENSE_OUTPUT: &str = "sentence_embedding";
+
 /// Bge wraps a committed ORT session + tokenizer for repeated batch embedding.
 pub struct Bge {
     session: Session,
     tokenizer: Tokenizer,
     needs_token_type: bool,
+    /// Name of the dense output tensor to read, resolved at load (DENSE_OUTPUT if the
+    /// graph declares it, else the first output) — bound by name, never by index.
+    dense_output: String,
 }
 
 impl Bge {
@@ -83,6 +95,14 @@ impl Bge {
             .commit_from_file(model_onnx)
             .with_context(|| format!("commit onnx {model_onnx:?}"))?;
         let needs_token_type = session.inputs.iter().any(|i| i.name == "token_type_ids");
+        // Bind the dense output by its declared name; fall back to the first output
+        // only if the graph has no `sentence_embedding` node (a pooled-less export).
+        let dense_output = session
+            .outputs
+            .iter()
+            .find(|o| o.name == DENSE_OUTPUT)
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| session.outputs[0].name.clone());
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_json).map_err(|e| anyhow!("load tokenizer: {e}"))?;
         // TRUNCATE to MAX_TOKENS so a long clause never tokenises past the model's
@@ -97,6 +117,7 @@ impl Bge {
             session,
             tokenizer,
             needs_token_type,
+            dense_output,
         })
     }
 
@@ -146,8 +167,9 @@ impl Bge {
         }
 
         let outputs = self.session.run(inputs)?;
-        let out_name = self.session.outputs[0].name.clone();
-        let view = outputs[out_name.as_str()].try_extract_tensor::<f32>()?;
+        // Read the dense head BY NAME (resolved at load), never by index 0 — a
+        // dual-head export must not silently return the wrong tensor (issue #208).
+        let view = outputs[self.dense_output.as_str()].try_extract_tensor::<f32>()?;
         let shape = view.shape().to_vec();
 
         let mut out = Vec::with_capacity(bsz);
