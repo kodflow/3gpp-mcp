@@ -353,6 +353,59 @@ if sh('/tmp/embed-io --db "%s" --export-worklist "%s" --resume' % (EMBEDDED_DB, 
     fail("export_worklist")
 say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
+# ---- fp16 smoke gate: Rust fp16 vs fp32 cosine (build pass only) -----------
+# The served data image is fp16; the existing Go cos>=0.9995 test validates the
+# CONVERSION but never the RUST embedder that actually bakes the corpus. Embed a small
+# fixed slice through the SAME Rust binary with the fp16 AND the fp32 model and assert
+# mean cos>=0.9995 BEFORE the bulk run, so a silent fp16/pooling regression in the Rust
+# path cannot contaminate the full index. Skipped on a tool-cache hit (the fp32 model
+# is not restored; the cached fp16 model was already gated on the pass that built it).
+def _load_gate_vecs(p):
+    m = {}
+    try:
+        with open(p) as gf:
+            for ln in gf:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                r = json.loads(ln)
+                v = r.get("vec")
+                if v and len(v) == 1024:
+                    m[r["chunk_id"]] = v
+    except Exception:
+        pass
+    return m
+
+
+if not CACHED_MODEL and os.path.isfile("%s/model.onnx" % BGE):
+    gate_wl = os.path.join(WORK, "gate.jsonl")
+    sh('head -n 32 "%s" > "%s"' % (WL, gate_wl))
+    if os.path.isfile(gate_wl) and os.path.getsize(gate_wl) > 0:
+        g16, g32 = os.path.join(WORK, "g16.jsonl"), os.path.join(WORK, "g32.jsonl")
+        for od in (g16, g32):
+            try:
+                os.remove(od)
+            except OSError:
+                pass
+        ok16 = subprocess.run('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --require-cuda'
+                              % (EMBEDDER, gate_wl, g16, BGE16, ID), shell=True, env=os.environ).returncode
+        ok32 = subprocess.run('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --require-cuda'
+                              % (EMBEDDER, gate_wl, g32, BGE, ID), shell=True, env=os.environ).returncode
+        a, b = _load_gate_vecs(g16), _load_gate_vecs(g32)
+        common = [k for k in a if k in b]
+        if ok16 != 0 or ok32 != 0 or not common:
+            fail("fp16_gate", "embed_failed ok16=%s ok32=%s common=%d" % (ok16, ok32, len(common)))
+        # Vectors are L2-normalised, so cosine == dot product.
+        mean_cos = sum(sum(x * y for x, y in zip(a[k], b[k])) for k in common) / len(common)
+        say("fp16_gate mean_cos=%.5f n=%d" % (mean_cos, len(common)))
+        if mean_cos < 0.9995:
+            fail("fp16_gate", "mean_cos=%.5f < 0.9995 — Rust fp16 path diverges from fp32" % mean_cos)
+        say("fp16_gate=ok")
+    else:
+        say("fp16_gate=skip (empty worklist)")
+else:
+    say("fp16_gate=skip (cache-hit or no fp32 model)")
+
 # Output is INHERITED (not captured) so PROGRESS lines stream LIVE into the Kaggle log.
 # MULTI-GPU: one embedder process per GPU, in PARALLEL. Each shards the work-list by a
 # hash of the clause text (--shard i/N) so the shards are disjoint AND every copy of a
