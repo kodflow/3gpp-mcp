@@ -43,6 +43,15 @@ type ModelSpec struct {
 	// (e.g. "sparse_weights") only for a model exported WITH the sparse head
 	// (scripts/export-bge-m3-sparse.py) — then EmbedSparse lights up.
 	SparseOutput string `yaml:"sparse_output"`
+	// Windowing is the long-clause strategy ("truncate" | "mean_pool"). Empty ⇒
+	// WindowingTruncate (the canonical default). It is an EmbedIdentity component, so
+	// a switch re-embeds. Omitting it in a registry YAML yields the same identity as
+	// declaring "truncate", so the embedded default, the Kaggle fp16 registry and the
+	// data-image registry stay coherent without all having to set it.
+	Windowing string `yaml:"windowing"`
+	// MaxTokens is the tokenizer truncation length. 0 ⇒ DefaultMaxTokens (1024).
+	// Identity component (Go used to default 512, Rust 1024 — a silent divergence).
+	MaxTokens int `yaml:"max_tokens"`
 }
 
 // registryFile is the YAML shape: a set of models + which one is active.
@@ -52,6 +61,10 @@ type registryFile struct {
 }
 
 // embedParts maps a model spec to the canonical EmbedParts (the identity inputs).
+// Windowing/MaxTokens fall back to the canonical defaults (truncate / 1024) when the
+// registry omits them, so a YAML that does not set them produces the SAME identity as
+// one that declares the defaults explicitly — keeping the embedded default, the
+// Kaggle fp16 registry and the data-image registry coherent without editing them all.
 func (m ModelSpec) embedParts() model.EmbedParts {
 	return model.EmbedParts{
 		ModelID:           m.Family,
@@ -60,7 +73,25 @@ func (m ModelSpec) embedParts() model.EmbedParts {
 		VectorDim:         strconv.Itoa(m.Dim),
 		NormalizationMode: m.Normalization,
 		Precision:         m.Precision,
+		Windowing:         m.windowingOrDefault(),
+		MaxTokens:         strconv.Itoa(m.maxTokensOrDefault()),
 	}
+}
+
+// windowingOrDefault resolves the long-clause strategy, defaulting to truncate.
+func (m ModelSpec) windowingOrDefault() string {
+	if m.Windowing == "" {
+		return WindowingTruncate
+	}
+	return m.Windowing
+}
+
+// maxTokensOrDefault resolves the truncation length, defaulting to DefaultMaxTokens.
+func (m ModelSpec) maxTokensOrDefault() int {
+	if m.MaxTokens <= 0 {
+		return DefaultMaxTokens
+	}
+	return m.MaxTokens
 }
 
 // hardcodedBGE is the last-resort default if even the embedded YAML fails to parse

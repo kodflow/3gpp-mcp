@@ -852,7 +852,10 @@ jobs:
           EMBEDDER: bge-m3
           EMBED_MODEL_DIR: ${{ github.workspace }}/data/models/bge-m3
           ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
-          EMBED_WINDOWING: mean_pool
+          # Windowing is single-sourced from the model registry (EmbedIdentity
+          # component), not this env — canonical default is truncate@1024 to match the
+          # Rust corpus embedder. mean_pool is the urgent Rust port (tracked issue);
+          # it will re-enable here via the registry once embed-core implements it.
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
           set -o pipefail

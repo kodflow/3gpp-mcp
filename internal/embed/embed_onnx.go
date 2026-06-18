@@ -34,9 +34,11 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/onnxrt"
 )
 
-// maxTokens bounds the sequence length (BGE-M3 supports 8192; 512 keeps CPU
-// inference fast and covers virtually every 3GPP clause).
-const maxTokens = 512
+// maxTokens bounds the sequence length (BGE-M3 supports 8192). Pinned to
+// DefaultMaxTokens (1024) so the Go query embedder truncates at the SAME length as
+// the Rust corpus embedder (rust/embedder MAX_TOKENS) and as the declared
+// EmbedIdentity component — a 512/1024 split used to be a silent divergence.
+const maxTokens = DefaultMaxTokens
 
 // gpuSession is one ORT session pinned to one device. Each carries its OWN mutex
 // + a pool of output buffers. N sessions run fully in parallel: across N CUDA
@@ -184,9 +186,12 @@ func newEmbedder() Embedder {
 	}
 	log.Printf("embed: ready with %d session(s) across %d device(s), %d %s tokeniser(s), batch=%d (ep=%s)", len(sessions), len(devices), len(toks), tokenizerImpl(), batchSize, ep)
 	e := &onnxEmbedder{
-		toks:      toks,
-		sessions:  sessions,
-		windowing: envOr("EMBED_WINDOWING", ""),
+		toks:     toks,
+		sessions: sessions,
+		// Single-sourced from the registry (NOT an env knob) so the runtime windowing
+		// behaviour always matches the declared EmbedIdentity component — identity and
+		// behaviour can no longer desync. Default = truncate.
+		windowing: ActiveModel().windowingOrDefault(),
 	}
 	e.warmup(ep)
 	return e
