@@ -350,7 +350,7 @@ fn main() -> Result<()> {
     // weights are already accounted for). No GPU → fixed CPU-fallback batch. gpu_total is
     // kept for the runtime VRAM probe that grows batches when headroom is left over.
     let mut gpu_total: Option<u64> = None;
-    let mut mem = match gpu::detect() {
+    let mut mem = match gpu::detect(args.device) {
         Some(g) => {
             gpu_total = Some(g.total_bytes);
             let avail = (g.free_bytes as f64) * args.vram_fraction;
@@ -451,7 +451,7 @@ fn main() -> Result<()> {
         batches_since_probe += 1;
         if batches_since_probe >= PROBE_EVERY {
             batches_since_probe = 0;
-            if let (Some(total_b), Some(g)) = (gpu_total, gpu::detect()) {
+            if let (Some(total_b), Some(g)) = (gpu_total, gpu::detect(args.device)) {
                 let oomed = mem.k_attn > k_at_window_start + 1e-9;
                 let headroom = (g.free_bytes as f64) > (total_b as f64) * 0.25;
                 if !oomed && headroom && i < distinct {
