@@ -113,6 +113,17 @@ type EmbedParts struct {
 	VectorDim         string // e.g. "1024"
 	NormalizationMode string // e.g. "l2"
 	Precision         string // e.g. "fp32"; an execution mode that changes numeric output
+	// Windowing is the long-clause strategy: "truncate" (embed only the first
+	// MaxTokens tokens) or "mean_pool" (window the whole clause and average). It
+	// CHANGES the vector of any clause longer than MaxTokens, so a truncate corpus
+	// and a mean_pool corpus must NEVER share one HNSW — hence it is an identity
+	// component. (Was previously absent, letting the Rust embedder (truncate) and
+	// the Go embedder (EMBED_WINDOWING=mean_pool) mix silently under one identity.)
+	Windowing string
+	// MaxTokens is the tokenizer truncation length, e.g. "1024". It decides which
+	// tail of a long clause is embedded (truncate) or how windows are cut, so it is
+	// an identity component too (Go used 512, Rust 1024 — a silent divergence).
+	MaxTokens string
 }
 
 // EmbedIdentity is the canonical re-embed gate. A change flips it so the embed
@@ -125,6 +136,7 @@ func (p EmbedParts) Identity() string {
 		"embed-v1",
 		p.ModelID, p.ModelRevision, p.TokenizerRevision,
 		p.VectorDim, p.NormalizationMode, p.Precision,
+		p.Windowing, p.MaxTokens,
 	)
 }
 

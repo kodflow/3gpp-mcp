@@ -46,6 +46,23 @@ const (
 	PrecisionFP16 = "fp16"
 )
 
+// Windowing modes — the long-clause strategy, an EmbedIdentity component (a switch
+// re-embeds every clause longer than MaxTokens, and a mixed corpus must never share
+// one HNSW). WindowingTruncate is the canonical default and is what the Rust
+// production embedder does today; WindowingMeanPool (window the whole clause +
+// mean-pool) captures the tail of long normative clauses and is the urgent Rust
+// port tracked as a critical TODO (see rust/embedder mean_pool issue).
+const (
+	WindowingTruncate = "truncate"
+	WindowingMeanPool = "mean_pool"
+
+	// DefaultMaxTokens is the canonical tokenizer truncation length. 1024 matches the
+	// Rust embedder (rust/embedder MAX_TOKENS) — the production embedder — so the Go
+	// query embedder and the Rust corpus agree. (Go previously truncated at 512, a
+	// silent divergence that this constant + the EmbedIdentity component close.)
+	DefaultMaxTokens = 1024
+)
+
 // BGEEmbedParts is the canonical EmbedParts for the ACTIVE model in the registry
 // (default: the pinned fp32 BGE-M3). model.EmbedIdentity(BGEEmbedParts()) is the
 // value stamped into DB meta (embedding_model), folded into ClauseHash, and compared
