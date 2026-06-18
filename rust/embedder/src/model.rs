@@ -28,10 +28,23 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tokenizers::{Tokenizer, TruncationParams};
 
-/// Tokenizer truncation length. BGE-M3 supports 8192, but full self-attention at
+/// Tokenizer truncation length and long-clause strategy = truncate (embed only the
+/// first MAX_TOKENS tokens). BGE-M3 supports 8192, but full self-attention at
 /// batch×seq² blows up GPU memory; 1024 keeps the attention buffer bounded and captures
-/// the discriminative head of a clause. The embedding_hash keys on the FULL text (not
-/// the truncated tokens), so tuning this never forces a re-embed.
+/// the discriminative head of a clause.
+///
+/// MAX_TOKENS (1024) and the truncate strategy are EmbedIdentity components on the Go
+/// side (model.EmbedParts.MaxTokens / .Windowing, default 1024 / "truncate"). This
+/// value MUST equal the Go registry's max_tokens (embed.DefaultMaxTokens) — they are
+/// kept in lockstep so the identity Go hands us via --embed-identity matches what we
+/// actually do. Changing it here REQUIRES bumping the Go registry (and forces a clean
+/// re-embed via the identity change). The mean_pool long-clause strategy (better recall
+/// on long normative clauses) is the urgent Rust port tracked in issue #208; until it
+/// lands the canonical corpus config is truncate@1024.
+//
+// TODO(#208): port internal/embed/window.go mean_pool (window ≤300 words, embed each,
+// mean-pool + L2) here, then flip the registry windowing to mean_pool (identity bump
+// ⇒ clean re-embed). MUST be GPU-validated for Go↔Rust parity before any 31-series bake.
 pub const MAX_TOKENS: usize = 1024;
 
 /// Bge wraps a committed ORT session + tokenizer for repeated batch embedding.
