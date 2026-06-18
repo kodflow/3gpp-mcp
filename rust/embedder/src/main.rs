@@ -185,7 +185,24 @@ struct Resume {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Clamp --vram-fraction to a sane (0, 1] range: a value >1 (typo, e.g. `--vram-fraction
+    // 8`) would oversubscribe VRAM and trigger avoidable CUDA OOMs, while a negative/NaN
+    // value makes avail_bytes ≤0 and collapses every batch to size 1. The OOM backoff would
+    // eventually recover, but clamping is cheaper and fails-soft with a clear log.
+    if !(args.vram_fraction > 0.0 && args.vram_fraction <= 1.0) {
+        let clamped = if args.vram_fraction.is_finite() {
+            args.vram_fraction.clamp(0.05, 1.0)
+        } else {
+            0.8
+        };
+        eprintln!(
+            "embedder: --vram-fraction {} out of (0,1] — clamped to {clamped}",
+            args.vram_fraction
+        );
+        args.vram_fraction = clamped;
+    }
 
     // Surface ort's logs (default WARN, ort=DEBUG): EP-registration failures — e.g. WHY
     // the CUDA provider fell back to CPU — are logged via `tracing`.
@@ -498,7 +515,7 @@ fn run_adaptive<R: AsRef<[i64]>>(
         Err(e) if is_oom(&e) => {
             mem.shrink(1.5);
             if rows.len() <= 1 {
-                return Err(e.context("CUDA OOM on a single clause (raise --vram-fraction headroom or lower MAX_TOKENS)"));
+                return Err(e.context("CUDA OOM on a single clause (LOWER --vram-fraction for more headroom, or lower MAX_TOKENS)"));
             }
             let mid = rows.len() / 2;
             eprintln!(

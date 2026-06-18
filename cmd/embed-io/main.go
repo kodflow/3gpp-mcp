@@ -219,6 +219,7 @@ func runImport(dbPath, in, embedID string, batch int, buildHNSW bool) error {
 		ids, vecs, hashes = ids[:0], vecs[:0], hashes[:0]
 		return nil
 	}
+	skipped := 0
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -226,10 +227,19 @@ func runImport(dbPath, in, embedID string, batch int, buildHNSW bool) error {
 		}
 		var r vecRecord
 		if err := json.Unmarshal(line, &r); err != nil {
-			return fmt.Errorf("parse vector line: %w", err)
+			// Tolerate a truncated/garbled line (e.g. a multi-GPU shard worker killed
+			// mid-write at the Kaggle timeout, then byte-concatenated into the merged
+			// ledger): skip it so the clause stays NULL and the next resume pass
+			// re-embeds it — mirroring the Rust embedder's lenient ledger parse instead
+			// of aborting the whole import on one bad line.
+			skipped++
+			continue
 		}
 		if len(r.Vec) != denseDim {
-			return fmt.Errorf("clause %d: vec dim %d, want %d", r.ChunkID, len(r.Vec), denseDim)
+			// A wrong-dimension vector is corrupt, not importable; skip it too rather
+			// than stamp a bad embedding. The clause stays NULL and is retried.
+			skipped++
+			continue
 		}
 		ids = append(ids, r.ChunkID)
 		vecs = append(vecs, r.Vec)
@@ -246,6 +256,9 @@ func runImport(dbPath, in, embedID string, batch int, buildHNSW bool) error {
 	if err := flush(); err != nil {
 		return err
 	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "import-vectors: skipped %d malformed/truncated line(s) — affected clauses stay NULL and resume next pass\n", skipped)
+	}
 
 	if embedID != "" {
 		if err := db.SetMeta("embedding_model", embedID); err != nil {
@@ -260,6 +273,12 @@ func runImport(dbPath, in, embedID string, batch int, buildHNSW bool) error {
 	// partial DB stays index-free and serve degrades to an exact scan (still correct).
 	built := false
 	if buildHNSW {
+		if embedID == "" {
+			// BuildAndFreezeHNSW stamps embedding_model = embedID into the freeze
+			// markers; an empty identity would advertise a model-less index and break
+			// the serve-time coherence guard. Refuse loudly rather than poison provenance.
+			return fmt.Errorf("build hnsw: --embed-identity is required to stamp the frozen index")
+		}
 		n, err := db.CountNullEmbeddings(ctx)
 		if err != nil {
 			return fmt.Errorf("count null embeddings: %w", err)

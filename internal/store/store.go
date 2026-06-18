@@ -689,16 +689,23 @@ func (s *Store) ClausesNeedingEmbedding(ctx context.Context, scan EmbedScan) (*s
 // dedup: run it on the merged corpus (or before exporting a delta work-list) so a future
 // incremental run never re-embeds a text whose twin is already vectorised.
 func (s *Store) BackfillDuplicateEmbeddings(ctx context.Context) (int64, error) {
+	// Pick ONE donor row per (heading,text) group via row_number, not two independent
+	// any_value() aggregates: any_value(embedding) and any_value(embedding_hash) carry
+	// no same-row guarantee, so on a (rare) mixed-identity group they could pair a
+	// vector from one identity with a hash from another — a corrupt (vector,hash) pair.
+	// Selecting a single donor row keeps the copied embedding and its hash consistent.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE clauses
 		SET embedding = d.embedding, embedding_hash = d.embedding_hash
 		FROM (
-			SELECT heading, text,
-			       any_value(embedding)      AS embedding,
-			       any_value(embedding_hash) AS embedding_hash
-			FROM clauses
-			WHERE embedding IS NOT NULL AND `+embeddableTextSQL+`
-			GROUP BY heading, text
+			SELECT heading, text, embedding, embedding_hash
+			FROM (
+				SELECT heading, text, embedding, embedding_hash,
+				       row_number() OVER (PARTITION BY heading, text) AS rn
+				FROM clauses
+				WHERE embedding IS NOT NULL AND `+embeddableTextSQL+`
+			)
+			WHERE rn = 1
 		) d
 		WHERE clauses.embedding IS NULL
 		  AND clauses.heading = d.heading
