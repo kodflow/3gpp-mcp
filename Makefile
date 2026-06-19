@@ -31,10 +31,9 @@ ingest-openapi: ## Build + load the 5GC OpenAPI corpus into the DuckDB (additive
 	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-openapi
 	./rust/target/release/ingest-openapi --src data/sources/5g-apis --db data/3gpp.duckdb
 
-ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest-catalog ./cmd/ingest-catalog
-	./$(BUILD_DIR)/$(BIN)-ingest-catalog $(ARGS)
+ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive; Rust)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-catalog
+	./rust/target/release/ingest-catalog $(ARGS)
 
 serve: build ## Start MCP server on stdio
 	./$(BUILD_DIR)/$(BIN) serve
