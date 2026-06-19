@@ -83,6 +83,9 @@ fn main() -> Result<()> {
     }
 
     store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
+    // Producer marker (Phase 11a A14): stamp the shard as Rust-produced.
+    store.set_meta("producer", "rust-writeside")?;
+    store.set_meta("schema_version", "1")?;
     store.checkpoint()?;
     if acronyms > 0 {
         eprintln!(
