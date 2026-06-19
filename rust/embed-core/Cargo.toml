@@ -25,7 +25,13 @@ path = "src/bin/check.rs"
 sha2 = "0.10"
 # Real BGE-M3 ONNX inference (single-query, serve-side). Pinned IN LOCKSTEP with
 # rust/embedder so the query vector is bit-identical to the corpus vector.
-ort = { version = "=2.0.0-rc.9", features = ["ndarray", "download-binaries"], optional = true }
+# load-dynamic (NOT download-binaries): the cdylib dlopens libonnxruntime.so at
+# runtime from ORT_DYLIB_PATH instead of bundling its OWN copy. This is the fix for
+# the FFI-flip blocker — when serve is built -tags onnx,embed_ffi the reranker
+# (Go/onnxrt) and embed (this cdylib) must share ONE onnxruntime in the process, not
+# load two (different versions → symbol clash). Runtime contexts (Kaggle kernels,
+# the prod image) set ORT_DYLIB_PATH to the shipped libonnxruntime.so.
+ort = { version = "=2.0.0-rc.9", features = ["ndarray", "load-dynamic"], optional = true }
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.20", optional = true }
 anyhow = { version = "1", optional = true }

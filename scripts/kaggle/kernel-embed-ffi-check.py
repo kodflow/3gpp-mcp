@@ -85,9 +85,29 @@ if sh(f"cd {src} && cargo build --release --manifest-path rust/embed-core/Cargo.
     fail("cargo build embed-core --features ort (see the Compiling… log above)")
 
 # --- run the check with the real model (CPU) ---------------------------------
-step("embedding %d test quer%s via the FFI" % (len(QUERIES), "y" if len(QUERIES) == 1 else "ies"))
+# embed-core now uses ort load-dynamic (not download-binaries) so the prod serve
+# can share ONE onnxruntime between the reranker and embed. That means the .so must
+# be supplied at runtime via ORT_DYLIB_PATH — here, the onnxruntime that ships with
+# the Kaggle Python (pip-installed if absent), the same way the prod image will
+# point at its bundled libonnxruntime.so.
+step("locating libonnxruntime.so for ORT_DYLIB_PATH (load-dynamic)")
+try:
+    import onnxruntime as _ort  # noqa: F401
+except Exception:  # noqa: BLE001
+    sh("pip -q install onnxruntime 2>&1 | tail -2")
+    import onnxruntime as _ort  # noqa: F401
+_ortlib = ""
+_capi = os.path.join(os.path.dirname(_ort.__file__), "capi")
+for _f in sorted(os.listdir(_capi)) if os.path.isdir(_capi) else []:
+    if _f.startswith("libonnxruntime.so"):
+        _ortlib = os.path.join(_capi, _f)
+        break
+if not _ortlib:
+    fail("could not find libonnxruntime.so for ORT_DYLIB_PATH (load-dynamic)")
+step("ORT_DYLIB_PATH=" + _ortlib)
 env = os.environ.copy()
 env["EMBED_MODEL_DIR"] = mdir
+env["ORT_DYLIB_PATH"] = _ortlib
 qargs = " ".join('"%s"' % q.replace('"', "") for q in QUERIES)
 bin_path = f"{src}/rust/embed-core/target/release/embed-core-check"
 r = subprocess.run(f"{bin_path} {qargs}", shell=True, env=env, text=True, capture_output=True)
