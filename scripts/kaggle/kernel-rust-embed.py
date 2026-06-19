@@ -314,9 +314,24 @@ with open(MODELS_YAML, "w") as f:
     )
 EMBED_MODEL_ENV = {**os.environ, "EMBED_MODELS_CONFIG": MODELS_YAML}
 
-# ---- build the Go bridge + the Rust embedder -------------------------------
-if sh("CGO_ENABLED=1 go build -o /tmp/embed-io ./cmd/embed-io").returncode != 0:
-    fail("build_embed_io")
+# ---- build the embed-io bridge (Rust by default; Go fallback) + the embedder --
+# Phase 10 repoint: the DuckDB I/O bridge is the RUST embed-io (store-rs), the same
+# binary the rust-go-roundtrip CI proves byte-compatible with the Go serve side. Its
+# CLI is a drop-in for cmd/embed-io, and libduckdb is statically bundled (no
+# LD_LIBRARY_PATH). Set LEGACY_EMBED_IO=1 to fall back to the Go bridge (rollback).
+if os.environ.get("LEGACY_EMBED_IO", "").strip() == "1":
+    if sh("CGO_ENABLED=1 go build -o /tmp/embed-io ./cmd/embed-io").returncode != 0:
+        fail("build_embed_io_go")
+    EMBED_IO, RESUME_FLAG = "/tmp/embed-io", " --resume"
+    say("embed_io=go (legacy)")
+else:
+    bio = sh("cargo build --release --manifest-path rust/store/Cargo.toml --bin embed-io")
+    if bio.returncode != 0:
+        fail("build_embed_io_rs", (bio.stderr or "")[-200:])
+    # workspace target → src/rust/target/release/embed-io. Rust export is inherently
+    # resume (worklist = clauses WHERE embedding IS NULL), so no --resume flag.
+    EMBED_IO, RESUME_FLAG = os.path.join(src, "rust/target/release/embed-io"), ""
+    say("embed_io=rust")
 # fp16 identity (EMBED_MODELS_CONFIG → cmd/embedid resolves the fp16 model).
 ID = sh("CGO_ENABLED=1 go run ./cmd/embedid", env=EMBED_MODEL_ENV).stdout.strip()
 if not re.match(r"^[0-9a-f]{6,}$", ID):
@@ -349,7 +364,7 @@ else:
 
 # ---- export → embed → import ----------------------------------------------
 WL = os.path.join(WORK, "work.jsonl")
-if sh('/tmp/embed-io --db "%s" --export-worklist "%s" --resume' % (EMBEDDED_DB, WL)).returncode != 0:
+if sh('%s --db "%s" --export-worklist "%s"%s' % (EMBED_IO, EMBEDDED_DB, WL, RESUME_FLAG)).returncode != 0:
     fail("export_worklist")
 say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
@@ -457,8 +472,8 @@ if emb_rc != 0:
 vec_lines = sh('wc -l < "%s"' % VECS).stdout.strip() if os.path.isfile(VECS) else "0"
 say("vectors_written=%s" % vec_lines)
 
-if sh('/tmp/embed-io --db "%s" --import-vectors "%s" --embed-identity "%s" --build-hnsw'
-      % (EMBEDDED_DB, VECS, ID)).returncode != 0:
+if sh('%s --db "%s" --import-vectors "%s" --embed-identity "%s" --build-hnsw'
+      % (EMBED_IO, EMBEDDED_DB, VECS, ID)).returncode != 0:
     fail("import_vectors")
 # Count only EMBEDDABLE clauses still NULL. Heading-only / "void" / table-stripped
 # clauses have empty text and are skipped by the embedder (main.rs: text.trim()
