@@ -15,6 +15,12 @@ description = "Shared BGE-M3 inference exposed as a cdylib + C ABI for the Go se
 name = "embed_core"
 crate-type = ["cdylib", "rlib"]
 
+# Smoke bin for the Kaggle FFI-validation kernel: embed test queries via the C ABI + print
+# norms (real model with --features ort,cuda on GPU; hash baseline otherwise).
+[[bin]]
+name = "embed-core-check"
+path = "src/bin/check.rs"
+
 [dependencies]
 sha2 = "0.10"
 # Real BGE-M3 ONNX inference (single-query, serve-side). Pinned IN LOCKSTEP with
