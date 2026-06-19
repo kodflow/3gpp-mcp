@@ -6,6 +6,7 @@
 //! against known Go outputs. The HTML clause walker lands on top of this seam next.
 
 pub mod catalog;
+pub mod glossary;
 pub mod openapi;
 
 use regex::Regex;
