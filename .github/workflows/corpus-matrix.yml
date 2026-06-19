@@ -509,6 +509,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Rust toolchain + cargo cache for this job's runner Rust builds (ingest, embed-io,
+      # embedder): restore libduckdb-sys/ort & deps instead of recompiling each shard build;
+      # only a Cargo.lock change rebuilds. (The merge bin is built INSIDE Dockerfile.merge —
+      # a docker stage — so it's covered by buildkit layer cache, not this.)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust -> rust/target
+            rust/embedder -> rust/embedder/target
       # Warm buildkit with a retry'd pull so the buildx builder boot survives a
       # transient Docker Hub timeout (the exact break that failed this scheduled
       # build on 2026-06-08..10). build-push then finds it locally cached.
