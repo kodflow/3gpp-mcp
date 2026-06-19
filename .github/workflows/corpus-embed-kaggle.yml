@@ -111,9 +111,10 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # Modern access-token auth (kaggle CLI 2.x). Two accounts: scripts/kaggle-auth.sh
-      # probes them (order = KAGGLE_ACCOUNT) and exports the SELECTED KAGGLE_API_TOKEN +
-      # KAGGLE_USER (the slug namespace handle); the run stops only if BOTH fail auth.
+      # Modern access-token auth (kaggle CLI 2.x). Two accounts: the drive step below loops
+      # over them (order = KAGGLE_ACCOUNT), auth-probes each, and on GPU-quota exhaustion
+      # falls back to the other; it stops only if NO account gets a GPU.
+      # scripts/kaggle-gpu-check.sh classifies a run as gpu vs quota (KAGGLE_USER = handle).
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
       # The handle is NOT sensitive, so it may live as a repo VARIABLE (preferred) or a
@@ -138,13 +139,45 @@ jobs:
         run: |
           pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
           kaggle --version
-      - name: Select Kaggle account (primary → fallback; stop if both fail)
-        run: bash scripts/kaggle-auth.sh
-      - name: Drive series ${{ matrix.series }} (time-boxed; resumes next dispatch)
+      - name: Drive series ${{ matrix.series }} on Kaggle GPU (auto-fallback on quota)
         run: |
+          set -uo pipefail
+          # Two-account GPU fallback (see corpus-rust-embed-kaggle.yml): run the series on
+          # the first account; if it got NO GPU (weekly quota exhausted → the kernel logs
+          # gpu=absent / the session errors with no output, scripts/kaggle-gpu-check.sh
+          # reports "quota") automatically re-drive it on the other account. Stop only if
+          # NO account is granted a GPU. The driver is resumable, so a fallback re-drive
+          # continues from the account's own state (idempotent via embedding_hash).
+          PRIM_TOK="${KAGGLE_API_TOKEN:-}"; PRIM_USER="${KAGGLE_USERNAME:-}"
+          FB_TOK="${KAGGLE_API_TOKEN_FALLBACK:-}"; FB_USER="${KAGGLE_USERNAME_FALLBACK:-}"
+          case "${KAGGLE_ACCOUNT:-primary}" in
+            fallback) ORDER="fallback primary" ;;
+            *) ORDER="primary fallback" ;;
+          esac
+          series="${{ matrix.series }}"
           mins="${{ github.event.inputs.runner_minutes }}"
-          timeout "${mins:-330}m" scripts/kaggle-embed-campaign.sh one "${{ matrix.series }}" || \
-            echo "::notice::series ${{ matrix.series }} timed out / incomplete — resume on next dispatch (lossless)"
+          got_gpu=0
+          for acct in $ORDER; do
+            case "$acct" in
+              primary)  export KAGGLE_API_TOKEN="$PRIM_TOK" KAGGLE_USER="$PRIM_USER" ;;
+              fallback) export KAGGLE_API_TOKEN="$FB_TOK"   KAGGLE_USER="$FB_USER" ;;
+            esac
+            if [ -z "$KAGGLE_API_TOKEN" ] || [ -z "$KAGGLE_USER" ]; then
+              echo "account '$acct' not configured (token/username empty) — skipping"; continue
+            fi
+            echo "::group::Kaggle account=$acct user=$KAGGLE_USER (series $series)"
+            if ! kaggle kernels list -m -p 1 >/dev/null 2>&1; then
+              echo "::warning::account '$acct' auth failed — trying next"; echo "::endgroup::"; continue
+            fi
+            rm -rf ".kaggle-campaign/out-$series"
+            timeout "${mins:-330}m" scripts/kaggle-embed-campaign.sh one "$series" \
+              || echo "::notice::series $series timed out / incomplete on account '$acct' (judging by GPU marker)"
+            status="$(bash scripts/kaggle-gpu-check.sh ".kaggle-campaign/out-$series" 2>/dev/null || echo quota)"
+            echo "account '$acct' gpu-check=$status"; echo "::endgroup::"
+            if [ "$status" = gpu ]; then echo "GPU obtained on account '$acct' for series $series"; got_gpu=1; break; fi
+            echo "::warning::account '$acct' got NO GPU (quota) for series $series — falling back to the next account"
+          done
+          [ "$got_gpu" = 1 ] || { echo "::error::no Kaggle account had GPU quota for series $series — stopping"; exit 1; }
       # Stage the sub-base under its SERIES-KEYED filename before upload:
       # download-artifact extracts a SINGLE matched artifact directly into the
       # destination (no per-artifact dir), so a one-series dispatch used to land

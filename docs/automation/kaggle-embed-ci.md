@@ -184,10 +184,11 @@ Rel-99→latest, exactly as you asked). Enable it:
 
 ## 9. Two Kaggle accounts (automatic fallback + one-click switch)
 
-The Kaggle GPU quota is per-account and weekly. To keep the campaign moving when
-one account is rate-limited or its token expires, the CI carries **two** accounts and
-falls back automatically. `scripts/kaggle-auth.sh` probes them and exports the working
-one; the run stops **only if BOTH fail** auth.
+The Kaggle GPU quota is per-account and weekly. To keep the campaign moving when one
+account is rate-limited or its token expires, the CI carries **two** accounts. Each of
+the three Kaggle workflows loops over them: it auth-probes an account, runs the kernel,
+and **falls back to the other account** if the first either fails auth or gets **no GPU**
+(weekly quota exhausted). The run stops **only if NO account is granted a GPU**.
 
 **Secrets / variables (Settings → Secrets and variables → Actions):**
 
@@ -207,26 +208,28 @@ Usernames are not sensitive → store them as repo **variables**.
 So switching accounts is a one-field change in the *Run workflow* dialog of any Kaggle
 workflow (`Corpus · Rust embed`, `Corpus · Sparse`, `Corpus · Embed`).
 
-**Two fallback triggers:**
-1. **Auth failure** (expired/invalid token) — all three workflows: `scripts/kaggle-auth.sh`
-   probes each account and selects the first that authenticates.
-2. **GPU quota** (no GPU allocated) — **`Corpus · Rust embed`**: the dispatch step *runs*
-   the kernel on the first account and, if that account got **no GPU** (weekly quota
-   exhausted → the kernel logs `gpu=absent`, or yields no output), it **automatically
-   re-dispatches on the other account**. `scripts/kaggle-gpu-check.sh` reads the pulled
-   output's `gpu=present`/`gpu=absent` marker to decide. The run stops only if **no**
-   account is granted a GPU. (Auth probe ≠ GPU quota, so this is a separate, run-time
-   trigger.) `Corpus · Sparse` / `Corpus · Embed` currently have the auth fallback only.
+**Two fallback triggers (all three workflows: Rust embed / Sparse / Embed):**
+1. **Auth failure** (expired/invalid token) — the per-account loop auth-probes
+   (`kaggle kernels list -m`) and skips an account that fails to authenticate.
+2. **GPU quota** (no GPU allocated) — the loop *runs* the kernel on an account and, if it
+   got **no GPU** (weekly quota exhausted → the kernel logs `gpu=absent`, or the session
+   errors with no output), it **automatically re-runs on the other account**.
+   `scripts/kaggle-gpu-check.sh` reads the pulled output's `gpu=present`/`gpu=absent`
+   marker (emitted by every kernel) to classify the run as `gpu` vs `quota`.
+
+In practice quota exhaustion makes the Kaggle session error/404 quickly (no committed
+output), so the fallback fires fast rather than after a full CPU run.
 
 > Cross-account note: each account has its **own** per-shard resume Dataset
-> (`<user>/3gpp-rust-embedded-<shard>`). Falling back to account B continues from B's
-> own state (or a fresh slice) — re-embedding is idempotent (keyed by `embedding_hash`),
-> so no corruption, but B may redo work A had done. Progress is never lost.
+> (`<user>/3gpp-rust-embedded-<shard>`, `<user>/3gpp-embedded-s<NN>`). Falling back to
+> account B continues from B's own state (or a fresh slice) — re-embedding is idempotent
+> (keyed by `embedding_hash`), so no corruption, but B may redo work A had done. Progress
+> is never lost.
 
-**Add a third account?** Extend `scripts/kaggle-auth.sh` (`token_of`/`user_of`/`ORDER`)
-and the rust-embed dispatch loop, plus the matching secret/variable and the workflow
-`env`. The logic is unit-tested offline: `scripts/kaggle-auth_test.sh` (account select)
-and `scripts/kaggle-gpu-check_test.sh` (gpu/quota verdict) — both mock, no network.
+**Add a third account?** Add the matching secret/variable + the workflow `env`, and
+extend each workflow's per-account loop (`PRIM_*`/`FB_*` capture + the `case`/`ORDER`).
+The GPU/quota verdict is unit-tested offline by `scripts/kaggle-gpu-check_test.sh`
+(7 fixtures, no network).
 
 **Note (in-kernel versioning):** the CI selects the account that *pushes/mounts* the
 kernel. The kernel's own dataset-versioning tail (`KAGGLE_USERNAME`/`KAGGLE_KEY` read
