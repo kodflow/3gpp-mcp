@@ -46,11 +46,12 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - name: Go ↔ Rust round-trip + Rust embed-io + ingest E2E
+      - name: Go ↔ Rust round-trip + Rust embed-io + ingest + openapi E2E
         run: |
           CGO_ENABLED=1 \
             RT_DB="$RUNNER_TEMP/rt.duckdb" \
             RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
             RUST_EMBED_IO="$(pwd)/rust/target/debug/embed-io" \
             RUST_INGEST="$(pwd)/rust/target/debug/ingest" \
-            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E' -v
+            RUST_INGEST_OPENAPI="$(pwd)/rust/target/debug/ingest-openapi" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E|TestRustIngestOpenapiE2E' -v
