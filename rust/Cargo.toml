@@ -7,3 +7,7 @@
 resolver = "2"
 members = ["store", "parse", "ingest"]
 exclude = ["embedder"]
+
+[profile.dev]
+debug = false
+strip = true
