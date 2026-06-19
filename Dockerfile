@@ -40,6 +40,20 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/root/go/pkg/mod go mod download
 
 COPY . .
+# When BUILD_TAGS carries embed_ffi, build the rust/embed-core cdylib FIRST — it is
+# the cgo link target for serve's query-embed. ort is `load-dynamic` (no bundled
+# onnxruntime): the cdylib dlopens the image's libonnxruntime.so at run time
+# (ORT_DYLIB_PATH, set in the runtime stage), SHARING it with the Go reranker so the
+# process never loads two onnxruntimes. Verified live on Kaggle (FFI-CHECK OK).
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    mkdir -p /out/lib; \
+    if echo " ${BUILD_TAGS} " | grep -q embed_ffi; then \
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal; \
+      "$HOME/.cargo/bin/cargo" build --release --features ort \
+        --manifest-path rust/embed-core/Cargo.toml; \
+      cp rust/embed-core/target/release/libembed_core.so /out/lib/libembed_core.so; \
+    fi
 # DuckDB links statically via duckdb-go-bindings (no runtime .so). GOTOOLCHAIN=local
 # pins the go.mod toolchain. -trimpath + -s -w keep the binary lean.
 RUN --mount=type=cache,target=/root/go/pkg/mod \
@@ -73,6 +87,12 @@ RUN groupadd -g 10001 mcp && \
     install -d -o mcp -g mcp /data /data/mcp-3gpp
 
 COPY --from=builder /out/mcp-3gpp /usr/local/bin/mcp-3gpp
+# The embed-core cdylib (present only when BUILD_TAGS carries embed_ffi; an empty
+# dir otherwise). load-dynamic → it links no onnxruntime, so the binary loads it at
+# startup without ORT; onnxruntime is dlopened lazily on the first query-embed via
+# ORT_DYLIB_PATH (set where ORT is present — full/fulltop). ldconfig registers it.
+COPY --from=builder /out/lib/ /usr/local/lib/
+RUN ldconfig
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -138,6 +158,12 @@ RUN groupadd -g 10001 mcp && \
     install -d -o mcp -g mcp /data
 
 COPY --from=builder /out/mcp-3gpp /usr/local/bin/mcp-3gpp
+# The embed-core cdylib (present only when BUILD_TAGS carries embed_ffi; an empty
+# dir otherwise). load-dynamic → it links no onnxruntime, so the binary loads it at
+# startup without ORT; onnxruntime is dlopened lazily on the first query-embed via
+# ORT_DYLIB_PATH (set where ORT is present — full/fulltop). ldconfig registers it.
+COPY --from=builder /out/lib/ /usr/local/lib/
+RUN ldconfig
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -179,7 +205,8 @@ ENV MCP3GPP_CACHE=/data/mcp-3gpp \
     MCP_TRANSPORT=stdio \
     MCP_PORT=8765 \
     MCP3GPP_DATA_CREATED=${DATA_CREATED} \
-    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS}
+    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS} \
+    ORT_DYLIB_PATH=/data/mcp-3gpp/models/onnxruntime/lib/libonnxruntime.so
 USER mcp:mcp
 WORKDIR /home/mcp
 
@@ -223,7 +250,8 @@ RUN set -eu; \
     chown -R mcp:mcp /data/mcp-3gpp/models/onnxruntime; \
     rm /tmp/ort.tgz
 ENV MCP3GPP_DATA_CREATED=${DATA_CREATED} \
-    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS}
+    MCP3GPP_SOURCE_CORPUS=${SOURCE_CORPUS} \
+    ORT_DYLIB_PATH=/data/mcp-3gpp/models/onnxruntime/lib/libonnxruntime.so
 USER mcp:mcp
 
 # ---- light: lexical DB.zst baked from the build context ----------------------
