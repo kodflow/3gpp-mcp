@@ -1066,12 +1066,14 @@ jobs:
               echo "COPY --from=ghcr.io/${OWNER}/3gpp-shard:${tag}${sfx}-${RUN_ID} /shard.duckdb /shards/${tag}.duckdb"
             done
             [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=${corpus} /3gpp.duckdb /base.duckdb"
-            echo "FROM golang:1.26-bookworm AS merge"
+            # Phase 9/11b: merge is the RUST store-rs bin (libduckdb bundled, statically
+            # linked). Its corpus-/subject-/build-index sidecars are golden-tested
+            # byte-identical to the Go cmd/merge that discover reads.
+            echo "FROM rust:1-bookworm AS merge"
+            echo "RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake && rm -rf /var/lib/apt/lists/*"
             echo "WORKDIR /src"
-            echo "COPY go.mod go.sum ./"
-            echo "RUN go mod download"
             echo "COPY . ."
-            echo "RUN CGO_ENABLED=1 GOTOOLCHAIN=local go build -trimpath -o /bin/merge ./cmd/merge"
+            echo "RUN cargo build --release --manifest-path rust/store/Cargo.toml --bin merge && cp rust/target/release/merge /bin/merge"
             echo "COPY --from=shards /shards /shards"
             [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=shards /base.duckdb /base.duckdb"
             base_arg=""; [ "$BASE_PRESENT" = 1 ] && base_arg="--base /base.duckdb"
