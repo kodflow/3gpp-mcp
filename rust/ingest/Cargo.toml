@@ -1,0 +1,16 @@
+[package]
+name = "ingest3gpp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust ingest orchestration (Phase 5): parse a converted spec (parse3gpp) and write it to DuckDB (store-rs). Closes the loop — Rust parses + writes a corpus the Go serve side reads."
+
+[dependencies]
+parse3gpp = { path = "../parse" }
+store-rs = { path = "../store" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "ingest"
+path = "src/main.rs"

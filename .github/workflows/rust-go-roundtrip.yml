@@ -11,15 +11,13 @@ name: Rust↔Go DuckDB round-trip
 on:
   push:
     paths:
-      - "rust/store/**"
-      - "rust/parse/**"
+      - "rust/**"
       - "internal/store/**"
       - "scripts/check-duckdb-pin.sh"
       - ".github/workflows/rust-go-roundtrip.yml"
   pull_request:
     paths:
-      - "rust/store/**"
-      - "rust/parse/**"
+      - "rust/**"
       - "internal/store/**"
   workflow_dispatch:
 
@@ -38,22 +36,21 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build the Rust store bins + write DuckDBs (data only + FTS/HNSW/sparse)
+      - name: Build the Rust write-side workspace (store + parse + ingest) + write DuckDBs
         run: |
-          cargo build --manifest-path rust/store/Cargo.toml --bins
-          ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
-          ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt_full.duckdb" indexes
-      - name: Rust crate unit tests (store + parse)
-        run: |
-          cargo test --manifest-path rust/store/Cargo.toml
-          cargo test --manifest-path rust/parse/Cargo.toml
+          cargo build --manifest-path rust/Cargo.toml --workspace
+          ./rust/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
+          ./rust/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt_full.duckdb" indexes
+      - name: Rust workspace unit tests (store + parse + ingest)
+        run: cargo test --manifest-path rust/Cargo.toml --workspace
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - name: Go ↔ Rust round-trip + Rust embed-io E2E
+      - name: Go ↔ Rust round-trip + Rust embed-io + ingest E2E
         run: |
           CGO_ENABLED=1 \
             RT_DB="$RUNNER_TEMP/rt.duckdb" \
             RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
-            RUST_EMBED_IO="$(pwd)/rust/store/target/debug/embed-io" \
-            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E' -v
+            RUST_EMBED_IO="$(pwd)/rust/target/debug/embed-io" \
+            RUST_INGEST="$(pwd)/rust/target/debug/ingest" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E' -v
