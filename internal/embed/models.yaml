@@ -41,3 +41,16 @@ models:
     tokenizer_dir: data/models/bge-m3   # fp16 export often ships the model only
     inputs: [input_ids, attention_mask]
     output: sentence_embedding
+
+  - name: bge-m3-sparse     # dual-head export: dense sentence_embedding + the learned
+    family: bge-m3          # lexical sparse_weights head. Validated live on Kaggle
+    dir: data/models/bge-m3-sparse  # (both outputs present; sparse byte-exact vs
+    precision: fp32         # FlagEmbedding, maxdiff 0.0000). Published as Kaggle Dataset
+    dim: 1024               # extazy937/bge-m3-sparse-onnx. Bake at `dir` so serve can
+    normalization: l2       # sparse-embed the QUERY (the sparse arm's serve side); the
+    revision: 5617a9f       # corpus sparse pass fills clause_sparse.
+    tokenizer_revision: 5617a9f
+    tokenizer_dir: data/models/bge-m3
+    inputs: [input_ids, attention_mask]
+    output: sentence_embedding
+    sparse_output: sparse_weights   # <- the head that makes SparseModelID non-empty
