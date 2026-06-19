@@ -10,9 +10,12 @@
 //! It deliberately mirrors the Go `internal/store` write surface method-for-method so a
 //! Rust-built corpus is byte-compatible with what Go would have built.
 
-pub mod identity;
+// identity is now its own CGO-free crate (so discover can share these golden-matched
+// digests without libduckdb); re-exported here so `store_rs::identity::*` and
+// `crate::identity::*` paths stay valid.
 use anyhow::{Context, Result};
 use duckdb::Connection;
+pub use identity3gpp as identity;
 
 /// BGE-M3 dense dimensionality — must match clauses.embedding FLOAT[1024].
 pub const DENSE_DIM: usize = 1024;
