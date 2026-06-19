@@ -23,9 +23,20 @@ Public visé : ingénieurs télécom (cœur EPC/5GC, RAN, LI, IMS) qui ont besoi
 
 ## 2. Stack technique — **figée**
 
+> **`arch-change` 2026-06-19 — write-side Rust / read-side Go.** La frontière
+> d'écriture DuckDB a migré vers Rust (plan `rust-writeside-go-readside.md`). **Rust
+> écrit TOUT** le `.duckdb` (parse, ingest, embed dense+sparse, FTS, HNSW, merge,
+> discover-parité) ; **Go ouvre read-only** et sert (MCP, search, rerank). Une
+> implémentation d'inférence unique (`rust/embed-core`, cdylib BGE-M3 dense+sparse) :
+> l'embedder bulk l'utilise comme crate, et Go-serve l'embedding de requête via FFI
+> (`-tags embed_ffi`, `ort` en **load-dynamic** partageant l'unique onnxruntime avec
+> le reranker). Le Go ONNX embed backend a été **supprimé** (l'image livrée build
+> `onnx,embed_ffi`). `internal/onnxrt` **reste** (le reranker l'utilise). §2.1
+> ci-dessous décrit le « pourquoi Go » HISTORIQUE ; il vaut toujours pour le read-side.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  mcp-3gpp  (binaire Go avec CGO, ~25 MB statique)           │
+│  mcp-3gpp  (binaire Go+CGO read-side ; producteurs = bins Rust) │
 └─────────────────────────────────────────────────────────────┘
 
 Langage       : Go 1.23+               (productivité solo dev, mono-binaire)
@@ -357,12 +368,17 @@ Ajouts spécifiques au projet (à venir, dans `.githooks/`) :
 
 Les décisions ci-dessous sont **figées**. Une PR/MR proposant l'inverse doit être explicitement justifiée _et_ recevoir le label `arch-change` :
 
-- ❌ Pas de Python
+- ✅ **Write-side Rust / read-side Go** (`arch-change` 2026-06-19, cf. §2) : les
+  producteurs DuckDB sont des binaires Rust ; Go ouvre read-only + sert. Inverser
+  (réintroduire un write-side Go) demande un nouvel `arch-change`.
+- ❌ Pas de Python (sauf kernels Kaggle GPU offline — embed/export, jamais au query)
 - ❌ Pas d'Ollama / LLM local au moment du query
 - ❌ Pas de KV store nu (Bolt, Badger, LMDB) — KV n'a ni FTS, ni vector, ni SQL
 - ❌ Pas de Neo4j (JVM) — KuzuDB est préféré pour rester embedded
 - ❌ Pas d'Elasticsearch (licence, opex)
-- ❌ Pas de PDF parsing — DOCX uniquement
+- ⚠️ **Parsing** : HTML (LibreOffice-convert) est le chemin 3GPP primaire ; ETSI
+  extrait la couche-texte des PDF (poppler, **jamais d'OCR**). « DOCX uniquement »
+  était la cible V1 ; corrigé par la réalité du corpus (cf. mémoire reference_3gpp_doc_format).
 - ❌ Pas d'OCR
 - ❌ Pas de chunking par token-window arbitraire — toujours clause-aware
 - ❌ Pas de résumés côté serveur — Claude synthétise
