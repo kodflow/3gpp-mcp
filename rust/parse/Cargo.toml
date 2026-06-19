@@ -1,0 +1,13 @@
+[package]
+name = "parse3gpp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust port of the 3GPP spec parser (internal/htmlparse + model helpers). Phase 4 of the write-side migration; starts with the parity-critical filename→metadata derivation."
+
+[dependencies]
+regex = "1"
+
+[lib]
+name = "parse3gpp"
+path = "src/lib.rs"
