@@ -42,6 +42,10 @@ wl="$(mktemp)"
 disc_args=(--emit-worklist)
 [ -n "$INDEX" ] && disc_args+=(--index "$INDEX")
 [ -n "${ETSI_SPECS:-}" ] && disc_args+=(--specs "$ETSI_SPECS")
+# ETSI_ALL=1 → enumerate the WHOLE /deliver corpus (etsi_ts+tr+en), not just the LI
+# suite (3GPP-parity completeness). Mutually exclusive with ETSI_SPECS in practice.
+[ -n "${ETSI_ALL:-}" ] && disc_args+=(--all)
+[ -n "${ETSI_TYPE_DIRS:-}" ] && disc_args+=(--type-dirs "$ETSI_TYPE_DIRS")
 "$ROOT/bin/discover-etsi" "${disc_args[@]}" >"$wl" || { echo "::error::discover-etsi failed"; exit 1; }
 n_total=$(wc -l <"$wl" | tr -dc '0-9'); n_total=${n_total:-0}
 echo "[etsi] work-list: ${n_total} deliverable(s) to (re)fetch"
