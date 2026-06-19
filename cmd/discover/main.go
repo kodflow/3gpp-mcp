@@ -57,6 +57,7 @@ var legacyGSMSeries = []string{"03"}
 
 func main() {
 	statusURL := flag.String("status-url", "https://www.3gpp.org/DynaReport/status-report.htm", "3GPP global status report")
+	statusFile := flag.String("status-file", "", "read the status report from this local file instead of fetching --status-url (offline / cached fetch; also the Rust discover parity seam)")
 	indexPath := flag.String("index", "", "corpus-index.json (spec_id -> indexed version); empty/missing => full")
 	subjectIndexPath := flag.String("subject-index", "", "subject-index.json (subject -> footprint); a changed subject forces its series into the delta")
 	buildIndexPath := flag.String("build-index", "", "build-index.json (the three canonical identities); a drift vs current code forces a full rebuild")
@@ -81,7 +82,19 @@ func main() {
 		return
 	}
 
-	site, err := fetchStatus(*statusURL)
+	// Status source: a local --status-file (offline, deterministic, the Rust
+	// parity seam) takes precedence over fetching --status-url. Both feed the SAME
+	// parseStatus so the selection is identical regardless of source.
+	var site map[string]string
+	var err error
+	if *statusFile != "" {
+		var body []byte
+		if body, err = os.ReadFile(*statusFile); err == nil {
+			site, err = parseStatus(body)
+		}
+	} else {
+		site, err = fetchStatus(*statusURL)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "discover:", err)
 		os.Exit(1)

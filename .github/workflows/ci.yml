@@ -225,6 +225,11 @@ jobs:
           # internal/embed) — the serve-side Rust query-embed integration end to end.
           CGO_ENABLED=1 go build -tags embed_ffi -o /tmp/mcp-ffi ./cmd/server
           echo "cmd/server built on the embed-core FFI ✓"
+      - name: discover Go↔Rust output parity (Phase 9 close-out)
+        # Diffs Go cmd/discover vs the rust/discover port on the real status-report
+        # fixture across every mode — proves the Rust binary reproduces the Go matrix
+        # selection before Phase 10 can repoint the CI matrix onto it.
+        run: bash scripts/dev/discover-parity.sh
 
   # --- Stage 3 (parallel): retrieval quality regression (advisory gate) -------
   retrieval-regression:
