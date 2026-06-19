@@ -25,7 +25,8 @@ files=(
   Dockerfile.data
   cmd/freeze-hnsw/main.go
   cmd/overlay/main.go
-  cmd/merge/main.go
+  rust/store/src/bin/merge.rs
+  rust/store/src/identity.rs
   cmd/validate/main.go
   internal/store/hnsw.go
   internal/store/store.go
