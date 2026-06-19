@@ -100,6 +100,89 @@ impl Store {
         Ok(n)
     }
 
+    /// series_in_db returns the DISTINCT series present (drives subject-footprint advance).
+    pub fn series_in_db(&self) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT series FROM specs WHERE series IS NOT NULL")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// spec_versions returns every (spec_id, release, version) row (drives corpus-index).
+    pub fn spec_versions(&self) -> Result<Vec<(String, String, String)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT spec_id, release, version FROM spec_versions")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// shard_spec_releases lists a shard's (spec_id, release) buckets — for --base, these
+    /// REPLACE the base's copy (== Go merge incremental bucket replacement).
+    pub fn shard_spec_releases(&self, shard_path: &str) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS shard (READ_ONLY)",
+            shard_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self
+                .conn
+                .prepare("SELECT DISTINCT spec_id, release FROM shard.spec_versions")?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH shard")?;
+        Ok(out)
+    }
+
+    /// shard_series lists a shard's DISTINCT series (the "rebuilt" set for the subject
+    /// footprint advance decision — a subject advances iff ALL its series were rebuilt).
+    pub fn shard_series(&self, shard_path: &str) -> Result<Vec<String>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS sh2 (READ_ONLY)",
+            shard_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self
+                .conn
+                .prepare("SELECT DISTINCT series FROM sh2.specs WHERE series IS NOT NULL")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH sh2")?;
+        Ok(out)
+    }
+
+    /// delete_spec_release purges one (spec_id, release) bucket from the merged DB so a
+    /// fresher shard can replace it (== Go merge --base bucket replacement).
+    pub fn delete_spec_release(&self, spec_id: &str, release: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM clauses WHERE spec_id = ? AND release = ?",
+            duckdb::params![spec_id, release],
+        )?;
+        self.conn.execute(
+            "DELETE FROM spec_versions WHERE spec_id = ? AND release = ?",
+            duckdb::params![spec_id, release],
+        )?;
+        self.conn.execute(
+            "DELETE FROM specs WHERE spec_id = ? AND NOT EXISTS (SELECT 1 FROM spec_versions WHERE spec_id = ?)",
+            duckdb::params![spec_id, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// strip_embeddings NULLs every vector + purges the vector meta, yielding a lexical-only
+    /// DB (== Go merge --strip-embeddings; keeps the lexical channel slim while embed runs).
+    pub fn strip_embeddings(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "UPDATE clauses SET embedding = NULL;
+             DELETE FROM schema_meta WHERE key IN ('embedding_model','hnsw_state','hnsw_metric','embedding_dim');",
+        )?;
+        Ok(())
+    }
+
     /// count_clauses returns the total clause count (== Go CountClauses).
     pub fn count_clauses(&self) -> Result<i64> {
         let n: i64 = self
