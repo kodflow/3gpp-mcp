@@ -44,6 +44,10 @@ struct Args {
     /// cmd/ingest --count-only; the CI gate reads .embedded_clauses / .clauses).
     #[arg(long, default_value_t = false)]
     count_only: bool,
+    /// ETSI corpus mode: ingest every .html under --convert deriving id/version from the
+    /// in-body ETSI provenance header (not a 3GPP filename); series/release do not apply.
+    #[arg(long, default_value_t = false)]
+    etsi: bool,
 }
 
 /// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
@@ -61,13 +65,34 @@ fn run_count_only(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// ingest_one parses one converted HTML and writes it, offsetting clause chunk_ids by
-/// `offset` so a multi-spec DB keeps a single id space. Returns the clause count.
+/// ingest_one parses one converted HTML by its 3GPP filename and writes it.
 fn ingest_one(store: &Store, html_path: &str, offset: u64) -> Result<(SpecMeta, usize)> {
     let meta = parse_filename_meta(html_path).map_err(|e| anyhow::anyhow!(e))?;
     let html = std::fs::read_to_string(html_path).with_context(|| format!("read {html_path}"))?;
+    let n = write_spec(store, &meta, &html, offset)?;
+    Ok((meta, n))
+}
+
+/// ingest_etsi_one parses one converted ETSI deliverable by its in-body provenance header
+/// (no 3GPP filename) and writes it. None when the file carries no ETSI header.
+fn ingest_etsi_one(
+    store: &Store,
+    html_path: &str,
+    offset: u64,
+) -> Result<Option<(SpecMeta, usize)>> {
+    let html = std::fs::read_to_string(html_path).with_context(|| format!("read {html_path}"))?;
+    let Some(meta) = parse3gpp::etsi::parse_etsi_meta(&html) else {
+        return Ok(None);
+    };
+    let n = write_spec(store, &meta, &html, offset)?;
+    Ok(Some((meta, n)))
+}
+
+/// write_spec parses the clauses and writes the spec/version/clauses (+ glossary subject),
+/// offsetting clause chunk_ids by `offset` so a multi-spec DB keeps a single id space.
+fn write_spec(store: &Store, meta: &SpecMeta, html: &str, offset: u64) -> Result<usize> {
     let (clauses, _saw_ch, _degraded) =
-        parse_html_clauses(&html, &meta.spec_id, &meta.release, &meta.version);
+        parse_html_clauses(html, &meta.spec_id, &meta.release, &meta.version);
 
     store.log_ingest(&meta.spec_id, &meta.version, "started", PIPELINE_VERSION)?;
     store.upsert_spec(
@@ -108,7 +133,31 @@ fn ingest_one(store: &Store, html_path: &str, offset: u64) -> Result<(SpecMeta, 
         }
     }
     store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
-    Ok((meta, rows.len()))
+    Ok(rows.len())
+}
+
+/// collect_html_recursive walks all .html under a root (any depth) — the ETSI corpus has
+/// no series/release dir structure; spec id/version come from each file's body header.
+fn collect_html_recursive(root: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd {
+            let p = e?.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("html") {
+                if let Some(s) = p.to_str() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// collect_series_html walks <convert>/<Rel>/*.html keeping files whose spec_id is in the
@@ -151,6 +200,42 @@ fn main() -> Result<()> {
 
     if args.count_only {
         return run_count_only(&store);
+    }
+
+    // ETSI corpus mode: walk every .html under --convert, deriving id/version from the body.
+    if args.etsi {
+        let convert = args
+            .convert
+            .as_deref()
+            .context("--etsi requires --convert <dir>")?;
+        let mut specs = 0usize;
+        let mut clauses = 0usize;
+        for f in collect_html_recursive(convert)? {
+            if args.resume {
+                if let Some(m) = std::fs::read_to_string(&f)
+                    .ok()
+                    .and_then(|h| parse3gpp::etsi::parse_etsi_meta(&h))
+                {
+                    if store.ingest_done(&m.spec_id, &m.version, PIPELINE_VERSION)? {
+                        continue;
+                    }
+                }
+            }
+            let off = store.max_chunk_id()?;
+            match ingest_etsi_one(&store, &f, off) {
+                Ok(Some((_, n))) => {
+                    specs += 1;
+                    clauses += n;
+                }
+                Ok(None) => {} // no ETSI header → not an ETSI deliverable, skip
+                Err(e) => eprintln!("ingest: skip {f}: {e:#}"),
+            }
+        }
+        eprintln!("ingest: ETSI → {specs} spec(s), {clauses} clause(s)");
+        store.set_meta("producer", "rust-writeside")?;
+        store.set_meta("schema_version", "1")?;
+        store.checkpoint()?;
+        return Ok(());
     }
 
     let total: usize = if let Some(html) = args.html.as_deref() {
