@@ -8,7 +8,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
+.PHONY: all build build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
 
 all: build ## Build the binary
 
@@ -19,6 +19,11 @@ build: ## Build static binary into bin/
 build-onnx: ## Build with the real BGE-M3 semantic backend (run `make model` first)
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
+
+build-ffi: ## Build serve on the Rust embed-core cdylib (FFI query-embed; Phase 11 target). Add `--features ort` to the cargo line for the real BGE-M3 backend.
+	@mkdir -p $(BUILD_DIR)
+	cargo build --release --manifest-path rust/embed-core/Cargo.toml
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags embed_ffi -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
 ingest: ## Build and run the Rust ingest (parse3gpp + store-rs)
 	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
