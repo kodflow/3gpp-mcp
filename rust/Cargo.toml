@@ -1,0 +1,9 @@
+# Cargo workspace for the DuckDB-writing crates of the write-side migration. Sharing one
+# target/ means the bundled libduckdb compiles ONCE for store + ingest instead of per
+# crate (local + CI build time). The embedder is EXCLUDED on purpose: it pulls the heavy
+# ort/CUDA toolchain and is built standalone on Kaggle (--manifest-path rust/embedder),
+# and keeping it out avoids any risk to that proven GPU build.
+[workspace]
+resolver = "2"
+members = ["store", "parse", "ingest"]
+exclude = ["embedder"]
