@@ -41,6 +41,12 @@ fn main() -> Result<()> {
         store.fold_shard(shard, offset)?;
         eprintln!("merge: folded {shard} (chunk_id offset {offset})");
     }
+
+    // Producer marker (Phase 11a A14): the merged corpus is stamped as Rust-produced so a
+    // Go read-side OpenReadOnly can assert "served a DB built by the Rust write-side" and
+    // warn on a schema_version mismatch. schema_meta is read-only to the serve side.
+    store.set_meta("producer", "rust-writeside")?;
+    store.set_meta("schema_version", "1")?;
     store.checkpoint()?;
 
     if !args.no_index {
