@@ -35,8 +35,12 @@ pub extern "C" fn embed_core_backend() -> *const c_char {
     }
 }
 
+#[cfg(feature = "ort")]
+mod ort_backend;
+
 /// embed_core_embed writes the query's dense vector into `out[0..out_len)`.
-/// Returns 0 on success, -1 on a null/short buffer, -2 on invalid UTF-8.
+/// Returns 0 on success, -1 on a null/short buffer, -2 on invalid UTF-8, -3 if the backend
+/// (ort) failed to produce a vector (e.g. model not loadable).
 ///
 /// # Safety
 /// `text` must be a valid NUL-terminated C string; `out` must point to at least `out_len`
@@ -50,27 +54,35 @@ pub extern "C" fn embed_core_embed(text: *const c_char, out: *mut f32, out_len: 
         Ok(s) => s,
         Err(_) => return -2,
     };
-    let v = embed(s);
-    unsafe {
-        std::ptr::copy_nonoverlapping(v.as_ptr(), out, DENSE_DIM);
+    match backend_embed(s) {
+        Some(v) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr(), out, DENSE_DIM);
+            }
+            0
+        }
+        None => -3,
     }
-    0
 }
 
-/// embed produces the dense vector for `text`. Baseline = a deterministic, L2-normalised
-/// hash expansion (sha256-seeded); with `--features ort` this is replaced by the BGE-M3
-/// ONNX forward pass over the same crate API.
-pub fn embed(text: &str) -> [f32; DENSE_DIM] {
+/// backend_embed routes to the active backend: the deterministic hash baseline (default) or
+/// the real BGE-M3 ONNX forward pass (`--features ort`). None ⇒ the backend could not embed.
+fn backend_embed(text: &str) -> Option<[f32; DENSE_DIM]> {
     #[cfg(feature = "ort")]
     {
-        // The real inference is wired here in the CI/infra build (model + onnxruntime);
-        // the baseline below is never compiled with the `ort` feature.
-        ort_embed(text)
+        ort_backend::embed_one(text)
     }
     #[cfg(not(feature = "ort"))]
     {
-        hash_embed(text)
+        Some(embed(text))
     }
+}
+
+/// embed is the deterministic hash baseline (non-ort builds + unit tests): a sha256-seeded,
+/// L2-normalised expansion. Same query → same vector; different queries → different vectors.
+#[cfg(not(feature = "ort"))]
+pub fn embed(text: &str) -> [f32; DENSE_DIM] {
+    hash_embed(text)
 }
 
 /// hash_embed expands `text` into a deterministic unit vector: sha256 the text, then stream

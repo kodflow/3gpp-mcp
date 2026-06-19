@@ -17,9 +17,17 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 sha2 = "0.10"
+# Real BGE-M3 ONNX inference (single-query, serve-side). Pinned IN LOCKSTEP with
+# rust/embedder so the query vector is bit-identical to the corpus vector.
+ort = { version = "=2.0.0-rc.9", features = ["ndarray", "download-binaries"], optional = true }
+ndarray = { version = "0.16", optional = true }
+tokenizers = { version = "0.20", optional = true }
+anyhow = { version = "1", optional = true }
 
 [features]
-# `ort` swaps the deterministic baseline for the real BGE-M3 ONNX inference (CI/infra only,
+# `ort` swaps the deterministic baseline for the real BGE-M3 ONNX inference (CI/Kaggle only,
 # needs the model + onnxruntime). Default = the hash baseline so the seam builds/tests anywhere.
+# CPU-only by default (serve query-embed is one query); `cuda` is a sub-feature for GPU boxes.
 default = []
-ort = []
+ort = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:anyhow"]
+cuda = ["ort/cuda"]
