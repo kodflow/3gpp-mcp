@@ -1110,7 +1110,12 @@ jobs:
           } > Dockerfile.merge
           echo "----- Dockerfile.merge -----"; cat Dockerfile.merge; echo "----------------------------"
           # ---- build: cmd/merge runs INSIDE the build; extract result to runner ----
-          retry docker buildx build -f Dockerfile.merge --output type=local,dest=mergeout .
+          # GitHub Actions buildkit cache so the rust:1-bookworm + cargo-build-merge layers
+          # are RESTORED across bakes instead of recompiled (the runner rust-cache can't
+          # reach a docker stage). mode=max caches intermediate layers; scope isolates it.
+          retry docker buildx build -f Dockerfile.merge \
+            --cache-from type=gha,scope=merge --cache-to type=gha,mode=max,scope=merge \
+            --output type=local,dest=mergeout .
           mkdir -p data
           cp mergeout/3gpp.duckdb        data/3gpp.duckdb
           cp mergeout/corpus-index.json  data/corpus-index.json
