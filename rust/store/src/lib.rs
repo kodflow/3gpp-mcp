@@ -596,6 +596,31 @@ impl Store {
             .with_context(|| format!("update_spec_meta {spec_id}"))?;
         Ok(n > 0)
     }
+
+    /// upsert_acronym inserts/updates a glossary acronym (== Go UpsertAcronym). The PK is
+    /// (term, expansion, domain) so the same term keeps every distinct expansion/domain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_acronym(
+        &self,
+        term: &str,
+        expansion: &str,
+        domain: &str,
+        first_release: &str,
+        last_release: &str,
+        source_series: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (term, expansion, domain) DO UPDATE SET
+                   first_release = excluded.first_release, last_release = excluded.last_release,
+                   source_series = excluded.source_series",
+                duckdb::params![term, expansion, domain, first_release, last_release, source_series],
+            )
+            .with_context(|| format!("upsert_acronym {term}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

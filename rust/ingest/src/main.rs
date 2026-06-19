@@ -65,8 +65,31 @@ fn main() -> Result<()> {
         .collect();
     store.insert_clauses(&rows)?;
 
+    // Subject pass: the glossary vertical seeds the acronym vocabulary from TS 21.905's
+    // abbreviations region (== Go subject.Ingest). Other verticals (LI) hook here too.
+    let mut acronyms = 0usize;
+    if meta.spec_id == parse3gpp::glossary::GLOSSARY_SPEC_ID {
+        for a in parse3gpp::glossary::extract_acronyms(&clauses, &meta.release) {
+            store.upsert_acronym(
+                &a.term,
+                &a.expansion,
+                "",
+                &a.first_release,
+                &a.last_release,
+                &a.source_series,
+            )?;
+            acronyms += 1;
+        }
+    }
+
     store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
     store.checkpoint()?;
+    if acronyms > 0 {
+        eprintln!(
+            "ingest: glossary seeded {acronyms} acronym(s) from {}",
+            meta.spec_id
+        );
+    }
 
     eprintln!(
         "ingest: {} {} {} → {} clause(s) (change_history={saw_change_history} degraded={degraded})",
