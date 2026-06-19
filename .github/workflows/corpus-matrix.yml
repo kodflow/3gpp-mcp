@@ -252,6 +252,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Build rust/discover for the Phase-10 shadow (best-effort, never gates)
+        # Go cmd/discover stays AUTHORITATIVE for the matrix; this only lets the `set`
+        # step cross-check the parity-proven Rust port against the live status report
+        # and ::warning:: on any divergence. continue-on-error so a Rust build hiccup
+        # can never break the daily build.
+        continue-on-error: true
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          "$HOME/.cargo/bin/cargo" build --release --manifest-path rust/discover/Cargo.toml
       - id: set
         run: |
           scope="${{ github.event.inputs.series_scope }}"
@@ -299,6 +308,30 @@ jobs:
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
             else
               matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy $absent)
+            fi
+            # ---- Phase 10: rust/discover SHADOW (Go AUTHORITATIVE; warn-only) -----
+            # Cross-check the parity-proven Rust port against the matrix Go just
+            # produced, on the SAME live status report. Every op is best-effort and a
+            # divergence is a ::warning::, never a failure — so this can't break the
+            # daily build. Go resolves --embed-model (family) internally; Rust takes
+            # the pre-resolved digest from `go run ./cmd/embedid` via --embed-identity.
+            # Flip to Rust-primary once the shadow stays clean over real cycles.
+            RB=./rust/discover/target/release/discover
+            if [ -x "$RB" ] && source scripts/lib/discover.sh \
+               && discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" /tmp/status.htm 2>/dev/null; then
+              if [ "$full" = "true" ]; then
+                rust_matrix=$("$RB" --status-file /tmp/status.htm --all --floor "$floor" $legacy 2>/dev/null || true)
+              else
+                embed_id=""
+                [ -n "$embed_model" ] && embed_id=$(EMBED_MODEL="$embed_model" CGO_ENABLED=0 go run ./cmd/embedid 2>/dev/null || true)
+                embarg=""; [ -n "$embed_id" ] && embarg="--embed-identity $embed_id"
+                rust_matrix=$("$RB" --status-file /tmp/status.htm --index corpus-index.json --subject-index subject-index.json --build-index build-index.json $embarg --floor "$floor" $legacy $absent 2>/dev/null || true)
+              fi
+              if [ -n "$rust_matrix" ] && [ "$rust_matrix" != "$matrix" ]; then
+                echo "::warning::Phase10 rust/discover shadow diverged (Go authoritative). go=$matrix rust=$rust_matrix"
+              elif [ -n "$rust_matrix" ]; then
+                echo "Phase10 rust/discover shadow agrees with Go ✓"
+              fi
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
