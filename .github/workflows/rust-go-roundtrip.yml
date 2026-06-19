@@ -38,6 +38,14 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cargo cache (registry + both target dirs)
+        # Keyed on the committed Cargo.lock files → after the first run the heavy deps
+        # (libduckdb-sys, arrow, ort-sys, …) are RESTORED instead of recompiled (~6 min → s).
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust -> rust/target
+            rust/embed-core -> rust/embed-core/target
       - name: Build the Rust write-side workspace (store + parse + ingest) + write DuckDBs
         run: |
           cargo build --manifest-path rust/Cargo.toml --workspace
