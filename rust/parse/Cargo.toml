@@ -19,6 +19,7 @@ ego-tree = "0.6"
 # navigation Go's yaml.Node does (mapFields / collectRefs).
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 
 [lib]
 name = "parse3gpp"

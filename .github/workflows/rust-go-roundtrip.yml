@@ -55,4 +55,5 @@ jobs:
             RUST_INGEST="$(pwd)/rust/target/debug/ingest" \
             RUST_INGEST_OPENAPI="$(pwd)/rust/target/debug/ingest-openapi" \
             RUST_INGEST_CATALOG="$(pwd)/rust/target/debug/ingest-catalog" \
-            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E|TestRustIngestOpenapiE2E|TestRustIngestCatalogE2E|TestRustGlossaryE2E' -v
+            RUST_INGEST_LI="$(pwd)/rust/target/debug/ingest-li" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E|TestRustIngestOpenapiE2E|TestRustIngestCatalogE2E|TestRustGlossaryE2E|TestRustIngestLiE2E' -v

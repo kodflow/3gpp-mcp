@@ -24,3 +24,8 @@ path = "src/bin/ingest_openapi.rs"
 [[bin]]
 name = "ingest-catalog"
 path = "src/bin/ingest_catalog.rs"
+
+# ingest-li — Lawful-Interception registry from TS 33.128's ASN.1 (Phase 8b).
+[[bin]]
+name = "ingest-li"
+path = "src/bin/ingest_li.rs"
