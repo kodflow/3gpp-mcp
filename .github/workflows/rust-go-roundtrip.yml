@@ -1,0 +1,47 @@
+# =============================================================================
+#  Rust ↔ Go DuckDB round-trip   — the migration keystone gate
+# =============================================================================
+#  Proves the one risk the "Rust writes DuckDB, Go reads it" migration hinges on:
+#  a .duckdb written by the Rust store crate (duckdb-rs, bundled DuckDB 1.4.x) opens
+#  and reads back in a SEPARATE Go process (go-duckdb, engine 1.4.3). If the on-disk
+#  storage formats ever diverge (a version-pin slip), this job goes red.
+# =============================================================================
+name: Rust↔Go DuckDB round-trip
+
+on:
+  push:
+    paths:
+      - "rust/store/**"
+      - "internal/store/**"
+      - "scripts/check-duckdb-pin.sh"
+      - ".github/workflows/rust-go-roundtrip.yml"
+  pull_request:
+    paths:
+      - "rust/store/**"
+      - "internal/store/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: DuckDB pin guard (Rust crate ↔ go-duckdb)
+        run: bash scripts/check-duckdb-pin.sh
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build + run the Rust store fixture (writes a DuckDB)
+        run: |
+          cargo build --manifest-path rust/store/Cargo.toml --bin roundtrip-fixture
+          ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: Go reads the Rust-written DuckDB read-only (round-trip)
+        run: CGO_ENABLED=1 RT_DB="$RUNNER_TEMP/rt.duckdb" go test ./internal/store/ -run TestPhase0RustGoRoundTrip -v

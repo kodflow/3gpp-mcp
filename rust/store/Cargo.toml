@@ -1,0 +1,19 @@
+[package]
+name = "store-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust DuckDB write layer for the 3GPP corpus (duckdb-rs). Go reads the file back read-only; the round-trip proves the on-disk format is shared."
+
+# duckdb-rs MUST bundle the SAME DuckDB engine version as go-duckdb (v2.4.3 → engine
+# v1.4.3), else a Rust-written file does not open in the Go serve side. The round-trip
+# test (a separate Go process opening this fixture) is the binding proof; the version
+# pin is checked by scripts/check-duckdb-pin.sh. The duckdb crate's 1.4.x line bundles
+# DuckDB 1.4.x, storage-compatible with engine 1.4.3.
+[dependencies]
+duckdb = { version = "1.4", features = ["bundled"] }
+anyhow = "1"
+
+[[bin]]
+name = "roundtrip-fixture"
+path = "src/bin/roundtrip_fixture.rs"
