@@ -60,6 +60,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Rust toolchain + cargo cache: the Rust ingest restores libduckdb-sys & deps
+      # instead of recompiling each sync (only a Cargo.lock change rebuilds).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
 
       - name: Install deps (build + LibreOffice + zstd)
         run: |
