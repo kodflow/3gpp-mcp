@@ -15,6 +15,11 @@ scraper = "0.20"
 # pin the SAME ego-tree version scraper 0.20 uses (0.6.x) to avoid two incompatible copies.
 ego-tree = "0.6"
 
+# 5GC OpenAPI YAML parsing (Phase 6). serde_yaml::Value gives the same untyped-node
+# navigation Go's yaml.Node does (mapFields / collectRefs).
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
 [lib]
 name = "parse3gpp"
 path = "src/lib.rs"
