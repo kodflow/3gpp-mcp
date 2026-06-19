@@ -23,6 +23,7 @@
 #
 # Usage:  SERIES=21 LIMIT=2000 scripts/embed-run.sh
 set -euo pipefail
+echo "::error::RETIRED (Phase 11b): the Go embed path was removed; embed runs in Rust via .github/workflows/corpus-rust-embed-kaggle.yml (kernel-rust-embed.py). This driver is kept for history only." >&2; exit 1
 
 SERIES="${SERIES:-21}"
 EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}"
