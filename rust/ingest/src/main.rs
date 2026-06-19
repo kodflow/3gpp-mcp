@@ -48,6 +48,13 @@ struct Args {
     /// in-body ETSI provenance header (not a 3GPP filename); series/release do not apply.
     #[arg(long, default_value_t = false)]
     etsi: bool,
+    /// Accepted for Go cmd/ingest CLI compat (per-spec progress is already terse). No-op.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+    /// Accepted for Go cmd/ingest CLI compat (ASN.1 origin zips); the LI registry is now a
+    /// separate pass (ingest-li). No-op here.
+    #[arg(long, default_value = "")]
+    origin: String,
 }
 
 /// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
@@ -197,6 +204,7 @@ fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec
 fn main() -> Result<()> {
     let args = Args::parse();
     let store = Store::open_rw(&args.db)?;
+    let _ = (&args.quiet, &args.origin); // accepted-for-compat no-ops
 
     if args.count_only {
         return run_count_only(&store);

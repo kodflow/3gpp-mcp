@@ -126,10 +126,12 @@ jobs:
           cache: true
       - name: Install deps (LibreOffice + build + time)
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui time
-      - name: Build ingest
+      - name: Build ingest (Rust)
         run: |
           mkdir -p bin dist out
-          go build -trimpath -o bin/ingest ./cmd/ingest
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
+          cp rust/target/release/ingest bin/ingest
       - name: Disk before
         run: df -B1 / | tee out/df-before.txt
       - name: Download + convert series ${{ github.event.inputs.series }}
@@ -144,10 +146,10 @@ jobs:
       - name: Lexical ingest
         run: |
           /usr/bin/time -v ./bin/ingest --series "${{ github.event.inputs.series }}" \
-            --out dist/shard.duckdb --quiet 2> out/ingest.time
+            --convert data/sources/convert --db dist/shard.duckdb --quiet 2> out/ingest.time
       - name: Count-only + disk after ingest
         run: |
-          ./bin/ingest --out dist/shard.duckdb --count-only | tee out/count.json
+          ./bin/ingest --db dist/shard.duckdb --count-only | tee out/count.json
           df -B1 / | tee out/df-after-ingest.txt
           ls -l dist/shard.duckdb | tee out/db-size.txt
       - name: Worst-shard disk summary + gate
@@ -192,18 +194,20 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config libreoffice-writer-nogui time
       - name: Fetch BGE-M3 + ONNX Runtime (~2.3 GB)
         run: ./scripts/fetch-model.sh
-      - name: Build ingest WITH onnx
+      - name: Build ingest (Rust; inline-onnx embed is superseded by the decoupled embedder)
         run: |
           mkdir -p bin dist out
-          go build -trimpath -tags onnx -o bin/ingest-onnx ./cmd/ingest
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
+          cp rust/target/release/ingest bin/ingest-onnx
       - name: Download + convert series ${{ github.event.inputs.series }}
         run: ./scripts/corpus.sh --set "${{ github.event.inputs.floor }}" --series "${{ github.event.inputs.series }}" --jobs 2
       - name: Embed (fp32) under time -v
         run: |
           mkdir -p out
           /usr/bin/time -v ./bin/ingest-onnx --series "${{ github.event.inputs.series }}" \
-            --out dist/shard-onnx.duckdb --quiet 2> out/embed-fp32.time
-          ./bin/ingest-onnx --out dist/shard-onnx.duckdb --count-only | tee out/count-onnx.json
+            --convert data/sources/convert --db dist/shard-onnx.duckdb --quiet 2> out/embed-fp32.time
+          ./bin/ingest-onnx --db dist/shard-onnx.duckdb --count-only | tee out/count-onnx.json
           SECS=$(awk -F': ' '/Elapsed .wall/{print $2}' out/embed-fp32.time)
           EMB=$(jq -r '.embedded_clauses' out/count-onnx.json)
           echo "embedded_clauses=$EMB wall=$SECS" | tee out/embed-fp32.report
