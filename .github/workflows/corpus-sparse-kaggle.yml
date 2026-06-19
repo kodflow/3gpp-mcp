@@ -198,7 +198,7 @@ jobs:
           test -f out/sparse-index.json || { echo "::error::no sparse-index.json to publish"; exit 1; }
           echo "publishing sparse-index: $(cat out/sparse-index.json)"
           retry gh release upload latest out/sparse-index.json --repo "$GITHUB_REPOSITORY" --clobber
-      - name: Push the sparse shard to GHCR 3gpp-sparse (the bake folds it via cmd/overlay)
+      - name: Push the sparse shard to GHCR 3gpp-sparse (the bake folds it via the Rust overlay)
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh

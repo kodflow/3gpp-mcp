@@ -24,7 +24,7 @@ files=(
   .github/workflows/corpus-data-image.yml
   Dockerfile.data
   rust/store/src/bin/freeze_hnsw.rs
-  cmd/overlay/main.go
+  rust/store/src/bin/overlay.rs
   rust/store/src/bin/merge.rs
   rust/store/src/identity.rs
   cmd/validate/main.go
