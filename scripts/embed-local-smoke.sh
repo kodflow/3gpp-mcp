@@ -14,6 +14,7 @@
 #
 # Run:  make embed-smoke           (or)   scripts/embed-local-smoke.sh
 set -euo pipefail
+echo "::error::RETIRED (Phase 11b): the Go embed path was removed; embed runs in Rust via .github/workflows/corpus-rust-embed-kaggle.yml (kernel-rust-embed.py). This driver is kept for history only." >&2; exit 1
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GO="${GO:-go}"
