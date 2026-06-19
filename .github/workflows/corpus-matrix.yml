@@ -104,7 +104,7 @@ on:
       - 'cmd/merge/**'
       - 'cmd/discover/**'
       - 'cmd/ingest-catalog/**'
-      - 'cmd/ingest-openapi/**'
+      - 'rust/ingest/**'
       - 'internal/ingest/**'
       - 'internal/htmlparse/**'
       - 'internal/ooxml/**'
@@ -1089,14 +1089,19 @@ jobs:
           go build -trimpath -o bin/ingest-catalog ./cmd/ingest-catalog
           ./bin/ingest-catalog --out data/3gpp.duckdb --cache data/catalog \
             || echo "[merge] catalog overlay degraded (kept filename-derived metadata)"
-          go build -trimpath -o bin/ingest-openapi ./cmd/ingest-openapi
+          # OpenAPI overlay now runs the RUST ingest-openapi (parse3gpp::openapi + store-rs),
+          # the Go cmd/ingest-openapi having been removed (Phase 11b). It is fully
+          # degrade-don't-block: if this runner lacks the Rust toolchain or the build fails,
+          # the additive overlay is simply skipped and the DB stays valid (the full Phase 10
+          # CI repoint installs the toolchain + toolcaches the bin).
           # auto = fetch EVERY REL-* branch the Forge currently has, so a newly
           # published release (REL-20, REL-21, …) is picked up by a cron build with
           # no code change — and any release before the old hardcoded floor too.
           ./scripts/fetch-5g-apis.sh auto \
             || echo "[merge] 5g-apis fetch degraded"
-          ./bin/ingest-openapi --out data/3gpp.duckdb \
-            || echo "[merge] openapi ingest degraded"
+          ( cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-openapi \
+            && ./rust/target/release/ingest-openapi --src data/sources/5g-apis --db data/3gpp.duckdb ) \
+            || echo "[merge] openapi overlay skipped (Rust ingest-openapi unavailable on this runner)"
       - name: Package (zstd + sha256 over the enriched DB)
         run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst
