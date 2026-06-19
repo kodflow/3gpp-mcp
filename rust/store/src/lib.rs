@@ -10,6 +10,7 @@
 //! It deliberately mirrors the Go `internal/store` write surface method-for-method so a
 //! Rust-built corpus is byte-compatible with what Go would have built.
 
+pub mod identity;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 
