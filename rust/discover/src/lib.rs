@@ -351,6 +351,77 @@ fn triple(s: &str) -> [i64; 3] {
     t
 }
 
+/// BuildIndex holds the three canonical identities published alongside the corpus
+/// (== Go model.BuildIndex). A drift in any of them is corpus-global: discover
+/// forces every above-floor series back into the matrix so the affected refresh
+/// runs even though no spec version moved.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct BuildIndex {
+    #[serde(default)]
+    pub spec_ingest_identity: String,
+    #[serde(default)]
+    pub global_enrichment_identity: String,
+    #[serde(default)]
+    pub embed_identity: String,
+}
+
+/// current_footprints returns all subjects at their CURRENT code footprint (every
+/// series advanced), sorted — the input the current code would stamp (== Go
+/// subjectmeta.IngestFootprints). Computed from the shared, golden-matched
+/// identity3gpp::SUBJECTS so it can never drift from the write-side.
+pub fn current_footprints() -> Vec<String> {
+    let all: BTreeSet<String> = identity3gpp::SUBJECTS
+        .iter()
+        .flat_map(|(_, _, _, series)| series.iter().map(|s| s.to_string()))
+        .collect();
+    identity3gpp::effective_subject_footprints(&all, &std::collections::HashMap::new())
+        .into_iter()
+        .map(|(_, fp)| fp)
+        .collect()
+}
+
+/// current_build_index composes the three identities for the CURRENT code (== Go
+/// model.CurrentBuildIndex). `model_id` is the resolved embedder model id the caller
+/// supplies (Go resolves it from --embed-model; "" compares against an empty embed
+/// identity). The digests come from identity3gpp, golden-matched to the Go side.
+pub fn current_build_index(model_id: &str) -> BuildIndex {
+    BuildIndex {
+        spec_ingest_identity: identity3gpp::spec_ingest_identity(&current_footprints()),
+        global_enrichment_identity: identity3gpp::global_enrichment_identity(),
+        embed_identity: identity3gpp::embed_identity(model_id),
+    }
+}
+
+/// build_index_differs returns the names of the identities in `published` that
+/// disagree with `current` (== Go BuildIndex.Differs). Empty = up to date.
+pub fn build_index_differs(published: &BuildIndex, current: &BuildIndex) -> Vec<String> {
+    let mut out = Vec::new();
+    if published.spec_ingest_identity != current.spec_ingest_identity {
+        out.push("spec_ingest_identity".to_string());
+    }
+    if published.global_enrichment_identity != current.global_enrichment_identity {
+        out.push("global_enrichment_identity".to_string());
+    }
+    if published.embed_identity != current.embed_identity {
+        out.push("embed_identity".to_string());
+    }
+    out
+}
+
+/// load_build_index reads build-index.json; a missing/unreadable/malformed file
+/// yields the default (all-empty) BuildIndex, which Differs reports as a full drift
+/// — so a legacy publish with no build index self-heals on the next discover
+/// (== Go loadBuildIndex).
+pub fn load_build_index(path: &str) -> BuildIndex {
+    if path.is_empty() {
+        return BuildIndex::default();
+    }
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+        Err(_) => BuildIndex::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +609,52 @@ mod tests {
         assert!(sparse_needed("abc123", ""));
         assert!(sparse_needed("abc123", "old999"));
         assert!(!sparse_needed("abc123", "abc123"));
+    }
+
+    #[test]
+    fn build_index_differs_reports_each() {
+        let cur = current_build_index("");
+        // A published index equal to current => no drift.
+        assert!(build_index_differs(&cur, &cur).is_empty());
+        // A stale enrichment identity => exactly that name.
+        let mut pub_stale = cur.clone();
+        pub_stale.global_enrichment_identity = "stale00000000".into();
+        assert_eq!(
+            build_index_differs(&pub_stale, &cur),
+            vec!["global_enrichment_identity".to_string()]
+        );
+        // All three stale => all three names, in order.
+        let allstale = BuildIndex::default();
+        assert_eq!(
+            build_index_differs(&allstale, &cur),
+            vec![
+                "spec_ingest_identity".to_string(),
+                "global_enrichment_identity".to_string(),
+                "embed_identity".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_build_index_matches_identity_goldens() {
+        // The composed identities must equal the golden digests pinned in
+        // identity3gpp (which are byte-matched to the Go cmd/merge output).
+        let cur = current_build_index("");
+        assert_eq!(cur.global_enrichment_identity, "5fb3a6c87488");
+        assert_eq!(cur.embed_identity, "2d36b4425d54");
+        // spec_ingest is the all-advanced-footprints digest — recompute and compare.
+        assert_eq!(
+            cur.spec_ingest_identity,
+            identity3gpp::spec_ingest_identity(&current_footprints())
+        );
+    }
+
+    #[test]
+    fn load_build_index_missing_is_full_drift() {
+        let bi = load_build_index("");
+        assert_eq!(bi, BuildIndex::default());
+        // default vs current => all three drift (legacy publish self-heals).
+        assert_eq!(build_index_differs(&bi, &current_build_index("")).len(), 3);
     }
 
     #[test]

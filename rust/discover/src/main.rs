@@ -29,6 +29,8 @@ struct Args {
     mode: Mode,
     sparse_id: String,
     sparse_index: String,
+    build_index: String,
+    embed_model_id: String,
 }
 
 enum Mode {
@@ -51,6 +53,8 @@ fn parse_args() -> Args {
         mode: Mode::Delta,
         sparse_id: String::new(),
         sparse_index: String::new(),
+        build_index: String::new(),
+        embed_model_id: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -68,6 +72,8 @@ fn parse_args() -> Args {
             "--series" => a.series = next(),
             "--sparse-id" => a.sparse_id = next(),
             "--sparse-index" => a.sparse_index = next(),
+            "--build-index" => a.build_index = next(),
+            "--embed-model-id" => a.embed_model_id = next(),
             "--all" => a.all = true,
             "--include-legacy-gsm" => a.include_legacy_gsm = true,
             "--emit-worklist" => a.mode = Mode::Worklist,
@@ -147,6 +153,26 @@ fn main() {
             let full = a.all || idx.is_empty();
             let mut series = delta_series(&site, &have, floor_major, full);
 
+            // Build-identity drift (== Go): a parser/chunking/schema/model/global-
+            // enricher change moves NO spec version, so the per-(spec,release) delta
+            // is blind to it. Compare the published build-index against the current
+            // code; ANY of the three identities drifting is corpus-global → force
+            // every above-floor series into the matrix. Only on a delta build.
+            let mut identity_drift: Vec<String> = Vec::new();
+            if !full && !a.build_index.is_empty() {
+                let published = load_build_index(&a.build_index);
+                let current = current_build_index(&a.embed_model_id);
+                identity_drift = build_index_differs(&published, &current);
+                if !identity_drift.is_empty() {
+                    for key in site.keys() {
+                        let (spec, rel) = split_key(key);
+                        if major(rel) >= floor_major && spec.len() >= 2 {
+                            series.insert(spec[..2].to_string());
+                        }
+                    }
+                }
+            }
+
             // Legacy GSM opt-in: add a legacy series ONLY when absent from the index
             // (so it converges; an unconditional add re-selects it forever — #129).
             if a.include_legacy_gsm {
@@ -160,10 +186,11 @@ fn main() {
             let out: Vec<String> = series.into_iter().collect();
             let mode = if full { "full" } else { "delta" };
             eprintln!(
-                "discover: mode={mode} site_keys={} indexed={} -> {} series: {:?} \
-                 (subject-delta + build-identity-drift NOT ported — Go cmd/discover owns those)",
+                "discover: mode={mode} site_keys={} indexed={} identity-drift={:?} -> {} series: {:?} \
+                 (subject-delta NOT ported — Go cmd/discover owns it)",
                 site.len(),
                 idx.len(),
+                identity_drift,
                 out.len(),
                 out
             );
