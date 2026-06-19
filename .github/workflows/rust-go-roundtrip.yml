@@ -66,3 +66,7 @@ jobs:
           # The real BGE-M3 path (--features ort) is validated separately with the model.
           cargo build --release --manifest-path rust/embed-core/Cargo.toml
           CGO_ENABLED=1 go test -tags embed_ffi ./internal/embed/ -run TestFFIEmbedderSeam -v
+          # Prove the FULL serve binary builds + links the cdylib on the FFI (not just
+          # internal/embed) — the serve-side Rust query-embed integration end to end.
+          CGO_ENABLED=1 go build -tags embed_ffi -o /tmp/mcp-ffi ./cmd/server
+          echo "cmd/server built on the embed-core FFI ✓"
