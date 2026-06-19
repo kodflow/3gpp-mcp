@@ -22,16 +22,27 @@ dir="${1:?usage: kaggle-gpu-check.sh <output_dir>}"
 blob="$( { cat "$dir/RESULT.txt" 2>/dev/null; cat "$dir"/*.log 2>/dev/null; } || true )"
 
 # A GPU was demonstrably present → this account has quota; do NOT fall back.
-if printf '%s' "$blob" | grep -q 'gpu=present'; then
+#
+# Matched with `case`, NOT `printf '%s' "$blob" | grep -q`: under `set -o pipefail`
+# that pipeline misreads a SUCCESSFUL GPU run as quota. grep -q exits on the first
+# match and closes the pipe; printf, still writing a LARGE blob (the full kernel log
+# > the 64 KiB pipe buffer), then takes SIGPIPE (exit 141), and pipefail propagates
+# that 141 as the pipeline status — so the `if` is false even though grep matched.
+# Small test fixtures fit the pipe buffer so printf never blocked, hiding the bug
+# until a real multi-hundred-KB log hit it (Kaggle run 27798943323 threw away a GPU
+# run that wrote 400 vectors). `case` does the match in-shell: no pipe, no SIGPIPE.
+case "$blob" in
+*gpu=present*)
   echo gpu
   exit 0
-fi
+  ;;
+esac
 
 # Otherwise: explicit no-GPU marker, a quota/usage-limit keyword, or no output at all
 # (whitespace-only blob). Any of these means the account did not get a GPU → fall back.
+# The keyword scan uses a here-string (`<<<`), not a printf pipe, for the same reason.
 if [ -z "${blob//[[:space:]]/}" ] ||
-  printf '%s' "$blob" | grep -q 'gpu=absent' ||
-  printf '%s' "$blob" | grep -qiE 'quota|usage limit|exceeded[^.]*gpu|no gpu( available)?|gpuquota'; then
+  grep -qiE 'gpu=absent|quota|usage limit|exceeded[^.]*gpu|no gpu( available)?|gpuquota' <<<"$blob"; then
   echo quota
   exit 0
 fi
