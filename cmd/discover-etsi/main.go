@@ -43,13 +43,10 @@ func main() {
 	indexPath := flag.String("index", "", "etsi-index.json (id -> indexed version); empty/missing => full (every scoped spec selected)")
 	emitWL := flag.Bool("emit-worklist", false, "print the FETCH worklist '<id>\\t<pdf-url>\\t<version>' for every CHANGED/new scoped spec (drives etsi-corpus.sh)")
 	report := flag.String("report", "matrix", "matrix (JSON array of changed ids, for the CI matrix) | worklist")
+	allFlag := flag.Bool("all", false, "enumerate the WHOLE ETSI /deliver corpus (etsi_ts+etsi_tr+etsi_en) — the latest PUBLISHED version of EVERY deliverable, not just the LI suite. Tens of thousands of specs; pair with --report worklist + a chunked CI matrix.")
+	typeDirsFlag := flag.String("type-dirs", strings.Join(etsicat.DeliverTypeDirs, ","), "with --all: which /deliver document-type folders to crawl (comma/space-separated)")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request HTTP timeout")
 	flag.Parse()
-
-	specs := defaultLISpecs
-	if s := splitList(*specsFlag); len(s) > 0 {
-		specs = s
-	}
 
 	client := &http.Client{Timeout: *timeout}
 	fetch := func(url string) (io.ReadCloser, error) {
@@ -68,6 +65,30 @@ func main() {
 			return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 		}
 		return resp.Body, nil
+	}
+
+	// Scope: --all enumerates the WHOLE /deliver corpus (the 3GPP-parity completeness:
+	// latest published version of every deliverable); --specs scopes explicitly; else
+	// the built-in LI suite.
+	specs := defaultLISpecs
+	switch {
+	case *allFlag:
+		specs = nil
+		var enumFailed []string
+		dirs := splitList(*typeDirsFlag)
+		for _, td := range dirs {
+			ids, f := etsicat.EnumerateIDs(fetch, td)
+			specs = append(specs, ids...)
+			enumFailed = append(enumFailed, f...)
+		}
+		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v (%d range-fetch failures)\n",
+			len(specs), dirs, len(enumFailed))
+		if len(specs) == 0 {
+			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
+			os.Exit(1)
+		}
+	case len(splitList(*specsFlag)) > 0:
+		specs = splitList(*specsFlag)
 	}
 
 	site, failed := etsicat.BuildSite(fetch, specs)
