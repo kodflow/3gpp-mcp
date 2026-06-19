@@ -322,27 +322,41 @@ impl Store {
     /// clauses), oldest chunk first, capped at `limit` (0 = all). Mirrors the Go
     /// ClausesNeedingEmbedding ResumeOnly path so the Rust embedder can read the
     /// work-list straight from the DB instead of a JSONL bridge.
-    pub fn clauses_needing_embedding(&self, limit: usize) -> Result<Vec<WorkItem>> {
-        let mut sql = format!(
-            "SELECT chunk_id, COALESCE(heading,''), COALESCE(text,'') FROM clauses
+    pub fn clauses_needing_embedding(&self, limit: usize, floor_ord: i64) -> Result<Vec<WorkItem>> {
+        // Carry `release` so the floor (release ordinal ≥ floor_ord) is applied in Rust — the
+        // Rel-99→3 special makes a pure-SQL ordinal awkward (== Go ClausesNeedingEmbedding
+        // FloorOrd). floor_ord ≤ 0 = no floor.
+        let sql = format!(
+            "SELECT chunk_id, COALESCE(release,''), COALESCE(heading,''), COALESCE(text,'') FROM clauses
              WHERE embedding IS NULL AND {EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
         );
-        if limit > 0 {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
         let mut stmt = self.conn.prepare(&sql).context("prepare worklist")?;
         let rows = stmt
             .query_map([], |r| {
-                Ok(WorkItem {
-                    chunk_id: r.get(0)?,
-                    heading: r.get(1)?,
-                    text: r.get(2)?,
-                })
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })
             .context("query worklist")?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.context("scan worklist row")?);
+            let (chunk_id, release, heading, text) = r.context("scan worklist row")?;
+            if floor_ord > 0
+                && crate::identity::release_ordinal(&release).map_or(true, |o| o < floor_ord)
+            {
+                continue; // below the embed floor → leave lexical-only
+            }
+            out.push(WorkItem {
+                chunk_id,
+                heading,
+                text,
+            });
+            if limit > 0 && out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
