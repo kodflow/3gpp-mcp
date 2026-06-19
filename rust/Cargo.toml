@@ -5,7 +5,7 @@
 # and keeping it out avoids any risk to that proven GPU build.
 [workspace]
 resolver = "2"
-members = ["store", "parse", "ingest"]
+members = ["store", "parse", "ingest", "identity"]
 # embedder + embed-core are EXCLUDED: the embedder pulls the heavy ort/CUDA toolchain
 # (built standalone on Kaggle); embed-core is a cdylib whose real path also needs ort
 # (built + FFI-validated in the rust-go-roundtrip CI), so neither belongs in the
