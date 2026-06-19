@@ -13,6 +13,8 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/kodflow/3gpp-mcp/internal/etsicat"
 	"github.com/kodflow/3gpp-mcp/internal/model"
+	"github.com/kodflow/3gpp-mcp/internal/retry"
 )
 
 // defaultLISpecs is the ETSI Lawful-Interception suite the MCP cares about: the
@@ -48,23 +51,38 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request HTTP timeout")
 	flag.Parse()
 
-	client := &http.Client{Timeout: *timeout}
+	// Force HTTP/1.1: the ETSI CDN intermittently returns "HTTP2 framing layer"
+	// errors under the thousands of requests an --all crawl makes — disabling h2
+	// (empty TLSNextProto + ForceAttemptHTTP2=false) sidesteps it. Each GET is
+	// retried with backoff so a transient hiccup mid-crawl never aborts the run.
+	client := &http.Client{
+		Timeout: *timeout,
+		Transport: &http.Transport{
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+		},
+	}
 	fetch := func(url string) (io.ReadCloser, error) {
-		req, err := http.NewRequest(http.MethodGet, url, nil)
-		if err != nil {
-			return nil, err
-		}
-		// A browser UA: some ETSI endpoints 403 a bare Go client.
-		req.Header.Set("User-Agent", "Mozilla/5.0 (3gpp-mcp discover-etsi)")
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != http.StatusOK {
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-		}
-		return resp.Body, nil
+		var body io.ReadCloser
+		err := retry.Do(context.Background(), 5, time.Second, 20*time.Second, func() error {
+			req, rerr := http.NewRequest(http.MethodGet, url, nil)
+			if rerr != nil {
+				return rerr
+			}
+			// A browser UA: some ETSI endpoints 403 a bare Go client.
+			req.Header.Set("User-Agent", "Mozilla/5.0 (3gpp-mcp discover-etsi)")
+			resp, derr := client.Do(req)
+			if derr != nil {
+				return derr
+			}
+			if resp.StatusCode != http.StatusOK {
+				_ = resp.Body.Close()
+				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+			}
+			body = resp.Body
+			return nil
+		})
+		return body, err
 	}
 
 	// Scope: --all enumerates the WHOLE /deliver corpus (the 3GPP-parity completeness:
