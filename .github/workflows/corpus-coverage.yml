@@ -40,8 +40,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Emit the worklist from the live status report
-        run: CGO_ENABLED=0 go run ./cmd/discover --emit-worklist --floor Rel-99 > worklist.txt
+      - name: Build the Rust discover binary (Phase 10 — primary; Go stays as shadow)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" build --release --manifest-path rust/discover/Cargo.toml
+      - name: Emit the worklist from the live status report (rust primary, go shadow)
+        run: |
+          source scripts/lib/discover.sh
+          discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" status.htm
+          discover_run status.htm ./rust/discover/target/release/discover raw \
+            --emit-worklist --floor Rel-99 > worklist.txt
       - name: Verify coverage (exact + same-release fallback) over the whole worklist
         run: JOBS=10 bash scripts/verify-coverage.sh worklist.txt coverage
       - name: Build absent-index.json from the genuine-absent rows (C2)
@@ -57,7 +66,9 @@ jobs:
         # Drafts are still FETCHED (emit-worklist includes them); this only quiets
         # drift reporting. A frozen (major>=3) version re-flags naturally.
         run: |
-          CGO_ENABLED=0 go run ./cmd/discover --emit-draft-ledger --floor Rel-99 > draft-ledger.json
+          source scripts/lib/discover.sh
+          discover_run status.htm ./rust/discover/target/release/discover json \
+            --emit-draft-ledger --floor Rel-99 > draft-ledger.json
           jq -s 'reduce .[] as $o ({}; . * $o)' absent-index.json draft-ledger.json > merged.json
           mv merged.json absent-index.json
           echo "ledger size after drafts: $(grep -c '\": \"' absent-index.json || echo 0)"
