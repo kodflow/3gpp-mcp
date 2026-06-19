@@ -20,11 +20,20 @@ const MAX_TOKENS: usize = 1024;
 /// Dense head declared name (bound by name, never index 0 — dual-head export safety).
 const DENSE_OUTPUT: &str = "sentence_embedding";
 
+/// Sparse (learned-lexical) head output name, set by the dual-head export
+/// (scripts/export-bge-m3-sparse.py). Absent on the dense-only model → no sparse arm.
+const SPARSE_OUTPUT: &str = "sparse_weights";
+/// Per-run sparse sequence cap (== Go maxSparseSeq default): BGE-M3 self-attention is
+/// O(seq²); window longer inputs and merge term weights (max per id).
+const SPARSE_MAX_SEQ: usize = 512;
+
 struct Model {
     session: Session,
     tokenizer: Tokenizer,
     needs_token_type: bool,
     dense_output: String,
+    /// Some(name) when the model was exported with the sparse head; None on dense-only.
+    sparse_output: Option<String>,
 }
 
 static MODEL: OnceLock<Result<Model, String>> = OnceLock::new();
@@ -58,11 +67,17 @@ fn load() -> Result<Model> {
             ..Default::default()
         }))
         .map_err(|e| anyhow!("set truncation: {e}"))?;
+    let sparse_output = session
+        .outputs
+        .iter()
+        .find(|o| o.name == SPARSE_OUTPUT)
+        .map(|o| o.name.clone());
     Ok(Model {
         session,
         tokenizer,
         needs_token_type,
         dense_output,
+        sparse_output,
     })
 }
 
@@ -133,4 +148,85 @@ fn l2_normalize(v: &mut [f32]) {
             *x /= n;
         }
     }
+}
+
+/// has_sparse reports whether the loaded model carries the sparse head.
+pub fn has_sparse() -> bool {
+    matches!(model(), Ok(m) if m.sparse_output.is_some())
+}
+
+/// embed_sparse_one returns the query's deduped sparse term→weight pairs (== Go EmbedSparse):
+/// window the ids into ≤SPARSE_MAX_SEQ chunks, run the sparse head, keep the MAX ReLU weight
+/// per token id, drop the 4 special ids (cls/pad/eos/unk) + non-positive weights, merge windows
+/// (max per id). None on any failure / no sparse head. Sorted by descending weight.
+pub fn embed_sparse_one(text: &str) -> Option<Vec<(u32, f32)>> {
+    match embed_sparse_res(text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("embed-core: sparse embed failed: {e:#}");
+            None
+        }
+    }
+}
+
+fn embed_sparse_res(text: &str) -> Result<Vec<(u32, f32)>> {
+    let m = model().as_ref().map_err(|e| anyhow!("model load: {e}"))?;
+    let sparse_out = m
+        .sparse_output
+        .as_deref()
+        .ok_or_else(|| anyhow!("model has no sparse head ({SPARSE_OUTPUT})"))?;
+    let enc = m
+        .tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let ids: Vec<u32> = enc.get_ids().to_vec();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // specials dropped from the sparse representation (== Go default cls/pad/eos/unk).
+    let special = |id: u32| matches!(id, 0 | 1 | 2 | 3);
+    let mut merged: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + SPARSE_MAX_SEQ).min(ids.len());
+        let chunk = &ids[start..end];
+        let seq = chunk.len();
+        let mut id_arr = Array2::<i64>::zeros((1, seq));
+        let mut mask = Array2::<i64>::zeros((1, seq));
+        for (j, &id) in chunk.iter().enumerate() {
+            id_arr[[0, j]] = i64::from(id);
+            mask[[0, j]] = 1;
+        }
+        let mut inputs = ort::inputs![
+            "input_ids" => Tensor::from_array(id_arr)?,
+            "attention_mask" => Tensor::from_array(mask)?,
+        ]?;
+        if m.needs_token_type {
+            inputs.push((
+                "token_type_ids".into(),
+                Tensor::from_array(Array2::<i64>::zeros((1, seq)))?.into(),
+            ));
+        }
+        let outputs = m.session.run(inputs)?;
+        let view = outputs[sparse_out].try_extract_tensor::<f32>()?;
+        // sparse_weights is [1, seq] ReLU weights, one per position.
+        let w = view.into_dimensionality::<Ix2>()?;
+        for (j, &id) in chunk.iter().enumerate() {
+            if special(id) {
+                continue;
+            }
+            let weight = w[[0, j]];
+            if weight <= 0.0 {
+                continue;
+            }
+            let e = merged.entry(id).or_insert(0.0);
+            if weight > *e {
+                *e = weight; // max per token id (== toSparse)
+            }
+        }
+        start = end;
+    }
+    let mut out: Vec<(u32, f32)> = merged.into_iter().collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(out)
 }

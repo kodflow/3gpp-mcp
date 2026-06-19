@@ -65,6 +65,70 @@ pub extern "C" fn embed_core_embed(text: *const c_char, out: *mut f32, out_len: 
     }
 }
 
+/// embed_core_has_sparse reports whether the loaded model carries the BGE-M3 sparse head
+/// (dual-head export). 1 = sparse available, 0 = dense-only / no model / hash baseline.
+#[no_mangle]
+pub extern "C" fn embed_core_has_sparse() -> c_int {
+    #[cfg(feature = "ort")]
+    {
+        c_int::from(ort_backend::has_sparse())
+    }
+    #[cfg(not(feature = "ort"))]
+    {
+        0
+    }
+}
+
+/// embed_core_embed_sparse writes the query's sparse (learned-lexical) postings into the
+/// caller-owned `out_ids[0..cap)` / `out_weights[0..cap)` (parallel arrays), sorted by
+/// descending weight. Returns the number of postings produced (≥0; if > cap, only the first
+/// `cap` are written — grow the buffer and retry), -1 on null/bad args, -2 on invalid UTF-8,
+/// -3 when the model has no sparse head / the backend failed.
+///
+/// # Safety
+/// `text` is a NUL-terminated C string; `out_ids`/`out_weights` point to ≥ `cap` writable slots.
+#[no_mangle]
+pub extern "C" fn embed_core_embed_sparse(
+    text: *const c_char,
+    out_ids: *mut u32,
+    out_weights: *mut f32,
+    cap: c_int,
+) -> c_int {
+    if text.is_null() || out_ids.is_null() || out_weights.is_null() || cap < 0 {
+        return -1;
+    }
+    let s = match unsafe { CStr::from_ptr(text) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let Some(postings) = backend_embed_sparse(s) else {
+        return -3;
+    };
+    let n = postings.len();
+    let w = (cap as usize).min(n);
+    for (i, (id, weight)) in postings.into_iter().take(w).enumerate() {
+        unsafe {
+            *out_ids.add(i) = id;
+            *out_weights.add(i) = weight;
+        }
+    }
+    n as c_int
+}
+
+/// backend_embed_sparse routes the sparse arm: real BGE-M3 sparse head (`--features ort`,
+/// dual-head model) or None (hash baseline / dense-only has no sparse).
+fn backend_embed_sparse(text: &str) -> Option<Vec<(u32, f32)>> {
+    #[cfg(feature = "ort")]
+    {
+        ort_backend::embed_sparse_one(text)
+    }
+    #[cfg(not(feature = "ort"))]
+    {
+        let _ = text;
+        None
+    }
+}
+
 /// backend_embed routes to the active backend: the deterministic hash baseline (default) or
 /// the real BGE-M3 ONNX forward pass (`--features ort`). None ⇒ the backend could not embed.
 fn backend_embed(text: &str) -> Option<[f32; DENSE_DIM]> {
