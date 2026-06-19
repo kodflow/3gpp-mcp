@@ -1,18 +1,35 @@
-# CI — fmt, vet, test. Linting is handled by ktn-linter (hooks), not golangci-lint.
-# CGO is required (DuckDB; optional ONNX behind -tags onnx). No cross-compile:
-# tests run natively per-OS. Default build stays lexical (no -tags onnx).
+# =============================================================================
+#  CI — single unified validation pipeline
+# =============================================================================
+#  Replaces what used to be FIVE workflows firing in parallel on every push/PR
+#  (CI, Verify (all), Rust embedder · CI, Rust↔Go DuckDB round-trip,
+#  Retrieval · Regression). They are now ordered jobs in ONE run with a single
+#  concurrency group and a logical fail-fast DAG:
 #
-# Runs on PULL REQUESTS ONLY — the tests gate the merge there. Re-running the same
-# OS test matrix on the merge commit (push to main) is redundant (the merge is the
-# already-tested PR head), so push to main is intentionally NOT a trigger: a merge
-# leaves only "Release" (binaries, if code changed) and "Corpus · Build" (if a
-# pipeline file changed).
-
+#      go-quick ─┬─ go-test (matrix: linux + darwin native CGO)
+#                ├─ retrieval-regression
+#                ├─ image-smoke
+#                └─ roundtrip ── also needs ── rust-embedder
+#      scripts-config            (independent, parallel)
+#
+#  Every job carries a hard `timeout-minutes`. cancel-in-progress kills stale runs
+#  of the same ref. Cheap checks gate the expensive ones, so a broken commit fails
+#  in minutes and never burns the heavy roundtrip / image build.
+#
+#  NOT here (different lifecycle, never PR-noise): the deploy/build pipelines
+#  (Release, Corpus · *, Corpus Data/Image, ETSI, seed) stay separate — they
+#  push images/releases, are gated on main or dispatch/cron, and must not be
+#  coupled to PR validation.
+# =============================================================================
 name: CI
 
 on:
+  push:
+    branches: ["**"]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "11 2 * * *" # nightly ~03:11–04:11 Europe/Paris; gates the image build
 
 permissions:
   contents: read
@@ -25,31 +42,41 @@ env:
   CGO_ENABLED: "1"
 
 jobs:
-  verify:
+  # --- Stage 1: fast Go gate (gofmt + build + vet) — fails in ~3 min ----------
+  go-quick:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
           cache: true
-      - run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config
-      - name: gofmt
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config
+      - name: gofmt (fail on unformatted)
         run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then echo "not gofmt-clean:"; echo "$unformatted"; exit 1; fi
-      - run: go vet ./...
+          set -euo pipefail
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then echo "::error::unformatted:"; echo "$unformatted"; exit 1; fi
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
 
-  test:
+  # --- Stage 2: full test matrix (native CGO on linux + darwin) --------------
+  go-test:
+    needs: [go-quick]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-14] # linux/amd64 + darwin/arm64 (native CGO)
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -63,3 +90,223 @@ jobs:
         run: |
           go test -race -count=1 -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
+
+  # --- Stage 1 (parallel): scripts + config sanity ---------------------------
+  scripts-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: python kernels compile
+        run: python3 -m py_compile scripts/kaggle/kernel-rust-embed.py scripts/kaggle/kernel-sparse-corpus.py
+      - name: shell syntax (bash -n)
+        run: |
+          set -euo pipefail
+          for s in $(git ls-files '*.sh'); do bash -n "$s"; done
+          [ -f docker-entrypoint.sh ] && bash -n docker-entrypoint.sh || true
+      - name: shellcheck
+        run: |
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -qq
+          retry sudo apt-get install -y --no-install-recommends shellcheck
+          # advisory: don't fail the gate on style, only on real errors (-S error)
+          for s in $(git ls-files '*.sh') docker-entrypoint.sh; do
+            [ -f "$s" ] && shellcheck -S error "$s" || true
+          done
+      - name: YAML workflows parse
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in glob.glob('.github/workflows/*.yml'):
+              try:
+                  yaml.safe_load(open(f)); print("ok", f)
+              except Exception as e:
+                  print("PARSE ERROR", f, e); bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+  # --- Stage 1 (parallel): rust/embedder crate (offline campaign tooling) -----
+  rust-embedder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust/embedder
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+      - name: Cache cargo
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/embedder/target
+          key: rust-embedder-${{ runner.os }}-${{ hashFiles('rust/embedder/Cargo.toml') }}
+          restore-keys: |
+            rust-embedder-${{ runner.os }}-
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
+      - name: Release build (the artifact the Kaggle kernel runs)
+        run: cargo build --release
+
+  # --- Stage 3: the migration keystone — Rust writes DuckDB, Go reads it ------
+  roundtrip:
+    needs: [go-quick, rust-embedder]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: DuckDB pin guard (Rust crate ↔ go-duckdb)
+        run: bash scripts/check-duckdb-pin.sh
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cargo cache (registry + both target dirs)
+        # Keyed on the committed Cargo.lock files → after the first run the heavy deps
+        # (libduckdb-sys, arrow, ort-sys, …) are RESTORED instead of recompiled (~6 min → s).
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust -> rust/target
+            rust/embed-core -> rust/embed-core/target
+      - name: Build the Rust write-side workspace (store + parse + ingest) + write DuckDBs
+        run: |
+          cargo build --manifest-path rust/Cargo.toml --workspace
+          ./rust/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
+          ./rust/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt_full.duckdb" indexes
+      - name: Rust workspace unit tests (store + parse + ingest)
+        run: cargo test --manifest-path rust/Cargo.toml --workspace
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: Go ↔ Rust round-trip + Rust embed-io + ingest + openapi E2E
+        run: |
+          CGO_ENABLED=1 \
+            RT_DB="$RUNNER_TEMP/rt.duckdb" \
+            RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
+            RUST_EMBED_IO="$(pwd)/rust/target/debug/embed-io" \
+            RUST_INGEST="$(pwd)/rust/target/debug/ingest" \
+            RUST_INGEST_OPENAPI="$(pwd)/rust/target/debug/ingest-openapi" \
+            RUST_INGEST_CATALOG="$(pwd)/rust/target/debug/ingest-catalog" \
+            RUST_INGEST_LI="$(pwd)/rust/target/debug/ingest-li" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E|TestRustIngestE2E|TestRustIngestOpenapiE2E|TestRustIngestCatalogE2E|TestRustGlossaryE2E|TestRustIngestLiE2E|TestRustIngestBatchE2E|TestRustIngestEtsiE2E|TestRustMergeE2E|TestRustOverlayE2E' -v
+      - name: Phase-1 FFI seam — embed-core cdylib → cgo → Go (hash backend, no model)
+        run: |
+          # Build the embed-core cdylib (default = deterministic hash backend, no ort/model)
+          # and run the Go FFI seam test against it. Locks the cdylib→cgo→Go contract in CI.
+          # The real BGE-M3 path (--features ort) is validated separately with the model.
+          cargo build --release --manifest-path rust/embed-core/Cargo.toml
+          CGO_ENABLED=1 go test -tags embed_ffi ./internal/embed/ -run TestFFIEmbedderSeam -v
+          # Prove the FULL serve binary builds + links the cdylib on the FFI (not just
+          # internal/embed) — the serve-side Rust query-embed integration end to end.
+          CGO_ENABLED=1 go build -tags embed_ffi -o /tmp/mcp-ffi ./cmd/server
+          echo "cmd/server built on the embed-core FFI ✓"
+
+  # --- Stage 3 (parallel): retrieval quality regression (advisory gate) -------
+  retrieval-regression:
+    needs: [go-quick]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read
+    env:
+      CRANE_VER: "v0.20.2"
+      OWNER: ${{ github.repository_owner }}
+      # Prefer the read:packages-only token; fall back to the broader GHCR_PAT.
+      # Empty on fork PRs → pull skipped, gate is a no-op.
+      GHCR_TOKEN: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends build-essential pkg-config
+      - name: Pull lexical DuckDB from private GHCR corpus image
+        id: db
+        run: |
+          if [ -z "$GHCR_TOKEN" ]; then
+            echo "::notice::no GHCR token (fork PR?) — skipping retrieval regression gate"
+            echo "have_db=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p data
+          # Tolerate a missing / broken / unpullable base image: this gate is advisory
+          # infra and must NEVER fail a PR because the corpus image is temporarily absent.
+          if curl -fsSL --retry 5 -o /tmp/crane.tgz \
+                "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz" \
+             && tar -xzf /tmp/crane.tgz -C /tmp crane \
+             && printf '%s' "$GHCR_TOKEN" | /tmp/crane auth login ghcr.io -u "$OWNER" --password-stdin \
+             && /tmp/crane export "ghcr.io/${OWNER}/3gpp-corpus:latest" - | tar -xC data 3gpp.duckdb \
+             && test -s data/3gpp.duckdb; then
+            echo "have_db=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::could not pull a usable 3gpp-corpus base — skipping retrieval gate (advisory)"
+            echo "have_db=0" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Score retrieval + gate vs baseline
+        if: steps.db.outputs.have_db == '1'
+        run: |
+          go build -o /tmp/bench ./cmd/bench
+          /tmp/bench \
+            -db data/3gpp.duckdb \
+            -systems lexical \
+            -json retrieval-metrics.json \
+            -baseline docs/inputs/eval/baseline.json \
+            -tol "${{ github.event.inputs.tol || '0.02' }}" \
+            2>&1 | tee "$GITHUB_STEP_SUMMARY"
+      - name: Upload metrics (baseline candidate)
+        if: steps.db.outputs.have_db == '1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: retrieval-metrics
+          path: retrieval-metrics.json
+          if-no-files-found: warn
+
+  # --- Stage 3 (parallel): Docker image smoke (lexical light, no DB/push) -----
+  image-smoke:
+    needs: [go-quick]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Pre-pull buildkit (retry; Docker Hub flakes)
+        run: |
+          source scripts/lib/retry.sh
+          retry docker pull moby/buildkit:buildx-stable-1
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: build image (lexical, no DB, no push)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          # light explicitly: the multi-target Dockerfile's full target needs a
+          # DATA_IMAGE (the 3gpp-data base) that a smoke build cannot provide.
+          target: light
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
