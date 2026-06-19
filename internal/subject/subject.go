@@ -17,21 +17,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
-
-// IngestContext carries everything a subject needs to extract its structured
-// artefacts from one parsed spec during the offline ingest pass.
-type IngestContext struct {
-	SpecID      string
-	Release     string
-	Version     string
-	ConvertPath string // path of the converted file being ingested (to locate siblings)
-	OriginDir   string // data/sources/origin (for attachment zips)
-	Clauses     []model.Clause
-	IsLatest    bool // this (spec, version) is the newest indexed version of the spec
-}
 
 // ToolRegistration is one MCP tool a subject contributes.
 type ToolRegistration struct {
@@ -43,13 +30,11 @@ type ToolRegistration struct {
 type Subject interface {
 	// Name is the stable subject id ("li").
 	Name() string
-	// Activates reports whether this subject ingests the given spec.
+	// Activates reports whether this subject owns the given spec.
 	Activates(specID string) bool
-	// Ingest extracts the subject's structured data for one spec into the store.
-	// Returns the number of records added (degrade-don't-block: a missing source
-	// returns 0, nil). Called only when Activates(ic.SpecID) is true.
-	Ingest(ctx context.Context, db *store.Store, ic IngestContext) (added int, err error)
-	// Tools returns the MCP tools this subject contributes (may be empty).
+	// Tools returns the MCP tools this subject contributes (may be empty). Ingestion
+	// moved to the Rust write-side (Phase 11b), so the Go Subject contract is read-only:
+	// it declares spec ownership and contributes serve-time tools only.
 	Tools(db *store.Store, baseline string) []ToolRegistration
 }
 
