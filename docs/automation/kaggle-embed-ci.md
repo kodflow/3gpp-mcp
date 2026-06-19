@@ -181,3 +181,37 @@ Rel-99→latest, exactly as you asked). Enable it:
 - Plan: `.claude/plans/embed-maximization.md` (15-commit roadmap; 1,3-8,10,12-14 done).
 - Hardening branch this builds on: `feat/append-resume-hardening` (PR #62).
 - CI semantic channel: GHCR `3gpp-vec:latest`, serve `--vec-ghcr` / `--vec-manifest`.
+
+## 9. Two Kaggle accounts (automatic fallback + one-click switch)
+
+The Kaggle GPU quota is per-account and weekly. To keep the campaign moving when
+one account is rate-limited or its token expires, the CI carries **two** accounts and
+falls back automatically. `scripts/kaggle-auth.sh` probes them and exports the working
+one; the run stops **only if BOTH fail** auth.
+
+**Secrets / variables (Settings → Secrets and variables → Actions):**
+
+| Account  | Token (secret)               | Username (variable) |
+|----------|------------------------------|---------------------|
+| primary  | `KAGGLE_API_TOKEN`           | `KAGGLE_USERNAME`           (e.g. `makingcodes`) |
+| fallback | `KAGGLE_API_TOKEN_FALLBACK`  | `KAGGLE_USERNAME_FALLBACK`  (e.g. `extazy937`)   |
+
+Tokens are KGAT access tokens (Kaggle → Settings → API → *Generate New Token*).
+Usernames are not sensitive → store them as repo **variables**.
+
+**How it picks:** the `kaggle_account` dispatch input chooses which account is tried
+**first** (the other is the automatic fallback):
+- `primary` (default) → try `[primary, fallback]`
+- `fallback` → try `[fallback, primary]`
+
+So switching accounts is a one-field change in the *Run workflow* dialog of any Kaggle
+workflow (`Corpus · Rust embed`, `Corpus · Sparse`, `Corpus · Embed`).
+
+**Add a third account?** Extend `scripts/kaggle-auth.sh` (`token_of`/`user_of`/`ORDER`)
+plus the matching secret/variable and the workflow `env`. The selection logic is
+unit-tested offline by `scripts/kaggle-auth_test.sh` (mock probe, no network).
+
+**Note (in-kernel versioning):** the CI selects the account that *pushes/mounts* the
+kernel. The kernel's own dataset-versioning tail (`KAGGLE_USERNAME`/`KAGGLE_KEY` read
+on Kaggle) uses the **Kaggle Secrets attached to the kernel** for that account — keep
+those in sync per account on the Kaggle side.

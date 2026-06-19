@@ -59,6 +59,12 @@ on:
         description: "Push the pulled sub-bases to GHCR 3gpp-vec:latest when done. Default true — there is no point spending GPU on an embed you don't publish. Set false only for a throwaway shakedown."
         required: false
         default: "true"
+      kaggle_account:
+        description: "Kaggle account to try FIRST (the other is the automatic fallback; run stops only if BOTH fail auth)."
+        required: false
+        default: "primary"
+        type: choice
+        options: [primary, fallback]
   # Keep nibbling the weekly Kaggle quota unattended. Disabled by default — uncomment
   # and rely on Kaggle Secrets attached to the kernels for self-versioning.
   # schedule:
@@ -105,14 +111,16 @@ jobs:
       matrix:
         series: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # Modern access-token auth (kaggle CLI 2.x). The CLI reads KAGGLE_API_TOKEN
-      # directly and introspects it; KAGGLE_USER is only the slug namespace handle.
+      # Modern access-token auth (kaggle CLI 2.x). Two accounts: scripts/kaggle-auth.sh
+      # probes them (order = KAGGLE_ACCOUNT) and exports the SELECTED KAGGLE_API_TOKEN +
+      # KAGGLE_USER (the slug namespace handle); the run stops only if BOTH fail auth.
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-      # The handle is NOT sensitive, so it may live as a repo VARIABLE (preferred)
-      # or, for back-compat, a secret. Read the variable first; fall back to the
-      # secret. Reading only `secrets.KAGGLE_USERNAME` breaks the moment the handle
-      # is moved to a variable (empty → driver dies "set KAGGLE_USER" in ~1s).
-      KAGGLE_USER: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
+      # The handle is NOT sensitive, so it may live as a repo VARIABLE (preferred) or a
+      # secret. Read the variable first; fall back to the secret.
+      KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_USERNAME_FALLBACK: ${{ vars.KAGGLE_USERNAME_FALLBACK || secrets.KAGGLE_USERNAME_FALLBACK }}
+      KAGGLE_ACCOUNT: ${{ github.event.inputs.kaggle_account || 'primary' }}
       EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
       EMBED_PRECISION: ${{ github.event.inputs.precision }}
       KAGGLE_ACCELERATOR: ${{ github.event.inputs.accelerator }}
@@ -126,20 +134,12 @@ jobs:
       GHCR_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Guard — secrets present
-        run: |
-          if [ -z "${KAGGLE_API_TOKEN}" ]; then
-            echo "::error::KAGGLE_API_TOKEN secret is not set. Generate one at https://www.kaggle.com/settings/api → 'Generate New Token' (KGAT_…) and add it under Settings → Secrets and variables → Actions. See docs/automation/kaggle-embed-ci.md."
-            exit 1
-          fi
-          if [ -z "${KAGGLE_USER}" ]; then
-            echo "::error::KAGGLE_USERNAME is not set as a repo variable OR secret — needed as the handle that namespaces the kernel/dataset slugs."
-            exit 1
-          fi
       - name: Install kaggle CLI (pin 2.2.0 — access-token auth)
         run: |
           pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
           kaggle --version
+      - name: Select Kaggle account (primary → fallback; stop if both fail)
+        run: bash scripts/kaggle-auth.sh
       - name: Drive series ${{ matrix.series }} (time-boxed; resumes next dispatch)
         run: |
           mins="${{ github.event.inputs.runner_minutes }}"
