@@ -48,8 +48,10 @@ fi
 # re-published `latest`) — the catalogue is chunk_id-independent (joins on spec/release/
 # clause at query time). HNSW is not built (RAM); serve does exact-scan vectors.
 mkdir -p "$(dirname "$OUT")"
-log "merge lots → clauses + vectors → $OUT"
-CGO_ENABLED=1 "$GO" run "$ROOT/cmd/merge" --out "$OUT" --no-hnsw "$a" "$b"
+log "merge lots → clauses + vectors → $OUT (Rust store-rs merge)"
+command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path "$ROOT/rust/store/Cargo.toml" --bin merge
+"$ROOT/rust/target/release/merge" --out "$OUT" --no-hnsw "$a" "$b"
 LEX_URL="${LEX_URL:-https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.zst}"
 log "pull lexical base (catalogue source) ← $LEX_URL"
 curl -fsSL --retry 5 -o "$OUT.lex.zst" "$LEX_URL"
