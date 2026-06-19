@@ -158,9 +158,12 @@ cmd_merge() {
   local a="$STAGE/out-A/3gpp-embedded.duckdb" b="$STAGE/out-B/3gpp-embedded.duckdb"
   [ -f "$a" ] || die "missing lot A DB ($a) — run '$0 collect' first"
   [ -f "$b" ] || die "missing lot B DB ($b) — run '$0 collect' first"
-  log "merging lot A + lot B -> $out"
-  go -C "$ROOT" run ./cmd/merge --out "$out" "$a" "$b" \
-    || die "merge failed (check cmd/merge flags with: go run ./cmd/merge -h)"
+  log "merging lot A + lot B -> $out (Rust store-rs merge)"
+  command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path "$ROOT/rust/store/Cargo.toml" --bin merge \
+    || die "rust merge build failed"
+  "$ROOT/rust/target/release/merge" --out "$out" "$a" "$b" \
+    || die "merge failed"
   log "merged -> $out"
 }
 
