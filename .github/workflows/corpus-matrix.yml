@@ -103,7 +103,6 @@ on:
       - 'rust/parse/**'
       - 'cmd/merge/**'
       - 'cmd/discover/**'
-      - 'cmd/ingest-catalog/**'
       - 'rust/ingest/**'
       - 'internal/ingest/**'
       - 'internal/htmlparse/**'
@@ -1096,8 +1095,16 @@ jobs:
           # search_api). Both are idempotent (UPSERT / clear-api_*-then-reingest)
           # and degrade-don't-block: a forge/DynaReport outage must not fail the
           # corpus build — the DB stays valid with filename-derived metadata.
-          go build -trimpath -o bin/ingest-catalog ./cmd/ingest-catalog
-          ./bin/ingest-catalog --out data/3gpp.duckdb --cache data/catalog \
+          # Catalogue overlay now runs the RUST ingest-catalog (parse3gpp::catalog +
+          # store-rs); the Go cmd/ingest-catalog is removed (Phase 11b). Fetch the two
+          # DynaReport HTML pages, then overlay — all degrade-don't-block (a fetch/build
+          # outage keeps the DB valid with filename-derived metadata).
+          ( mkdir -p data/catalog \
+            && curl -fsSL --retry 3 "https://www.3gpp.org/dynareport?code=status-report.htm" -o data/catalog/status-report.htm \
+            && curl -fsSL --retry 3 "https://portal.3gpp.org/Releases.aspx" -o data/catalog/releases.htm \
+            && cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-catalog \
+            && ./rust/target/release/ingest-catalog --db data/3gpp.duckdb \
+                 --status-report data/catalog/status-report.htm --releases data/catalog/releases.htm ) \
             || echo "[merge] catalog overlay degraded (kept filename-derived metadata)"
           # OpenAPI overlay now runs the RUST ingest-openapi (parse3gpp::openapi + store-rs),
           # the Go cmd/ingest-openapi having been removed (Phase 11b). It is fully
