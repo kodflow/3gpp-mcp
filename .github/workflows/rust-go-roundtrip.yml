@@ -12,12 +12,14 @@ on:
   push:
     paths:
       - "rust/store/**"
+      - "rust/parse/**"
       - "internal/store/**"
       - "scripts/check-duckdb-pin.sh"
       - ".github/workflows/rust-go-roundtrip.yml"
   pull_request:
     paths:
       - "rust/store/**"
+      - "rust/parse/**"
       - "internal/store/**"
   workflow_dispatch:
 
