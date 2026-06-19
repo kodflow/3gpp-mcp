@@ -36,12 +36,17 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build + run the Rust store fixture (writes a DuckDB)
+      - name: Build the Rust store fixture + write DuckDBs (data only + FTS/HNSW/sparse)
         run: |
           cargo build --manifest-path rust/store/Cargo.toml --bin roundtrip-fixture
           ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
+          ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt_full.duckdb" indexes
+      - name: Rust store crate unit tests
+        run: cargo test --manifest-path rust/store/Cargo.toml
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - name: Go reads the Rust-written DuckDB read-only (round-trip)
-        run: CGO_ENABLED=1 RT_DB="$RUNNER_TEMP/rt.duckdb" go test ./internal/store/ -run TestPhase0RustGoRoundTrip -v
+      - name: Go reads the Rust-written DuckDB read-only (data + FTS/HNSW/sparse round-trip)
+        run: |
+          CGO_ENABLED=1 RT_DB="$RUNNER_TEMP/rt.duckdb" RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed' -v
