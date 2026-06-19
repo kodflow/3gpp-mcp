@@ -817,14 +817,32 @@ jobs:
           set -o pipefail
           mkdir -p dist
           OUT="dist/shard-${{ steps.shard.outputs.tag }}.duckdb"
+          SERIES="${{ steps.shard.outputs.series }}"
+          RELFLAG="${{ steps.shard.outputs.relflag }}"
+          RELVAL="${RELFLAG#--release }"   # "" when no release pin
+          # Phase 10 repoint: prefer the RUST ingest (parse3gpp + store-rs, the same parser
+          # the rust-go-roundtrip CI proves), FALL BACK to the Go cmd/ingest if the Rust
+          # toolchain/build is unavailable — so the prod corpus build NEVER regresses (worst
+          # case = today's Go path). A wrong/empty Rust shard is caught downstream by
+          # cmd/validate / data-contract; --resume + embedding_hash keep both paths idempotent.
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal || true
+          export PATH="$HOME/.cargo/bin:$PATH"
+          RUST_INGEST_BIN=""
+          if cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest; then
+            RUST_INGEST_BIN="rust/target/release/ingest"
+          else
+            echo "::warning::Rust ingest build failed — falling back to the Go cmd/ingest"
+          fi
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
             echo "::group::ingest attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
-            if ./bin/ingest --series "${{ steps.shard.outputs.series }}" ${{ steps.shard.outputs.relflag }} --out "$OUT" --resume; then
-              ingest_ok=1
+            if [ -n "$RUST_INGEST_BIN" ] && "$RUST_INGEST_BIN" --series "$SERIES" ${RELVAL:+--release "$RELVAL"} --convert data/sources/convert --db "$OUT" --resume; then
+              echo "ingest via Rust"; ingest_ok=1
+            elif ./bin/ingest --series "$SERIES" $RELFLAG --out "$OUT" --resume; then
+              echo "ingest via Go (fallback)"; ingest_ok=1
             fi
             echo "::endgroup::"
             if [ "$ingest_ok" -eq 1 ]; then
