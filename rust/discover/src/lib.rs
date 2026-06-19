@@ -351,6 +351,24 @@ fn triple(s: &str) -> [i64; 3] {
     t
 }
 
+/// changed_subject_series returns the sorted series owned by any subject whose
+/// published footprint differs from the current code's (or is absent) — the delta
+/// path's subject signal (== Go subjectmeta.ChangedSeries). An empty published map
+/// returns every subject's series (once-only re-index after the index first ships).
+/// Footprints come from the shared identity3gpp::SUBJECTS, byte-matched to Go.
+pub fn changed_subject_series(published: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (name, version, source_hash, series) in identity3gpp::SUBJECTS {
+        let cur = identity3gpp::footprint(name, version, source_hash);
+        if published.get(*name).map(String::as_str).unwrap_or("") != cur {
+            for s in *series {
+                out.insert(s.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// BuildIndex holds the three canonical identities published alongside the corpus
 /// (== Go model.BuildIndex). A drift in any of them is corpus-global: discover
 /// forces every above-floor series back into the matrix so the affected refresh
@@ -609,6 +627,23 @@ mod tests {
         assert!(sparse_needed("abc123", ""));
         assert!(sparse_needed("abc123", "old999"));
         assert!(!sparse_needed("abc123", "abc123"));
+    }
+
+    #[test]
+    fn changed_subject_series_cases() {
+        // Empty published => every subject's series (21 glossary + 33 li).
+        let all = changed_subject_series(&BTreeMap::new());
+        assert!(all.contains("21") && all.contains("33"));
+        // Published == current => nothing changed.
+        let mut pubd = BTreeMap::new();
+        for (n, v, sh, _) in identity3gpp::SUBJECTS {
+            pubd.insert(n.to_string(), identity3gpp::footprint(n, v, sh));
+        }
+        assert!(changed_subject_series(&pubd).is_empty());
+        // A stale li footprint => only li's series (33), not glossary's (21).
+        pubd.insert("li".to_string(), "stale0000".to_string());
+        let ch = changed_subject_series(&pubd);
+        assert!(ch.contains("33") && !ch.contains("21"));
     }
 
     #[test]
