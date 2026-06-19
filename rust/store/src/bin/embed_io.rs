@@ -45,6 +45,10 @@ struct Args {
     /// --embed-floor). Lexical coverage is unaffected; this only narrows what gets vectorised.
     #[arg(long, default_value = "")]
     embed_floor: String,
+    /// Print the embed completeness report as JSON (model, hnsw, embedded_clauses,
+    /// null_embeddings_at_floor) and exit — the CI semantic gate (== Go embed --report json).
+    #[arg(long, default_value_t = false)]
+    report: bool,
     /// Rows per write transaction on import.
     #[arg(long, default_value_t = 512)]
     batch: usize,
@@ -159,5 +163,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("embed-io: pass --export-worklist <file> or --import-vectors <file>");
+    if args.report {
+        let model = store.get_meta("embedding_model")?;
+        let hnsw = store.get_meta("hnsw_state")? == "frozen";
+        let floor_ord = if args.embed_floor.is_empty() {
+            0
+        } else {
+            store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
+        };
+        // null_embeddings_at_floor = embeddable + still-NULL clauses at/above the floor.
+        let null_at_floor = store.clauses_needing_embedding(0, floor_ord)?.len();
+        let total = store.count_clauses()?;
+        let null_all = store.count_null_embeddings()?;
+        println!(
+            "{{\n  \"model\": \"{}\",\n  \"hnsw\": {hnsw},\n  \"embedded_clauses\": {},\n  \"null_embeddings_at_floor\": {null_at_floor}\n}}",
+            model.replace('"', "\\\""),
+            total - null_all
+        );
+        return Ok(());
+    }
+
+    anyhow::bail!("embed-io: pass --export-worklist <file>, --import-vectors <file>, or --report");
 }
