@@ -37,6 +37,19 @@ pub struct WorkItem {
     pub text: String,
 }
 
+/// A clause to ingest (no vector yet — embedding/embedding_hash default NULL). Mirrors
+/// the columns Go's InsertClauses writes; the Rust ingest builds these from the parser.
+pub struct ClauseIn {
+    pub chunk_id: u64,
+    pub spec_id: String,
+    pub release: String,
+    pub version: String,
+    pub clause_path: String,
+    pub heading: String,
+    pub text: String,
+    pub is_normative: bool,
+}
+
 impl Store {
     /// open_rw opens (creating if absent) the DuckDB file read-write and bootstraps the
     /// schema idempotently.
@@ -267,6 +280,100 @@ impl Store {
             .with_context(|| format!("fold_shard {shard_path}"))?;
         Ok(())
     }
+
+    // ---- ingest write surface (== Go store catalogue/clause writes) -----------------
+
+    /// upsert_spec inserts/updates a spec catalogue row (== Go UpsertSpec).
+    pub fn upsert_spec(
+        &self,
+        spec_id: &str,
+        series: &str,
+        title: &str,
+        doc_type: &str,
+        working_group: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO specs(spec_id, series, title, doc_type, working_group)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT (spec_id) DO UPDATE SET
+                   series = excluded.series, title = excluded.title,
+                   doc_type = excluded.doc_type, working_group = excluded.working_group",
+                duckdb::params![spec_id, series, title, doc_type, working_group],
+            )
+            .with_context(|| format!("upsert_spec {spec_id}"))?;
+        Ok(())
+    }
+
+    /// upsert_version inserts/ignores a (spec, release, version) row (== Go UpsertVersion).
+    pub fn upsert_version(
+        &self,
+        spec_id: &str,
+        release: &str,
+        version: &str,
+        docx_url: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO spec_versions(spec_id, release, version, docx_url)
+                 VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                duckdb::params![spec_id, release, version, docx_url],
+            )
+            .with_context(|| format!("upsert_version {spec_id} {version}"))?;
+        Ok(())
+    }
+
+    /// insert_clauses bulk-inserts vector-less clauses in one transaction (== Go
+    /// InsertClauses). embedding + embedding_hash default NULL — the embed pass fills them.
+    pub fn insert_clauses(&self, clauses: &[ClauseIn]) -> Result<()> {
+        if clauses.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN")?;
+        {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO clauses(chunk_id, spec_id, release, version, clause_path, heading, text, is_normative)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for c in clauses {
+                stmt.execute(duckdb::params![
+                    c.chunk_id,
+                    c.spec_id,
+                    c.release,
+                    c.version,
+                    c.clause_path,
+                    c.heading,
+                    c.text,
+                    c.is_normative,
+                ])
+                .with_context(|| format!("insert clause {}", c.chunk_id))?;
+            }
+        }
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// log_ingest stamps the resume ledger (== Go ingest_log upsert). status is
+    /// 'started' then 'done'; pipeline_version invalidates the log on an algorithm change.
+    pub fn log_ingest(
+        &self,
+        spec_id: &str,
+        version: &str,
+        status: &str,
+        pipeline_version: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO ingest_log(spec_id, version, status, pipeline_version, started_at, completed_at)
+                 VALUES (?, ?, ?, ?, now(), CASE WHEN ? = 'done' THEN now() ELSE NULL END)
+                 ON CONFLICT (spec_id, version) DO UPDATE SET
+                   status = excluded.status, pipeline_version = excluded.pipeline_version,
+                   completed_at = CASE WHEN excluded.status = 'done' THEN now() ELSE ingest_log.completed_at END",
+                duckdb::params![spec_id, version, status, pipeline_version, status],
+            )
+            .with_context(|| format!("log_ingest {spec_id} {version} {status}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +479,85 @@ mod tests {
         assert_eq!(clauses, 4, "all clauses folded");
         assert_eq!(distinct, 4, "chunk_ids offset, no collision");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ingest_write_surface_roundtrips() {
+        let s = Store::in_memory().unwrap();
+        s.upsert_spec("23.501", "23", "System architecture", "TS", "SA2")
+            .unwrap();
+        // idempotent upsert updates in place.
+        s.upsert_spec(
+            "23.501",
+            "23",
+            "System architecture and procedures",
+            "TS",
+            "SA2",
+        )
+        .unwrap();
+        s.upsert_version("23.501", "Rel-19", "19.0.0", "http://x/23501.zip")
+            .unwrap();
+        s.insert_clauses(&[
+            ClauseIn {
+                chunk_id: 1,
+                spec_id: "23.501".into(),
+                release: "Rel-19".into(),
+                version: "19.0.0".into(),
+                clause_path: "5.1".into(),
+                heading: "5.1".into(),
+                text: "alpha".into(),
+                is_normative: true,
+            },
+            ClauseIn {
+                chunk_id: 2,
+                spec_id: "23.501".into(),
+                release: "Rel-19".into(),
+                version: "19.0.0".into(),
+                clause_path: "5.2".into(),
+                heading: "5.2".into(),
+                text: "beta".into(),
+                is_normative: false,
+            },
+        ])
+        .unwrap();
+        s.log_ingest("23.501", "19.0.0", "started", "html-v2|clause-leaf-v1|1")
+            .unwrap();
+        s.log_ingest("23.501", "19.0.0", "done", "html-v2|clause-leaf-v1|1")
+            .unwrap();
+
+        let specs: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        let title: String = s
+            .raw()
+            .query_row("SELECT title FROM specs WHERE spec_id='23.501'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let clauses: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        let done: String = s
+            .raw()
+            .query_row(
+                "SELECT status FROM ingest_log WHERE spec_id='23.501'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(specs, 1);
+        assert_eq!(
+            title, "System architecture and procedures",
+            "upsert updated in place"
+        );
+        assert_eq!(clauses, 2);
+        assert_eq!(
+            s.count_null_embeddings().unwrap(),
+            2,
+            "fresh clauses need vectors"
+        );
+        assert_eq!(done, "done");
     }
 }
