@@ -26,3 +26,8 @@ path = "src/bin/roundtrip_fixture.rs"
 [[bin]]
 name = "embed-io"
 path = "src/bin/embed_io.rs"
+
+# merge — the Rust replacement for cmd/merge (Go): fold per-shard DuckDBs into one corpus.
+[[bin]]
+name = "merge"
+path = "src/bin/merge.rs"
