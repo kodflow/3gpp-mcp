@@ -10,7 +10,9 @@ members = ["store", "parse", "ingest"]
 # (built standalone on Kaggle); embed-core is a cdylib whose real path also needs ort
 # (built + FFI-validated in the rust-go-roundtrip CI), so neither belongs in the
 # DuckDB-writing workspace that compiles libduckdb once.
-exclude = ["embedder", "embed-core"]
+# discover is also excluded: it is a CI-matrix tool, not a DuckDB writer (Phase 9,
+# additive — Go cmd/discover stays production until it reaches parity).
+exclude = ["embedder", "embed-core", "discover"]
 
 [profile.dev]
 debug = false

@@ -1,0 +1,27 @@
+# discover3gpp — Rust port of cmd/discover (migration plan Phase 9).
+#
+# EXCLUDED from the rust/ workspace on purpose (like embedder + embed-core): it is
+# a standalone CI-matrix tool, not a DuckDB writer, so it must not drag the
+# write-side workspace's build. Build it explicitly:
+#   scripts/dev/rust-safe.sh build --manifest-path rust/discover/Cargo.toml
+#
+# discover writes NOTHING to the DuckDB — it only decides which series the CI
+# matrix rebuilds and emits fetch/ledger work-lists. Kept dependency-light: the
+# status-report HTML is parsed by the shared parse3gpp crate (the SAME parser the
+# Go side reuses), JSON via serde_json. No HTTP client here — main reads the
+# status report from a file/stdin so the fetch stays a one-line curl in the driver.
+[package]
+name = "discover3gpp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "discover"
+path = "src/main.rs"
+
+[dependencies]
+parse3gpp = { path = "../parse" }
+serde_json = "1"
