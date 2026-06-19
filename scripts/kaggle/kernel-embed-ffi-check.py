@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
 BRANCH = os.environ.get("BRANCH", "main")
@@ -18,11 +19,20 @@ REPO = os.environ.get("REPO", "https://github.com/kodflow/3gpp-mcp")
 QUERIES = os.environ.get("FFI_QUERIES", "AMF registration procedure|lawful interception X2 interface|UPF session establishment").split("|")
 HF = "https://huggingface.co/BAAI/bge-m3/resolve/main"
 WORK = "/kaggle/working"
+T0 = time.time()
+
+
+def step(msg):
+    """Timestamped progress line — every stage logs so a long build is never silent."""
+    print("[+%6.1fs] %s" % (time.time() - T0, msg), flush=True)
 
 
 def sh(cmd, env=None, check=False):
-    print("+ " + cmd, flush=True)
+    step("RUN " + cmd)
+    # No capture: stream the child's stdout/stderr LIVE (cargo's per-crate "Compiling …"
+    # progress shows in the Kaggle log instead of a silent ~90s gap).
     r = subprocess.run(cmd, shell=True, env=env or os.environ.copy(), text=True)
+    step("→ rc=%d  (%s)" % (r.returncode, cmd.split()[0]))
     if check and r.returncode != 0:
         fail("cmd failed: " + cmd)
     return r
@@ -66,20 +76,16 @@ except Exception as e:  # noqa: BLE001
 
 # --- build embed-core --features ort + the check bin (CPU; single-query is cheap) ------
 # `cuda` is intentionally OFF: serve query-embed is ONE query, CPU ort is plenty, and it
-# avoids any CUDA-toolkit build/link risk on the Kaggle image. We CAPTURE the build output
-# so a failure is diagnosable from ffi-check.json (the kaggle log is not always pulled).
-b = subprocess.run(
-    f"cd {src} && cargo build --release --manifest-path rust/embed-core/Cargo.toml --features ort --bin embed-core-check",
-    shell=True, env=os.environ.copy(), text=True, capture_output=True,
-)
-if b.returncode != 0:
-    tail = (b.stderr or "")[-3000:]
+# avoids any CUDA-toolkit build/link risk on the Kaggle image. The build STREAMS live (sh)
+# so cargo's per-crate "Compiling …" progress shows instead of a silent ~90s gap; the
+# Kaggle web log captures it for diagnosis.
+if sh(f"cd {src} && cargo build --release --manifest-path rust/embed-core/Cargo.toml --features ort --bin embed-core-check").returncode != 0:
     with open(os.path.join(WORK, "ffi-check.json"), "w") as f:
-        json.dump({"ok": False, "stage": "cargo build --features ort", "rc": b.returncode, "stderr_tail": tail}, f, indent=2)
-    print(tail, flush=True)
-    fail("cargo build embed-core --features ort")
+        json.dump({"ok": False, "stage": "cargo build --features ort"}, f, indent=2)
+    fail("cargo build embed-core --features ort (see the Compiling… log above)")
 
 # --- run the check with the real model (CPU) ---------------------------------
+step("embedding %d test quer%s via the FFI" % (len(QUERIES), "y" if len(QUERIES) == 1 else "ies"))
 env = os.environ.copy()
 env["EMBED_MODEL_DIR"] = mdir
 qargs = " ".join('"%s"' % q.replace('"', "") for q in QUERIES)
