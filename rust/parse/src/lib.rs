@@ -177,6 +177,240 @@ pub fn parse_filename_meta(path: &str) -> Result<SpecMeta, String> {
     })
 }
 
+// ===========================================================================
+//  HTML clause walker (== internal/htmlparse walker) — document-order traversal
+//  that segments a LibreOffice-converted spec into clause-leaf chunks. chunk_id is
+//  a per-spec sequential counter (1-based, one per heading) — the SAME order Go
+//  assigns, so the ingest's global offset yields identical ids (resume/merge
+//  stability hinges on this). Change-History sections are excluded from clauses
+//  here exactly as in Go (their structured CR extraction is a later increment).
+// ===========================================================================
+
+use std::sync::OnceLock;
+
+/// A clause-leaf chunk emitted by the walker (chunk_id is per-spec sequential).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedClause {
+    pub chunk_id: u64,
+    pub clause_path: String,
+    pub heading: String,
+    pub text: String,
+    pub is_normative: bool,
+}
+
+fn re_ws() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[ \t\x{00a0}]+").unwrap())
+}
+fn re_numeric() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^([0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$").unwrap())
+}
+fn re_annex_sub() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^([A-Z]\.[0-9]+(?:\.[0-9A-Za-z]+)*)\s+(.+)$").unwrap())
+}
+fn re_annex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?i)^Annex\s+([A-Z][0-9]*)\s*[:.)]?\s*(.*)$").unwrap())
+}
+
+/// collapse normalises whitespace exactly like Go's collapse: NBSP→space, runs of
+/// space/tab/NBSP→one space, newlines→space, trimmed.
+fn collapse(s: &str) -> String {
+    let s = s.replace('\u{00a0}', " ");
+    let s = re_ws().replace_all(&s, " ");
+    s.replace('\n', " ").trim().to_string()
+}
+
+fn is_change_history(text: &str) -> bool {
+    let t = collapse(text).to_lowercase();
+    t.contains("change history")
+}
+
+/// classify_heading splits "6.2.3 Title" → ("6.2.3","Title",informative?) (== Go).
+fn classify_heading(text: &str) -> (String, String, bool) {
+    if let Some(m) = re_annex().captures(text) {
+        let inf = text.to_lowercase().contains("informative");
+        let h = m.get(2).map_or("", |x| x.as_str()).trim().to_string();
+        let label = format!("Annex {}", &m[1]);
+        let heading = if h.is_empty() { label.clone() } else { h };
+        return (label, heading, inf);
+    }
+    if let Some(m) = re_annex_sub().captures(text) {
+        return (m[1].to_string(), m[2].trim().to_string(), false);
+    }
+    if let Some(m) = re_numeric().captures(text) {
+        return (m[1].to_string(), m[2].trim().to_string(), false);
+    }
+    (String::new(), text.to_string(), false)
+}
+
+/// node_text concatenates all descendant text nodes (== Go nodeText).
+fn node_text(n: ego_tree::NodeRef<scraper::Node>) -> String {
+    let mut sb = String::new();
+    for d in n.descendants() {
+        if let scraper::Node::Text(t) = d.value() {
+            sb.push_str(t);
+        }
+    }
+    sb
+}
+
+/// table_rows extracts tr → td/th cells, collapse-normalised (== Go tableRows).
+fn table_rows(n: ego_tree::NodeRef<scraper::Node>) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for d in n.descendants() {
+        if let scraper::Node::Element(e) = d.value() {
+            if e.name() == "tr" {
+                let mut cells = Vec::new();
+                for c in d.children() {
+                    if let scraper::Node::Element(ce) = c.value() {
+                        if ce.name() == "td" || ce.name() == "th" {
+                            cells.push(collapse(&node_text(c)));
+                        }
+                    }
+                }
+                if !cells.is_empty() {
+                    rows.push(cells);
+                }
+            }
+        }
+    }
+    rows
+}
+
+struct Walker {
+    spec_id: String,
+    release: String,
+    version: String,
+    clauses: Vec<ParsedClause>,
+    cur: Option<ParsedClause>,
+    buf: String,
+    id: u64,
+    informative_annex: bool,
+    in_change_history: bool,
+    pub saw_change_history: bool,
+    pub degraded: bool,
+}
+
+impl Walker {
+    fn walk(&mut self, n: ego_tree::NodeRef<scraper::Node>) {
+        match n.value() {
+            scraper::Node::Comment(c) => {
+                if c.contains("3GPP-MCP-DEGRADED") {
+                    self.degraded = true;
+                }
+            }
+            scraper::Node::Element(e) => match e.name() {
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    self.on_heading(&node_text(n));
+                    return;
+                }
+                "table" => {
+                    self.on_table(n);
+                    return;
+                }
+                "p" | "li" | "pre" | "dd" | "dt" => {
+                    let txt = node_text(n);
+                    if !txt.is_empty() {
+                        self.buf.push_str(&txt);
+                        self.buf.push('\n');
+                    }
+                    return;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        for c in n.children() {
+            self.walk(c);
+        }
+    }
+
+    fn on_heading(&mut self, raw: &str) {
+        let text = collapse(raw);
+        if text.is_empty() {
+            return;
+        }
+        if is_change_history(&text) {
+            self.flush();
+            self.in_change_history = true;
+            self.saw_change_history = true;
+            self.cur = None;
+            return;
+        }
+        self.in_change_history = false;
+        let (path, heading, informative) = classify_heading(&text);
+        if re_annex().is_match(&text) {
+            self.informative_annex = informative;
+        } else if !path.is_empty() && !path.contains('.') {
+            self.informative_annex = false;
+        }
+        self.flush();
+        self.id += 1;
+        self.cur = Some(ParsedClause {
+            chunk_id: self.id,
+            clause_path: path,
+            heading,
+            text: String::new(),
+            is_normative: !self.informative_annex,
+        });
+    }
+
+    fn on_table(&mut self, n: ego_tree::NodeRef<scraper::Node>) {
+        for r in table_rows(n) {
+            self.buf.push_str(&r.join("\t"));
+            self.buf.push('\n');
+        }
+    }
+
+    fn flush(&mut self) {
+        let Some(mut cur) = self.cur.take() else {
+            self.buf.clear();
+            return;
+        };
+        cur.text = self.buf.trim().to_string();
+        self.buf.clear();
+        if !cur.clause_path.is_empty() || !cur.heading.is_empty() || !cur.text.is_empty() {
+            self.clauses.push(cur);
+        }
+    }
+}
+
+/// parse_html_clauses walks a converted spec's HTML into clause-leaf chunks, in the same
+/// document order and with the same per-spec chunk_id sequence as Go's htmlparse walker.
+/// spec_id/release/version come from parse_filename_meta. Returns (clauses, saw_change_history,
+/// degraded).
+pub fn parse_html_clauses(
+    html: &str,
+    spec_id: &str,
+    release: &str,
+    version: &str,
+) -> (Vec<ParsedClause>, bool, bool) {
+    let doc = Html::parse_document(html);
+    let mut w = Walker {
+        spec_id: spec_id.to_string(),
+        release: release.to_string(),
+        version: version.to_string(),
+        clauses: Vec::new(),
+        cur: None,
+        buf: String::new(),
+        id: 0,
+        informative_annex: false,
+        in_change_history: false,
+        saw_change_history: false,
+        degraded: false,
+    };
+    w.walk(doc.tree.root());
+    w.flush();
+    // silence unused-field warnings on the metadata the ingest will read off each clause.
+    let _ = (&w.spec_id, &w.release, &w.version);
+    (w.clauses, w.saw_change_history, w.degraded)
+}
+
+use scraper::Html;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +496,43 @@ mod tests {
     #[test]
     fn bad_filename_errors() {
         assert!(parse_filename_meta("/x/not-a-spec.html").is_err());
+    }
+
+    #[test]
+    fn walker_segments_clauses_like_go() {
+        let html = r#"<html><body>
+            <h1>1 Scope</h1><p>This document specifies the system.</p>
+            <h2>1.1 General</h2><p>General text.</p>
+            <h1>Annex A (informative): Examples</h1><p>Example text.</p>
+            <h2>A.1 Sub</h2><p>Sub annex text.</p>
+            <h1>Change history</h1><table><tr><td>2024-01</td><td>edit</td></tr></table>
+        </body></html>"#;
+        let (clauses, saw_ch, degraded) = parse_html_clauses(html, "23.501", "Rel-19", "19.5.0");
+        assert!(saw_ch, "change history heading detected");
+        assert!(!degraded);
+        // Change-History section is excluded → exactly 4 clauses, chunk_ids 1..4 in order.
+        assert_eq!(clauses.len(), 4, "got {:?}", clauses);
+        let got: Vec<(u64, &str, &str, bool)> = clauses
+            .iter()
+            .map(|c| {
+                (
+                    c.chunk_id,
+                    c.clause_path.as_str(),
+                    c.heading.as_str(),
+                    c.is_normative,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "1", "Scope", true),
+                (2, "1.1", "General", true),
+                (3, "Annex A", "(informative): Examples", false),
+                (4, "A.1", "Sub", false), // inherits the informative-annex context
+            ]
+        );
+        assert_eq!(clauses[0].text, "This document specifies the system.");
+        assert_eq!(clauses[3].text, "Sub annex text.");
     }
 }

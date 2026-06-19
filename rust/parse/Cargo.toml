@@ -7,6 +7,13 @@ description = "Rust port of the 3GPP spec parser (internal/htmlparse + model hel
 
 [dependencies]
 regex = "1"
+# html5ever-backed DOM, for the clause walker. The walker dispatches on tag name and
+# concatenates text nodes (collapse-normalised), so html5ever's tree differs from Go's
+# golang.org/x/net/html only in ways the golden tests pin down.
+scraper = "0.20"
+# scraper builds its DOM as an ego_tree::Tree; we name NodeRef directly for the walk, so
+# pin the SAME ego-tree version scraper 0.20 uses (0.6.x) to avoid two incompatible copies.
+ego-tree = "0.6"
 
 [lib]
 name = "parse3gpp"
