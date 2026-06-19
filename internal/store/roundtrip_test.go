@@ -36,6 +36,7 @@ func TestPhase0RustGoRoundTrip(t *testing.T) {
 	}
 	t.Logf("engine reported by go-duckdb over the Rust-written file: %s", engine)
 
+	// The data-only fixture seeds 1 spec and 3 embedded clauses (chunk_ids 1..3).
 	var specs, clauses, dim int
 	if err := s.DB().QueryRowContext(ctx, "SELECT count(*) FROM specs").Scan(&specs); err != nil {
 		t.Fatalf("read specs: %v", err)
@@ -46,8 +47,8 @@ func TestPhase0RustGoRoundTrip(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, "SELECT len(embedding) FROM clauses WHERE chunk_id = 1").Scan(&dim); err != nil {
 		t.Fatalf("read vector: %v", err)
 	}
-	if specs != 1 || clauses != 1 || dim != 1024 {
-		t.Fatalf("round-trip mismatch: specs=%d clauses=%d vec_dim=%d (want 1/1/1024)", specs, clauses, dim)
+	if specs != 1 || clauses != 3 || dim != 1024 {
+		t.Fatalf("round-trip mismatch: specs=%d clauses=%d vec_dim=%d (want 1/3/1024)", specs, clauses, dim)
 	}
 	t.Logf("Rust→Go round-trip OK: specs=%d clauses=%d vec_dim=%d", specs, clauses, dim)
 }
