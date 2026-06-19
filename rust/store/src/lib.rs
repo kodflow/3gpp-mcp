@@ -623,6 +623,124 @@ impl Store {
     }
 }
 
+/// LI registry rows for the asn1 subject (== Go li/asn1store). spec_id is always "33.128".
+pub struct LiEventIn {
+    pub interface: String,
+    pub event_name: String,
+    pub asn1_type: String,
+    pub asn1_tag: i64,
+    pub originating_nf: String,
+    pub domain: String,
+    pub spec_clause: String,
+    pub field_count: i64,
+}
+pub struct LiFieldIn {
+    pub interface: String,
+    pub event_name: String,
+    pub field_name: String,
+    pub asn1_type: String,
+    pub asn1_tag: i64,
+    pub is_optional: bool,
+    pub ordinal: i64,
+}
+pub struct LiNfClauseIn {
+    pub originating_nf: String,
+    pub interface: String,
+    pub spec_clause: String,
+}
+pub struct Asn1TypeIn {
+    pub type_name: String,
+    pub kind: String,
+    pub members_json: String,
+}
+
+impl Store {
+    /// clear_li removes the LI registry rows for one (spec, release) — additive subject,
+    /// idempotent re-ingest (== Go li store clear).
+    pub fn clear_li(&self, spec_id: &str, release: &str) -> Result<()> {
+        let w = format!(
+            "WHERE spec_id = {} AND release = {}",
+            q(spec_id),
+            q(release)
+        );
+        self.conn
+            .execute_batch(&format!(
+                "DELETE FROM li_events {w}; DELETE FROM li_event_fields {w};
+                 DELETE FROM li_nf_clauses {w}; DELETE FROM asn1_types {w};"
+            ))
+            .context("clear_li")?;
+        Ok(())
+    }
+
+    /// write_li_registry writes the parsed TS 33.128 LI registry (events + fields +
+    /// nf-clauses + the full asn1 type catalogue) for one (spec, release) in one transaction.
+    pub fn write_li_registry(
+        &self,
+        spec_id: &str,
+        release: &str,
+        module_version: &str,
+        events: &[LiEventIn],
+        fields: &[LiFieldIn],
+        nf_clauses: &[LiNfClauseIn],
+        types: &[Asn1TypeIn],
+    ) -> Result<()> {
+        let mut sql = String::from("BEGIN;");
+        for e in events {
+            sql.push_str(&format!(
+                "INSERT INTO li_events VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
+                q(spec_id),
+                q(release),
+                q(module_version),
+                q(&e.interface),
+                q(&e.event_name),
+                q(&e.asn1_type),
+                e.asn1_tag,
+                q(&e.originating_nf),
+                q(&e.domain),
+                q(&e.spec_clause),
+                e.field_count,
+            ));
+        }
+        for f in fields {
+            sql.push_str(&format!(
+                "INSERT INTO li_event_fields VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {});",
+                q(spec_id),
+                q(release),
+                q(&f.interface),
+                q(&f.event_name),
+                q(&f.field_name),
+                q(&f.asn1_type),
+                f.asn1_tag,
+                f.is_optional,
+                f.ordinal,
+            ));
+        }
+        for c in nf_clauses {
+            sql.push_str(&format!(
+                "INSERT INTO li_nf_clauses VALUES ({}, {}, {}, {}, {});",
+                q(spec_id),
+                q(release),
+                q(&c.originating_nf),
+                q(&c.interface),
+                q(&c.spec_clause),
+            ));
+        }
+        for t in types {
+            sql.push_str(&format!(
+                "INSERT INTO asn1_types VALUES ({}, {}, {}, {}, {});",
+                q(spec_id),
+                q(release),
+                q(&t.type_name),
+                q(&t.kind),
+                q(&t.members_json),
+            ));
+        }
+        sql.push_str("COMMIT;");
+        self.conn.execute_batch(&sql).context("write_li_registry")?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

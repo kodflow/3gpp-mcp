@@ -5,6 +5,7 @@
 //! forever, so every function here mirrors its Go counterpart exactly and is golden-tested
 //! against known Go outputs. The HTML clause walker lands on top of this seam next.
 
+pub mod asn1;
 pub mod catalog;
 pub mod glossary;
 pub mod openapi;
