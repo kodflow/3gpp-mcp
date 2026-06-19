@@ -38,3 +38,8 @@ path = "src/bin/merge.rs"
 [[bin]]
 name = "freeze-hnsw"
 path = "src/bin/freeze_hnsw.rs"
+
+# overlay — the Rust replacement for cmd/overlay (Go): fuse vector shards onto a lexical base.
+[[bin]]
+name = "overlay"
+path = "src/bin/overlay.rs"

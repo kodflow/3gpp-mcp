@@ -183,6 +183,119 @@ impl Store {
         Ok(())
     }
 
+    /// overlay writes vectors (+ sparse postings) from one or more vector shards onto this
+    /// base by NATURAL identity (spec_id,release,clause_path,text — NOT the unstable
+    /// chunk_id), optionally copies the catalogue tables from `catalogue_from`, enforces a
+    /// single embedding_model across all sources, and stamps it (== Go cmd/overlay). Returns
+    /// (clauses_vectorised, agreed_model).
+    pub fn overlay(
+        &self,
+        vecs: &[String],
+        catalogue_from: &str,
+        model_flag: &str,
+    ) -> Result<(i64, String)> {
+        const CATALOGUE_TABLES: &[&str] = &[
+            "specs",
+            "spec_versions",
+            "acronyms",
+            "evolutions",
+            "releases",
+            "changes",
+            "api_operations",
+            "api_schemas",
+            "li_events",
+            "li_event_fields",
+            "li_nf_clauses",
+            "asn1_types",
+        ];
+        let esc = |p: &str| p.replace('\'', "''");
+        if !catalogue_from.is_empty() {
+            self.conn.execute_batch(&format!(
+                "ATTACH '{}' AS cat (READ_ONLY)",
+                esc(catalogue_from)
+            ))?;
+            for t in CATALOGUE_TABLES {
+                // A table may be absent in either side (older schema) — skip, don't abort.
+                let _ = self
+                    .conn
+                    .execute_batch(&format!("INSERT INTO {t} SELECT * FROM cat.{t}"));
+            }
+            self.conn.execute_batch("DETACH cat")?;
+        }
+        let mut model = model_flag.to_string();
+        for (i, v) in vecs.iter().enumerate() {
+            let alias = format!("v{i}");
+            self.conn
+                .execute_batch(&format!("ATTACH '{}' AS {alias} (READ_ONLY)", esc(v)))?;
+            let m: String = self
+                .conn
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(value), '') FROM {alias}.schema_meta WHERE key = 'embedding_model'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            if !m.is_empty() {
+                if model.is_empty() {
+                    model = m;
+                } else if m != model {
+                    anyhow::bail!("shard {v} embedding_model={m:?} != {model:?} — refusing to fuse mixed models");
+                }
+            }
+            self.conn.execute_batch(&format!(
+                "UPDATE clauses SET embedding = s.embedding, embedding_hash = s.embedding_hash
+                 FROM {alias}.clauses AS s
+                 WHERE clauses.spec_id = s.spec_id AND clauses.release = s.release
+                   AND clauses.clause_path = s.clause_path AND clauses.text = s.text
+                   AND s.embedding IS NOT NULL",
+            ))?;
+            self.overlay_sparse(&alias)?;
+            self.conn.execute_batch(&format!("DETACH {alias}"))?;
+        }
+        self.conn.execute_batch("CHECKPOINT")?;
+        self.set_meta("pipeline_version", "overlay")?;
+        if !model.is_empty() {
+            self.set_meta("embedding_model", &model)?;
+        }
+        let after: i64 = self.conn.query_row(
+            "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((after, model))
+    }
+
+    /// overlay_sparse carries an attached shard's clause_sparse postings onto the base,
+    /// re-keyed by the SAME natural identity as the dense column (== Go overlaySparse).
+    /// Best-effort: a shard with no clause_sparse table contributes nothing.
+    fn overlay_sparse(&self, alias: &str) -> Result<()> {
+        let id_match = "b.spec_id = s.spec_id AND b.release = s.release \
+                        AND b.clause_path = s.clause_path AND b.text = s.text";
+        // Probe the table; absence/empty is not an error.
+        if self
+            .conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE _probe AS SELECT 1 FROM {alias}.clause_sparse LIMIT 0"
+            ))
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _ = self.conn.execute_batch("DROP TABLE IF EXISTS _probe");
+        self.conn.execute_batch(&format!(
+            "DELETE FROM clause_sparse WHERE chunk_id IN (
+               SELECT b.chunk_id FROM {alias}.clauses s
+               JOIN clauses b ON {id_match}
+               WHERE EXISTS (SELECT 1 FROM {alias}.clause_sparse ss WHERE ss.chunk_id = s.chunk_id));
+             INSERT INTO clause_sparse (chunk_id, term_id, weight)
+             SELECT b.chunk_id, ss.term_id, ss.weight
+             FROM {alias}.clause_sparse ss
+             JOIN {alias}.clauses s ON s.chunk_id = ss.chunk_id
+             JOIN clauses b ON {id_match};",
+        ))?;
+        Ok(())
+    }
+
     /// count_clauses returns the total clause count (== Go CountClauses).
     pub fn count_clauses(&self) -> Result<i64> {
         let n: i64 = self
