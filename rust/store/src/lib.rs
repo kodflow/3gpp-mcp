@@ -376,6 +376,127 @@ impl Store {
     }
 }
 
+/// A 5GC OpenAPI operation row (== Go model.APIOperation; op_id is assigned on insert).
+pub struct ApiOperationIn {
+    pub spec_id: String,
+    pub release: String,
+    pub version: String,
+    pub api_doc_version: String,
+    pub service: String,
+    pub service_family: String,
+    pub api_root: String,
+    pub path: String,
+    pub method: String,
+    pub operation_id: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    pub request_schema: String,
+    pub response_codes: Vec<String>,
+    pub yaml_file: String,
+    pub forge_sha: String,
+    pub forge_url: String,
+}
+
+/// A 5GC OpenAPI schema row (== Go model.APISchema; schema_id is assigned on insert).
+pub struct ApiSchemaIn {
+    pub spec_id: String,
+    pub release: String,
+    pub version: String,
+    pub service: String,
+    pub schema_name: String,
+    pub kind: String,
+    pub description: String,
+    pub properties: Vec<String>,
+    pub enum_values: Vec<String>,
+    pub refs_out: Vec<String>,
+    pub yaml_file: String,
+    pub forge_sha: String,
+    pub forge_url: String,
+}
+
+/// q quotes a string as a SQL literal (single-quote escaped).
+fn q(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// lst renders a VARCHAR[] DuckDB list literal from strings.
+fn lst(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| q(s)).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+impl Store {
+    /// clear_api_tables removes the api_* rows only (additive overlay; never touches
+    /// clauses — internal/openapi/CLAUDE.md). Run before a fresh OpenAPI ingest.
+    pub fn clear_api_tables(&self) -> Result<()> {
+        self.conn
+            .execute_batch("DELETE FROM api_operations; DELETE FROM api_schemas;")
+            .context("clear_api_tables")?;
+        Ok(())
+    }
+
+    /// next_api_op_id / next_api_schema_id return the next free synthetic id.
+    fn next_id(&self, table: &str, col: &str) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COALESCE(max({col}), 0) FROM {table}"),
+                [],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("max {col}"))?;
+        Ok(n as u64 + 1)
+    }
+
+    /// insert_api_operations writes operations in one transaction, assigning op_id from the
+    /// current max+1 (== Go ingest-openapi).
+    pub fn insert_api_operations(&self, ops: &[ApiOperationIn]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut id = self.next_id("api_operations", "op_id")?;
+        let mut sql = String::from("BEGIN;");
+        for o in ops {
+            sql.push_str(&format!(
+                "INSERT INTO api_operations VALUES ({id}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
+                q(&o.spec_id), q(&o.release), q(&o.version), q(&o.api_doc_version), q(&o.service),
+                q(&o.service_family), q(&o.api_root), q(&o.path), q(&o.method), q(&o.operation_id),
+                q(&o.summary), lst(&o.tags), q(&o.request_schema), lst(&o.response_codes),
+                q(&o.yaml_file), q(&o.forge_sha), q(&o.forge_url),
+            ));
+            id += 1;
+        }
+        sql.push_str("COMMIT;");
+        self.conn
+            .execute_batch(&sql)
+            .context("insert_api_operations")?;
+        Ok(())
+    }
+
+    /// insert_api_schemas writes schemas in one transaction, assigning schema_id from max+1.
+    pub fn insert_api_schemas(&self, schemas: &[ApiSchemaIn]) -> Result<()> {
+        if schemas.is_empty() {
+            return Ok(());
+        }
+        let mut id = self.next_id("api_schemas", "schema_id")?;
+        let mut sql = String::from("BEGIN;");
+        for s in schemas {
+            sql.push_str(&format!(
+                "INSERT INTO api_schemas VALUES ({id}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
+                q(&s.spec_id), q(&s.release), q(&s.version), q(&s.service), q(&s.schema_name),
+                q(&s.kind), q(&s.description), lst(&s.properties), lst(&s.enum_values),
+                lst(&s.refs_out), q(&s.yaml_file), q(&s.forge_sha), q(&s.forge_url),
+            ));
+            id += 1;
+        }
+        sql.push_str("COMMIT;");
+        self.conn
+            .execute_batch(&sql)
+            .context("insert_api_schemas")?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
