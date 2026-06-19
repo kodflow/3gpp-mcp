@@ -31,6 +31,9 @@ struct Args {
     /// Batch: the converted-corpus root (…/convert), holding <Rel>/<num>-<code>.html.
     #[arg(long)]
     convert: Option<String>,
+    /// Batch: restrict to one release dir (the Go `--release Rel-NN` / --relflag). Empty = all.
+    #[arg(long, default_value = "")]
+    release: String,
     /// Output DuckDB shard (created/opened read-write).
     #[arg(long)]
     db: String,
@@ -91,7 +94,7 @@ fn ingest_one(store: &Store, html_path: &str, offset: u64) -> Result<(SpecMeta, 
 
 /// collect_series_html walks <convert>/<Rel>/*.html keeping files whose spec_id is in the
 /// series, sorted for deterministic chunk_id assignment.
-fn collect_series_html(convert: &str, series: &str) -> Result<Vec<String>> {
+fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for rel in std::fs::read_dir(convert).with_context(|| format!("read_dir {convert}"))? {
         let rel = rel?.path();
@@ -105,7 +108,7 @@ fn collect_series_html(convert: &str, series: &str) -> Result<Vec<String>> {
             }
             let Some(path) = p.to_str() else { continue };
             if let Ok(meta) = parse_filename_meta(path) {
-                if meta.series == series {
+                if meta.series == series && (release.is_empty() || meta.release == release) {
                     out.push(path.to_string());
                 }
             }
@@ -132,7 +135,7 @@ fn main() -> Result<()> {
         else {
             anyhow::bail!("ingest: pass --html <file> or --series <NN> --convert <dir>");
         };
-        let files = collect_series_html(convert, series)?;
+        let files = collect_series_html(convert, series, &args.release)?;
         let mut specs = 0usize;
         let mut clauses = 0usize;
         for f in &files {
