@@ -227,6 +227,46 @@ impl Store {
             .context("checkpoint")?;
         Ok(())
     }
+
+    /// max_chunk_id returns the largest clauses.chunk_id (0 if empty) — used to offset a
+    /// folded shard's synthetic PKs so two disjoint shards never collide on merge.
+    pub fn max_chunk_id(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(max(chunk_id), 0) FROM clauses", [], |r| {
+                r.get(0)
+            })
+            .context("max_chunk_id")?;
+        Ok(n as u64)
+    }
+
+    /// fold_shard ATTACHes a per-series/-release shard DB read-only and folds its rows
+    /// into this (merged) DB, offsetting clause chunk_ids by `offset` so disjoint shards
+    /// keep distinct synthetic PKs (== Go cmd/merge fold). clause_sparse rides the same
+    /// offset; catalogue rows (specs/versions/releases/acronyms) dedup on their PKs.
+    /// Vectors are copied as-is; the caller rebuilds FTS + HNSW once on the merged DB
+    /// (per-shard HNSW indexes are not concatenable — internal/store/CLAUDE.md).
+    pub fn fold_shard(&self, shard_path: &str, offset: u64) -> Result<()> {
+        let sql = format!(
+            "ATTACH '{shard_path}' AS s (READ_ONLY);
+             INSERT INTO specs SELECT * FROM s.specs ON CONFLICT DO NOTHING;
+             INSERT INTO spec_versions SELECT * FROM s.spec_versions ON CONFLICT DO NOTHING;
+             INSERT INTO releases SELECT * FROM s.releases ON CONFLICT DO NOTHING;
+             INSERT INTO acronyms SELECT * FROM s.acronyms ON CONFLICT DO NOTHING;
+             INSERT INTO clauses
+               SELECT chunk_id + {offset}, spec_id, release, version, clause_path, heading, text,
+                      is_normative, embedding, embedding_hash
+               FROM s.clauses;
+             INSERT INTO clause_sparse SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse;
+             INSERT INTO changes SELECT * FROM s.changes;
+             INSERT INTO evolutions SELECT * FROM s.evolutions;
+             DETACH s;"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .with_context(|| format!("fold_shard {shard_path}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +321,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn fold_shard_offsets_chunk_ids_and_dedups_catalogue() {
+        // Two disjoint shards on disk, each reusing chunk_ids 1..2 and the same spec.
+        let base = std::env::temp_dir().join(format!("storers-fold-{}", std::process::id()));
+        let mk = |suffix: &str, sp: &str| {
+            let p = base.join(suffix);
+            std::fs::create_dir_all(&base).unwrap();
+            let _ = std::fs::remove_file(&p);
+            let path = p.to_str().unwrap().to_string();
+            let s = Store::open_rw(&path).unwrap();
+            s.raw()
+                .execute_batch(&format!(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('{sp}','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES
+                       (1,'{sp}','h1','t1'),(2,'{sp}','h2','t2');"
+                ))
+                .unwrap();
+            s.checkpoint().unwrap();
+            path
+        };
+        let a = mk("a.duckdb", "23.501");
+        let b = mk("b.duckdb", "23.502");
+
+        let merged = base.join("merged.duckdb").to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&merged);
+        let m = Store::open_rw(&merged).unwrap();
+        for shard in [&a, &b] {
+            let off = m.max_chunk_id().unwrap();
+            m.fold_shard(shard, off).unwrap();
+        }
+        // 2 distinct specs, 4 clauses with no chunk_id collision.
+        let specs: i64 = m
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        let clauses: i64 = m
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        let distinct: i64 = m
+            .raw()
+            .query_row("SELECT count(DISTINCT chunk_id) FROM clauses", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(specs, 2, "specs deduped/kept");
+        assert_eq!(clauses, 4, "all clauses folded");
+        assert_eq!(distinct, 4, "chunk_ids offset, no collision");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
