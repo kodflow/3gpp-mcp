@@ -147,6 +147,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Rust toolchain + cargo cache so the Rust bins this job builds (overlay,
+      # freeze-hnsw) restore libduckdb-sys & deps instead of recompiling them each bake —
+      # only a real Cargo.lock change rebuilds. The build steps' `command -v cargo` finds
+      # this toolchain and skips their ad-hoc rustup install.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+
       # The bake stages ~27 GB in the workspace, and buildx (container driver)
       # then needs roughly 2x that AGAIN in Docker storage (build-context copy +
       # image snapshot) — the runner agent died of ENOSPC before this relocation
