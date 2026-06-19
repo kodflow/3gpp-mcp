@@ -13,7 +13,16 @@ description = "Rust DuckDB write layer for the 3GPP corpus (duckdb-rs). Go reads
 [dependencies]
 duckdb = { version = "1.4", features = ["bundled"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
 
 [[bin]]
 name = "roundtrip-fixture"
 path = "src/bin/roundtrip_fixture.rs"
+
+# embed-io — the Rust replacement for cmd/embed-io (Go): export the work-list / import
+# vectors / build HNSW, all via store-rs, so the embed pipeline writes DuckDB without Go.
+[[bin]]
+name = "embed-io"
+path = "src/bin/embed_io.rs"
