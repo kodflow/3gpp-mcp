@@ -1024,7 +1024,7 @@ mod tests {
             .unwrap();
         // clause 3 has empty text → not embeddable.
         assert_eq!(s.count_null_embeddings().unwrap(), 2);
-        let wl = s.clauses_needing_embedding(0).unwrap();
+        let wl = s.clauses_needing_embedding(0, 0).unwrap();
         assert_eq!(wl.len(), 2);
 
         let v = vec![0.1f32; DENSE_DIM];
