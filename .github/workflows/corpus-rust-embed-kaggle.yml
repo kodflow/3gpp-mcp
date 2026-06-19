@@ -63,9 +63,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      # Two Kaggle accounts: primary + fallback. scripts/kaggle-auth.sh probes them
-      # (order set by KAGGLE_ACCOUNT) and exports the SELECTED KAGGLE_API_TOKEN +
-      # KAGGLE_USER for the steps below; it stops the run only if BOTH fail auth.
+      # Two Kaggle accounts: primary + fallback. The embed step below loops over them
+      # (order set by KAGGLE_ACCOUNT), auth-probes each, runs the kernel, and on GPU-quota
+      # exhaustion (no GPU allocated) falls back to the other — stopping only if NO account
+      # gets a GPU. scripts/kaggle-gpu-check.sh classifies each run as gpu vs quota.
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
       KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}

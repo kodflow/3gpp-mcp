@@ -75,6 +75,15 @@ def res(m):
 
 
 try:
+    # GPU presence marker (read by CI's kaggle-gpu-check.sh for the quota fallback):
+    # a no-GPU session means this account's weekly GPU quota is exhausted, so the CI
+    # falls back to the other Kaggle account. Mirrors the rust/embed kernels.
+    _g = sh("nvidia-smi -L")
+    if _g.returncode == 0 and _g.stdout.strip():
+        res("gpu=present detail=%s" % _g.stdout.splitlines()[0].strip())
+    else:
+        res("gpu=absent (CPU fallback — GPU not attached to this worker)")
+
     if not GHCR_PAT:
         res("fail ghcr_pat_missing")
         sys.exit(0)
