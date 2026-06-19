@@ -86,8 +86,12 @@ jobs:
             echo "publish=${{ github.event.inputs.publish_to_latest }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build ingest
-        run: go build -trimpath -o bin/ingest ./cmd/ingest
+      - name: Build ingest (Rust)
+        run: |
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
+          cp rust/target/release/ingest bin/ingest
 
       - name: Download + convert 3GPP specs (3gpp.org → HTML)
         run: |
@@ -99,7 +103,7 @@ jobs:
       - name: Consolidate → DuckDB
         run: |
           series_csv=$(echo "${{ steps.scope.outputs.series }}" | tr ' ' ',')
-          ./bin/ingest --series "$series_csv" --out data/3gpp.duckdb
+          ./bin/ingest --series "$series_csv" --convert data/sources/convert --db data/3gpp.duckdb
           echo "=== built DB ===" && ls -lh data/3gpp.duckdb
 
       - name: Package

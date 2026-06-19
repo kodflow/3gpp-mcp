@@ -100,7 +100,7 @@ on:
     # off the heavy build. discover still makes a triggered run a near-no-op when the
     # 3GPP site hasn't moved either.
     paths:
-      - 'cmd/ingest/**'
+      - 'rust/parse/**'
       - 'cmd/merge/**'
       - 'cmd/discover/**'
       - 'cmd/ingest-catalog/**'
@@ -568,11 +568,9 @@ jobs:
         run: scripts/lib/soffice-guard.sh
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
-          # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
-          # separate step (cmd/embed), so ingest just produces the clause text +
-          # FTS. When embed=true we ALSO build the onnx-tagged cmd/embed, which
+          # Ingest is the Rust bin (built in the ingest step below). Embedding stays a
+          # separate step: when embed=true build the onnx-tagged cmd/embed, which
           # vectorises the shard in place, re-embedding ONLY changed clauses.
-          go build -trimpath -o bin/ingest ./cmd/ingest
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
             CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/embed ./cmd/embed
           fi
@@ -737,7 +735,7 @@ jobs:
       - name: Shard cache code-hash (embed code counts only when embedding)
         id: codehash
         run: |
-          files="internal/ingest internal/htmlparse internal/ooxml internal/model internal/store/schema.sql internal/store/hnsw.go cmd/ingest/main.go internal/subject internal/subjectmeta internal/registry"
+          files="rust/ingest rust/parse rust/store internal/model internal/store/schema.sql internal/store/hnsw.go internal/subject internal/subjectmeta internal/registry"
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
             files="$files internal/embed cmd/embed/main.go"
           fi
@@ -820,29 +818,23 @@ jobs:
           SERIES="${{ steps.shard.outputs.series }}"
           RELFLAG="${{ steps.shard.outputs.relflag }}"
           RELVAL="${RELFLAG#--release }"   # "" when no release pin
-          # Phase 10 repoint: prefer the RUST ingest (parse3gpp + store-rs, the same parser
-          # the rust-go-roundtrip CI proves), FALL BACK to the Go cmd/ingest if the Rust
-          # toolchain/build is unavailable — so the prod corpus build NEVER regresses (worst
-          # case = today's Go path). A wrong/empty Rust shard is caught downstream by
-          # cmd/validate / data-contract; --resume + embedding_hash keep both paths idempotent.
-          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal || true
+          # Phase 11b: the RUST ingest (parse3gpp + store-rs) is now the ONLY ingest — the
+          # Go cmd/ingest is deleted. All cmd/ingest modes are ported + rust-go-roundtrip-CI
+          # tested. A toolchain/build failure fails the step LOUDLY (visible + re-runnable,
+          # not a silent empty corpus); a wrong/empty shard is caught downstream by
+          # cmd/validate / data-contract. --resume + embedding_hash stay idempotent.
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           export PATH="$HOME/.cargo/bin:$PATH"
-          RUST_INGEST_BIN=""
-          if cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest; then
-            RUST_INGEST_BIN="rust/target/release/ingest"
-          else
-            echo "::warning::Rust ingest build failed — falling back to the Go cmd/ingest"
-          fi
+          cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest \
+            || { echo "::error::Rust ingest build failed"; exit 1; }
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
             echo "::group::ingest attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
-            if [ -n "$RUST_INGEST_BIN" ] && "$RUST_INGEST_BIN" --series "$SERIES" ${RELVAL:+--release "$RELVAL"} --convert data/sources/convert --db "$OUT" --resume; then
+            if rust/target/release/ingest --series "$SERIES" ${RELVAL:+--release "$RELVAL"} --convert data/sources/convert --db "$OUT" --resume; then
               echo "ingest via Rust"; ingest_ok=1
-            elif ./bin/ingest --series "$SERIES" $RELFLAG --out "$OUT" --resume; then
-              echo "ingest via Go (fallback)"; ingest_ok=1
             fi
             echo "::endgroup::"
             if [ "$ingest_ok" -eq 1 ]; then
