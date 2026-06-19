@@ -36,9 +36,9 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build the Rust store fixture + write DuckDBs (data only + FTS/HNSW/sparse)
+      - name: Build the Rust store bins + write DuckDBs (data only + FTS/HNSW/sparse)
         run: |
-          cargo build --manifest-path rust/store/Cargo.toml --bin roundtrip-fixture
+          cargo build --manifest-path rust/store/Cargo.toml --bins
           ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt.duckdb"
           ./rust/store/target/debug/roundtrip-fixture "$RUNNER_TEMP/rt_full.duckdb" indexes
       - name: Rust store crate unit tests
@@ -46,7 +46,10 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - name: Go reads the Rust-written DuckDB read-only (data + FTS/HNSW/sparse round-trip)
+      - name: Go ↔ Rust round-trip + Rust embed-io E2E
         run: |
-          CGO_ENABLED=1 RT_DB="$RUNNER_TEMP/rt.duckdb" RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
-            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed' -v
+          CGO_ENABLED=1 \
+            RT_DB="$RUNNER_TEMP/rt.duckdb" \
+            RT_DB_FULL="$RUNNER_TEMP/rt_full.duckdb" \
+            RUST_EMBED_IO="$(pwd)/rust/store/target/debug/embed-io" \
+            go test ./internal/store/ -run 'TestPhase0RustGoRoundTrip|TestPhase2RustGoRoundTripIndexed|TestRustEmbedIoE2E' -v
