@@ -114,6 +114,12 @@ fn ingest_one(store: &Store, html_path: &str, offset: u64) -> Result<(SpecMeta, 
 /// collect_series_html walks <convert>/<Rel>/*.html keeping files whose spec_id is in the
 /// series, sorted for deterministic chunk_id assignment.
 fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec<String>> {
+    // --series accepts a comma-separated set (the Go --series CSV, e.g. "23,33").
+    let wanted: std::collections::HashSet<&str> = series
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut out = Vec::new();
     for rel in std::fs::read_dir(convert).with_context(|| format!("read_dir {convert}"))? {
         let rel = rel?.path();
@@ -127,7 +133,9 @@ fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec
             }
             let Some(path) = p.to_str() else { continue };
             if let Ok(meta) = parse_filename_meta(path) {
-                if meta.series == series && (release.is_empty() || meta.release == release) {
+                if wanted.contains(meta.series.as_str())
+                    && (release.is_empty() || meta.release == release)
+                {
                     out.push(path.to_string());
                 }
             }
