@@ -52,7 +52,7 @@ jobs:
         with:
           persist-credentials: false
       - name: python kernels compile
-        run: python3 -m py_compile scripts/kaggle/kernel-embed.py scripts/kaggle/kernel-embed-probe.py
+        run: python3 -m py_compile scripts/kaggle/kernel-rust-embed.py scripts/kaggle/kernel-sparse-corpus.py
       - name: shell syntax (bash -n)
         run: |
           set -euo pipefail

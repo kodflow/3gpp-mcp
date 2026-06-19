@@ -567,11 +567,15 @@ jobs:
         run: scripts/lib/soffice-guard.sh
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
-          # Ingest is the Rust bin (built in the ingest step below). Embedding stays a
-          # separate step: when embed=true build the onnx-tagged cmd/embed, which
-          # vectorises the shard in place, re-embedding ONLY changed clauses.
+          # Ingest is the Rust bin (built in the ingest step below). Embedding is the RUST
+          # path (Phase 11b, cmd/embed deleted): when embed=true build the store-rs embed-io
+          # bridge + the Rust embedder; the embed step runs export-worklist → embedder →
+          # import → report, re-embedding ONLY changed clauses (embedding_hash).
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/embed ./cmd/embed
+            command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo build --release --manifest-path rust/store/Cargo.toml --bin embed-io
+            cargo build --release --manifest-path rust/embedder/Cargo.toml
           fi
       - name: Restore model components from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
@@ -736,7 +740,7 @@ jobs:
         run: |
           files="rust/ingest rust/parse rust/store internal/model internal/store/schema.sql internal/store/hnsw.go internal/subject internal/subjectmeta internal/registry"
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            files="$files internal/embed cmd/embed/main.go"
+            files="$files internal/embed rust/embedder/src rust/store/src/bin/embed_io.rs"
           fi
           h="$(find $files -type f \( -name '*.go' -o -name '*.sql' \) 2>/dev/null | sort | xargs sha256sum | sha256sum | cut -c1-40)"
           echo "hash=$h" >> "$GITHUB_OUTPUT"
@@ -892,9 +896,22 @@ jobs:
             # _at_floor==0 means the
             # shard is fully vectorised at/above the floor; a 6h-cap partial
             # leaves >0 and fails → the rerun resumes via embedding_hash.
-            if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
-                 --require-semantic --report json | tee "$RPT" \
-               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
+            # RUST embed flow: export the at/above-floor work-list → embedder (CUDA→CPU
+            # fallback) → import + freeze HNSW → report. The gate requires a stamped model,
+            # 0 at-floor NULLs, and a frozen HNSW. (.model is the canonical EmbedIdentity
+            # digest — checked non-empty, not a literal family, which the old Go gate got
+            # wrong: rep.Model was always the digest, so `=="bge-m3"` could never pass.)
+            export PATH="$HOME/.cargo/bin:$PATH"
+            export ORT_DYLIB_PATH="$ONNXRUNTIME_SHARED_LIBRARY_PATH"
+            FLOOR="${{ github.event.inputs.embed_floor }}"
+            EMBED_ID="$(EMBED_MODELS_CONFIG="$EMBED_MODEL_DIR/../models.yaml" go run ./cmd/embedid 2>/dev/null || echo bge-m3)"
+            if rust/target/release/embed-io --db "$OUT" --export-worklist /tmp/wl.jsonl --embed-floor "$FLOOR" \
+               && rust/embedder/target/release/embedder --in /tmp/wl.jsonl --out /tmp/vecs.jsonl \
+                    --model-dir "$EMBED_MODEL_DIR" --embed-identity "$EMBED_ID" \
+               && rust/target/release/embed-io --db "$OUT" --import-vectors /tmp/vecs.jsonl \
+                    --embed-identity "$EMBED_ID" --build-hnsw \
+               && rust/target/release/embed-io --db "$OUT" --report --embed-floor "$FLOOR" | tee "$RPT" \
+               && jq -e '.model != "" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
               embed_ok=1
             fi
             echo "::endgroup::"
