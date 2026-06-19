@@ -31,6 +31,7 @@ struct Args {
     sparse_index: String,
     build_index: String,
     embed_model_id: String,
+    embed_identity: String,
     subject_index: String,
 }
 
@@ -56,6 +57,7 @@ fn parse_args() -> Args {
         sparse_index: String::new(),
         build_index: String::new(),
         embed_model_id: String::new(),
+        embed_identity: String::new(),
         subject_index: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -76,6 +78,7 @@ fn parse_args() -> Args {
             "--sparse-index" => a.sparse_index = next(),
             "--build-index" => a.build_index = next(),
             "--embed-model-id" => a.embed_model_id = next(),
+            "--embed-identity" => a.embed_identity = next(),
             "--subject-index" => a.subject_index = next(),
             "--all" => a.all = true,
             "--include-legacy-gsm" => a.include_legacy_gsm = true,
@@ -178,7 +181,14 @@ fn main() {
             let mut identity_drift: Vec<String> = Vec::new();
             if !full && !a.build_index.is_empty() {
                 let published = load_build_index(&a.build_index);
-                let current = current_build_index(&a.embed_model_id);
+                let mut current = current_build_index(&a.embed_model_id);
+                // The embed identity is the one Go-coupled input (family→ModelID
+                // resolution lives in the embed registry). Prefer the pre-resolved
+                // digest the caller supplies via `go run ./cmd/embedid` so we compare
+                // the SAME value Go merge stamped, without re-deriving the model id.
+                if !a.embed_identity.is_empty() {
+                    current.embed_identity = a.embed_identity.clone();
+                }
                 identity_drift = build_index_differs(&published, &current);
                 if !identity_drift.is_empty() {
                     for key in site.keys() {
