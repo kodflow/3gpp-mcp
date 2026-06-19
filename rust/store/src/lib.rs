@@ -353,6 +353,26 @@ impl Store {
         Ok(())
     }
 
+    /// ingest_done reports whether (spec, version) is already fully ingested under the SAME
+    /// pipeline_version — the batch resume skip predicate (== Go ingest_log 'done' check).
+    pub fn ingest_done(
+        &self,
+        spec_id: &str,
+        version: &str,
+        pipeline_version: &str,
+    ) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM ingest_log WHERE spec_id = ? AND version = ?
+                 AND status = 'done' AND pipeline_version = ?",
+                duckdb::params![spec_id, version, pipeline_version],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("ingest_done {spec_id} {version}"))?;
+        Ok(n > 0)
+    }
+
     /// log_ingest stamps the resume ledger (== Go ingest_log upsert). status is
     /// 'started' then 'done'; pipeline_version invalidates the log on an algorithm change.
     pub fn log_ingest(
