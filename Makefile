@@ -20,15 +20,9 @@ build-onnx: ## Build with the real BGE-M3 semantic backend (run `make model` fir
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
-ingest: ## Build and run one-shot ingestion CLI
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest ./cmd/ingest
-	./$(BUILD_DIR)/$(BIN)-ingest $(ARGS)
-
-ingest-onnx: ## Build + ingest with real BGE-M3 vectors (run `make model` first)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest ./cmd/ingest
-	ONNXRUNTIME_SHARED_LIBRARY_PATH=$(ORT_LIB) ./$(BUILD_DIR)/$(BIN)-ingest $(ARGS)
+ingest: ## Build and run the Rust ingest (parse3gpp + store-rs)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
+	./rust/target/release/ingest $(ARGS)
 
 fetch-apis: ## Fetch the 5GC OpenAPI YAML corpus from 3GPP Forge (ARGS=releases)
 	./scripts/fetch-5g-apis.sh $(ARGS)
