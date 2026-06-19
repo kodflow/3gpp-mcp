@@ -18,7 +18,7 @@ build: ## Build static binary into bin/
 
 build-onnx: ## Build with the real BGE-M3 semantic backend (run `make model` first)
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx,embed_ffi -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
 build-ffi: ## Build serve on the Rust embed-core cdylib (FFI query-embed; Phase 11 target). Add `--features ort` to the cargo line for the real BGE-M3 backend.
 	@mkdir -p $(BUILD_DIR)
