@@ -158,8 +158,12 @@ jobs:
         include:
           - variant: light # binary only; corpus bootstrapped from the network on first run.
             build_tags: ""
-          - variant: full # onnx + DB + vectors + BGE-M3 baked → offline semantic. = :latest.
-            build_tags: onnx
+          - variant: full # onnx (reranker) + embed_ffi (Rust query-embed cdylib) + DB +
+            # vectors + BGE-M3 baked → offline semantic. = :latest. embed_ffi routes
+            # query-embed through rust/embed-core (ort load-dynamic shares the image's
+            # ONE onnxruntime with the Go reranker); the cdylib is built + shipped by the
+            # Dockerfile builder, ORT_DYLIB_PATH points at the baked ORT.
+            build_tags: onnx,embed_ffi
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
