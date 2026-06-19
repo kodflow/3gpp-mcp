@@ -1,0 +1,25 @@
+# embed-core — the shared BGE-M3 inference, exposed as a cdylib over a tiny C ABI so the Go
+# serve query-embed can call the SAME Rust embedder the corpus pipeline uses (Phase 1 of the
+# write-side→Rust plan: resolve the internal/embed write/read coupling). This baseline crate
+# ships a DETERMINISTIC hash embedder (no ort) so the FFI seam — cdylib → cgo → Go — is
+# end-to-end testable locally with no model/GPU. The real ort/BGE-M3 inference plugs into the
+# SAME exported symbols behind the `ort` feature (built + validated in CI with the model).
+[package]
+name = "embed-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shared BGE-M3 inference exposed as a cdylib + C ABI for the Go serve query-embed (Phase 1 FFI)."
+
+[lib]
+name = "embed_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sha2 = "0.10"
+
+[features]
+# `ort` swaps the deterministic baseline for the real BGE-M3 ONNX inference (CI/infra only,
+# needs the model + onnxruntime). Default = the hash baseline so the seam builds/tests anywhere.
+default = []
+ort = []

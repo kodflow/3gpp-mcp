@@ -1,4 +1,4 @@
-//go:build !onnx
+//go:build !onnx && !embed_ffi
 
 package embed
 

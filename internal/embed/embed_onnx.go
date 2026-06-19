@@ -1,4 +1,4 @@
-//go:build onnx
+//go:build onnx && !embed_ffi
 
 // This file is the real BGE-M3 dense embedder, compiled only with `-tags onnx`
 // (CLAUDE.md §2: ONNX Runtime via github.com/yalue/onnxruntime_go, 1024-dim).
