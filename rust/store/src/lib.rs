@@ -345,7 +345,7 @@ impl Store {
         for r in rows {
             let (chunk_id, release, heading, text) = r.context("scan worklist row")?;
             if floor_ord > 0
-                && crate::identity::release_ordinal(&release).map_or(true, |o| o < floor_ord)
+                && crate::identity::release_ordinal(&release).is_none_or(|o| o < floor_ord)
             {
                 continue; // below the embed floor → leave lexical-only
             }
