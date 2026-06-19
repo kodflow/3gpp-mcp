@@ -33,10 +33,9 @@ ingest-onnx: ## Build + ingest with real BGE-M3 vectors (run `make model` first)
 fetch-apis: ## Fetch the 5GC OpenAPI YAML corpus from 3GPP Forge (ARGS=releases)
 	./scripts/fetch-5g-apis.sh $(ARGS)
 
-ingest-openapi: ## Build + load the 5GC OpenAPI corpus into the DuckDB (additive)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest-openapi ./cmd/ingest-openapi
-	./$(BUILD_DIR)/$(BIN)-ingest-openapi $(ARGS)
+ingest-openapi: ## Build + load the 5GC OpenAPI corpus into the DuckDB (additive; Rust)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-openapi
+	./rust/target/release/ingest-openapi --src data/sources/5g-apis --db data/3gpp.duckdb
 
 ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive)
 	@mkdir -p $(BUILD_DIR)
