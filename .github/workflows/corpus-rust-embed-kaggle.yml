@@ -44,6 +44,12 @@ on:
         description: "Cap clauses embedded this session (0 = all). Set small (e.g. 1000) for a fast GPU/throughput diagnostic."
         required: false
         default: "0"
+      kaggle_account:
+        description: "Kaggle account to try FIRST (the other is the automatic fallback; run stops only if BOTH fail auth)."
+        required: false
+        default: "primary"
+        type: choice
+        options: [primary, fallback]
 
 concurrency:
   group: corpus-rust-embed-kaggle
@@ -57,22 +63,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
+      # Two Kaggle accounts: primary + fallback. scripts/kaggle-auth.sh probes them
+      # (order set by KAGGLE_ACCOUNT) and exports the SELECTED KAGGLE_API_TOKEN +
+      # KAGGLE_USER for the steps below; it stops the run only if BOTH fail auth.
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-      KAGGLE_USER: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
+      KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_USERNAME_FALLBACK: ${{ vars.KAGGLE_USERNAME_FALLBACK || secrets.KAGGLE_USERNAME_FALLBACK }}
+      KAGGLE_ACCOUNT: ${{ github.event.inputs.kaggle_account || 'primary' }}
       GHCR_OWNER: ${{ github.repository_owner }}
       GHCR_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
       BRANCH: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Guard — secrets present
-        run: |
-          [ -n "$KAGGLE_API_TOKEN" ] || { echo "::error::KAGGLE_API_TOKEN not set (Settings → API → Generate New Token)."; exit 1; }
-          [ -n "$KAGGLE_USER" ]      || { echo "::error::KAGGLE_USERNAME not set (repo variable or secret) — namespaces the kernel slug."; exit 1; }
-          [ -n "$GHCR_PAT" ]         || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private base."; exit 1; }
       - name: Install kaggle CLI (pin 2.2.0 — access-token auth)
         run: |
           pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
           kaggle --version
+      - name: Select Kaggle account (primary → fallback; stop if both fail)
+        run: bash scripts/kaggle-auth.sh
+      - name: Guard — GHCR token present
+        run: |
+          [ -n "$GHCR_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private base."; exit 1; }
       - name: Stage + run kernel-rust-embed.py (GPU, resumable)
         env:
           SERIES: ${{ github.event.inputs.series }}
