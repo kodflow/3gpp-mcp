@@ -32,7 +32,10 @@ retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; sl
 
 echo "[etsi] building tools…"
 go build -o "$ROOT/bin/discover-etsi" ./cmd/discover-etsi
-go build -o "$ROOT/bin/ingest" ./cmd/ingest
+# ingest is the RUST bin (parse3gpp + store-rs; --etsi mode). libduckdb is bundled.
+command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path "$ROOT/rust/ingest/Cargo.toml" --bin ingest
+cp "$ROOT/rust/target/release/ingest" "$ROOT/bin/ingest"
 
 echo "[etsi] discovering work-list…"
 wl="$(mktemp)"
@@ -90,5 +93,5 @@ rm -f "$wl"
 echo "[etsi] converted=${ok} failed=${fail}"
 
 echo "[etsi] ingesting…"
-"$ROOT/bin/ingest" --etsi --convert "$CONVERT" --origin "$ORIGIN" --out "$OUT" --resume
+"$ROOT/bin/ingest" --etsi --convert "$CONVERT" --origin "$ORIGIN" --db "$OUT" --resume
 echo "[etsi] done: $OUT"
