@@ -19,3 +19,8 @@ path = "src/main.rs"
 [[bin]]
 name = "ingest-openapi"
 path = "src/bin/ingest_openapi.rs"
+
+# ingest-catalog — additive DynaReport metadata overlay (Phase 7): title/WG/freeze_date.
+[[bin]]
+name = "ingest-catalog"
+path = "src/bin/ingest_catalog.rs"

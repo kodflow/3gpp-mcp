@@ -497,6 +497,107 @@ impl Store {
     }
 }
 
+/// A release-calendar row for the DynaReport overlay (== Go store.ReleaseRow). Dates are
+/// "YYYY-MM-DD" or None.
+pub struct ReleaseRow {
+    pub code: String,
+    pub name: String,
+    pub status: String,
+    pub start_date: Option<String>,
+    pub freeze_date: Option<String>,
+    pub freeze_meeting: String,
+}
+
+/// date_lit renders an "YYYY-MM-DD" option as a DuckDB DATE literal or NULL.
+fn date_lit(d: &Option<String>) -> String {
+    match d {
+        Some(s) if !s.is_empty() => format!("DATE '{}'", s.replace('\'', "''")),
+        _ => "NULL".to_string(),
+    }
+}
+
+impl Store {
+    /// upsert_releases replaces the release calendar (== Go UpsertReleases).
+    pub fn upsert_releases(&self, releases: &[ReleaseRow]) -> Result<()> {
+        if releases.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("BEGIN;");
+        for r in releases {
+            sql.push_str(&format!(
+                "INSERT INTO releases (code, name, status, start_date, freeze_date, freeze_meeting)
+                 VALUES ({}, {}, {}, {}, {}, {})
+                 ON CONFLICT (code) DO UPDATE SET name=excluded.name, status=excluded.status,
+                   start_date=excluded.start_date, freeze_date=excluded.freeze_date,
+                   freeze_meeting=excluded.freeze_meeting;",
+                q(&r.code),
+                q(&r.name),
+                q(&r.status),
+                date_lit(&r.start_date),
+                date_lit(&r.freeze_date),
+                q(&r.freeze_meeting),
+            ));
+        }
+        sql.push_str("COMMIT;");
+        self.conn.execute_batch(&sql).context("upsert_releases")?;
+        Ok(())
+    }
+
+    /// apply_release_freeze stamps each spec_versions row with its release's freeze_date +
+    /// status — the non-monotonic-ordering fix (== Go ApplyReleaseFreeze).
+    pub fn apply_release_freeze(&self, releases: &[ReleaseRow]) -> Result<()> {
+        let mut sql = String::from("BEGIN;");
+        for r in releases {
+            sql.push_str(&format!(
+                "UPDATE spec_versions SET freeze_date = {}, status = {} WHERE release = {};",
+                date_lit(&r.freeze_date),
+                q(&r.status),
+                q(&r.code),
+            ));
+        }
+        sql.push_str("COMMIT;");
+        self.conn
+            .execute_batch(&sql)
+            .context("apply_release_freeze")?;
+        Ok(())
+    }
+
+    /// set_version_metadata_source tags spec_versions rows with their provenance (== Go).
+    pub fn set_version_metadata_source(&self, source: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE spec_versions SET metadata_source = ? WHERE metadata_source IS NULL",
+                duckdb::params![source],
+            )
+            .context("set_version_metadata_source")?;
+        Ok(())
+    }
+
+    /// update_spec_meta overlays authoritative title/doc_type/working_group onto an EXISTING
+    /// spec row; an empty incoming value never clobbers a non-empty one (== Go UpdateSpecMeta).
+    /// No-op if the spec is not on disk (cite-or-silent: never invents catalogue-only specs).
+    pub fn update_spec_meta(
+        &self,
+        spec_id: &str,
+        title: &str,
+        doc_type: &str,
+        wg: &str,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE specs SET
+                   title         = CASE WHEN ? <> '' THEN ? ELSE title END,
+                   doc_type      = CASE WHEN ? <> '' THEN ? ELSE doc_type END,
+                   working_group = CASE WHEN ? <> '' THEN ? ELSE working_group END
+                 WHERE spec_id = ?",
+                duckdb::params![title, title, doc_type, doc_type, wg, wg, spec_id],
+            )
+            .with_context(|| format!("update_spec_meta {spec_id}"))?;
+        Ok(n > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
