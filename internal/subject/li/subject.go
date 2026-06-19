@@ -7,7 +7,6 @@ package li
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -16,7 +15,6 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subject"
-	"github.com/kodflow/3gpp-mcp/internal/subject/li/asn1"
 )
 
 // specID is the spec this subject owns.
@@ -30,33 +28,6 @@ func New() *Subject { return &Subject{} }
 
 func (*Subject) Name() string             { return "li" }
 func (*Subject) Activates(id string) bool { return id == specID }
-
-// Ingest parses the TS 33.128 ASN.1 attachment for this release and loads the
-// authoritative registry + type catalogue. Degrade-don't-block: a missing
-// attachment returns (0, nil) so ingestion never stalls on it.
-func (*Subject) Ingest(ctx context.Context, db *store.Store, ic subject.IngestContext) (int, error) {
-	rel := filepath.Base(filepath.Dir(ic.ConvertPath))
-	base := strings.TrimSuffix(filepath.Base(ic.ConvertPath), filepath.Ext(ic.ConvertPath))
-	zipPath := filepath.Join(ic.OriginDir, rel, base+".zip")
-
-	m, err := asn1.ParseFromSpecZip(zipPath)
-	if err != nil {
-		return 0, nil // no ASN.1 registry — clause/prose fallback at query time
-	}
-	if err := InsertEvents(db, m.Release, m.ModuleVersion, m.Events); err != nil {
-		return 0, err
-	}
-	if err := InsertFields(db, m.Release, m.Fields); err != nil {
-		return 0, err
-	}
-	if err := InsertNFClauses(db, m.Release, m.NFClauses); err != nil {
-		return 0, err
-	}
-	if err := InsertASN1Types(db, specID, m.Release, m.Types); err != nil {
-		return 0, err
-	}
-	return len(m.Events), nil
-}
 
 // Purge clears every LI-owned row for (specID, release) so a --resume redo of
 // TS 33.128 re-ingests from a clean slate (subject.Purger). version is unused:
