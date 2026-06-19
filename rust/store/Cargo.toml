@@ -33,3 +33,8 @@ path = "src/bin/embed_io.rs"
 [[bin]]
 name = "merge"
 path = "src/bin/merge.rs"
+
+# freeze-hnsw — the Rust replacement for cmd/freeze-hnsw (Go): build + freeze the cosine HNSW.
+[[bin]]
+name = "freeze-hnsw"
+path = "src/bin/freeze_hnsw.rs"
