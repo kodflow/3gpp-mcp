@@ -41,6 +41,10 @@ struct Args {
     /// Cap the exported work-list to N clauses (0 = all).
     #[arg(long, default_value_t = 0)]
     limit: usize,
+    /// Export ONLY clauses at/above this release (e.g. Rel-19); empty = all (== Go embed
+    /// --embed-floor). Lexical coverage is unaffected; this only narrows what gets vectorised.
+    #[arg(long, default_value = "")]
+    embed_floor: String,
     /// Rows per write transaction on import.
     #[arg(long, default_value_t = 512)]
     batch: usize,
@@ -66,7 +70,13 @@ fn main() -> Result<()> {
     let store = Store::open_rw(&args.db)?;
 
     if let Some(out) = args.export_worklist.as_deref() {
-        let wl = store.clauses_needing_embedding(args.limit)?;
+        // Resolve the optional release floor to its ordinal (unparseable → 0 = no floor).
+        let floor_ord = if args.embed_floor.is_empty() {
+            0
+        } else {
+            store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
+        };
+        let wl = store.clauses_needing_embedding(args.limit, floor_ord)?;
         let f = std::fs::File::create(out).with_context(|| format!("create {out}"))?;
         let mut w = BufWriter::new(f);
         for it in &wl {

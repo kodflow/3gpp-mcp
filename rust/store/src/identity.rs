@@ -126,6 +126,20 @@ pub fn effective_subject_footprints(
     out
 }
 
+/// release_ordinal maps a 3GPP release label to its monotonic ordinal (== model.ReleaseOrdinal):
+/// "Rel-99" → 3 (1999, between Phase-2 and Rel-4), "Rel-N" → N for N≥4. None for anything
+/// older/unparseable (callers treat None as "no floor" → include). Drives --embed-floor.
+pub fn release_ordinal(rel: &str) -> Option<i64> {
+    if rel == "Rel-99" {
+        return Some(3);
+    }
+    let n: i64 = rel.strip_prefix("Rel-")?.parse().ok()?;
+    if n < 4 {
+        return None;
+    }
+    Some(n)
+}
+
 /// cmp_ver compares two "a.b.c" version triples numerically (== merge.cmpVer). Missing/garbage
 /// components sort low. Returns Ordering.
 pub fn cmp_ver(a: &str, b: &str) -> std::cmp::Ordering {
