@@ -1,4 +1,4 @@
-//go:build onnx && !fasttok
+//go:build onnx && !fasttok && !embed_ffi
 
 package embed
 
