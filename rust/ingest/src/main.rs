@@ -40,6 +40,25 @@ struct Args {
     /// Batch: skip specs already 'done' in the ingest ledger under this pipeline_version.
     #[arg(long, default_value_t = false)]
     resume: bool,
+    /// Phase-0: open --db, print clause embedded/null counts as JSON, then exit (== Go
+    /// cmd/ingest --count-only; the CI gate reads .embedded_clauses / .clauses).
+    #[arg(long, default_value_t = false)]
+    count_only: bool,
+}
+
+/// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
+fn run_count_only(store: &Store) -> Result<()> {
+    let total = store.count_clauses()?;
+    let null = store.count_null_embeddings()?;
+    let model = store.get_meta("embedding_model")?;
+    let hnsw = store.get_meta("hnsw_state")? == "frozen";
+    // JSON object with the keys the Phase-0 CI gate consumes.
+    println!(
+        "{{\n  \"clauses\": {total},\n  \"embedded_clauses\": {},\n  \"null_embeddings\": {null},\n  \"this_run_clauses\": 0,\n  \"model\": \"{}\",\n  \"hnsw\": {hnsw},\n  \"version\": \"rust\"\n}}",
+        total - null,
+        model.replace('"', "\\\"")
+    );
+    Ok(())
 }
 
 /// ingest_one parses one converted HTML and writes it, offsetting clause chunk_ids by
@@ -121,6 +140,10 @@ fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec
 fn main() -> Result<()> {
     let args = Args::parse();
     let store = Store::open_rw(&args.db)?;
+
+    if args.count_only {
+        return run_count_only(&store);
+    }
 
     let total: usize = if let Some(html) = args.html.as_deref() {
         let off = store.max_chunk_id()?;

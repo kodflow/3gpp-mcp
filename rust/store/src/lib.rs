@@ -99,6 +99,28 @@ impl Store {
         Ok(n)
     }
 
+    /// count_clauses returns the total clause count (== Go CountClauses).
+    pub fn count_clauses(&self) -> Result<i64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .context("count_clauses")?;
+        Ok(n)
+    }
+
+    /// get_meta reads a schema_meta value ("" if absent).
+    pub fn get_meta(&self, key: &str) -> Result<String> {
+        let v: String = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(value), '') FROM schema_meta WHERE key = ?",
+                duckdb::params![key],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("get_meta {key}"))?;
+        Ok(v)
+    }
+
     /// clauses_needing_embedding streams the work-list (never-embedded, embeddable
     /// clauses), oldest chunk first, capped at `limit` (0 = all). Mirrors the Go
     /// ClausesNeedingEmbedding ResumeOnly path so the Rust embedder can read the
