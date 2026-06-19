@@ -14,3 +14,8 @@ clap = { version = "4", features = ["derive"] }
 [[bin]]
 name = "ingest"
 path = "src/main.rs"
+
+# ingest-openapi — additive 5GC OpenAPI overlay (Phase 6): parse YAML → api_* tables.
+[[bin]]
+name = "ingest-openapi"
+path = "src/bin/ingest_openapi.rs"
