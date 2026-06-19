@@ -298,7 +298,9 @@ jobs:
           esac
           retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
-          CGO_ENABLED=1 go build -o /tmp/overlay ./cmd/overlay
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay
+          cp rust/target/release/overlay /tmp/overlay
           EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
           echo "embed identity (baked registry): $EMBED_ID"
           test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
