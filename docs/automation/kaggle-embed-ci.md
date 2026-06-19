@@ -207,9 +207,26 @@ Usernames are not sensitive → store them as repo **variables**.
 So switching accounts is a one-field change in the *Run workflow* dialog of any Kaggle
 workflow (`Corpus · Rust embed`, `Corpus · Sparse`, `Corpus · Embed`).
 
+**Two fallback triggers:**
+1. **Auth failure** (expired/invalid token) — all three workflows: `scripts/kaggle-auth.sh`
+   probes each account and selects the first that authenticates.
+2. **GPU quota** (no GPU allocated) — **`Corpus · Rust embed`**: the dispatch step *runs*
+   the kernel on the first account and, if that account got **no GPU** (weekly quota
+   exhausted → the kernel logs `gpu=absent`, or yields no output), it **automatically
+   re-dispatches on the other account**. `scripts/kaggle-gpu-check.sh` reads the pulled
+   output's `gpu=present`/`gpu=absent` marker to decide. The run stops only if **no**
+   account is granted a GPU. (Auth probe ≠ GPU quota, so this is a separate, run-time
+   trigger.) `Corpus · Sparse` / `Corpus · Embed` currently have the auth fallback only.
+
+> Cross-account note: each account has its **own** per-shard resume Dataset
+> (`<user>/3gpp-rust-embedded-<shard>`). Falling back to account B continues from B's
+> own state (or a fresh slice) — re-embedding is idempotent (keyed by `embedding_hash`),
+> so no corruption, but B may redo work A had done. Progress is never lost.
+
 **Add a third account?** Extend `scripts/kaggle-auth.sh` (`token_of`/`user_of`/`ORDER`)
-plus the matching secret/variable and the workflow `env`. The selection logic is
-unit-tested offline by `scripts/kaggle-auth_test.sh` (mock probe, no network).
+and the rust-embed dispatch loop, plus the matching secret/variable and the workflow
+`env`. The logic is unit-tested offline: `scripts/kaggle-auth_test.sh` (account select)
+and `scripts/kaggle-gpu-check_test.sh` (gpu/quota verdict) — both mock, no network.
 
 **Note (in-kernel versioning):** the CI selects the account that *pushes/mounts* the
 kernel. The kernel's own dataset-versioning tail (`KAGGLE_USERNAME`/`KAGGLE_KEY` read

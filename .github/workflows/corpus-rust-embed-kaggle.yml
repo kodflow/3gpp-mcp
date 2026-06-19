@@ -80,12 +80,10 @@ jobs:
         run: |
           pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
           kaggle --version
-      - name: Select Kaggle account (primary → fallback; stop if both fail)
-        run: bash scripts/kaggle-auth.sh
       - name: Guard — GHCR token present
         run: |
           [ -n "$GHCR_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private base."; exit 1; }
-      - name: Stage + run kernel-rust-embed.py (GPU, resumable)
+      - name: Embed on Kaggle GPU (auto-fallback across accounts on quota)
         env:
           SERIES: ${{ github.event.inputs.series }}
           EMBED_RELEASES: ${{ github.event.inputs.embed_releases }}
@@ -94,7 +92,19 @@ jobs:
           EMBED_LIMIT: ${{ github.event.inputs.limit }}
         run: |
           set -euo pipefail
-          dir="$RUNNER_TEMP/rust-embed-kernel"; mkdir -p "$dir"
+          # Two-account GPU fallback: try each account's GPU; if one is out of its weekly
+          # quota (no GPU allocated) the kernel logs gpu=absent / yields no output, and
+          # scripts/kaggle-gpu-check.sh reports "quota" → fall back to the other account.
+          # Stop only if NO account gets a GPU. Capture both accounts up front; the loop
+          # swaps the exported KAGGLE_API_TOKEN/KAGGLE_USER per attempt.
+          PRIM_TOK="${KAGGLE_API_TOKEN:-}"; PRIM_USER="${KAGGLE_USERNAME:-}"
+          FB_TOK="${KAGGLE_API_TOKEN_FALLBACK:-}"; FB_USER="${KAGGLE_USERNAME_FALLBACK:-}"
+          case "${KAGGLE_ACCOUNT:-primary}" in
+            fallback) ORDER="fallback primary" ;;
+            *) ORDER="primary fallback" ;;
+          esac
+          dispatch() {
+          dir="$RUNNER_TEMP/rust-embed-kernel"; rm -rf "$dir"; mkdir -p "$dir"
           # Kaggle slugifies the TITLE (lowercase + dashes) and REQUIRES it to resolve to
           # the metadata id, else `kernels push` 409s. So lowercase the shard and build the
           # title from it ("3gpp rust embed 23" → slug "3gpp-rust-embed-23" == id).
@@ -155,12 +165,40 @@ jobs:
           done
           echo "=== KERNEL LOG (tail) ==="; tail -n 120 out/*.log 2>/dev/null || echo "(no .log pulled)"
           echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt — see log above)"
-          grep -q 'step=OK' out/RESULT.txt 2>/dev/null || { echo "::error::kernel did not reach step=OK (see log)"; exit 1; }
-          # PERSIST the embedded shard DB to the resume/output dataset (creds stay in CI,
-          # never in the kernel). This is BOTH the resume point for the next dispatch (the
-          # restored DB's still-NULL clauses are the remaining work) AND the consumable
-          # output the bake folds. The DB carries the fp16 vectors; vecs.jsonl is the
-          # per-session ledger only, so the DB alone is sufficient to resume.
+          }
+          # Try each account until one is granted a GPU. quota (no GPU) → fall back to the
+          # next; gpu → keep that account and proceed. dispatch is best-effort (|| true):
+          # a failed push/pull leaves no usable output → gpu-check reports quota → fall back.
+          got_gpu=0
+          for acct in $ORDER; do
+            case "$acct" in
+              primary)  export KAGGLE_API_TOKEN="$PRIM_TOK" KAGGLE_USER="$PRIM_USER" ;;
+              fallback) export KAGGLE_API_TOKEN="$FB_TOK"   KAGGLE_USER="$FB_USER" ;;
+            esac
+            if [ -z "$KAGGLE_API_TOKEN" ] || [ -z "$KAGGLE_USER" ]; then
+              echo "account '$acct' not configured (token/username empty) — skipping"; continue
+            fi
+            echo "::group::Kaggle account=$acct user=$KAGGLE_USER"
+            if ! kaggle kernels list -m -p 1 >/dev/null 2>&1; then
+              echo "::warning::account '$acct' auth failed — trying next"; echo "::endgroup::"; continue
+            fi
+            rm -rf out
+            dispatch || echo "::warning::dispatch on account '$acct' errored — judging by output"
+            status="$(bash scripts/kaggle-gpu-check.sh out)"
+            echo "account '$acct' gpu-check=$status"; echo "::endgroup::"
+            if [ "$status" = gpu ]; then
+              echo "GPU obtained on account '$acct'"; got_gpu=1; SEL_ACCT="$acct"; break
+            fi
+            echo "::warning::account '$acct' got NO GPU (quota) — falling back to the next account"
+          done
+          [ "$got_gpu" = 1 ] || { echo "::error::no Kaggle account had GPU quota this run — stopping"; exit 1; }
+          # The winning account had a GPU; now require the run to have made progress on it
+          # (a GPU-present run that did not step=OK is a real error, not a quota fallback).
+          grep -q 'step=OK' out/RESULT.txt 2>/dev/null || { echo "::error::account '$SEL_ACCT' got a GPU but the kernel did not reach step=OK (real error, see log)"; exit 1; }
+          # PERSIST the embedded shard DB to the SELECTED account's resume/output dataset
+          # (creds stay in CI, never in the kernel). shard/RESUME_DS were set by dispatch on
+          # the winning account, so this lands in that account's namespace. The DB is BOTH
+          # the resume point for the next dispatch AND the consumable output the bake folds.
           db="$(find out -name '3gpp-embedded.duckdb' | head -1)"
           if [ -n "$db" ] && [ -s "$db" ]; then
             rm -rf state && mkdir -p state && cp "$db" state/3gpp-embedded.duckdb
