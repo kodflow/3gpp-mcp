@@ -5,6 +5,8 @@
 //! forever, so every function here mirrors its Go counterpart exactly and is golden-tested
 //! against known Go outputs. The HTML clause walker lands on top of this seam next.
 
+pub mod openapi;
+
 use regex::Regex;
 
 /// Metadata derived from a `…/convert/<Rel>/<num>-<code>.html` path — the spec catalogue
