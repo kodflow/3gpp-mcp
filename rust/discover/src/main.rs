@@ -31,6 +31,7 @@ struct Args {
     sparse_index: String,
     build_index: String,
     embed_model_id: String,
+    subject_index: String,
 }
 
 enum Mode {
@@ -55,6 +56,7 @@ fn parse_args() -> Args {
         sparse_index: String::new(),
         build_index: String::new(),
         embed_model_id: String::new(),
+        subject_index: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -74,6 +76,7 @@ fn parse_args() -> Args {
             "--sparse-index" => a.sparse_index = next(),
             "--build-index" => a.build_index = next(),
             "--embed-model-id" => a.embed_model_id = next(),
+            "--subject-index" => a.subject_index = next(),
             "--all" => a.all = true,
             "--include-legacy-gsm" => a.include_legacy_gsm = true,
             "--emit-worklist" => a.mode = Mode::Worklist,
@@ -153,6 +156,20 @@ fn main() {
             let full = a.all || idx.is_empty();
             let mut series = delta_series(&site, &have, floor_major, full);
 
+            // Subject delta (== Go): a subject whose code changed (footprint shifts
+            // vs the published subject-index.json) forces its owning series back into
+            // the matrix so its shard rebuilds and the ingest pass re-extracts it.
+            // Delta-only — a full build already rebuilds everything.
+            let mut subj_changed: Vec<String> = Vec::new();
+            if !full {
+                subj_changed = changed_subject_series(&load_index(&a.subject_index))
+                    .into_iter()
+                    .collect();
+                for s in &subj_changed {
+                    series.insert(s.clone());
+                }
+            }
+
             // Build-identity drift (== Go): a parser/chunking/schema/model/global-
             // enricher change moves NO spec version, so the per-(spec,release) delta
             // is blind to it. Compare the published build-index against the current
@@ -186,10 +203,10 @@ fn main() {
             let out: Vec<String> = series.into_iter().collect();
             let mode = if full { "full" } else { "delta" };
             eprintln!(
-                "discover: mode={mode} site_keys={} indexed={} identity-drift={:?} -> {} series: {:?} \
-                 (subject-delta NOT ported — Go cmd/discover owns it)",
+                "discover: mode={mode} site_keys={} indexed={} subject-changed={:?} identity-drift={:?} -> {} series: {:?}",
                 site.len(),
                 idx.len(),
+                subj_changed,
                 identity_drift,
                 out.len(),
                 out
