@@ -1,0 +1,58 @@
+# =============================================================================
+#  contracts/identity.toml — single source of the Go↔Rust shared contracts
+# =============================================================================
+# The write side (Rust) and the read side (Go) MUST agree on these or a corpus
+# produced by one is silently wrong to the other. They are documented here as the
+# canonical values; the live wiring is:
+#   - the EMBED IDENTITY is computed by Go `cmd/embedid` (model.EmbedParts) and handed
+#     to the Rust embedder via --embed-identity, so both hash the SAME string
+#     (rust/embedder/src/hash.rs == internal/embed.ClauseHash; pinned by the golden
+#     cross-runtime test added in Phase −1).
+#   - the SCHEMA is internal/store/schema.sql (Go go:embed); the Rust store crate will
+#     bootstrap from the same DDL.
+#   - the DuckDB ENGINE is pinned 1.4.x on both sides (scripts/check-duckdb-pin.sh) and
+#     proven by the rust-go-roundtrip workflow.
+# A change to any value below is an arch-change: re-embed (identity) or re-ingest
+# (parser/chunking/schema) follows.
+
+[engine]
+duckdb = "1.4.x"          # go-duckdb v2.4.3 bundles engine 1.4.3; rust `duckdb` crate "1.4"
+
+[vector]
+dense_dim = 1024          # clauses.embedding FLOAT[1024]; DENSE_DIM in Go + Rust
+normalization = "l2"      # every dense vector is L2-normalised (cosine/HNSW ready)
+
+[embed_identity]
+# Components folded into model.EmbedParts.Identity() (digest12 "embed-v1"). A change
+# flips the identity → clean re-embed. Windowing + max_tokens were added in Phase −1.
+family = "bge-m3"
+revision = "5617a9f"            # pinned BAAI/bge-m3 HF commit (BGEModelRevision)
+tokenizer_revision = "5617a9f"
+precision = ["fp32", "fp16"]    # fp16 corpus and fp32 query must never share one HNSW
+windowing = "truncate"          # canonical; "mean_pool" is the urgent Rust port (#208)
+max_tokens = 1024               # DefaultMaxTokens; truncation length (Go == Rust)
+
+[clause_hash]
+# Per-clause fingerprint = hex(sha256( embed_text(heading,text) + "|" + embed_identity ))[:16]
+# embed_text(heading,text) = heading + "\n" + text. modelID is hashed RAW (no re-wrap) —
+# the Phase −1 fix that aligned Go and Rust (golden TestClauseHashGoldenCrossRuntime).
+embed_text_rule = "heading + '\\n' + text"
+digest = "sha256, first 16 hex"
+
+[sparse]
+# BGE-M3 learned-lexical arm. Separate identity (SparseParts) so a sparse change never
+# invalidates the expensive dense vectors. clause_sparse(chunk_id, term_id, weight).
+output_node = "sparse_weights"  # ONNX dual-head export; empty ⇒ no sparse arm
+weights = "raw ReLU(linear), max-per-id, xlm-r special tokens excluded, unnormalised"
+
+[ingest_identity]
+# SpecIngestParts (digest12 "spec-ingest-v1") — gates the ingest_log resume ledger.
+# Does NOT include the embedding model (a model bump re-embeds, never re-ingests).
+parser_version = "html-v2"
+chunking_version = "clause-leaf-v1"
+schema_version = "1"
+
+[release_ordinal]
+# model.ReleaseOrdinal — release label → int for recency ordering / embed floors.
+# f=15 g=16 h=17 i=18 j=19 (filename code → release); GSM/legacy below every floor.
+encoding = "filename code f..j = Rel-15..Rel-19; GSM = below all floors (never vectorised)"

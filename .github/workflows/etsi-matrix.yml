@@ -26,6 +26,10 @@ on:
         description: "Override the ETSI scope (comma-separated ids, e.g. '103 221-1,103 280'). Empty = the built-in LI suite."
         required: false
         default: ""
+      all:
+        description: "Enumerate the WHOLE ETSI /deliver corpus (etsi_ts+tr+en) — latest published of EVERY deliverable, not just the LI suite. Tens of thousands of specs (long run)."
+        required: false
+        default: "false"
       publish:
         description: "Push the etsi-corpus image to GHCR (private). Default true."
         required: false
@@ -87,6 +91,9 @@ jobs:
       - name: Build the ETSI corpus (discover → fetch → convert → ingest)
         env:
           ETSI_SPECS: ${{ github.event.inputs.specs }}
+          # all=true → ETSI_ALL=1 → discover-etsi --all enumerates the whole /deliver
+          # corpus (3GPP-parity completeness, not just the LI suite).
+          ETSI_ALL: ${{ github.event.inputs.all == 'true' && '1' || '' }}
           ETSI_OUT: data/etsi.duckdb
         run: |
           set -euo pipefail

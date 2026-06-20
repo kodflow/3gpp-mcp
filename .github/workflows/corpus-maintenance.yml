@@ -70,11 +70,9 @@ jobs:
         id: discover
         run: |
           set -euo pipefail
-          # cmd/discover diffs the live 3GPP state vs the published manifests (corpus-index/
-          # build-index). Best-effort here; a real run needs the published baseline.
-          if CGO_ENABLED=1 go run ./cmd/discover --help >/dev/null 2>&1; then
-            echo "discover binary OK"
-          fi
+          # rust/discover diffs the live 3GPP state vs the published manifests
+          # (corpus-index/build-index). Best-effort here; a real run needs the
+          # published baseline + a status report (see corpus-matrix discover job).
           echo "changed=unknown" >> "$GITHUB_OUTPUT"
 
       # --- c. INGEST the delta + merge --base + log pending (gated on a base) -----------

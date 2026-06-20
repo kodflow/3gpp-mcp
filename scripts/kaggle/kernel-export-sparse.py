@@ -114,7 +114,11 @@ try:
             result("ref_skip type=%s" % type(r0).__name__)
     except Exception as re:
         result("ref_skip exc=%s" % type(re).__name__)
-    sz = os.path.getsize(out_path) + (os.path.getsize(out_path + "_data") if os.path.exists(out_path + "_data") else 0)
+    # torch.onnx.export names the >2GB external-data file differently across versions
+    # ("model.onnx.data" on the Kaggle torch, not the "model.onnx_data" this once
+    # assumed) — probe both so the reported size isn't a misleading 3 MB graph-only.
+    ext = next((c for c in (out_path + ".data", out_path + "_data") if os.path.exists(c)), None)
+    sz = os.path.getsize(out_path) + (os.path.getsize(ext) if ext else 0)
     result("DONE structural_ok=%s ref_ok=%s dense_dim=%d model_bytes=%d" %
            (structural_ok, ref_ok, dense_o.shape[-1], sz))
     if not structural_ok:

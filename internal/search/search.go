@@ -125,7 +125,7 @@ func Classify(q string) Intent {
 // per-request rerank only. They only ever turn a CAPABLE arm down/up — they can't
 // conjure a vector arm with no embedder.
 type Engine struct {
-	st        *store.Store
+	st        store.Reader
 	emb       embed.Embedder
 	sp        embed.SparseEmbedder // non-nil when the embedder also produces sparse weights
 	rr        rerank.Reranker
@@ -143,7 +143,7 @@ type Engine struct {
 // embedder is wrapped in a bounded LRU (serve repeats queries; zero quality loss),
 // and RERANK_ALL=1 turns on always-rerank at startup so the deploy can ship the
 // reranker on every query without a per-request flag.
-func New(st *store.Store) *Engine {
+func New(st store.Reader) *Engine {
 	base := embed.New()
 	e := &Engine{
 		st:  st,

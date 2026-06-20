@@ -1,0 +1,31 @@
+[package]
+name = "ingest3gpp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust ingest orchestration (Phase 5): parse a converted spec (parse3gpp) and write it to DuckDB (store-rs). Closes the loop — Rust parses + writes a corpus the Go serve side reads."
+
+[dependencies]
+parse3gpp = { path = "../parse" }
+store-rs = { path = "../store" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "ingest"
+path = "src/main.rs"
+
+# ingest-openapi — additive 5GC OpenAPI overlay (Phase 6): parse YAML → api_* tables.
+[[bin]]
+name = "ingest-openapi"
+path = "src/bin/ingest_openapi.rs"
+
+# ingest-catalog — additive DynaReport metadata overlay (Phase 7): title/WG/freeze_date.
+[[bin]]
+name = "ingest-catalog"
+path = "src/bin/ingest_catalog.rs"
+
+# ingest-li — Lawful-Interception registry from TS 33.128's ASN.1 (Phase 8b).
+[[bin]]
+name = "ingest-li"
+path = "src/bin/ingest_li.rs"

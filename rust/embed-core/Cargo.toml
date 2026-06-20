@@ -1,0 +1,45 @@
+# embed-core — the shared BGE-M3 inference, exposed as a cdylib over a tiny C ABI so the Go
+# serve query-embed can call the SAME Rust embedder the corpus pipeline uses (Phase 1 of the
+# write-side→Rust plan: resolve the internal/embed write/read coupling). This baseline crate
+# ships a DETERMINISTIC hash embedder (no ort) so the FFI seam — cdylib → cgo → Go — is
+# end-to-end testable locally with no model/GPU. The real ort/BGE-M3 inference plugs into the
+# SAME exported symbols behind the `ort` feature (built + validated in CI with the model).
+[package]
+name = "embed-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shared BGE-M3 inference exposed as a cdylib + C ABI for the Go serve query-embed (Phase 1 FFI)."
+
+[lib]
+name = "embed_core"
+crate-type = ["cdylib", "rlib"]
+
+# Smoke bin for the Kaggle FFI-validation kernel: embed test queries via the C ABI + print
+# norms (real model with --features ort,cuda on GPU; hash baseline otherwise).
+[[bin]]
+name = "embed-core-check"
+path = "src/bin/check.rs"
+
+[dependencies]
+sha2 = "0.10"
+# Real BGE-M3 ONNX inference (single-query, serve-side). Pinned IN LOCKSTEP with
+# rust/embedder so the query vector is bit-identical to the corpus vector.
+# load-dynamic (NOT download-binaries): the cdylib dlopens libonnxruntime.so at
+# runtime from ORT_DYLIB_PATH instead of bundling its OWN copy. This is the fix for
+# the FFI-flip blocker — when serve is built -tags onnx,embed_ffi the reranker
+# (Go/onnxrt) and embed (this cdylib) must share ONE onnxruntime in the process, not
+# load two (different versions → symbol clash). Runtime contexts (Kaggle kernels,
+# the prod image) set ORT_DYLIB_PATH to the shipped libonnxruntime.so.
+ort = { version = "=2.0.0-rc.9", features = ["ndarray", "load-dynamic"], optional = true }
+ndarray = { version = "0.16", optional = true }
+tokenizers = { version = "0.20", optional = true }
+anyhow = { version = "1", optional = true }
+
+[features]
+# `ort` swaps the deterministic baseline for the real BGE-M3 ONNX inference (CI/Kaggle only,
+# needs the model + onnxruntime). Default = the hash baseline so the seam builds/tests anywhere.
+# CPU-only by default (serve query-embed is one query); `cuda` is a sub-feature for GPU boxes.
+default = []
+ort = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:anyhow"]
+cuda = ["ort/cuda"]

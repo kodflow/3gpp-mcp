@@ -262,7 +262,14 @@ func serve(args []string) error {
 		}
 	}
 
-	srv, eng := mcp.New(st, Version, *release, vecShards, etsiSt)
+	// Pass the ETSI store as a Reader. Build the interface explicitly so a nil
+	// *store.Store does NOT become a non-nil typed-nil interface (Go gotcha) —
+	// mcp's `etsi != nil` federation check must see a genuine nil when absent.
+	var etsiReader store.Reader
+	if etsiSt != nil {
+		etsiReader = etsiSt
+	}
+	srv, eng := mcp.New(st, Version, *release, vecShards, etsiReader)
 	scope := *release
 	if scope == "" {
 		scope = "latest"

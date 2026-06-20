@@ -6,8 +6,13 @@
 # $EMBED_MODEL env for a one-off run) picks which model the embedder loads.
 #
 # Identity: family / revision / tokenizer_revision / dim / normalization / precision
-# are folded into the EmbedIdentity — change any and the re-embed + serve-compat
-# gates fire, so an fp16 corpus and an fp32 query can never share one HNSW.
+# / windowing / max_tokens are folded into the EmbedIdentity — change any and the
+# re-embed + serve-compat gates fire, so an fp16 corpus and an fp32 query (or a
+# truncate corpus and a mean_pool corpus) can never share one HNSW.
+#
+# windowing (truncate|mean_pool) and max_tokens default to truncate / 1024 when
+# omitted, so a registry that does not set them yields the SAME identity as one that
+# declares the defaults — the Kaggle fp16 and data-image registries stay coherent.
 #
 # Runtime tuning stays in env, NOT here (it doesn't change the vectors' identity):
 #   ORT_EP=cpu|cuda · EMBED_PIPELINE · EMBED_GRAPH_OPT · BGE_BATCH · EMBED_BUCKET_WINDOW
@@ -36,3 +41,16 @@ models:
     tokenizer_dir: data/models/bge-m3   # fp16 export often ships the model only
     inputs: [input_ids, attention_mask]
     output: sentence_embedding
+
+  - name: bge-m3-sparse     # dual-head export: dense sentence_embedding + the learned
+    family: bge-m3          # lexical sparse_weights head. Validated live on Kaggle
+    dir: data/models/bge-m3-sparse  # (both outputs present; sparse byte-exact vs
+    precision: fp32         # FlagEmbedding, maxdiff 0.0000). Published as Kaggle Dataset
+    dim: 1024               # extazy937/bge-m3-sparse-onnx. Bake at `dir` so serve can
+    normalization: l2       # sparse-embed the QUERY (the sparse arm's serve side); the
+    revision: 5617a9f       # corpus sparse pass fills clause_sparse.
+    tokenizer_revision: 5617a9f
+    tokenizer_dir: data/models/bge-m3
+    inputs: [input_ids, attention_mask]
+    output: sentence_embedding
+    sparse_output: sparse_weights   # <- the head that makes SparseModelID non-empty

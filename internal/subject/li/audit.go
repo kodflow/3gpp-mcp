@@ -99,7 +99,7 @@ func parentClause(p string) string {
 // then the best-matching clause WITHIN the cited spec; when no clause co-locates
 // the tokens it searches the WHOLE index to relocate the event to its true spec
 // — turning a bare "suspect" into "WRONG_SPEC_REF, real home = X §Y".
-func AuditCatalog(ctx context.Context, st *store.Store, events []SentinelEvent) ([]Finding, error) {
+func AuditCatalog(ctx context.Context, st store.Reader, events []SentinelEvent) ([]Finding, error) {
 	type idx struct{ byPath map[string]string }
 	cache := map[string]idx{}
 	loadSpec := func(spec string) idx {
@@ -155,7 +155,7 @@ func AuditCatalog(ctx context.Context, st *store.Store, events []SentinelEvent) 
 // bestHit returns the best token-coverage clause for name, optionally scoped to
 // onlySpec (empty = whole index). It ranks via the store's lexical search then
 // re-scores each hit by event-token co-location.
-func bestHit(ctx context.Context, st *store.Store, name string, tk []string, onlySpec string) (string, string, float64) {
+func bestHit(ctx context.Context, st store.Reader, name string, tk []string, onlySpec string) (string, string, float64) {
 	hits, err := st.SearchClauses(ctx, store.SearchQuery{Text: name, Filter: store.SpecFilter{SpecID: onlySpec}, TopK: 8})
 	if err != nil {
 		return "", "", 0
@@ -171,7 +171,7 @@ func bestHit(ctx context.Context, st *store.Store, name string, tk []string, onl
 }
 
 // relocate finds the event's true home in a spec OTHER than the cited one.
-func relocate(ctx context.Context, st *store.Store, tk []string, name, citedSpec string) (string, string, string, float64) {
+func relocate(ctx context.Context, st store.Reader, tk []string, name, citedSpec string) (string, string, string, float64) {
 	hits, err := st.SearchClauses(ctx, store.SearchQuery{Text: name, TopK: 12})
 	if err != nil {
 		return "", "", "", 0

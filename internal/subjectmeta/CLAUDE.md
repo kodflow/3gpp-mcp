@@ -6,11 +6,16 @@ The CGO-free source of truth for **which domain subjects exist, what version eac
 is at, and which 3GPP series each owns** — the metadata the incremental corpus
 build uses to detect a *changed subject* and re-index only its series.
 
-Separate from `internal/subject` + `internal/registry` because `cmd/discover`
+Separate from `internal/subject` + `internal/registry` because the discoverer
 runs **without CGO** (it only fetches + diffs the 3GPP status report) and so
 cannot import the concrete subjects, which transitively pull in the DuckDB CGO
-store. `subjectmeta` has zero CGO deps, so `discover`, `merge`, and `ingest`
-all share it.
+store. `subjectmeta` has zero CGO deps.
+
+Since the write-side moved to Rust (arch-change 2026-06-19), the production
+consumers — discover, merge, ingest — are Rust and use the `identity3gpp` crate
+(`rust/identity`), the byte-for-byte port of this subsystem. The Go package
+remains as the CGO-free reference these digests are kept identical to (see
+`rust/identity/src/lib.rs`).
 
 ## Structure
 

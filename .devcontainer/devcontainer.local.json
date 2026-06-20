@@ -1,7 +1,8 @@
 {
-  "// note": "Project overrides — preserved by /update. Enables what the 3GPP MCP product needs to build/ingest: Go (DuckDB+ONNX CGO), LibreOffice (DOCX/DOC -> HTML for scripts/corpus.sh), Python (batch scripts).",
+  "// note": "Project overrides — preserved by /update. Enables what the 3GPP MCP product needs to build/ingest: Go (DuckDB+ONNX CGO, read/MCP side), Rust (rust/embedder + the write-side migration — ort/tokenizers/duckdb crates), LibreOffice (DOCX/DOC -> HTML for scripts/corpus.sh), Python (batch scripts).",
   "features": {
     "./features/languages/go": {},
+    "./features/languages/rust": {},
     "./features/libreoffice": {},
     "ghcr.io/kodflow/devcontainer-features/python:1": {}
   },
@@ -9,6 +10,7 @@
     "vscode": {
       "extensions": [
         "golang.go",
+        "rust-lang.rust-analyzer",
         "ms-python.python",
         "ms-python.vscode-pylance",
         "redhat.vscode-yaml",

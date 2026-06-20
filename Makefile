@@ -8,7 +8,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
+.PHONY: all build build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
 
 all: build ## Build the binary
 
@@ -18,30 +18,27 @@ build: ## Build static binary into bin/
 
 build-onnx: ## Build with the real BGE-M3 semantic backend (run `make model` first)
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx,embed_ffi -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
-ingest: ## Build and run one-shot ingestion CLI
+build-ffi: ## Build serve on the Rust embed-core cdylib (FFI query-embed; Phase 11 target). Add `--features ort` to the cargo line for the real BGE-M3 backend.
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest ./cmd/ingest
-	./$(BUILD_DIR)/$(BIN)-ingest $(ARGS)
+	cargo build --release --manifest-path rust/embed-core/Cargo.toml
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags embed_ffi -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
-ingest-onnx: ## Build + ingest with real BGE-M3 vectors (run `make model` first)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags onnx -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest ./cmd/ingest
-	ONNXRUNTIME_SHARED_LIBRARY_PATH=$(ORT_LIB) ./$(BUILD_DIR)/$(BIN)-ingest $(ARGS)
+ingest: ## Build and run the Rust ingest (parse3gpp + store-rs)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest
+	./rust/target/release/ingest $(ARGS)
 
 fetch-apis: ## Fetch the 5GC OpenAPI YAML corpus from 3GPP Forge (ARGS=releases)
 	./scripts/fetch-5g-apis.sh $(ARGS)
 
-ingest-openapi: ## Build + load the 5GC OpenAPI corpus into the DuckDB (additive)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest-openapi ./cmd/ingest-openapi
-	./$(BUILD_DIR)/$(BIN)-ingest-openapi $(ARGS)
+ingest-openapi: ## Build + load the 5GC OpenAPI corpus into the DuckDB (additive; Rust)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-openapi
+	./rust/target/release/ingest-openapi --src data/sources/5g-apis --db data/3gpp.duckdb
 
-ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive)
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN)-ingest-catalog ./cmd/ingest-catalog
-	./$(BUILD_DIR)/$(BIN)-ingest-catalog $(ARGS)
+ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive; Rust)
+	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-catalog
+	./rust/target/release/ingest-catalog $(ARGS)
 
 serve: build ## Start MCP server on stdio
 	./$(BUILD_DIR)/$(BIN) serve

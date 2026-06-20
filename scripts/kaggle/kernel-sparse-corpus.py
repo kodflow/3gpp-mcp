@@ -75,6 +75,15 @@ def res(m):
 
 
 try:
+    # GPU presence marker (read by CI's kaggle-gpu-check.sh for the quota fallback):
+    # a no-GPU session means this account's weekly GPU quota is exhausted, so the CI
+    # falls back to the other Kaggle account. Mirrors the rust/embed kernels.
+    _g = sh("nvidia-smi -L")
+    if _g.returncode == 0 and _g.stdout.strip():
+        res("gpu=present detail=%s" % _g.stdout.splitlines()[0].strip())
+    else:
+        res("gpu=absent (CPU fallback — GPU not attached to this worker)")
+
     if not GHCR_PAT:
         res("fail ghcr_pat_missing")
         sys.exit(0)
@@ -182,10 +191,10 @@ try:
     if b.returncode != 0:
         res("fail build_embed " + (b.stderr or "")[-400:])
         sys.exit(0)
-    # cmd/overlay carries an attached shard's clause_sparse onto the base (overlaySparse)
-    # — the RESUME carry-over. Built with the same onnx tag so the binary links the same
-    # go-duckdb engine that wrote the base.
-    bo = sh('cd %s && go build -tags onnx -o %s/overlay ./cmd/overlay' % (src, TMP), env=benv)
+    # The RUST overlay (store-rs) carries an attached shard's clause_sparse onto the base by
+    # natural identity — the RESUME carry-over. libduckdb is statically bundled (same engine
+    # the round-trip CI proves byte-compatible with the Go serve side).
+    bo = sh('cd %s && cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay && cp rust/target/release/overlay %s/overlay' % (src, TMP), env=benv)
     if bo.returncode != 0:
         res("fail build_overlay " + (bo.stderr or "")[-400:])
         sys.exit(0)

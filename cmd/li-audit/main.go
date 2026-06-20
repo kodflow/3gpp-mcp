@@ -23,7 +23,7 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	st, err := store.Open(*db)
+	st, err := store.OpenReadOnly(*db) // li-audit only reads (AuditCatalog/SearchClauses)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(1)

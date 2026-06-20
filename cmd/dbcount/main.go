@@ -40,7 +40,7 @@ func main() {
 }
 
 func run(ctx context.Context, path string) error {
-	s, err := store.Open(path)
+	s, err := store.OpenReadOnly(path) // dbcount only reads row counts
 	if err != nil {
 		return err
 	}
