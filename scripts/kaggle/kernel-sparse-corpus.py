@@ -122,16 +122,33 @@ try:
             return dense, sparse
 
     enc = m3.tokenizer(["AMF SMF N4 registration"], return_tensors="pt", padding=True, truncation=True, max_length=8192)
-    torch.onnx.export(
-        DenseSparse(backbone, sparse_linear).eval(),
-        (enc["input_ids"], enc["attention_mask"]), MDIR + "/model.onnx",
+    args = (enc["input_ids"], enc["attention_mask"])
+    common = dict(
         input_names=["input_ids", "attention_mask"],
         output_names=["sentence_embedding", "sparse_weights"],
         dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"},
                       "sentence_embedding": {0: "batch"}, "sparse_weights": {0: "batch", 1: "seq"}},
-        opset_version=18, export_params=True, do_constant_folding=True)
+        opset_version=18)
+    # BGE-M3 fp32 weights are ~2.2 GB, OVER the 2 GB ONNX protobuf limit → they MUST be
+    # written as external data (model.onnx_data). An inline export produces a corrupt model
+    # that HANGS embed-core at load (the 4h "Output 0 B" spins). Save the dynamo ONNXProgram
+    # with external_data=True; fall back to the legacy exporter if the API shape differs.
+    model = DenseSparse(backbone, sparse_linear).eval()
+    try:
+        prog = torch.onnx.export(model, args, dynamo=True, **common)
+        prog.save(MDIR + "/model.onnx", external_data=True)
+    except Exception as e:
+        print("dynamo external-data save failed (%s) — legacy fallback" % e, flush=True)
+        torch.onnx.export(model, args, MDIR + "/model.onnx",
+                          export_params=True, do_constant_folding=True, **common)
     m3.tokenizer.save_pretrained(MDIR)
-    res("model_exported has_data=%s" % os.path.exists(MDIR + "/model.onnx_data"))
+    has_data = os.path.exists(MDIR + "/model.onnx_data")
+    res("model_exported has_data=%s" % has_data)
+    # FAIL-FAST: without the external-data sidecar a >2GB model is unloadable; abort here
+    # (a few minutes) instead of hanging hours in embed-core at the first inference.
+    if not has_data:
+        res("fail model_export_no_external_data (>2GB model needs model.onnx_data)")
+        sys.exit(0)
 
     # --- 2. Toolchain: Go (from go.mod), crane, ORT-gpu ----------------------
     gomod = sh('curl -fsSL --retry 5 "%s/raw/%s/go.mod"' % (REPO, BRANCH)).stdout
