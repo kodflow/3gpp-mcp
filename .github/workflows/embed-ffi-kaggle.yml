@@ -1,0 +1,94 @@
+# =============================================================================
+#  Embed · FFI check (Kaggle GPU)   — Phase-1 embed-core validation
+# =============================================================================
+#  Validates the Rust serve query-embed (rust/embed-core --features ort,cuda) on a real
+#  GPU with the real BGE-M3 model: pushes scripts/kaggle/kernel-embed-ffi-check.py, which
+#  builds the cdylib + check bin and embeds a few test queries, then pulls ffi-check.json.
+#  MANUAL (workflow_dispatch) only. Two-account GPU fallback (primary → fallback), same as
+#  corpus-rust-embed-kaggle. No credentials in the kernel; the runner holds the Kaggle key.
+name: Embed · FFI check (Kaggle GPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "branch the kernel clones + builds"
+        required: false
+        default: perf/embedder-dynamic-batch
+      queries:
+        description: "pipe-separated test queries"
+        required: false
+        default: "AMF registration procedure|lawful interception X2 interface|UPF session establishment"
+      kaggle_account:
+        description: "primary | fallback (which account to try first)"
+        required: false
+        default: primary
+
+jobs:
+  ffi-check:
+    runs-on: ubuntu-latest
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
+      KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_USERNAME_FALLBACK: ${{ vars.KAGGLE_USERNAME_FALLBACK || secrets.KAGGLE_USERNAME_FALLBACK }}
+      KAGGLE_ACCOUNT: ${{ github.event.inputs.kaggle_account || 'primary' }}
+      BRANCH: ${{ github.event.inputs.branch || 'perf/embedder-dynamic-batch' }}
+      FFI_QUERIES: ${{ github.event.inputs.queries }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kaggle CLI
+        run: pipx install kaggle || pip install --user kaggle
+      - name: Dispatch FFI-check kernel (two-account GPU fallback)
+        run: |
+          set -euo pipefail
+          PRIM_TOK="${KAGGLE_API_TOKEN:-}"; PRIM_USER="${KAGGLE_USERNAME:-}"
+          FB_TOK="${KAGGLE_API_TOKEN_FALLBACK:-}"; FB_USER="${KAGGLE_USERNAME_FALLBACK:-}"
+          case "${KAGGLE_ACCOUNT:-primary}" in
+            fallback) ORDER="fallback primary" ;;
+            *) ORDER="primary fallback" ;;
+          esac
+          dispatch() {
+            dir="$RUNNER_TEMP/ffi-kernel"; rm -rf "$dir"; mkdir -p "$dir"
+            slug="${KAGGLE_USERNAME}/3gpp-embed-ffi-check"
+            {
+              echo "import os"
+              echo "os.environ.setdefault('BRANCH', '${BRANCH}')"
+              echo "os.environ.setdefault('FFI_QUERIES', '''${FFI_QUERIES}''')"
+              cat scripts/kaggle/kernel-embed-ffi-check.py
+            } > "$dir/kernel.py"
+            printf '{\n "id": "%s",\n "title": "3gpp embed ffi check",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true\n}\n' "$slug" > "$dir/kernel-metadata.json"
+            kaggle kernels push -p "$dir" --accelerator NvidiaTeslaT4
+            echo "waiting 90s for the new kernel version to start…"; sleep 90
+            done_poll=""
+            for i in $(seq 1 240); do
+              st="$(kaggle kernels status "$slug" 2>&1 || true)"
+              echo "poll $i: $st"
+              case "$st" in
+                *running*|*RUNNING*|*queued*|*QUEUED*) sleep 30; continue ;;
+                *complete*|*COMPLETE*) echo "kernel complete"; done_poll=1; break ;;
+                *error*|*ERROR*|*cancel*|*CANCEL*|*fail*|*FAIL*|*"not found"*|*404*) echo "::warning::kernel ended: $st"; done_poll=1; break ;;
+                *) sleep 30 ;;
+              esac
+            done
+            [ -n "$done_poll" ] || echo "::warning::poll cap reached"
+            mkdir -p out
+            for a in 1 2 3 4; do kaggle kernels output "$slug" -p out && break; echo "pull $a failed"; sleep 15; done
+            echo "=== ffi-check.json ==="; cat out/ffi-check.json 2>/dev/null || echo "(none)"
+            echo "=== kernel log tail ==="; tail -n 80 out/*.log 2>/dev/null || true
+            python3 -c "import json,sys; d=json.load(open('out/ffi-check.json')); print('FFI OK' if d.get('ok') else 'FFI FAIL'); sys.exit(0 if d.get('ok') else 1)"
+          }
+          for acct in $ORDER; do
+            case "$acct" in
+              primary)  export KAGGLE_USERNAME="$PRIM_USER" KAGGLE_KEY="$PRIM_TOK" ;;
+              fallback) export KAGGLE_USERNAME="$FB_USER"   KAGGLE_KEY="$FB_TOK" ;;
+            esac
+            [ -n "${KAGGLE_KEY:-}" ] && [ -n "${KAGGLE_USERNAME:-}" ] || { echo "account '$acct' not configured — skip"; continue; }
+            echo "::group::Kaggle account=$acct user=$KAGGLE_USERNAME"
+            if ! kaggle kernels list -m -p 1 >/dev/null 2>&1; then
+              echo "::warning::account '$acct' auth failed — trying next"; echo "::endgroup::"; continue
+            fi
+            if dispatch; then echo "::endgroup::"; exit 0; fi
+            echo "::endgroup::"
+          done
+          echo "::error::no account produced a passing FFI check"; exit 1

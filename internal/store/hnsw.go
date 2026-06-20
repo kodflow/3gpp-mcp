@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 )
 
 // HNSW "build-then-freeze" (axis #6): the index is a disposable cache over the
@@ -32,10 +33,22 @@ func OpenReadOnly(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
+	ctx := context.Background()
 	// Read-only: schema already exists; just detect FTS presence like Open does.
-	_ = s.LoadFTS(context.Background())
+	_ = s.LoadFTS(ctx)
+	// Producer marker (migration Phase 11a A14): a DB built by the Rust write-side stamps
+	// schema_meta.producer + .schema_version. Warn (never fail) on a schema_version the
+	// read side wasn't built for — a self-describing guard that the served corpus matches.
+	if v := s.GetMeta(ctx, "schema_version"); v != "" && v != ExpectedSchemaVersion {
+		fmt.Fprintf(os.Stderr, "[store] WARNING: corpus schema_version=%q != expected %q (producer=%q) — read side may be stale\n",
+			v, ExpectedSchemaVersion, s.GetMeta(ctx, "producer"))
+	}
 	return s, nil
 }
+
+// ExpectedSchemaVersion is the schema_meta.schema_version the read side is built for; a
+// producer (Go ingest or the Rust write-side) stamps the DB with its version.
+const ExpectedSchemaVersion = "1"
 
 // VSSAvailable reports whether a verified, frozen HNSW index is usable. When
 // false, vector search degrades to an exact full-scan (still correct, just O(N)).

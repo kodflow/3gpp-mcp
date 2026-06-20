@@ -9,8 +9,6 @@ import (
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
-	"github.com/kodflow/3gpp-mcp/internal/subject/li"
-	"github.com/kodflow/3gpp-mcp/internal/subject/li/asn1"
 )
 
 // When the ASN.1 registry was ingested, li_events must answer from it
@@ -38,19 +36,13 @@ func TestLIEventsAuthoritative(t *testing.T) {
 		}})
 	}
 
-	base := []asn1.Event{
-		{Interface: "X2", Name: "registration", Type: "AMFRegistration", Tag: 1, NF: "AMF", Domain: "5GC", Clause: "6.2.2.2", FieldCount: 32},
-		{Interface: "X2", Name: "deregistration", Type: "AMFDeregistration", Tag: 2, NF: "AMF", Domain: "5GC", Clause: "6.2.2.2", FieldCount: 13},
-	}
-	if err := li.InsertEvents(st, "Rel-18", "r18 version14", base); err != nil {
-		t.Fatal(err)
-	}
+	// Rel-18 baseline: two authoritative AMF X2 events.
+	seedLIEvent(t, st, "Rel-18", "r18 version14", "X2", "registration", "AMFRegistration", 1, "AMF", "6.2.2.2", 32)
+	seedLIEvent(t, st, "Rel-18", "r18 version14", "X2", "deregistration", "AMFDeregistration", 2, "AMF", "6.2.2.2", 13)
 	// Rel-19 keeps the two and adds one new AMF X2 event.
-	later := append(append([]asn1.Event{}, base...),
-		asn1.Event{Interface: "X2", Name: "locationUpdate", Type: "AMFLocationUpdate", Tag: 3, NF: "AMF", Domain: "5GC", Clause: "6.2.2.2", FieldCount: 10})
-	if err := li.InsertEvents(st, "Rel-19", "r19 version6", later); err != nil {
-		t.Fatal(err)
-	}
+	seedLIEvent(t, st, "Rel-19", "r19 version6", "X2", "registration", "AMFRegistration", 1, "AMF", "6.2.2.2", 32)
+	seedLIEvent(t, st, "Rel-19", "r19 version6", "X2", "deregistration", "AMFDeregistration", 2, "AMF", "6.2.2.2", 13)
+	seedLIEvent(t, st, "Rel-19", "r19 version6", "X2", "locationUpdate", "AMFLocationUpdate", 3, "AMF", "6.2.2.2", 10)
 
 	c := mustClient(t, st)
 
@@ -87,11 +79,7 @@ func TestResolveTermASN1(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
 	_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-18", Version: "18.15.0"})
-	if err := li.InsertASN1Types(st, "33.128", "Rel-18", []asn1.TypeDef{
-		{Name: "AMFRegistration", Kind: "SEQUENCE", Members: []asn1.Member{{Name: "sUPI", Type: "SUPI", Tag: 1}}},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	seedASN1Type(t, st, "Rel-18", "AMFRegistration", "SEQUENCE", `[{"name":"sUPI","type":"SUPI","tag":1}]`)
 
 	c := mustClient(t, st)
 	got := call(t, c, ctx, "resolve_term", map[string]any{"term": "AMFRegistration"})
@@ -112,6 +100,30 @@ func chunkFor(rel string) uint64 {
 		return 2
 	}
 	return 1
+}
+
+// seedLIEvent inserts one authoritative li_events row directly. The Go LI write
+// helpers (li.InsertEvents/…) were removed in Phase 11b — Rust owns ingest — so
+// the read-path tests seed their fixtures with plain SQL over the test DB.
+func seedLIEvent(t *testing.T, st *store.Store, release, moduleVersion, iface, name, typ string, tag int, nf, clause string, fieldCount int) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO li_events
+		 (spec_id, release, module_version, interface, event_name, asn1_type, asn1_tag, originating_nf, domain, spec_clause, field_count)
+		 VALUES ('33.128', ?, ?, ?, ?, ?, ?, ?, '5GC', ?, ?)`,
+		release, moduleVersion, iface, name, typ, tag, nf, clause, fieldCount); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedASN1Type inserts one asn1_types row directly (see seedLIEvent rationale).
+func seedASN1Type(t *testing.T, st *store.Store, release, name, kind, membersJSON string) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO asn1_types (spec_id, release, type_name, kind, members) VALUES ('33.128', ?, ?, ?, ?)`,
+		release, name, kind, membersJSON); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // search_api must answer from the api_* tables with a SHA-pinned forge citation.

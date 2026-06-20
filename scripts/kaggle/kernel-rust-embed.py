@@ -60,9 +60,38 @@ def have(cmd):
     return shutil.which(cmd) is not None
 
 
+def srchash(src):
+    """Deterministic hash of the rust/embedder sources, so the cached build/model is
+    reused only while the code is unchanged. Returns '' on any error (cache disabled)."""
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        root = os.path.join(src, "rust/embedder")
+        files = sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True))
+        files += [os.path.join(root, "Cargo.toml"), os.path.join(root, "Cargo.lock")]
+        for p in files:
+            if os.path.isfile(p):
+                h.update(os.path.relpath(p, root).encode())
+                with open(p, "rb") as f:
+                    h.update(f.read())
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
 def duckdb_scalar(db, query):
     r = sh('duckdb "%s" -noheader -list "%s"' % (db, query))
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def gpu_count():
+    """Number of CUDA GPUs visible (Kaggle gives T4 x2; a rented box may give more).
+    Falls back to 1 on any error so the single-GPU path always works."""
+    r = sh("nvidia-smi -L")
+    if r.returncode != 0:
+        return 1
+    n = sum(1 for ln in r.stdout.splitlines() if ln.strip().startswith("GPU "))
+    return max(1, n)
 
 
 # ---- config ----------------------------------------------------------------
@@ -196,41 +225,73 @@ say("sliced_clauses=%s" % sln)
 if not (sln.isdigit() and int(sln) >= 1):
     fail("empty_slice", "shard=%s" % SHARD)
 
+# ---- tool cache (FAIL-OPEN) -------------------------------------------------
+# Reuse the built embedder binary + libonnxruntime.so + the fp16 model across resume
+# passes of this shard, guarded by a hash of the rust/embedder sources (a code change
+# rebuilds). ANY failure here falls through to the normal download+build path below —
+# the cache can never block a run. Persisted once (on the build pass) into the per-shard
+# resume Dataset; restored on the next pass to skip ~10 min of cargo build + model fetch.
+CACHED_BIN = ""
+CACHED_LIBDIR = ""
+CACHED_MODEL = ""
+SRCHASH = srchash(src)
+try:
+    hits = sorted(glob.glob("/kaggle/input/**/embedder-cache/srchash.txt", recursive=True))
+    if SRCHASH and hits and open(hits[0]).read().strip() == SRCHASH:
+        cdir = os.path.dirname(hits[0])
+        cbin = os.path.join(cdir, "embedder")
+        cso = sorted(glob.glob(os.path.join(cdir, "libonnxruntime.so*")), key=len)
+        cmod = os.path.join(cdir, "bge-m3-fp16")
+        if os.path.isfile(cbin) and cso and os.path.isfile(os.path.join(cmod, "model.onnx_data")):
+            os.chmod(cbin, 0o755)
+            CACHED_BIN, CACHED_LIBDIR, CACHED_MODEL = cbin, os.path.dirname(cso[0]), cmod
+            say("toolcache=hit srchash=%s" % SRCHASH[:12])
+except Exception as e:
+    say("toolcache=error detail=%s" % str(e)[:80])
+if not CACHED_BIN:
+    say("toolcache=miss srchash=%s (build+fetch this run)" % (SRCHASH[:12] or "none"))
+
 # ---- BGE-M3 model files (external-data ONNX + tokenizer) -------------------
-BGE = os.path.join(WORK, "bge-m3")
-os.makedirs(BGE, exist_ok=True)
-for url, dest in (
-    ("%s/onnx/model.onnx" % HF, "%s/model.onnx" % BGE),
-    ("%s/onnx/model.onnx_data" % HF, "%s/model.onnx_data" % BGE),
-    ("%s/tokenizer.json" % HF, "%s/tokenizer.json" % BGE),
-):
-    if not os.path.isfile(dest):
-        if sh('curl -fSL --retry 5 -C - -A "Mozilla/5.0" "%s" -o "%s"' % (url, dest)).returncode != 0:
-            fail("model_dl", url)
-say("model_data_bytes=%d" % (os.path.getsize("%s/model.onnx_data" % BGE)))
+if CACHED_MODEL:
+    BGE16 = CACHED_MODEL
+    say("model=cached %s" % BGE16)
+else:
+    BGE = os.path.join(WORK, "bge-m3")
+    os.makedirs(BGE, exist_ok=True)
+    for url, dest in (
+        ("%s/onnx/model.onnx" % HF, "%s/model.onnx" % BGE),
+        ("%s/onnx/model.onnx_data" % HF, "%s/model.onnx_data" % BGE),
+        ("%s/tokenizer.json" % HF, "%s/tokenizer.json" % BGE),
+    ):
+        if not os.path.isfile(dest):
+            if sh('curl -fSL --retry 5 -C - -A "Mozilla/5.0" "%s" -o "%s"' % (url, dest)).returncode != 0:
+                fail("model_dl", url)
+    say("model_data_bytes=%d" % (os.path.getsize("%s/model.onnx_data" % BGE)))
 
 # ---- fp16 conversion (keep_io_types) — kernel-identical to corpus-data-image.yml.
 # fp16 is ~2-6x faster on T4 Tensor Cores AND halves attention memory; the served data
 # image bakes fp16, so the campaign MUST be fp16 for the EmbedIdentity to match (else
 # semantic is refused at serve). keep_io_types keeps fp32 IO so the Rust embedder reads
-# []f32 unchanged — only the weights become fp16.
-BGE16 = os.path.join(WORK, "bge-m3-fp16")
-os.makedirs(BGE16, exist_ok=True)
-sh("python3 -m pip install --quiet onnx onnxruntime sympy packaging")
-conv = os.path.join(WORK, "convfp16.py")
-with open(conv, "w") as f:
-    f.write(
-        "import onnx\n"
-        "from onnxruntime.transformers.onnx_model import OnnxModel\n"
-        "m = onnx.load('%s/model.onnx')\n"
-        "om = OnnxModel(m); om.convert_float_to_float16(keep_io_types=True)\n"
-        "onnx.save(om.model, '%s/model.onnx', save_as_external_data=True, "
-        "all_tensors_to_one_file=True, location='model.onnx_data')\n"
-        "print('fp16_saved')\n" % (BGE, BGE16)
-    )
-if sh("python3 %s" % conv).returncode != 0 or not os.path.isfile("%s/model.onnx_data" % BGE16):
-    fail("fp16_convert")
-sh("cp '%s/tokenizer.json' '%s/'" % (BGE, BGE16))
+# []f32 unchanged — only the weights become fp16. Skipped entirely when the toolcache
+# restored a ready fp16 model.
+if not CACHED_MODEL:
+    BGE16 = os.path.join(WORK, "bge-m3-fp16")
+    os.makedirs(BGE16, exist_ok=True)
+    sh("python3 -m pip install --quiet onnx onnxruntime sympy packaging")
+    conv = os.path.join(WORK, "convfp16.py")
+    with open(conv, "w") as f:
+        f.write(
+            "import onnx\n"
+            "from onnxruntime.transformers.onnx_model import OnnxModel\n"
+            "m = onnx.load('%s/model.onnx')\n"
+            "om = OnnxModel(m); om.convert_float_to_float16(keep_io_types=True)\n"
+            "onnx.save(om.model, '%s/model.onnx', save_as_external_data=True, "
+            "all_tensors_to_one_file=True, location='model.onnx_data')\n"
+            "print('fp16_saved')\n" % (BGE, BGE16)
+        )
+    if sh("python3 %s" % conv).returncode != 0 or not os.path.isfile("%s/model.onnx_data" % BGE16):
+        fail("fp16_convert")
+    sh("cp '%s/tokenizer.json' '%s/'" % (BGE, BGE16))
 # The fp16 model registry — fields MUST match corpus-data-image.yml's models.yaml so
 # cmd/embedid emits the SAME identity the served fp16 image expects (dir is irrelevant
 # to the identity — only family/precision/dim/normalization/revision are).
@@ -253,59 +314,158 @@ with open(MODELS_YAML, "w") as f:
     )
 EMBED_MODEL_ENV = {**os.environ, "EMBED_MODELS_CONFIG": MODELS_YAML}
 
-# ---- build the Go bridge + the Rust embedder -------------------------------
-if sh("CGO_ENABLED=1 go build -o /tmp/embed-io ./cmd/embed-io").returncode != 0:
-    fail("build_embed_io")
+# ---- build the RUST embed-io bridge (store-rs) + the embedder --------------
+# Phase 11b: the DuckDB I/O bridge is the RUST embed-io (store-rs) — the Go cmd/embed-io
+# is deleted. The same binary rust-go-roundtrip CI proves byte-compatible with the Go
+# serve side; libduckdb is statically bundled (no LD_LIBRARY_PATH). Rust export is
+# inherently resume (worklist = clauses WHERE embedding IS NULL), so no --resume flag.
+bio = sh("cargo build --release --manifest-path rust/store/Cargo.toml --bin embed-io")
+if bio.returncode != 0:
+    fail("build_embed_io_rs", (bio.stderr or "")[-200:])
+EMBED_IO, RESUME_FLAG = os.path.join(src, "rust/target/release/embed-io"), ""
+say("embed_io=rust")
 # fp16 identity (EMBED_MODELS_CONFIG → cmd/embedid resolves the fp16 model).
 ID = sh("CGO_ENABLED=1 go run ./cmd/embedid", env=EMBED_MODEL_ENV).stdout.strip()
 if not re.match(r"^[0-9a-f]{6,}$", ID):
     fail("bad_identity", ID)
 say("embed_identity=%s (fp16)" % ID)
-bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
-if bc.returncode != 0:
-    fail("cargo_build", (bc.stderr or "")[-200:])
-EMBEDDER = os.path.join(src, "rust/embedder/target/release/embedder")
-# ort's `download-binaries` fetches libonnxruntime.so at BUILD time into the ort-sys
-# OUT_DIR, but the release binary has no $ORIGIN RPATH, so at RUNTIME it can't find the
-# lib (error 127: "libonnxruntime.so: cannot open shared object file"). Locate the .so
-# anywhere under target/ and prepend its dir to LD_LIBRARY_PATH for the embedder run.
-_ortlibs = sorted(
-    glob.glob(os.path.join(src, "rust/embedder/target/release/**/libonnxruntime.so*"), recursive=True),
-    key=len,
-)
-if _ortlibs:
-    _libdir = os.path.dirname(_ortlibs[0])
-    os.environ["LD_LIBRARY_PATH"] = _libdir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
-    say("ort_lib=%s" % _ortlibs[0])
+if CACHED_BIN:
+    # Toolcache hit: skip the ~5-10 min cargo build, run the cached binary + its .so.
+    EMBEDDER = CACHED_BIN
+    os.environ["LD_LIBRARY_PATH"] = CACHED_LIBDIR + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    say("cargo=cached ort_lib=%s/libonnxruntime.so" % CACHED_LIBDIR)
 else:
-    say("ort_lib=NONE (libonnxruntime.so not found under target/ — embed will fail)")
+    bc = sh("cargo build --release --manifest-path rust/embedder/Cargo.toml")
+    if bc.returncode != 0:
+        fail("cargo_build", (bc.stderr or "")[-200:])
+    EMBEDDER = os.path.join(src, "rust/embedder/target/release/embedder")
+    # ort's `download-binaries` fetches libonnxruntime.so at BUILD time into the ort-sys
+    # OUT_DIR, but the release binary has no $ORIGIN RPATH, so at RUNTIME it can't find the
+    # lib (error 127: "libonnxruntime.so: cannot open shared object file"). Locate the .so
+    # anywhere under target/ and prepend its dir to LD_LIBRARY_PATH for the embedder run.
+    _ortlibs = sorted(
+        glob.glob(os.path.join(src, "rust/embedder/target/release/**/libonnxruntime.so*"), recursive=True),
+        key=len,
+    )
+    if _ortlibs:
+        _libdir = os.path.dirname(_ortlibs[0])
+        os.environ["LD_LIBRARY_PATH"] = _libdir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+        say("ort_lib=%s" % _ortlibs[0])
+    else:
+        say("ort_lib=NONE (libonnxruntime.so not found under target/ — embed will fail)")
 
 # ---- export → embed → import ----------------------------------------------
 WL = os.path.join(WORK, "work.jsonl")
-if sh('/tmp/embed-io --db "%s" --export-worklist "%s" --resume' % (EMBEDDED_DB, WL)).returncode != 0:
+if sh('%s --db "%s" --export-worklist "%s"%s' % (EMBED_IO, EMBEDDED_DB, WL, RESUME_FLAG)).returncode != 0:
     fail("export_worklist")
 say("worklist_lines=%s" % (sh('wc -l < "%s"' % WL).stdout.strip()))
 
-# Run the embedder with output INHERITED (not captured) so its PROGRESS lines stream
-# LIVE into the Kaggle log — capturing them (the old sh()) buffered everything until the
-# end, hiding the progress bar. The embedder prints "PROGRESS done/total (%) rate eta"
-# every 2000 clauses.
-embcmd = '"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --batch %s --limit %s --require-cuda' % (
-    EMBEDDER, WL, VECS, BGE16, ID, BATCH, LIMIT)
-try:
-    emb_rc = subprocess.run(embcmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
-except subprocess.TimeoutExpired:
-    emb_rc = 124
-    say("embedder hit TIME_BUDGET — partial (ledger resumes next run)")
+# ---- fp16 smoke gate: Rust fp16 vs fp32 cosine (build pass only) -----------
+# The served data image is fp16; the existing Go cos>=0.9995 test validates the
+# CONVERSION but never the RUST embedder that actually bakes the corpus. Embed a small
+# fixed slice through the SAME Rust binary with the fp16 AND the fp32 model and assert
+# mean cos>=0.9995 BEFORE the bulk run, so a silent fp16/pooling regression in the Rust
+# path cannot contaminate the full index. Skipped on a tool-cache hit (the fp32 model
+# is not restored; the cached fp16 model was already gated on the pass that built it).
+def _load_gate_vecs(p):
+    m = {}
+    try:
+        with open(p) as gf:
+            for ln in gf:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                r = json.loads(ln)
+                v = r.get("vec")
+                if v and len(v) == 1024:
+                    m[r["chunk_id"]] = v
+    except Exception as e:
+        # Fail-open (the gate's own ok16/ok32/common checks catch a truly empty load),
+        # but log WHY so an operator can tell a parse/disk error from "no vectors".
+        say("fp16_gate vec-load error path=%s detail=%s" % (os.path.basename(p), str(e)[:120]))
+    return m
+
+
+if not CACHED_MODEL and os.path.isfile("%s/model.onnx" % BGE):
+    gate_wl = os.path.join(WORK, "gate.jsonl")
+    sh('head -n 32 "%s" > "%s"' % (WL, gate_wl))
+    if os.path.isfile(gate_wl) and os.path.getsize(gate_wl) > 0:
+        g16, g32 = os.path.join(WORK, "g16.jsonl"), os.path.join(WORK, "g32.jsonl")
+        for od in (g16, g32):
+            try:
+                os.remove(od)
+            except OSError:
+                pass
+        ok16 = subprocess.run('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --require-cuda'
+                              % (EMBEDDER, gate_wl, g16, BGE16, ID), shell=True, env=os.environ).returncode
+        ok32 = subprocess.run('"%s" --in "%s" --out "%s" --model-dir "%s" --embed-identity "%s" --require-cuda'
+                              % (EMBEDDER, gate_wl, g32, BGE, ID), shell=True, env=os.environ).returncode
+        a, b = _load_gate_vecs(g16), _load_gate_vecs(g32)
+        common = [k for k in a if k in b]
+        if ok16 != 0 or ok32 != 0 or not common:
+            fail("fp16_gate", "embed_failed ok16=%s ok32=%s common=%d" % (ok16, ok32, len(common)))
+        # Vectors are L2-normalised, so cosine == dot product.
+        mean_cos = sum(sum(x * y for x, y in zip(a[k], b[k])) for k in common) / len(common)
+        say("fp16_gate mean_cos=%.5f n=%d" % (mean_cos, len(common)))
+        if mean_cos < 0.9995:
+            fail("fp16_gate", "mean_cos=%.5f < 0.9995 — Rust fp16 path diverges from fp32" % mean_cos)
+        say("fp16_gate=ok")
+    else:
+        say("fp16_gate=skip (empty worklist)")
+else:
+    say("fp16_gate=skip (cache-hit or no fp32 model)")
+
+# Output is INHERITED (not captured) so PROGRESS lines stream LIVE into the Kaggle log.
+# MULTI-GPU: one embedder process per GPU, in PARALLEL. Each shards the work-list by a
+# hash of the clause text (--shard i/N) so the shards are disjoint AND every copy of a
+# clause stays in one shard (the dedup is never split). Each writes its own ledger
+# vecs.<i> and treats the merged VECS as already-done (--resume-from), then we fold the
+# shard ledgers back into VECS. N==1 runs the plain single-GPU path. Scales to any N.
+NGPU = gpu_count()
+say("gpus=%d" % NGPU)
+COMMON = '--model-dir "%s" --embed-identity "%s" --batch %s --limit %s --require-cuda' % (
+    BGE16, ID, BATCH, LIMIT)
+if NGPU <= 1:
+    cmd = '"%s" --in "%s" --out "%s" %s' % (EMBEDDER, WL, VECS, COMMON)
+    try:
+        emb_rc = subprocess.run(cmd, shell=True, env=os.environ, timeout=TIME_BUDGET).returncode
+    except subprocess.TimeoutExpired:
+        emb_rc = 124
+        say("embedder hit TIME_BUDGET — partial (ledger resumes next run)")
+else:
+    shard_outs = ["%s.%d" % (VECS, i) for i in range(NGPU)]
+    procs = []
+    for i in range(NGPU):
+        cmd = '"%s" --in "%s" --out "%s" --resume-from "%s" --device %d --shard-index %d --shard-count %d %s' % (
+            EMBEDDER, WL, shard_outs[i], VECS, i, i, NGPU, COMMON)
+        procs.append(subprocess.Popen(cmd, shell=True, env=os.environ))
+    deadline = time.time() + TIME_BUDGET
+    emb_rc = 0
+    for i, p in enumerate(procs):
+        try:
+            rc = p.wait(timeout=max(1, int(deadline - time.time())))
+            emb_rc = emb_rc or rc
+        except subprocess.TimeoutExpired:
+            p.kill()
+            emb_rc = 124
+            say("gpu %d shard hit TIME_BUDGET — partial (resumes next run)" % i)
+    # Fold each shard's new vectors into the canonical ledger (VECS already holds the prior
+    # merged ledger; the shards carry only this run's additions, so appending is correct).
+    with open(VECS, "a") as merged:
+        for vi in shard_outs:
+            if os.path.isfile(vi):
+                with open(vi) as f:
+                    shutil.copyfileobj(f, merged)
+                os.remove(vi)
+    say("multi_gpu merged %d shard ledgers" % NGPU)
 if emb_rc != 0:
-    # Non-fatal: the vecs.jsonl ledger is a valid resume point; import what we have. The
-    # actual error already streamed live above.
+    # Non-fatal: the vecs.jsonl ledger is a valid resume point; import what we have.
     say("embedder_rc=%d (partial allowed — ledger resumes next run; see live log above)" % emb_rc)
 vec_lines = sh('wc -l < "%s"' % VECS).stdout.strip() if os.path.isfile(VECS) else "0"
 say("vectors_written=%s" % vec_lines)
 
-if sh('/tmp/embed-io --db "%s" --import-vectors "%s" --embed-identity "%s" --build-hnsw'
-      % (EMBEDDED_DB, VECS, ID)).returncode != 0:
+if sh('%s --db "%s" --import-vectors "%s" --embed-identity "%s" --build-hnsw'
+      % (EMBED_IO, EMBEDDED_DB, VECS, ID)).returncode != 0:
     fail("import_vectors")
 # Count only EMBEDDABLE clauses still NULL. Heading-only / "void" / table-stripped
 # clauses have empty text and are skipped by the embedder (main.rs: text.trim()
@@ -325,6 +485,21 @@ if KU and KK and os.path.isfile(VECS):
         os.makedirs(out, exist_ok=True)
         shutil.copy(EMBEDDED_DB, "%s/3gpp-embedded.duckdb" % out)
         shutil.copy(VECS, "%s/vecs.jsonl" % out)
+        # Persist the toolcache ONCE (only on the build pass — a cache-hit run already has
+        # it, so don't re-upload). Fail-open: a copy error never fails the run.
+        if not CACHED_BIN and SRCHASH:
+            try:
+                cc = "%s/embedder-cache" % out
+                os.makedirs(cc, exist_ok=True)
+                shutil.copy(EMBEDDER, "%s/embedder" % cc)
+                libdir = os.environ.get("LD_LIBRARY_PATH", "").split(":")[0]
+                for so in glob.glob(os.path.join(libdir, "libonnxruntime.so*")):
+                    shutil.copy(so, cc)
+                shutil.copytree(BGE16, "%s/bge-m3-fp16" % cc, dirs_exist_ok=True)
+                open("%s/srchash.txt" % cc, "w").write(SRCHASH)
+                say("toolcache=persisted srchash=%s" % SRCHASH[:12])
+            except Exception as e:
+                say("toolcache_persist=skip detail=%s" % str(e)[:80])
         json.dump({"title": "3gpp-rust-embedded-%s" % SHARD, "id": DS, "licenses": [{"name": "CC0-1.0"}]},
                   open("%s/dataset-metadata.json" % out, "w"))
         if sh('kaggle datasets version -p "%s" -m "shard=%s null=%s" --dir-mode zip' % (out, SHARD, nul)).returncode == 0:

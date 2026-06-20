@@ -10,9 +10,15 @@ import (
 // EMBED_WINDOWING=mean_pool path is enabled.
 const defaultWindowWords = 300
 
+// TODO(#208): this mean_pool windowing is the RECALL-correct long-clause strategy but
+// currently exists ONLY in Go. The production embedder is Rust (rust/embedder), which
+// truncates — so the canonical config is truncate@1024 until this is ported to Rust
+// (mirror windowText + meanPoolL2). Windowing is now an EmbedIdentity component, so the
+// switch to mean_pool will bump the identity and force a clean re-embed.
+//
 // windowText splits text into ≤maxWords word-windows (no overlap), respecting
 // word boundaries (never mid-word). Short text → a single window. Used to embed
-// long clauses (tables, ASN.1) in pieces instead of silently truncating at 512.
+// long clauses (tables, ASN.1) in pieces instead of silently truncating.
 func windowText(text string, maxWords int) []string {
 	if maxWords < 1 {
 		maxWords = defaultWindowWords
