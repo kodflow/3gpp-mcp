@@ -51,10 +51,17 @@ fn main() {
     let limit: usize = arg("--limit").and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // The dual-head model must carry the sparse head, else this pass cannot run.
+    // has_sparse() lazy-loads the ONNX model; log around it so a slow/hung model load
+    // (e.g. a >2GB model exported without external data) is visible within seconds.
+    eprintln!(
+        "embed-core-sparse: loading model (EMBED_MODEL_DIR={:?})…",
+        std::env::var("EMBED_MODEL_DIR").unwrap_or_default()
+    );
     if embed_core::embed_core_has_sparse() != 1 {
         eprintln!("embed-core-sparse: loaded model has NO sparse head (set EMBED_MODEL_DIR to the dual-head export) — nothing to do");
         std::process::exit(1);
     }
+    eprintln!("embed-core-sparse: model loaded ✓ (sparse head present) — starting embed");
 
     // Resume: skip chunk_ids already written to --out by a prior (bounded/killed) run.
     let mut done: HashSet<u64> = HashSet::new();
@@ -136,7 +143,9 @@ fn main() {
         }
         let _ = w.write_all(b"\n");
         embedded += 1;
-        if embedded % 256 == 0 {
+        // Log the very first success immediately (proves the model + inference path work,
+        // not hung), then every 32 — early, frequent signal for the bounded GPU runs.
+        if embedded == 1 || embedded % 32 == 0 {
             let _ = w.flush();
             eprintln!("embed-core-sparse: {embedded} embedded …");
         }
