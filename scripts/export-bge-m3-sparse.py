@@ -28,6 +28,9 @@ Requires: torch, transformers, FlagEmbedding (CPU is fine; export in fp32).
 """
 
 import argparse
+import hashlib
+import json
+import os
 
 import torch
 import torch.nn as nn
@@ -91,6 +94,38 @@ def main() -> None:
     )
     print(f"exported {args.out} (opset {args.opset}) with outputs "
           "[sentence_embedding, sparse_weights]")
+
+    # Versioned manifest (plan §1b / C7): pin the artifact so a baked sparse model
+    # is provably the dual-head export, not stale metadata. The onnx-inspect gate
+    # (cmd/validate --require-sparse + embed-core load-time output detection) reads
+    # this alongside the runtime check. Written next to the .onnx as manifest.json.
+    def _sha256(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    out_dir = os.path.dirname(os.path.abspath(args.out)) or "."
+    data_path = args.out + "_data"  # external-weights sidecar (large models)
+    tok_path = os.path.join(out_dir, "tokenizer.json")
+    manifest = {
+        "model": args.model,
+        "onnx": os.path.basename(args.out),
+        "onnx_sha256": _sha256(args.out),
+        "onnx_data_sha256": _sha256(data_path) if os.path.exists(data_path) else None,
+        "tokenizer_sha256": _sha256(tok_path) if os.path.exists(tok_path) else None,
+        "input_names": ["input_ids", "attention_mask"],
+        "output_names": ["sentence_embedding", "sparse_weights"],
+        "opset": args.opset,
+        "precision": "fp32",
+        "dense_dim": 1024,
+    }
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+    print(f"wrote manifest {manifest_path}: outputs={manifest['output_names']} "
+          f"opset={manifest['opset']} onnx_sha256={manifest['onnx_sha256'][:12]}…")
 
     # Sanity: ONNX sparse_weights (after Go-side dedup) should match FlagEmbedding's
     # lexical_weights. Verify on acronym-heavy strings before trusting it (brief §e).
