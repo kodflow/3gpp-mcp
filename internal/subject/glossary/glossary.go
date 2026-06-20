@@ -28,6 +28,6 @@ func New() *Subject { return &Subject{} }
 func (*Subject) Name() string             { return "glossary" }
 func (*Subject) Activates(id string) bool { return id == specID }
 
-func (*Subject) Tools(*store.Store, string) []subject.ToolRegistration { return nil }
+func (*Subject) Tools(store.Reader, string) []subject.ToolRegistration { return nil }
 
 var _ subject.Subject = (*Subject)(nil)
