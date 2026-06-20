@@ -169,13 +169,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # ---- publish-sparse: update sparse-index.json on `latest` so discover
-  # --sparse-check CONVERGES (otherwise dispatch-sparse re-fires every build). The
-  # clause_sparse overlay artifact is what the data-image bake folds via cmd/overlay
-  # overlaySparse. ----------------------------------------------------------------
+  # ---- publish-sparse: persist the PRIVATE resume shard to GHCR 3gpp-sparse on EVERY
+  # successful pass (the resume state the next run overlays — decoupled from the serve
+  # flip so publish=false runs still accumulate and the campaign can converge). The
+  # serve flip — updating sparse-index.json on the public `latest` release so discover
+  # --sparse-check converges and serve switches to the sparse arm — is the ONLY step
+  # gated on publish=true (a production deploy). ----------------------------------
   publish-sparse:
     needs: sparse
-    if: github.event.inputs.publish == 'true'
+    if: needs.sparse.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write # update the `latest` release asset
@@ -191,7 +193,8 @@ jobs:
         with:
           name: 3gpp-sparse
           path: out
-      - name: Publish sparse-index.json to `latest` (convergence)
+      - name: Publish sparse-index.json to `latest` (SERVE FLIP — publish=true only)
+        if: github.event.inputs.publish == 'true'
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh
