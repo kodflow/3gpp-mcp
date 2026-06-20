@@ -291,10 +291,11 @@ impl Store {
                JOIN clauses b ON {id_match}
                WHERE EXISTS (SELECT 1 FROM {alias}.clause_sparse ss WHERE ss.chunk_id = s.chunk_id));
              INSERT INTO clause_sparse (chunk_id, term_id, weight)
-             SELECT b.chunk_id, ss.term_id, ss.weight
+             SELECT b.chunk_id, ss.term_id, MAX(ss.weight)
              FROM {alias}.clause_sparse ss
              JOIN {alias}.clauses s ON s.chunk_id = ss.chunk_id
-             JOIN clauses b ON {id_match};",
+             JOIN clauses b ON {id_match}
+             GROUP BY b.chunk_id, ss.term_id;",
         ))?;
         Ok(())
     }
@@ -1175,6 +1176,72 @@ mod tests {
         assert_eq!(clauses, 4, "all clauses folded");
         assert_eq!(distinct, 4, "chunk_ids offset, no collision");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overlay_sparse_dedups_duplicate_identity() {
+        // A shard whose clause_sparse maps two clauses of IDENTICAL natural identity
+        // (spec/release/clause_path/text) onto ONE base clause must NOT raise a
+        // PRIMARY KEY (chunk_id, term_id) violation — the bug behind resume_overlay_failed.
+        let dir = std::env::temp_dir().join(format!("storers-ovl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mkpath = |n: &str| {
+            let p = dir.join(n).to_str().unwrap().to_string();
+            let _ = std::fs::remove_file(&p);
+            p
+        };
+
+        // Shard: two clauses, SAME identity, each with a posting for term 50 (diff weights).
+        let shard = mkpath("shard.duckdb");
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text) VALUES
+                       (1,'23.501','Rel-19','19.1.0','5.1','h','dup text'),
+                       (2,'23.501','Rel-19','19.2.0','5.1','h','dup text');
+                     INSERT INTO clause_sparse(chunk_id,term_id,weight) VALUES
+                       (1,50,0.5),(2,50,1.5);",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        // Base: one clause of that identity.
+        let basep = mkpath("base.duckdb");
+        let base = Store::open_rw(&basep).unwrap();
+        base.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text) VALUES
+                   (100,'23.501','Rel-19','19.1.0','5.1','h','dup text');",
+            )
+            .unwrap();
+
+        // Overlay must succeed (no PK violation) and collapse to ONE posting (MAX weight).
+        base.overlay(&[shard], "", "")
+            .expect("overlay must not raise a PK violation");
+        let rows: i64 = base
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM clause_sparse WHERE chunk_id=100",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let w: f64 = base
+            .raw()
+            .query_row(
+                "SELECT weight FROM clause_sparse WHERE chunk_id=100 AND term_id=50",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "duplicate-identity postings collapse to one (chunk_id,term_id)"
+        );
+        assert!((w - 1.5).abs() < 1e-6, "MAX weight kept, got {w}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
