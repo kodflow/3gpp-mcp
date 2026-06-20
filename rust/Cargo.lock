@@ -1154,6 +1154,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "identity3gpp"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2228,6 +2236,7 @@ dependencies = [
  "clap",
  "duckdb",
  "hex",
+ "identity3gpp",
  "serde",
  "serde_json",
  "sha2",
