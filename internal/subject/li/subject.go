@@ -29,18 +29,8 @@ func New() *Subject { return &Subject{} }
 func (*Subject) Name() string             { return "li" }
 func (*Subject) Activates(id string) bool { return id == specID }
 
-// Purge clears every LI-owned row for (specID, release) so a --resume redo of
-// TS 33.128 re-ingests from a clean slate (subject.Purger). version is unused:
-// LI's tables are release-scoped.
-func (s *Subject) Purge(ctx context.Context, db *store.Store, sid, release, _ string) error {
-	if !s.Activates(sid) {
-		return nil
-	}
-	return Purge(ctx, db, release)
-}
-
 // Tools contributes the li_events MCP tool.
-func (*Subject) Tools(db *store.Store, baseline string) []subject.ToolRegistration {
+func (*Subject) Tools(db store.Reader, baseline string) []subject.ToolRegistration {
 	return []subject.ToolRegistration{{
 		Tool: mcp.NewTool("li_events",
 			mcp.WithDescription("Lawful-Interception coverage from TS 33.128. With no 'nf': the full INVENTORY "+
@@ -59,7 +49,7 @@ func (*Subject) Tools(db *store.Store, baseline string) []subject.ToolRegistrati
 }
 
 // EnrichTerm attaches an ASN.1 definition + citation when the term names a type.
-func (*Subject) EnrichTerm(ctx context.Context, db *store.Store, term, baseline string) (map[string]any, bool) {
+func (*Subject) EnrichTerm(ctx context.Context, db store.Reader, term, baseline string) (map[string]any, bool) {
 	t, ok := GetASN1Type(ctx, db, term, baseline)
 	if !ok {
 		return nil, false
@@ -75,7 +65,7 @@ func (*Subject) EnrichTerm(ctx context.Context, db *store.Store, term, baseline 
 	}, true
 }
 
-func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func liEvents(ctx context.Context, db store.Reader, baseline string, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	nf := strings.TrimSpace(r.GetString("nf", ""))
 	avail, ordered, err := db.ClauseAvailability(ctx, specID, "6")
 	if err != nil {
@@ -137,7 +127,7 @@ func liEvents(ctx context.Context, db *store.Store, baseline string, r mcp.CallT
 
 // liEventsAuthoritativeIfAny renders the ASN.1-registry events for nf. ok=false when
 // the registry holds nothing for this NF (the caller then tries the prose miner).
-func liEventsAuthoritativeIfAny(ctx context.Context, db *store.Store, release, nf string, ordered []string) (*mcp.CallToolResult, bool) {
+func liEventsAuthoritativeIfAny(ctx context.Context, db store.Reader, release, nf string, ordered []string) (*mcp.CallToolResult, bool) {
 	evs, err := GetEvents(ctx, db, nf, release, "")
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("li_events failed", err), true
@@ -204,7 +194,7 @@ func liEventsAuthoritativeIfAny(ctx context.Context, db *store.Store, release, n
 // liInventory lists every NE/NF impacted over X1/X2/X3, grouped by interface — the
 // comprehensive footprint mined from the whole TS 33.128 (clauses 6+7). ifaceFilter
 // (LI_X1/LI_X2/LI_X3, optional) narrows it to NFs touched by that interface.
-func liInventory(ctx context.Context, db *store.Store, release, ifaceFilter string) (*mcp.CallToolResult, error) {
+func liInventory(ctx context.Context, db store.Reader, release, ifaceFilter string) (*mcp.CallToolResult, error) {
 	version, _, _ := db.VersionForRelease(ctx, specID, release)
 	if version == "" {
 		return mcp.NewToolResultError("no indexed version of TS 33.128 for release '" + release + "'"), nil
@@ -293,6 +283,5 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 var (
 	_ subject.Subject      = (*Subject)(nil)
 	_ subject.TermEnricher = (*Subject)(nil)
-	_ subject.Purger       = (*Subject)(nil)
 	_                      = server.ToolHandlerFunc(nil)
 )
