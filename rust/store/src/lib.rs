@@ -364,6 +364,46 @@ impl Store {
         Ok(out)
     }
 
+    /// clauses_needing_sparse streams the SPARSE work-list: embeddable clauses with no
+    /// clause_sparse posting yet, oldest chunk first, capped at `limit` (0 = all). Mirrors
+    /// clauses_needing_embedding but keys on the sparse table instead of `embedding`, so a
+    /// `--sparse-only` pass is resumable and additive (== Go embed --sparse-only worklist).
+    pub fn clauses_needing_sparse(&self, limit: usize, floor_ord: i64) -> Result<Vec<WorkItem>> {
+        let sql = format!(
+            "SELECT chunk_id, COALESCE(release,''), COALESCE(heading,''), COALESCE(text,'') FROM clauses
+             WHERE chunk_id NOT IN (SELECT chunk_id FROM clause_sparse) AND {EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare sparse worklist")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, u64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .context("query sparse worklist")?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (chunk_id, release, heading, text) = r.context("scan sparse worklist row")?;
+            if floor_ord > 0
+                && crate::identity::release_ordinal(&release).is_none_or(|o| o < floor_ord)
+            {
+                continue;
+            }
+            out.push(WorkItem {
+                chunk_id,
+                heading,
+                text,
+            });
+            if limit > 0 && out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// set_embeddings_batch writes (vector, hash) onto each clause in ONE transaction —
     /// the scalable write path (== Go SetEmbeddingsBatch). ids/vecs/hashes are parallel.
     pub fn set_embeddings_batch(
@@ -1057,6 +1097,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn sparse_worklist_excludes_done_and_unembeddable() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES
+                 (1,'23.501','a','alpha'),(2,'23.501','b','beta'),(3,'23.501','c','');",
+            )
+            .unwrap();
+        // Both embeddable clauses need sparse; the empty-text clause (3) is excluded.
+        let wl = s.clauses_needing_sparse(0, 0).unwrap();
+        assert_eq!(wl.len(), 2);
+        assert_eq!(
+            wl.iter().map(|w| w.chunk_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Writing a posting for clause 1 removes it from the next worklist (resume/additive).
+        s.set_sparse(1, &[(10, 0.5), (20, 1.5)]).unwrap();
+        let wl2 = s.clauses_needing_sparse(0, 0).unwrap();
+        assert_eq!(wl2.iter().map(|w| w.chunk_id).collect::<Vec<_>>(), vec![2]);
+
+        // --limit bounds the slice.
+        s.set_sparse(2, &[(30, 0.9)]).unwrap();
+        assert!(s.clauses_needing_sparse(0, 0).unwrap().is_empty());
     }
 
     #[test]
