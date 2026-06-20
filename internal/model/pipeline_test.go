@@ -89,6 +89,25 @@ func TestEmbedIdentitySeparate(t *testing.T) {
 	}
 }
 
+// TestEmbedIdentityCarriesWindowingAndMaxTokens locks that the long-clause strategy
+// (windowing) and the truncation length (max_tokens) are EmbedIdentity components, so
+// a truncate corpus and a mean_pool corpus — or a 512 and a 1024 corpus — get
+// DIFFERENT identities and can never silently share one HNSW (the Go/Rust divergence
+// this Phase −1 commit closes).
+func TestEmbedIdentityCarriesWindowingAndMaxTokens(t *testing.T) {
+	base := EmbedParts{ModelID: "bge-m3", VectorDim: "1024", NormalizationMode: "l2", Precision: "fp16", Windowing: "truncate", MaxTokens: "1024"}
+	meanPool := base
+	meanPool.Windowing = "mean_pool"
+	if base.Identity() == meanPool.Identity() {
+		t.Error("windowing switch (truncate→mean_pool) must flip EmbedIdentity — else a mixed-windowing HNSW is undetectable")
+	}
+	shorter := base
+	shorter.MaxTokens = "512"
+	if base.Identity() == shorter.Identity() {
+		t.Error("max_tokens change (1024→512) must flip EmbedIdentity — else 512 and 1024 corpora mix silently")
+	}
+}
+
 // TestGlobalEnrichmentIdentity locks that each enricher input flips the identity
 // and that it is independent of the spec/embed identities.
 func TestGlobalEnrichmentIdentity(t *testing.T) {

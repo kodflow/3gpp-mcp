@@ -94,7 +94,7 @@ Three structural guards, all in CI/build:
 
 ## Quality regression gate (IR metrics)
 
-`retrieval-regression.yml` scores the graded query set with `cmd/bench` on every PR
+The `retrieval-regression` job in `.github/workflows/ci.yml` scores the graded query set with `cmd/bench` on every PR
 touching `internal/search|store|rerank` or `cmd/bench`, comparing nDCG@5/@10,
 Recall@10, MRR@10, Success@1 to a committed baseline within a tolerance.
 

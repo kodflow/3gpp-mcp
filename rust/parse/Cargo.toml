@@ -1,0 +1,26 @@
+[package]
+name = "parse3gpp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust port of the 3GPP spec parser (internal/htmlparse + model helpers). Phase 4 of the write-side migration; starts with the parity-critical filename→metadata derivation."
+
+[dependencies]
+regex = "1"
+# html5ever-backed DOM, for the clause walker. The walker dispatches on tag name and
+# concatenates text nodes (collapse-normalised), so html5ever's tree differs from Go's
+# golang.org/x/net/html only in ways the golden tests pin down.
+scraper = "0.20"
+# scraper builds its DOM as an ego_tree::Tree; we name NodeRef directly for the walk, so
+# pin the SAME ego-tree version scraper 0.20 uses (0.6.x) to avoid two incompatible copies.
+ego-tree = "0.6"
+
+# 5GC OpenAPI YAML parsing (Phase 6). serde_yaml::Value gives the same untyped-node
+# navigation Go's yaml.Node does (mapFields / collectRefs).
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+[lib]
+name = "parse3gpp"
+path = "src/lib.rs"

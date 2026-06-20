@@ -147,6 +147,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Rust toolchain + cargo cache so the Rust bins this job builds (overlay,
+      # freeze-hnsw) restore libduckdb-sys & deps instead of recompiling them each bake —
+      # only a real Cargo.lock change rebuilds. The build steps' `command -v cargo` finds
+      # this toolchain and skips their ad-hoc rustup install.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+
       # The bake stages ~27 GB in the workspace, and buildx (container driver)
       # then needs roughly 2x that AGAIN in Docker storage (build-context copy +
       # image snapshot) — the runner agent died of ENOSPC before this relocation
@@ -298,7 +307,9 @@ jobs:
           esac
           retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_${oras_arch}.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
           retry bash -c 'echo "$GHCR_PAT" | oras login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
-          CGO_ENABLED=1 go build -o /tmp/overlay ./cmd/overlay
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay
+          cp rust/target/release/overlay /tmp/overlay
           EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
           echo "embed identity (baked registry): $EMBED_ID"
           test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
@@ -384,8 +395,10 @@ jobs:
           else
             echo "::warning::could not create swapfile — HNSW build may OOM"
           fi
-          echo "freezing HNSW index on the fused DB…"; df -h / /mnt | tail -2; free -h | head -2
-          CGO_ENABLED=1 go run ./cmd/freeze-hnsw --db image-data/3gpp.duckdb
+          echo "freezing HNSW index on the fused DB… (Rust store-rs freeze-hnsw)"; df -h / /mnt | tail -2; free -h | head -2
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin freeze-hnsw
+          ./rust/target/release/freeze-hnsw --db image-data/3gpp.duckdb
           sudo swapoff /mnt/hnsw-swap 2>/dev/null || true; sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
           echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
           # AUTHORITATIVE COMPLETENESS GATE — the data layer is now final (fused +

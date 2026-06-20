@@ -39,6 +39,12 @@ on:
         description: "Publish sparse-index.json to `latest` (convergence) + the overlay artifact. Default true."
         required: false
         default: "true"
+      kaggle_account:
+        description: "Kaggle account to try FIRST (the other is the automatic fallback; run stops only if BOTH fail auth)."
+        required: false
+        default: "primary"
+        type: choice
+        options: [primary, fallback]
 
 concurrency:
   group: corpus-sparse-kaggle
@@ -52,27 +58,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
+      # Two Kaggle accounts: the run step below loops over them (order = KAGGLE_ACCOUNT),
+      # auth-probes each, and on GPU-quota exhaustion falls back to the other; it stops
+      # only if NO account gets a GPU. scripts/kaggle-gpu-check.sh classifies gpu vs quota.
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-      KAGGLE_USER: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_API_TOKEN_FALLBACK: ${{ secrets.KAGGLE_API_TOKEN_FALLBACK }}
+      KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
+      KAGGLE_USERNAME_FALLBACK: ${{ vars.KAGGLE_USERNAME_FALLBACK || secrets.KAGGLE_USERNAME_FALLBACK }}
+      KAGGLE_ACCOUNT: ${{ github.event.inputs.kaggle_account || 'primary' }}
       GHCR_OWNER: ${{ github.repository_owner }}
       GHCR_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
       BRANCH: ${{ github.ref_name }}
       EMBED_FLOOR: ${{ github.event.inputs.embed_floor }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Guard — secrets present
-        run: |
-          [ -n "$KAGGLE_API_TOKEN" ] || { echo "::error::KAGGLE_API_TOKEN not set (Settings → API → Generate New Token)."; exit 1; }
-          [ -n "$KAGGLE_USER" ]      || { echo "::error::KAGGLE_USERNAME not set (repo variable or secret) — namespaces the kernel slug."; exit 1; }
-          [ -n "$GHCR_PAT" ]         || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private lexical base."; exit 1; }
       - name: Install kaggle CLI (pin 2.2.0 — access-token auth)
         run: |
           pipx install 'kaggle==2.2.0' || pip install --user 'kaggle==2.2.0'
           kaggle --version
-      - name: Stage + run kernel-sparse-corpus.py (GPU, single session, resumable)
+      - name: Guard — GHCR token present
+        run: |
+          [ -n "$GHCR_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set — needed to pull the private lexical base."; exit 1; }
+      - name: Run sparse pass on Kaggle GPU (auto-fallback across accounts on quota)
         run: |
           set -euo pipefail
-          dir="$RUNNER_TEMP/sparse-kernel"; mkdir -p "$dir"
+          # Two-account GPU fallback (see corpus-rust-embed-kaggle.yml): try each account's
+          # GPU; if one is out of weekly quota (no GPU → kernel logs gpu=absent / no output,
+          # scripts/kaggle-gpu-check.sh reports "quota") fall back to the other. Stop only if
+          # NO account is granted a GPU.
+          PRIM_TOK="${KAGGLE_API_TOKEN:-}"; PRIM_USER="${KAGGLE_USERNAME:-}"
+          FB_TOK="${KAGGLE_API_TOKEN_FALLBACK:-}"; FB_USER="${KAGGLE_USERNAME_FALLBACK:-}"
+          case "${KAGGLE_ACCOUNT:-primary}" in
+            fallback) ORDER="fallback primary" ;;
+            *) ORDER="primary fallback" ;;
+          esac
+          dispatch() {
+          dir="$RUNNER_TEMP/sparse-kernel"; rm -rf "$dir"; mkdir -p "$dir"
           slug="${KAGGLE_USER}/3gpp-sparse-corpus"
           # Generated kernel = env prepend (GHCR token reaches crane; kernel stays
           # is_private:true so the token is never exposed) + the committed kernel body.
@@ -109,7 +130,31 @@ jobs:
           # is the actual error. Print it so a failed run is debuggable from CI alone.
           echo "=== KERNEL LOG (tail) ==="; tail -n 120 out/*.log 2>/dev/null || echo "(no .log pulled)"
           echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt — see log above)"
-          test -f out/sparse-index.json || { echo "::error::kernel produced no sparse-index.json (see log above)"; exit 1; }
+          }
+          # Try each account until one is granted a GPU. quota → fall back; gpu → keep it.
+          got_gpu=0
+          for acct in $ORDER; do
+            case "$acct" in
+              primary)  export KAGGLE_API_TOKEN="$PRIM_TOK" KAGGLE_USER="$PRIM_USER" ;;
+              fallback) export KAGGLE_API_TOKEN="$FB_TOK"   KAGGLE_USER="$FB_USER" ;;
+            esac
+            if [ -z "$KAGGLE_API_TOKEN" ] || [ -z "$KAGGLE_USER" ]; then
+              echo "account '$acct' not configured (token/username empty) — skipping"; continue
+            fi
+            echo "::group::Kaggle account=$acct user=$KAGGLE_USER"
+            if ! kaggle kernels list -m -p 1 >/dev/null 2>&1; then
+              echo "::warning::account '$acct' auth failed — trying next"; echo "::endgroup::"; continue
+            fi
+            rm -rf out
+            dispatch || echo "::warning::dispatch on account '$acct' errored — judging by output"
+            status="$(bash scripts/kaggle-gpu-check.sh out)"
+            echo "account '$acct' gpu-check=$status"; echo "::endgroup::"
+            if [ "$status" = gpu ]; then echo "GPU obtained on account '$acct'"; got_gpu=1; break; fi
+            echo "::warning::account '$acct' got NO GPU (quota) — falling back to the next account"
+          done
+          [ "$got_gpu" = 1 ] || { echo "::error::no Kaggle account had GPU quota this run — stopping"; exit 1; }
+          # The winning account had a GPU; require the sparse pass to have produced its index.
+          test -f out/sparse-index.json || { echo "::error::an account got a GPU but produced no sparse-index.json (see log)"; exit 1; }
           echo "sparse-index: $(cat out/sparse-index.json)"
       - name: Upload sparse overlay + index
         if: always()
@@ -153,7 +198,7 @@ jobs:
           test -f out/sparse-index.json || { echo "::error::no sparse-index.json to publish"; exit 1; }
           echo "publishing sparse-index: $(cat out/sparse-index.json)"
           retry gh release upload latest out/sparse-index.json --repo "$GITHUB_REPOSITORY" --clobber
-      - name: Push the sparse shard to GHCR 3gpp-sparse (the bake folds it via cmd/overlay)
+      - name: Push the sparse shard to GHCR 3gpp-sparse (the bake folds it via the Rust overlay)
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh

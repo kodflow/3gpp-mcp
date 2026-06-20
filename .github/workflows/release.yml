@@ -13,7 +13,7 @@ on:
   push:
     branches: [main]
     # Only when the SHIPPED binary's sources change. cmd/server is the only binary
-    # GoReleaser builds, so a change to CI-only tooling (cmd/discover, cmd/embed, …)
+    # GoReleaser builds, so a change to CI-only tooling (cmd/bench, rust/* pipeline, …)
     # must NOT rebuild identical binaries; internal/** stays (cmd/server imports it).
     paths: ["cmd/server/**", "internal/**", "go.mod", "go.sum", ".goreleaser*.yaml", ".github/workflows/release.yml"]
   workflow_dispatch:

@@ -8,29 +8,34 @@ import (
 	"os"
 	"sort"
 	"strconv"
-
-	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // ClauseHash is the per-clause embedding fingerprint: it changes iff the embedded
-// text (heading + body, exactly what EmbedText feeds the model) OR the EmbedIdentity
-// changes. Stored next to the vector so the decoupled embed step can re-embed
-// ONLY clauses whose hash drifted — making repeat runs proportional to the clause
-// delta, not the spec or corpus. Keep this the single definition of "what text we
-// embed" so ingest and cmd/embed never disagree.
+// text (heading + body, exactly what EmbedText feeds the model) OR the embed
+// identity changes. Stored next to the vector so the decoupled embed step can
+// re-embed ONLY clauses whose hash drifted — making repeat runs proportional to the
+// clause delta, not the spec or corpus. Keep this the single definition of "what
+// text we embed" so ingest and cmd/embed never disagree.
 //
-// The model component is the canonical model.EmbedIdentity (plan PR-3/PR-6), so
-// the re-embed gate keys on the SAME identity as DB meta and serve-time
-// compatibility checks. modelID is the embedder's ModelID(): for the production
-// BGE-M3 backend that is ALREADY the full EmbedIdentity digest (model family +
-// weight revision + tokenizer revision + dim + normalisation + precision — see
-// embed.bgeModelID), so a change in any of those components re-embeds every clause
-// WITHOUT re-ingesting. Wrapping it in EmbedParts.ModelID keeps a single
-// definition of the embed component and stays deterministic for the lexical
-// ("hash-local") and disabled ("") embedders too.
+// CONTRACT (cross-runtime, byte-for-byte identical to rust/embedder src/hash.rs):
+//
+//	hash = hex(sha256( EmbedText(heading,text) + "|" + modelID ))[:16]
+//
+// modelID is the embedder's ModelID() and is hashed RAW — it is ALREADY the
+// canonical identity string: for the production BGE-M3 backend it is the full
+// model.EmbedIdentity digest (family + revision + tokenizer + dim + normalisation +
+// precision + windowing + max_tokens — see embed.bgeModelID), and it is the exact
+// value `go run ./cmd/embedid` prints and hands the Rust embedder via
+// --embed-identity. So a change in any identity component re-embeds every clause
+// WITHOUT re-ingesting, and a Rust-written hash matches a later Go re-check exactly.
+//
+// Do NOT re-wrap modelID in model.EmbedIdentity here: that produced a digest-of-a-
+// digest on the Go side while Rust hashed modelID raw, so identical (heading,text,
+// identity) yielded DIFFERENT hashes and a Go embed pass over a Rust-embedded DB
+// re-embedded the whole corpus. The golden cross-runtime test (and the Rust
+// clause_hash unit test, fed the same vectors) pin this parity.
 func ClauseHash(heading, text, modelID string) string {
-	embedID := model.EmbedIdentity(model.EmbedParts{ModelID: modelID})
-	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + embedID))
+	h := sha256.Sum256([]byte(EmbedText(heading, text) + "|" + modelID))
 	return hex.EncodeToString(h[:])[:16]
 }
 
