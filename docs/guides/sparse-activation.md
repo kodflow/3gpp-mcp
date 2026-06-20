@@ -22,7 +22,7 @@ C'est ce marqueur qui rend l'absence/obsolescence **détectable** (avant, rien n
 | **serve** | `warnIfSparseMissing` (cmd/server/main.go) : si le binaire est sparse-capable mais `clause_sparse` vide → **log d'alerte** avec la commande exacte ; si `sparse_model` ≠ attendu → **alerte « stale »**. |
 | **dashboard** | pastille « Sparse » + cause/fix (déjà présent). |
 | **validate** | `--require-sparse` est **identity-aware** : échoue si `clause_sparse` vide **ou** si `sparse_model` ≠ identité attendue du build. Gate de promotion du bake. |
-| **CI trigger (câblé)** | `corpus-matrix.yml` job `discover` exécute `cmd/discover --sparse-check` (attendu via `SPARSE_EMBED_MODEL` vs `sparse-index.json` sur `latest`) → sort `sparse_needed`. Le job `dispatch-sparse` (gated `AUTO_SPARSE_ON_BUILD` + `sparse_needed`, dormant par défaut) déclenche `corpus-sparse-kaggle.yml`, qui lance la passe GPU `--sparse-only` puis **publie `sparse-index.json`** sur `latest` (convergence : le trigger ne re-fire plus). |
+| **CI trigger (câblé)** | `corpus-matrix.yml` job `discover` exécute `rust/discover --sparse-check` (attendu via `SPARSE_EMBED_MODEL` vs `sparse-index.json` sur `latest`) → sort `sparse_needed`. Le job `dispatch-sparse` (gated `AUTO_SPARSE_ON_BUILD` + `sparse_needed`, dormant par défaut) déclenche `corpus-sparse-kaggle.yml`, qui lance la passe GPU `--sparse-only` puis **publie `sparse-index.json`** sur `latest` (convergence : le trigger ne re-fire plus). |
 
 ## Procédure d'activation (one-time, puis idempotente)
 

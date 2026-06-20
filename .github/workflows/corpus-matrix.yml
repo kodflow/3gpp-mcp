@@ -100,11 +100,10 @@ on:
     # off the heavy build. discover still makes a triggered run a near-no-op when the
     # 3GPP site hasn't moved either.
     paths:
-      - 'cmd/ingest/**'
+      - 'rust/parse/**'
       - 'cmd/merge/**'
-      - 'cmd/discover/**'
-      - 'cmd/ingest-catalog/**'
-      - 'cmd/ingest-openapi/**'
+      - 'rust/discover/**'
+      - 'rust/ingest/**'
       - 'internal/ingest/**'
       - 'internal/htmlparse/**'
       - 'internal/ooxml/**'
@@ -253,6 +252,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Build rust/discover (Phase 10/11b — the sole matrix discoverer)
+        # rust/discover is AUTHORITATIVE for the matrix (Go cmd/discover retired in
+        # Phase 11b after byte-for-byte parity; correctness is locked by the fixture
+        # tests in rust/discover/src/lib.rs). A build failure must fail the discover
+        # job — there is no Go fallback any more.
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" build --release --manifest-path rust/discover/Cargo.toml
       - id: set
         run: |
           scope="${{ github.event.inputs.series_scope }}"
@@ -296,10 +304,21 @@ jobs:
             # dispatch checkbox / auto push) — otherwise discover never surfaces them
             # and Phase 1/2 is never built despite the convert flag.
             legacy="${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push' || github.event_name == 'schedule') && '--include-legacy-gsm' || '' }}"
+            # rust/discover is the SOLE discoverer (Phase 10/11b — Go retired). It
+            # reads the status report from a local file, so fetch it first. Go used
+            # to resolve --embed-model (family) internally via CGO; Rust takes the
+            # pre-resolved digest from `go run ./cmd/embedid` (CGO-free) as
+            # --embed-identity.
+            source scripts/lib/discover.sh
+            discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" /tmp/status.htm
+            RB=./rust/discover/target/release/discover
             if [ "$full" = "true" ]; then
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
+              matrix=$("$RB" --status-file /tmp/status.htm --all --floor "$floor" $legacy)
             else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy $absent)
+              embed_id=""
+              [ -n "$embed_model" ] && embed_id=$(EMBED_MODEL="$embed_model" CGO_ENABLED=0 go run ./cmd/embedid 2>/dev/null || true)
+              embarg=""; [ -n "$embed_id" ] && embarg="--embed-identity $embed_id"
+              matrix=$("$RB" --status-file /tmp/status.htm --index corpus-index.json --subject-index subject-index.json --build-index build-index.json $embarg --floor "$floor" $legacy $absent)
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -338,7 +357,11 @@ jobs:
           # made active. This NEVER triggers a dense re-embed (separate identity).
           gh release download latest --repo "$GITHUB_REPOSITORY" -p sparse-index.json -D . 2>/dev/null || true
           sparse_model="${{ vars.SPARSE_EMBED_MODEL || 'bge-m3' }}"
-          if ! CGO_ENABLED=0 go run ./cmd/discover --sparse-check --sparse-model "$sparse_model" --sparse-index sparse-index.json >> "$GITHUB_OUTPUT"; then
+          # rust/discover --sparse-check takes the pre-resolved sparse identity
+          # (--sparse-id); `go run ./cmd/embedid --sparse` (CGO-free) resolves the
+          # FAMILY to it (empty when the active model has no sparse head).
+          sparse_id=$(EMBED_MODEL="$sparse_model" CGO_ENABLED=0 go run ./cmd/embedid --sparse 2>/dev/null || true)
+          if ! ./rust/discover/target/release/discover --sparse-check --sparse-id "$sparse_id" --sparse-index sparse-index.json >> "$GITHUB_OUTPUT"; then
             { echo "sparse_needed=false"; echo "sparse_id="; } >> "$GITHUB_OUTPUT"
           fi
 
@@ -510,6 +533,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Rust toolchain + cargo cache for this job's runner Rust builds (ingest, embed-io,
+      # embedder): restore libduckdb-sys/ort & deps instead of recompiling each shard build;
+      # only a Cargo.lock change rebuilds. (The merge bin is built INSIDE Dockerfile.merge —
+      # a docker stage — so it's covered by buildkit layer cache, not this.)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust -> rust/target
+            rust/embedder -> rust/embedder/target
       # Warm buildkit with a retry'd pull so the buildx builder boot survives a
       # transient Docker Hub timeout (the exact break that failed this scheduled
       # build on 2026-06-08..10). build-push then finds it locally cached.
@@ -568,13 +601,15 @@ jobs:
         run: scripts/lib/soffice-guard.sh
       - name: Build ingest (+ decoupled embed binary when embedding)
         run: |
-          # Ingest ALWAYS builds lexical (no -tags onnx): embedding is now a
-          # separate step (cmd/embed), so ingest just produces the clause text +
-          # FTS. When embed=true we ALSO build the onnx-tagged cmd/embed, which
-          # vectorises the shard in place, re-embedding ONLY changed clauses.
-          go build -trimpath -o bin/ingest ./cmd/ingest
+          # Ingest is the Rust bin (built in the ingest step below). Embedding is the RUST
+          # path (Phase 11b, cmd/embed deleted): when embed=true build the store-rs embed-io
+          # bridge + the Rust embedder; the embed step runs export-worklist → embedder →
+          # import → report, re-embedding ONLY changed clauses (embedding_hash).
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            CGO_ENABLED=1 go build -trimpath -tags onnx -o bin/embed ./cmd/embed
+            command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo build --release --manifest-path rust/store/Cargo.toml --bin embed-io
+            cargo build --release --manifest-path rust/embedder/Cargo.toml
           fi
       - name: Restore model components from the 'models' release (semantic only)
         if: github.event.inputs.embed == 'true'
@@ -671,7 +706,7 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'rust/discover/src/main.rs') }}
           restore-keys: |
             convert-v2-${{ steps.shard.outputs.tag }}-
       - name: Download + convert series ${{ steps.shard.outputs.tag }}
@@ -699,7 +734,7 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'rust/discover/src/main.rs') }}
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success
@@ -737,9 +772,9 @@ jobs:
       - name: Shard cache code-hash (embed code counts only when embedding)
         id: codehash
         run: |
-          files="internal/ingest internal/htmlparse internal/ooxml internal/model internal/store/schema.sql internal/store/hnsw.go cmd/ingest/main.go internal/subject internal/subjectmeta internal/registry"
+          files="rust/ingest rust/parse rust/store internal/model internal/store/schema.sql internal/store/hnsw.go internal/subject internal/subjectmeta internal/registry"
           if [ "${{ github.event.inputs.embed }}" = "true" ]; then
-            files="$files internal/embed cmd/embed/main.go"
+            files="$files internal/embed rust/embedder/src rust/store/src/bin/embed_io.rs"
           fi
           h="$(find $files -type f \( -name '*.go' -o -name '*.sql' \) 2>/dev/null | sort | xargs sha256sum | sha256sum | cut -c1-40)"
           echo "hash=$h" >> "$GITHUB_OUTPUT"
@@ -817,14 +852,26 @@ jobs:
           set -o pipefail
           mkdir -p dist
           OUT="dist/shard-${{ steps.shard.outputs.tag }}.duckdb"
+          SERIES="${{ steps.shard.outputs.series }}"
+          RELFLAG="${{ steps.shard.outputs.relflag }}"
+          RELVAL="${RELFLAG#--release }"   # "" when no release pin
+          # Phase 11b: the RUST ingest (parse3gpp + store-rs) is now the ONLY ingest — the
+          # Go cmd/ingest is deleted. All cmd/ingest modes are ported + rust-go-roundtrip-CI
+          # tested. A toolchain/build failure fails the step LOUDLY (visible + re-runnable,
+          # not a silent empty corpus); a wrong/empty shard is caught downstream by
+          # cmd/validate / data-contract. --resume + embedding_hash stay idempotent.
+          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest \
+            || { echo "::error::Rust ingest build failed"; exit 1; }
           attempt=0
           max_attempts=3
           ingest_ok=0
           while [ "$attempt" -lt "$max_attempts" ]; do
             attempt=$((attempt+1))
             echo "::group::ingest attempt $attempt/$max_attempts (shard ${{ steps.shard.outputs.tag }})"
-            if ./bin/ingest --series "${{ steps.shard.outputs.series }}" ${{ steps.shard.outputs.relflag }} --out "$OUT" --resume; then
-              ingest_ok=1
+            if rust/target/release/ingest --series "$SERIES" ${RELVAL:+--release "$RELVAL"} --convert data/sources/convert --db "$OUT" --resume; then
+              echo "ingest via Rust"; ingest_ok=1
             fi
             echo "::endgroup::"
             if [ "$ingest_ok" -eq 1 ]; then
@@ -852,7 +899,10 @@ jobs:
           EMBEDDER: bge-m3
           EMBED_MODEL_DIR: ${{ github.workspace }}/data/models/bge-m3
           ONNXRUNTIME_SHARED_LIBRARY_PATH: ${{ github.workspace }}/data/models/onnxruntime/lib/libonnxruntime.so
-          EMBED_WINDOWING: mean_pool
+          # Windowing is single-sourced from the model registry (EmbedIdentity
+          # component), not this env — canonical default is truncate@1024 to match the
+          # Rust corpus embedder. mean_pool is the urgent Rust port (tracked issue);
+          # it will re-enable here via the registry once embed-core implements it.
           RERANKER_DIR: ${{ github.workspace }}/data/models/bge-reranker-v2-m3
         run: |
           set -o pipefail
@@ -880,9 +930,22 @@ jobs:
             # _at_floor==0 means the
             # shard is fully vectorised at/above the floor; a 6h-cap partial
             # leaves >0 and fails → the rerun resumes via embedding_hash.
-            if ./bin/embed --db "$OUT" --embed-floor "${{ github.event.inputs.embed_floor }}" \
-                 --require-semantic --report json | tee "$RPT" \
-               && jq -e '.model=="bge-m3" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
+            # RUST embed flow: export the at/above-floor work-list → embedder (CUDA→CPU
+            # fallback) → import + freeze HNSW → report. The gate requires a stamped model,
+            # 0 at-floor NULLs, and a frozen HNSW. (.model is the canonical EmbedIdentity
+            # digest — checked non-empty, not a literal family, which the old Go gate got
+            # wrong: rep.Model was always the digest, so `=="bge-m3"` could never pass.)
+            export PATH="$HOME/.cargo/bin:$PATH"
+            export ORT_DYLIB_PATH="$ONNXRUNTIME_SHARED_LIBRARY_PATH"
+            FLOOR="${{ github.event.inputs.embed_floor }}"
+            EMBED_ID="$(EMBED_MODELS_CONFIG="$EMBED_MODEL_DIR/../models.yaml" go run ./cmd/embedid 2>/dev/null || echo bge-m3)"
+            if rust/target/release/embed-io --db "$OUT" --export-worklist /tmp/wl.jsonl --embed-floor "$FLOOR" \
+               && rust/embedder/target/release/embedder --in /tmp/wl.jsonl --out /tmp/vecs.jsonl \
+                    --model-dir "$EMBED_MODEL_DIR" --embed-identity "$EMBED_ID" \
+               && rust/target/release/embed-io --db "$OUT" --import-vectors /tmp/vecs.jsonl \
+                    --embed-identity "$EMBED_ID" --build-hnsw \
+               && rust/target/release/embed-io --db "$OUT" --report --embed-floor "$FLOOR" | tee "$RPT" \
+               && jq -e '.model != "" and .null_embeddings_at_floor==0 and .hnsw==true' "$RPT"; then
               embed_ok=1
             fi
             echo "::endgroup::"
@@ -1054,12 +1117,14 @@ jobs:
               echo "COPY --from=ghcr.io/${OWNER}/3gpp-shard:${tag}${sfx}-${RUN_ID} /shard.duckdb /shards/${tag}.duckdb"
             done
             [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=${corpus} /3gpp.duckdb /base.duckdb"
-            echo "FROM golang:1.26-bookworm AS merge"
+            # Phase 9/11b: merge is the RUST store-rs bin (libduckdb bundled, statically
+            # linked). Its corpus-/subject-/build-index sidecars are golden-tested
+            # byte-identical to the Go cmd/merge that discover reads.
+            echo "FROM rust:1-bookworm AS merge"
+            echo "RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake && rm -rf /var/lib/apt/lists/*"
             echo "WORKDIR /src"
-            echo "COPY go.mod go.sum ./"
-            echo "RUN go mod download"
             echo "COPY . ."
-            echo "RUN CGO_ENABLED=1 GOTOOLCHAIN=local go build -trimpath -o /bin/merge ./cmd/merge"
+            echo "RUN cargo build --release --manifest-path rust/store/Cargo.toml --bin merge && cp rust/target/release/merge /bin/merge"
             echo "COPY --from=shards /shards /shards"
             [ "$BASE_PRESENT" = 1 ] && echo "COPY --from=shards /base.duckdb /base.duckdb"
             base_arg=""; [ "$BASE_PRESENT" = 1 ] && base_arg="--base /base.duckdb"
@@ -1069,7 +1134,12 @@ jobs:
           } > Dockerfile.merge
           echo "----- Dockerfile.merge -----"; cat Dockerfile.merge; echo "----------------------------"
           # ---- build: cmd/merge runs INSIDE the build; extract result to runner ----
-          retry docker buildx build -f Dockerfile.merge --output type=local,dest=mergeout .
+          # GitHub Actions buildkit cache so the rust:1-bookworm + cargo-build-merge layers
+          # are RESTORED across bakes instead of recompiled (the runner rust-cache can't
+          # reach a docker stage). mode=max caches intermediate layers; scope isolates it.
+          retry docker buildx build -f Dockerfile.merge \
+            --cache-from type=gha,scope=merge --cache-to type=gha,mode=max,scope=merge \
+            --output type=local,dest=mergeout .
           mkdir -p data
           cp mergeout/3gpp.duckdb        data/3gpp.duckdb
           cp mergeout/corpus-index.json  data/corpus-index.json
@@ -1083,17 +1153,30 @@ jobs:
           # search_api). Both are idempotent (UPSERT / clear-api_*-then-reingest)
           # and degrade-don't-block: a forge/DynaReport outage must not fail the
           # corpus build — the DB stays valid with filename-derived metadata.
-          go build -trimpath -o bin/ingest-catalog ./cmd/ingest-catalog
-          ./bin/ingest-catalog --out data/3gpp.duckdb --cache data/catalog \
+          # Catalogue overlay now runs the RUST ingest-catalog (parse3gpp::catalog +
+          # store-rs); the Go cmd/ingest-catalog is removed (Phase 11b). Fetch the two
+          # DynaReport HTML pages, then overlay — all degrade-don't-block (a fetch/build
+          # outage keeps the DB valid with filename-derived metadata).
+          ( mkdir -p data/catalog \
+            && curl -fsSL --retry 3 "https://www.3gpp.org/dynareport?code=status-report.htm" -o data/catalog/status-report.htm \
+            && curl -fsSL --retry 3 "https://portal.3gpp.org/Releases.aspx" -o data/catalog/releases.htm \
+            && cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-catalog \
+            && ./rust/target/release/ingest-catalog --db data/3gpp.duckdb \
+                 --status-report data/catalog/status-report.htm --releases data/catalog/releases.htm ) \
             || echo "[merge] catalog overlay degraded (kept filename-derived metadata)"
-          go build -trimpath -o bin/ingest-openapi ./cmd/ingest-openapi
+          # OpenAPI overlay now runs the RUST ingest-openapi (parse3gpp::openapi + store-rs),
+          # the Go cmd/ingest-openapi having been removed (Phase 11b). It is fully
+          # degrade-don't-block: if this runner lacks the Rust toolchain or the build fails,
+          # the additive overlay is simply skipped and the DB stays valid (the full Phase 10
+          # CI repoint installs the toolchain + toolcaches the bin).
           # auto = fetch EVERY REL-* branch the Forge currently has, so a newly
           # published release (REL-20, REL-21, …) is picked up by a cron build with
           # no code change — and any release before the old hardcoded floor too.
           ./scripts/fetch-5g-apis.sh auto \
             || echo "[merge] 5g-apis fetch degraded"
-          ./bin/ingest-openapi --out data/3gpp.duckdb \
-            || echo "[merge] openapi ingest degraded"
+          ( cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-openapi \
+            && ./rust/target/release/ingest-openapi --src data/sources/5g-apis --db data/3gpp.duckdb ) \
+            || echo "[merge] openapi overlay skipped (Rust ingest-openapi unavailable on this runner)"
       - name: Package (zstd + sha256 over the enriched DB)
         run: |
           zstd -19 -T0 --long=27 -f data/3gpp.duckdb -o data/3gpp.duckdb.zst

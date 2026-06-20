@@ -17,21 +17,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
-
-// IngestContext carries everything a subject needs to extract its structured
-// artefacts from one parsed spec during the offline ingest pass.
-type IngestContext struct {
-	SpecID      string
-	Release     string
-	Version     string
-	ConvertPath string // path of the converted file being ingested (to locate siblings)
-	OriginDir   string // data/sources/origin (for attachment zips)
-	Clauses     []model.Clause
-	IsLatest    bool // this (spec, version) is the newest indexed version of the spec
-}
 
 // ToolRegistration is one MCP tool a subject contributes.
 type ToolRegistration struct {
@@ -43,29 +30,12 @@ type ToolRegistration struct {
 type Subject interface {
 	// Name is the stable subject id ("li").
 	Name() string
-	// Activates reports whether this subject ingests the given spec.
+	// Activates reports whether this subject owns the given spec.
 	Activates(specID string) bool
-	// Ingest extracts the subject's structured data for one spec into the store.
-	// Returns the number of records added (degrade-don't-block: a missing source
-	// returns 0, nil). Called only when Activates(ic.SpecID) is true.
-	Ingest(ctx context.Context, db *store.Store, ic IngestContext) (added int, err error)
-	// Tools returns the MCP tools this subject contributes (may be empty).
-	Tools(db *store.Store, baseline string) []ToolRegistration
-}
-
-// Purger is an optional capability: a subject that owns derived tables can clear
-// the rows it wrote for one (spec, release) so a --resume redo starts from a
-// clean slate. The generic PurgeSpecScope only knows the core tables (clauses,
-// spec_versions, ingest_log); subject-owned tables (li_events, asn1_types, …) are
-// invisible to it. Without this hook the resume "purge-then-redo-fresh" contract
-// silently skips subject rows, so a corrected norm's rows can never overwrite a
-// stale prior parse (ON CONFLICT DO NOTHING) and removed events linger forever.
-type Purger interface {
-	// Purge deletes every row this subject wrote for (specID, release). Called
-	// from the resume redo path alongside the core PurgeSpecScope, only for
-	// subjects whose Activates(specID) is true. version is provided for subjects
-	// keyed by version rather than release.
-	Purge(ctx context.Context, db *store.Store, specID, release, version string) error
+	// Tools returns the MCP tools this subject contributes (may be empty). Ingestion
+	// moved to the Rust write-side (Phase 11b), so the Go Subject contract is read-only:
+	// it declares spec ownership and contributes serve-time tools only.
+	Tools(db store.Reader, baseline string) []ToolRegistration
 }
 
 // TermEnricher is an optional capability: a subject can enrich the core
@@ -73,7 +43,7 @@ type Purger interface {
 type TermEnricher interface {
 	// EnrichTerm returns extra response fields (merged into resolve_term's output)
 	// and ok=true when the term is recognised by this subject.
-	EnrichTerm(ctx context.Context, db *store.Store, term, baseline string) (map[string]any, bool)
+	EnrichTerm(ctx context.Context, db store.Reader, term, baseline string) (map[string]any, bool)
 }
 
 // Registry holds the enabled subjects.
@@ -102,22 +72,6 @@ func (r *Registry) TermEnrichers() []TermEnricher {
 	for _, s := range r.subjects {
 		if te, ok := s.(TermEnricher); ok {
 			out = append(out, te)
-		}
-	}
-	return out
-}
-
-// Purgers returns the subjects that both activate on specID and implement the
-// Purger capability — i.e. the subjects whose derived rows a resume redo of
-// specID must clear before re-ingesting.
-func (r *Registry) Purgers(specID string) []Purger {
-	var out []Purger
-	for _, s := range r.subjects {
-		if !s.Activates(specID) {
-			continue
-		}
-		if p, ok := s.(Purger); ok {
-			out = append(out, p)
 		}
 	}
 	return out

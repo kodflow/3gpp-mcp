@@ -1,0 +1,48 @@
+[package]
+name = "store-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust DuckDB write layer for the 3GPP corpus (duckdb-rs). Go reads the file back read-only; the round-trip proves the on-disk format is shared."
+
+# duckdb-rs MUST bundle the SAME DuckDB engine version as go-duckdb (v2.4.3 → engine
+# v1.4.3), else a Rust-written file does not open in the Go serve side. The round-trip
+# test (a separate Go process opening this fixture) is the binding proof; the version
+# pin is checked by scripts/check-duckdb-pin.sh. The duckdb crate's 1.4.x line bundles
+# DuckDB 1.4.x, storage-compatible with engine 1.4.3.
+[dependencies]
+duckdb = { version = "1.4", features = ["bundled"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+# identity digests extracted to a CGO-free crate (shared with discover); re-exported
+# as store_rs::identity (see lib.rs).
+identity3gpp = { path = "../identity" }
+
+[[bin]]
+name = "roundtrip-fixture"
+path = "src/bin/roundtrip_fixture.rs"
+
+# embed-io — the Rust replacement for cmd/embed-io (Go): export the work-list / import
+# vectors / build HNSW, all via store-rs, so the embed pipeline writes DuckDB without Go.
+[[bin]]
+name = "embed-io"
+path = "src/bin/embed_io.rs"
+
+# merge — the Rust replacement for cmd/merge (Go): fold per-shard DuckDBs into one corpus.
+[[bin]]
+name = "merge"
+path = "src/bin/merge.rs"
+
+# freeze-hnsw — the Rust replacement for cmd/freeze-hnsw (Go): build + freeze the cosine HNSW.
+[[bin]]
+name = "freeze-hnsw"
+path = "src/bin/freeze_hnsw.rs"
+
+# overlay — the Rust replacement for cmd/overlay (Go): fuse vector shards onto a lexical base.
+[[bin]]
+name = "overlay"
+path = "src/bin/overlay.rs"
