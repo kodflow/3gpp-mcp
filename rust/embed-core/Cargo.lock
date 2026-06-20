@@ -256,6 +256,8 @@ dependencies = [
  "anyhow",
  "ndarray",
  "ort",
+ "serde",
+ "serde_json",
  "sha2",
  "tokenizers",
 ]

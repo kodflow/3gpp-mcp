@@ -1,12 +1,15 @@
 # Corpus-scale SPARSE pass on Kaggle GPU (additive — never recomputes dense).
 # Pulls the private lexical base (ghcr.io/<owner>/3gpp-corpus:latest) via crane,
 # exports the dense+sparse BGE-M3 model (proven recipe, kernel-sparse-embed-smoke.py),
-# builds `cmd/embed` + `cmd/overlay` (-tags onnx) on ORT-CUDA, then:
+# builds the Rust sparse pass (embed-core-sparse + store-rs overlay/embed-io) on ORT-CUDA, then:
 #   RESUME — pulls the previously published sparse layer (ghcr.io/<owner>/3gpp-sparse
 #            :latest, if any) and overlays its clause_sparse onto the fresh base, so
 #            this session only embeds clauses STILL missing a posting.
-#   PASS   — runs `--sparse-only --limit EMBED_LIMIT` (a BOUNDED slice that fits under
-#            Kaggle's 12 h cap; ClausesMissingSparse skips already-populated clauses).
+#   PASS   — the Rust sparse pass (embed-core-sparse, the proven dual-head sparse arm —
+#            replaces the deleted Go cmd/embed --sparse-only, Phase 11b): store-rs embed-io
+#            --export-sparse-worklist (a BOUNDED --limit slice that fits under Kaggle's 12 h
+#            cap; clauses_needing_sparse skips already-populated clauses) → embed-core-sparse
+#            → embed-io --import-sparse into clause_sparse.
 #   EMIT   — exports the CUMULATIVE clause_sparse shard to /kaggle/working so the
 #            workflow republishes it; the NEXT dispatch resumes from it.
 # The dense `embedding` column is NEVER touched. A full corpus is covered across
@@ -187,16 +190,21 @@ try:
     benv["CGO_ENABLED"] = "1"
     benv["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
     benv["LD_LIBRARY_PATH"] = ORT_DIR + ":" + benv.get("LD_LIBRARY_PATH", "")
-    b = sh('cd %s && go build -tags onnx -o %s/embed ./cmd/embed' % (src, TMP), env=benv)
-    if b.returncode != 0:
-        res("fail build_embed " + (b.stderr or "")[-400:])
-        sys.exit(0)
-    # The RUST overlay (store-rs) carries an attached shard's clause_sparse onto the base by
-    # natural identity — the RESUME carry-over. libduckdb is statically bundled (same engine
-    # the round-trip CI proves byte-compatible with the Go serve side).
-    bo = sh('cd %s && cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay && cp rust/target/release/overlay %s/overlay' % (src, TMP), env=benv)
+    # store-rs bins: overlay (RESUME carry-over) + embed-io (sparse worklist export +
+    # clause_sparse import). libduckdb is statically bundled (same engine the round-trip CI
+    # proves byte-compatible with the Go serve side).
+    bo = sh('cd %s && cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay --bin embed-io '
+            '&& cp rust/target/release/overlay rust/target/release/embed-io %s/' % (src, TMP), env=benv)
     if bo.returncode != 0:
-        res("fail build_overlay " + (bo.stderr or "")[-400:])
+        res("fail build_store_bins " + (bo.stderr or "")[-400:])
+        sys.exit(0)
+    # The bulk sparse embedder: embed-core-sparse drives the SAME proven dual-head sparse arm
+    # the serve path uses (embed_core_embed_sparse). Replaces the deleted Go cmd/embed
+    # --sparse-only (Phase 11b). load-dynamic ort dlopens libonnxruntime via ORT_DYLIB_PATH.
+    bs = sh('cd %s && cargo build --release --manifest-path rust/embed-core/Cargo.toml --bin embed-core-sparse --features ort,cuda '
+            '&& cp rust/embed-core/target/release/embed-core-sparse %s/sparse-embed' % (src, TMP), env=benv)
+    if bs.returncode != 0:
+        res("fail build_sparse_embed " + (bs.stderr or "")[-400:])
         sys.exit(0)
     with open(TMP + "/models.yaml", "w") as mf:
         mf.write(
@@ -238,7 +246,7 @@ try:
         else:
             print("resume: no published sparse shard yet — starting fresh", flush=True)
 
-    # --- 5. Run --sparse-only over the corpus (additive; resumable; BOUNDED) ----
+    # --- 5. Rust sparse pass over the corpus (additive; resumable; BOUNDED) -----
     # EMBED_LIMIT bounds THIS session to a slice that fits under Kaggle's 12 h cap;
     # ClausesMissingSparse skips whatever the 4.5 overlay already carried, so the
     # work-list is "the remaining gap", not the whole corpus. Re-dispatch until the
@@ -246,13 +254,30 @@ try:
     eenv = benv.copy()
     eenv["EMBED_MODELS_CONFIG"] = TMP + "/models.yaml"
     eenv["EMBED_MODEL"] = "bge-m3-sparse"
+    eenv["EMBED_MODEL_DIR"] = MDIR        # embed-core-sparse loads the dual-head model here
+    eenv["ORT_DYLIB_PATH"] = ORT_LIB      # load-dynamic onnxruntime for the cdylib/bin
     eenv["ORT_EP"] = "cuda"
+    # Resolve the sparse identity (CGO-free Go) to stamp meta sparse_model — the data-contract
+    # --require-sparse gate + rust/discover --sparse-check match against it.
+    sid = sh('cd %s && EMBED_MODEL=bge-m3-sparse EMBED_MODELS_CONFIG=%s/models.yaml CGO_ENABLED=0 '
+             'go run ./cmd/embedid --sparse' % (src, TMP), env=eenv).stdout.strip()
     lim = (" --limit %s" % LIMIT) if (LIMIT and LIMIT != "0") else ""
-    r = sh('%s/embed --db %s --sparse-only --sparse-batch %s%s' % (TMP, DB, SPARSE_BATCH, lim), env=eenv)
-    print("EMBED STDOUT:", (r.stdout or "")[-600:], flush=True)
-    print("EMBED STDERR:", (r.stderr or "")[-600:], flush=True)
-    if r.returncode != 0:
-        res("fail sparse_only rc=%d" % r.returncode)
+    # 3-step Rust sparse pass: export the remaining sparse gap → embed via the dual-head arm →
+    # import the postings into clause_sparse. Bounded by --limit on the worklist; resumable
+    # (export skips clauses already in clause_sparse, the embedder skips ids already in --out).
+    we = sh('%s/embed-io --db %s --export-sparse-worklist %s/sparse-wl.jsonl%s' % (TMP, DB, TMP, lim), env=eenv)
+    if we.returncode != 0:
+        res("fail export_sparse_worklist " + (we.stderr or "")[-400:])
+        sys.exit(0)
+    rs = sh('%s/sparse-embed --in %s/sparse-wl.jsonl --out %s/sparse-post.jsonl' % (TMP, TMP, TMP), env=eenv)
+    print("SPARSE-EMBED STDERR:", (rs.stderr or "")[-600:], flush=True)
+    if rs.returncode != 0:
+        res("fail sparse_embed rc=%d" % rs.returncode)
+        sys.exit(0)
+    ri = sh('%s/embed-io --db %s --import-sparse %s/sparse-post.jsonl --sparse-model "%s"' % (TMP, DB, TMP, sid), env=eenv)
+    print("IMPORT-SPARSE STDERR:", (ri.stderr or "")[-400:], flush=True)
+    if ri.returncode != 0:
+        res("fail import_sparse rc=%d" % ri.returncode)
         sys.exit(0)
 
     # --- 6. Convergence count + sparse identity + the CUMULATIVE shard --------
