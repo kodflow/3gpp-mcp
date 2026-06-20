@@ -706,6 +706,9 @@ impl Store {
 
     /// insert_api_operations writes operations in one transaction, assigning op_id from the
     /// current max+1 (== Go ingest-openapi).
+    // `id` is a DB primary-key offset (starts at max+1) interpolated into each INSERT,
+    // not a 0-based loop index, so enumerate() is not equivalent.
+    #[allow(clippy::explicit_counter_loop)]
     pub fn insert_api_operations(&self, ops: &[ApiOperationIn]) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -730,6 +733,8 @@ impl Store {
     }
 
     /// insert_api_schemas writes schemas in one transaction, assigning schema_id from max+1.
+    // `id` is a DB primary-key offset interpolated into each INSERT, not a loop index.
+    #[allow(clippy::explicit_counter_loop)]
     pub fn insert_api_schemas(&self, schemas: &[ApiSchemaIn]) -> Result<()> {
         if schemas.is_empty() {
             return Ok(());
@@ -930,6 +935,9 @@ impl Store {
 
     /// write_li_registry writes the parsed TS 33.128 LI registry (events + fields +
     /// nf-clauses + the full asn1 type catalogue) for one (spec, release) in one transaction.
+    // One cohesive transactional write; the four parallel slices + identity triple are
+    // intrinsic to the LI registry shape, so splitting into a struct would not clarify it.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_li_registry(
         &self,
         spec_id: &str,
