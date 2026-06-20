@@ -125,7 +125,7 @@ try:
         output_names=["sentence_embedding", "sparse_weights"],
         dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"},
                       "sentence_embedding": {0: "batch"}, "sparse_weights": {0: "batch", 1: "seq"}},
-        opset_version=17, export_params=True, do_constant_folding=True)
+        opset_version=18, export_params=True, do_constant_folding=True)
     m3.tokenizer.save_pretrained(MDIR)
     res("model_exported has_data=%s" % os.path.exists(MDIR + "/model.onnx_data"))
 
@@ -186,6 +186,16 @@ try:
     if sh('git clone --depth 1 -b %s %s %s' % (BRANCH, REPO, src)).returncode != 0:
         res("fail clone")
         sys.exit(0)
+    # The Kaggle image ships Go but NOT cargo — install Rust before the store-rs +
+    # embed-core builds below (mirror the dense rust kernel). Without this the cargo
+    # builds fail with "cargo: not found".
+    if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
+        sh("curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal")
+    os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + os.environ.get("PATH", "")
+    if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
+        res("fail no_cargo")
+        sys.exit(0)
+    print("cargo:", (sh("cargo --version").stdout or "").strip()[:40], flush=True)
     benv = os.environ.copy()
     benv["CGO_ENABLED"] = "1"
     benv["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
