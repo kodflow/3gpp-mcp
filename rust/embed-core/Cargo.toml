@@ -21,6 +21,15 @@ crate-type = ["cdylib", "rlib"]
 name = "embed-core-check"
 path = "src/bin/check.rs"
 
+# Bulk sparse corpus pass: read a clause work-list (JSONL) and emit per-clause learned-lexical
+# postings (JSONL) via the SAME proven sparse arm the serve path uses (embed_core_embed_sparse).
+# The store-rs `embed-io --import-sparse` loads the postings into clause_sparse. Needs the
+# dual-head model, so it only builds with --features ort (and ort,cuda on a GPU box).
+[[bin]]
+name = "embed-core-sparse"
+path = "src/bin/sparse_embed.rs"
+required-features = ["ort"]
+
 [dependencies]
 sha2 = "0.10"
 # Real BGE-M3 ONNX inference (single-query, serve-side). Pinned IN LOCKSTEP with
@@ -35,11 +44,14 @@ ort = { version = "=2.0.0-rc.9", features = ["ndarray", "load-dynamic"], optiona
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.20", optional = true }
 anyhow = { version = "1", optional = true }
+# JSONL I/O for the bulk sparse bin (only pulled in under `ort`, where the bin builds).
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 # `ort` swaps the deterministic baseline for the real BGE-M3 ONNX inference (CI/Kaggle only,
 # needs the model + onnxruntime). Default = the hash baseline so the seam builds/tests anywhere.
 # CPU-only by default (serve query-embed is one query); `cuda` is a sub-feature for GPU boxes.
 default = []
-ort = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:anyhow"]
+ort = ["dep:ort", "dep:ndarray", "dep:tokenizers", "dep:anyhow", "dep:serde", "dep:serde_json"]
 cuda = ["ort/cuda"]
