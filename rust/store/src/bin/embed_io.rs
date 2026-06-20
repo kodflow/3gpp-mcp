@@ -52,6 +52,25 @@ struct Args {
     /// Rows per write transaction on import.
     #[arg(long, default_value_t = 512)]
     batch: usize,
+    /// Export the SPARSE work-list (embeddable clauses with no clause_sparse posting) as
+    /// JSONL to this path, then exit. Mirrors --export-worklist for the sparse arm.
+    #[arg(long)]
+    export_sparse_worklist: Option<String>,
+    /// Import a JSONL sparse-postings file (from the embed-core sparse bin) into
+    /// clause_sparse, then exit. Each line: {"chunk_id":U64,"terms":[[term_id,weight],…]}.
+    #[arg(long)]
+    import_sparse: Option<String>,
+    /// SPARSE identity stamped into meta `sparse_model` on --import-sparse (so the
+    /// data-contract --require-sparse gate and discover --sparse-check can match it).
+    #[arg(long, default_value = "")]
+    sparse_model: String,
+}
+
+#[derive(Deserialize)]
+struct SparseRecord {
+    chunk_id: u64,
+    #[serde(default)]
+    terms: Vec<(u32, f32)>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +179,64 @@ fn main() -> Result<()> {
             eprintln!("embed-io: skipped {skipped} malformed/truncated line(s) — affected clauses stay NULL and resume next pass");
         }
         eprintln!("embed-io: wrote {total} vector(s) (hnsw={built})");
+        return Ok(());
+    }
+
+    if let Some(out) = args.export_sparse_worklist.as_deref() {
+        let floor_ord = if args.embed_floor.is_empty() {
+            0
+        } else {
+            store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
+        };
+        let wl = store.clauses_needing_sparse(args.limit, floor_ord)?;
+        let f = std::fs::File::create(out).with_context(|| format!("create {out}"))?;
+        let mut w = BufWriter::new(f);
+        for it in &wl {
+            serde_json::to_writer(
+                &mut w,
+                &WlRecord {
+                    chunk_id: it.chunk_id,
+                    heading: it.heading.clone(),
+                    text: it.text.clone(),
+                },
+            )?;
+            w.write_all(b"\n")?;
+        }
+        w.flush()?;
+        eprintln!("embed-io: wrote {} sparse work item(s) to {out}", wl.len());
+        return Ok(());
+    }
+
+    if let Some(inp) = args.import_sparse.as_deref() {
+        let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
+        let mut total = 0usize;
+        let mut skipped = 0usize;
+        for line in BufReader::new(f).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let r: SparseRecord = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(_) => {
+                    // truncated/garbled line (killed worker) — skip; the clause stays sparse-less
+                    // and is re-picked next pass (clauses_needing_sparse).
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // An empty-postings clause (heading-only/void text) still counts as "done" so the
+            // worklist converges — write the (empty) posting set, which set_sparse handles.
+            store.set_sparse(r.chunk_id, &r.terms)?;
+            total += 1;
+        }
+        if !args.sparse_model.is_empty() {
+            store.set_meta("sparse_model", &args.sparse_model)?;
+        }
+        if skipped > 0 {
+            eprintln!("embed-io: skipped {skipped} malformed sparse line(s) — affected clauses re-picked next pass");
+        }
+        eprintln!("embed-io: wrote sparse postings for {total} clause(s)");
         return Ok(());
     }
 
