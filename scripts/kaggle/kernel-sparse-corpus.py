@@ -131,16 +131,30 @@ try:
         opset_version=18)
     # BGE-M3 fp32 weights are ~2.2 GB, OVER the 2 GB ONNX protobuf limit → they MUST be
     # written as external data (model.onnx_data). An inline export produces a corrupt model
-    # that HANGS embed-core at load (the 4h "Output 0 B" spins). Save the dynamo ONNXProgram
-    # with external_data=True; fall back to the legacy exporter if the API shape differs.
+    # that HANGS embed-core at load (the 4h "Output 0 B" spins). prog.save(external_data=True)
+    # did NOT externalize, so write the in-memory proto via onnx.save_model with
+    # save_as_external_data=True (the proto has no 2 GB limit until it hits disk).
     model = DenseSparse(backbone, sparse_linear).eval()
+    import onnx
+    onnx_path = MDIR + "/model.onnx"
     try:
+        # Newer torch: f-path + external_data=True writes both .onnx and .onnx_data directly.
+        torch.onnx.export(model, args, onnx_path, dynamo=True, external_data=True, **common)
+    except TypeError:
+        # Older torch: capture the ONNXProgram and externalize via onnx.save_model.
         prog = torch.onnx.export(model, args, dynamo=True, **common)
-        prog.save(MDIR + "/model.onnx", external_data=True)
-    except Exception as e:
-        print("dynamo external-data save failed (%s) — legacy fallback" % e, flush=True)
-        torch.onnx.export(model, args, MDIR + "/model.onnx",
-                          export_params=True, do_constant_folding=True, **common)
+        proto = getattr(prog, "model_proto", None) or prog.model
+        onnx.save_model(proto, onnx_path, save_as_external_data=True,
+                        all_tensors_to_one_file=True, location="model.onnx_data", size_threshold=1024)
+    # Belt-and-braces: if external data still didn't land (some torch builds inline it),
+    # reload + rewrite with onnx.save_model to force the .onnx_data sidecar.
+    if not os.path.exists(MDIR + "/model.onnx_data"):
+        try:
+            proto = onnx.load(onnx_path)  # only succeeds if the .onnx is <2 GB / loadable
+            onnx.save_model(proto, onnx_path, save_as_external_data=True,
+                            all_tensors_to_one_file=True, location="model.onnx_data", size_threshold=1024)
+        except Exception as e:
+            print("external-data rewrite failed (%s)" % e, flush=True)
     m3.tokenizer.save_pretrained(MDIR)
     has_data = os.path.exists(MDIR + "/model.onnx_data")
     res("model_exported has_data=%s" % has_data)
