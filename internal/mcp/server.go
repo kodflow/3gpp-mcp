@@ -34,7 +34,7 @@ import (
 // corpora stay SPLIT (3gpp.duckdb + etsi.duckdb), never merged. When present, the
 // handlers federate to it: get_spec / list_releases / get_changelog route a spec_id
 // beginning "ETSI " to the ETSI store, and list_specs unions both. nil = 3GPP only.
-func New(st *store.Store, version, baseline string, vecShards []string, etsi *store.Store) (*server.MCPServer, *search.Engine) {
+func New(st store.Reader, version, baseline string, vecShards []string, etsi store.Reader) (*server.MCPServer, *search.Engine) {
 	eng := search.New(st)
 	eng.UseVectorShards(vecShards)
 	scope := "latest release"
@@ -150,8 +150,8 @@ func New(st *store.Store, version, baseline string, vecShards []string, etsi *st
 }
 
 type handlers struct {
-	st       *store.Store
-	etsi     *store.Store // optional SECOND store over etsi.duckdb (split, not merged); nil = 3GPP only
+	st       store.Reader
+	etsi     store.Reader // optional SECOND store over etsi.duckdb (split, not merged); nil = 3GPP only
 	eng      *search.Engine
 	etsiEng  *search.Engine // search engine over the ETSI store; nil = 3GPP only
 	reg      *subject.Registry
@@ -162,7 +162,7 @@ type handlers struct {
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
 // goes to the attached ETSI store (when present), everything else to the 3GPP store.
 // This is how the two SPLIT indexes are federated without a merge.
-func (h *handlers) specStore(specID string) *store.Store {
+func (h *handlers) specStore(specID string) store.Reader {
 	if h.etsi != nil && strings.HasPrefix(specID, "ETSI ") {
 		return h.etsi
 	}

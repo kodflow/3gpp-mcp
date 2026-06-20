@@ -23,9 +23,10 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 files=(
   .github/workflows/corpus-data-image.yml
   Dockerfile.data
-  cmd/freeze-hnsw/main.go
-  cmd/overlay/main.go
-  cmd/merge/main.go
+  rust/store/src/bin/freeze_hnsw.rs
+  rust/store/src/bin/overlay.rs
+  rust/store/src/bin/merge.rs
+  rust/store/src/identity.rs
   cmd/validate/main.go
   internal/store/hnsw.go
   internal/store/store.go

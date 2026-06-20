@@ -25,7 +25,7 @@ réalisable — simplement, personne ne l'appelle en CI.
 La décision « qu'est-ce qui doit être (ré)indexé » repose sur trois signaux, **aucun ne
 regarde le sparse** :
 
-- **Drift de version corpus** (`cmd/discover` : delta site vs `corpus-index.json`).
+- **Drift de version corpus** (`rust/discover` : delta site vs `corpus-index.json`).
 - **Drift de footprint subject** (`subjectmeta.ChangedSeries` — code des verticales li/glossary).
 - **Drift d'identité de build** : `SpecIngestIdentity`, `GlobalEnrichmentIdentity`, `EmbedIdentity`.
 
@@ -126,7 +126,7 @@ Sans jamais retoucher le dense :
    via `SetMeta`, comme `hnsw_state`) écrit à la fin de `runSparse`, **et/ou** ajouter une
    composante sparse à `EmbedParts` (`sparse_output` + revision) pour que `EmbedIdentity`
    flippe quand le sparse manque/change.
-2. **Câbler la détection.** Dans `cmd/discover` (ou un check de bake), comparer ce marqueur
+2. **Câbler la détection.** Dans `rust/discover` (ou un check de bake), comparer ce marqueur
    à l'attendu et émettre un signal « sparse-needed » quand `clause_sparse` est vide alors
    que le modèle a une tête sparse.
 3. **Exporter le modèle sparse en CI.** Ajouter un gate `WITH_SPARSE` à `fetch-model.sh` /

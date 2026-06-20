@@ -1,0 +1,15 @@
+# identity3gpp — the CGO-free build-identity + subject-footprint digests shared by
+# the write-side (store-rs/merge) AND the CI-matrix tool (discover). Extracted from
+# store-rs so discover can reuse the golden-matched digests WITHOUT pulling libduckdb
+# (store-rs is CGO/duckdb; discover must stay light). Deps are sha2 + hex only.
+[package]
+name = "identity3gpp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"

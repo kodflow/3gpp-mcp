@@ -1,0 +1,64 @@
+# =============================================================================
+#  Corpus · Embed orchestrator — autonomous dense campaign convergence
+# =============================================================================
+#  The dense embed workflow (Corpus · Rust embed) is SERIAL (its concurrency runs
+#  one Kaggle GPU session at a time) and has no self-dispatch — so embedding all
+#  31 series needs something to dispatch the NEXT series when the current one is
+#  done. This cron does exactly that, autonomously, and is bounded THREE ways so
+#  it can never run away:
+#    1. cron fires at most every 4h;
+#    2. it SKIPS if a dense embed run is already in_progress/queued (active guard);
+#    3. even if (2) ever mis-reads, the target workflow's own concurrency
+#       (cancel-in-progress:false, 1 running + 1 pending) caps the fan-out at one.
+#  Each series resumes (already-embedded chunk_ids are skipped), so revisiting a
+#  series is cheap and the campaign converges. Scheduled runs fire only from the
+#  default branch (GitHub rule) — until this is on main, tick it via workflow_dispatch.
+name: Corpus · Embed orchestrator
+
+on:
+  schedule:
+    - cron: "23 */4 * * *" # every 4h
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch the embed kernel clones/builds from."
+        required: false
+        default: "perf/embedder-dynamic-batch"
+
+permissions:
+  actions: write # dispatch the embed workflow
+  contents: read
+
+concurrency:
+  group: corpus-embed-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ${{ github.event.inputs.ref || 'perf/embedder-dynamic-batch' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Dispatch the next dense series if none is active
+        run: |
+          set -euo pipefail
+          wf="corpus-rust-embed-kaggle.yml"
+          active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
+            echo "a dense embed run is active ($active) / queued ($queued) — skip this tick"
+            exit 0
+          fi
+          # All 31 indexed corpus series, core-network + LI first (best-value early).
+          series=(23 24 29 38 33 28 36 37 21 22 25 26 27 30 31 32 34 35 41 42 43 44 45 46 48 49 50 51 52 55 03)
+          # Deterministic rotation by epoch-hours so successive ticks advance through
+          # the list; with per-series resume this revisits each until it converges.
+          idx=$(( ( $(date +%s) / 3600 ) % ${#series[@]} ))
+          s=${series[$idx]}
+          echo "no dense run active — dispatching series $s (idx $idx of ${#series[@]})"
+          gh workflow run "$wf" --ref "$REF" -f series="$s" -f kaggle_account=fallback

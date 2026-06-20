@@ -17,8 +17,9 @@ glossary/
 
 ## Conventions
 
-- Owns spec id `21.905`; extraction runs during the ingest pass via
-  `subject.IngestContext`.
+- Owns spec id `21.905`; acronym extraction moved to the Rust write-side
+  (`parse3gpp::glossary`, Phase 11b). This Go subject only declares ownership and
+  contributes no serve-time tool (the core `resolve_term` serves the acronyms).
 - `reAbbrev` matches `ABBR<TAB|2+ spaces>Expansion` — the TAB/multi-space
   separator keeps prose out. Acronyms are domain/release-qualified (CLAUDE.md §8
   #5: `AMF` differs between 5GC and IMS legacy).

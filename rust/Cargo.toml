@@ -1,0 +1,19 @@
+# Cargo workspace for the DuckDB-writing crates of the write-side migration. Sharing one
+# target/ means the bundled libduckdb compiles ONCE for store + ingest instead of per
+# crate (local + CI build time). The embedder is EXCLUDED on purpose: it pulls the heavy
+# ort/CUDA toolchain and is built standalone on Kaggle (--manifest-path rust/embedder),
+# and keeping it out avoids any risk to that proven GPU build.
+[workspace]
+resolver = "2"
+members = ["store", "parse", "ingest", "identity"]
+# embedder + embed-core are EXCLUDED: the embedder pulls the heavy ort/CUDA toolchain
+# (built standalone on Kaggle); embed-core is a cdylib whose real path also needs ort
+# (built + FFI-validated in the rust-go-roundtrip CI), so neither belongs in the
+# DuckDB-writing workspace that compiles libduckdb once.
+# discover is also excluded: it is a CI-matrix tool, not a DuckDB writer (Phase 9).
+# It is now the SOLE discoverer — the Go cmd/discover was retired in Phase 11b.
+exclude = ["embedder", "embed-core", "discover"]
+
+[profile.dev]
+debug = false
+strip = true

@@ -76,4 +76,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI (`.github/workflows/rust-embedder.yml`) runs all of the above + a release build.
+CI (the `rust-embedder` job in `.github/workflows/ci.yml`) runs all of the above + a release build.
