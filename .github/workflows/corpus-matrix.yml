@@ -102,7 +102,7 @@ on:
     paths:
       - 'rust/parse/**'
       - 'cmd/merge/**'
-      - 'cmd/discover/**'
+      - 'rust/discover/**'
       - 'rust/ingest/**'
       - 'internal/ingest/**'
       - 'internal/htmlparse/**'
@@ -252,14 +252,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build rust/discover for the Phase-10 shadow (best-effort, never gates)
-        # Go cmd/discover stays AUTHORITATIVE for the matrix; this only lets the `set`
-        # step cross-check the parity-proven Rust port against the live status report
-        # and ::warning:: on any divergence. continue-on-error so a Rust build hiccup
-        # can never break the daily build.
-        continue-on-error: true
+      - name: Build rust/discover (Phase 10/11b — the sole matrix discoverer)
+        # rust/discover is AUTHORITATIVE for the matrix (Go cmd/discover retired in
+        # Phase 11b after byte-for-byte parity; correctness is locked by the fixture
+        # tests in rust/discover/src/lib.rs). A build failure must fail the discover
+        # job — there is no Go fallback any more.
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" build --release --manifest-path rust/discover/Cargo.toml
       - id: set
         run: |
@@ -304,34 +304,21 @@ jobs:
             # dispatch checkbox / auto push) — otherwise discover never surfaces them
             # and Phase 1/2 is never built despite the convert flag.
             legacy="${{ (vars.INCLUDE_LEGACY_GSM == 'true' || vars.INCLUDE_LEGACY_GSM == 'TRUE' || vars.INCLUDE_LEGACY_GSM == '1' || github.event.inputs.include_legacy_gsm == 'true' || github.event_name == 'push' || github.event_name == 'schedule') && '--include-legacy-gsm' || '' }}"
-            if [ "$full" = "true" ]; then
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --all --floor "$floor" $legacy)
-            else
-              matrix=$(CGO_ENABLED=0 go run ./cmd/discover --index corpus-index.json --subject-index subject-index.json --build-index build-index.json --embed-model "$embed_model" --floor "$floor" $legacy $absent)
-            fi
-            # ---- Phase 10: rust/discover SHADOW (Go AUTHORITATIVE; warn-only) -----
-            # Cross-check the parity-proven Rust port against the matrix Go just
-            # produced, on the SAME live status report. Every op is best-effort and a
-            # divergence is a ::warning::, never a failure — so this can't break the
-            # daily build. Go resolves --embed-model (family) internally; Rust takes
-            # the pre-resolved digest from `go run ./cmd/embedid` via --embed-identity.
-            # Flip to Rust-primary once the shadow stays clean over real cycles.
+            # rust/discover is the SOLE discoverer (Phase 10/11b — Go retired). It
+            # reads the status report from a local file, so fetch it first. Go used
+            # to resolve --embed-model (family) internally via CGO; Rust takes the
+            # pre-resolved digest from `go run ./cmd/embedid` (CGO-free) as
+            # --embed-identity.
+            source scripts/lib/discover.sh
+            discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" /tmp/status.htm
             RB=./rust/discover/target/release/discover
-            if [ -x "$RB" ] && source scripts/lib/discover.sh \
-               && discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" /tmp/status.htm 2>/dev/null; then
-              if [ "$full" = "true" ]; then
-                rust_matrix=$("$RB" --status-file /tmp/status.htm --all --floor "$floor" $legacy 2>/dev/null || true)
-              else
-                embed_id=""
-                [ -n "$embed_model" ] && embed_id=$(EMBED_MODEL="$embed_model" CGO_ENABLED=0 go run ./cmd/embedid 2>/dev/null || true)
-                embarg=""; [ -n "$embed_id" ] && embarg="--embed-identity $embed_id"
-                rust_matrix=$("$RB" --status-file /tmp/status.htm --index corpus-index.json --subject-index subject-index.json --build-index build-index.json $embarg --floor "$floor" $legacy $absent 2>/dev/null || true)
-              fi
-              if [ -n "$rust_matrix" ] && [ "$rust_matrix" != "$matrix" ]; then
-                echo "::warning::Phase10 rust/discover shadow diverged (Go authoritative). go=$matrix rust=$rust_matrix"
-              elif [ -n "$rust_matrix" ]; then
-                echo "Phase10 rust/discover shadow agrees with Go ✓"
-              fi
+            if [ "$full" = "true" ]; then
+              matrix=$("$RB" --status-file /tmp/status.htm --all --floor "$floor" $legacy)
+            else
+              embed_id=""
+              [ -n "$embed_model" ] && embed_id=$(EMBED_MODEL="$embed_model" CGO_ENABLED=0 go run ./cmd/embedid 2>/dev/null || true)
+              embarg=""; [ -n "$embed_id" ] && embarg="--embed-identity $embed_id"
+              matrix=$("$RB" --status-file /tmp/status.htm --index corpus-index.json --subject-index subject-index.json --build-index build-index.json $embarg --floor "$floor" $legacy $absent)
             fi
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -370,7 +357,11 @@ jobs:
           # made active. This NEVER triggers a dense re-embed (separate identity).
           gh release download latest --repo "$GITHUB_REPOSITORY" -p sparse-index.json -D . 2>/dev/null || true
           sparse_model="${{ vars.SPARSE_EMBED_MODEL || 'bge-m3' }}"
-          if ! CGO_ENABLED=0 go run ./cmd/discover --sparse-check --sparse-model "$sparse_model" --sparse-index sparse-index.json >> "$GITHUB_OUTPUT"; then
+          # rust/discover --sparse-check takes the pre-resolved sparse identity
+          # (--sparse-id); `go run ./cmd/embedid --sparse` (CGO-free) resolves the
+          # FAMILY to it (empty when the active model has no sparse head).
+          sparse_id=$(EMBED_MODEL="$sparse_model" CGO_ENABLED=0 go run ./cmd/embedid --sparse 2>/dev/null || true)
+          if ! ./rust/discover/target/release/discover --sparse-check --sparse-id "$sparse_id" --sparse-index sparse-index.json >> "$GITHUB_OUTPUT"; then
             { echo "sparse_needed=false"; echo "sparse_id="; } >> "$GITHUB_OUTPUT"
           fi
 
@@ -715,7 +706,7 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'rust/discover/src/main.rs') }}
           restore-keys: |
             convert-v2-${{ steps.shard.outputs.tag }}-
       - name: Download + convert series ${{ steps.shard.outputs.tag }}
@@ -743,7 +734,7 @@ jobs:
           path: |
             data/sources/convert
             data/sources/origin
-          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'cmd/discover/main.go') }}
+          key: convert-v2-${{ steps.shard.outputs.tag }}-${{ hashFiles('scripts/corpus.sh', 'scripts/lib/convert.sh', 'internal/catalog/parse.go', 'rust/discover/src/main.rs') }}
       # ── CROSS-RUN cache (axis #16) ──────────────────────────────────────
       # Persists partial + completed shard DBs across DIFFERENT workflow runs
       # so a fresh dispatch on unchanged code finds yesterday's 13-success

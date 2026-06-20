@@ -1,9 +1,10 @@
-//! identity — Rust port of the build-identity + subject-footprint subsystem shared by the
-//! Go merge and cmd/discover (internal/model/pipeline.go, internal/subjectmeta,
-//! internal/enrichmeta, internal/evolseed). These 12-char sha256 digests gate the
-//! incremental build: a SpecIngestIdentity drift forces re-ingest, GlobalEnrichmentIdentity
-//! forces re-enrich, EmbedIdentity forces re-embed. They MUST stay byte-identical to the Go
-//! side (discover still reads them) — every value here is golden-tested against the Go output.
+//! identity — Rust port of the build-identity + subject-footprint subsystem, now shared by
+//! rust/store (merge) and rust/discover (the Go merge + cmd/discover were retired in
+//! Phase 11b). It mirrors the original Go definitions (internal/model/pipeline.go,
+//! internal/subjectmeta, internal/enrichmeta, internal/evolseed). These 12-char sha256
+//! digests gate the incremental build: a SpecIngestIdentity drift forces re-ingest,
+//! GlobalEnrichmentIdentity forces re-enrich, EmbedIdentity forces re-embed. They MUST stay
+//! byte-identical to those Go definitions — every value here is golden-tested against the Go output.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
