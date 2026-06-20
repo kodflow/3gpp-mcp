@@ -15,8 +15,8 @@ li/
 ├── subject.go     # Subject impl: registration, li_events tool, resolve enrichment
 ├── catalog.go     # LI type catalogue (NF / interface ownership)
 ├── release.go     # release-scoped event availability
-├── store.go       # LI-specific persistence over the generic store
-├── asn1store.go   # persist the parsed ASN.1 registry
+├── store.go       # LI-specific READ queries (HasEvents/GetEvents) over the generic store
+├── asn1store.go   # ASN.1 type READ lookup (GetASN1Type) — registry writes are Rust (Phase 11b)
 ├── audit.go       # cross-check events vs normative text (drives cmd/li-audit)
 ├── x2events.go    # X2 interface event handling
 └── asn1/          # dependency-free TS 33.128 ASN.1 scanner (see its CLAUDE.md)
