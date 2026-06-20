@@ -21,7 +21,7 @@ subject/
 
 ## Import rule (no cycles)
 
-- This package imports **only** `store`, `model`, and the mcp-go types.
+- This package imports **only** `store` (as `store.Reader`), `model`, and the mcp-go types.
 - Concrete subjects import THIS package.
 - The wiring that lists all subjects lives in `internal/registry` (which imports
   the subjects); the core (ingest/mcp) imports `registry` — **never** a subject
@@ -29,10 +29,16 @@ subject/
 
 ## Contract surface
 
-- `IngestContext` — everything a subject needs to extract structured artefacts
-  from one parsed spec during the offline ingest pass.
+The Go subject contract is **read-only** (ingest moved to the Rust write-side,
+Phase 11b): a subject declares spec ownership and contributes serve-time tools.
+
+- `Subject.Tools(store.Reader, baseline)` — the MCP tools a subject contributes.
+- `TermEnricher.EnrichTerm(store.Reader, …)` — optional resolve_term enrichment.
 - `ToolRegistration` — one MCP tool a subject contributes (tool + handler).
 - `Registry` — the iterable set of enabled subjects.
+
+Subjects take `store.Reader`, so a subject tool cannot write the DuckDB — the
+serve read-only invariant (Phase 11a) extends through the subject seam.
 
 ## Conventions
 
