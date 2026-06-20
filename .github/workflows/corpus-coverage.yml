@@ -40,12 +40,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build the Rust discover binary (Phase 10 — primary; Go stays as shadow)
+      - name: Build rust/discover (Phase 10/11b — the sole discoverer; Go retired)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo" build --release --manifest-path rust/discover/Cargo.toml
-      - name: Emit the worklist from the live status report (rust primary, go shadow)
+      - name: Emit the worklist from the live status report (rust/discover)
         run: |
           source scripts/lib/discover.sh
           discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" status.htm

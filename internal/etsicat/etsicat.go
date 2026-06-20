@@ -3,7 +3,7 @@
 // is the index. This package holds the pure, offline-testable core — parse a
 // directory-listing HTML page into its entries, select the latest PUBLISHED version
 // of a spec, and diff the live tree against a persisted index — exactly mirroring
-// what cmd/discover does for 3GPP. The HTTP crawl that feeds these functions lives in
+// what rust/discover does for 3GPP. The HTTP crawl that feeds these functions lives in
 // cmd/discover-etsi; keeping the parsing/selection/diff here makes it unit-testable
 // with fixtures and free of network flakiness.
 //

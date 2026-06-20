@@ -18,7 +18,7 @@
 #   (e.g. SET=Rel-4) to ingest older releases; Rel-99 / Phase* stay out.
 #   Override: SET=Rel-15 scripts/corpus.sh   or   scripts/corpus.sh --set Rel-15
 #
-# Source of truth = the 3GPP STATUS REPORT (via cmd/discover --emit-worklist):
+# Source of truth = the 3GPP STATUS REPORT (via rust/discover --emit-worklist):
 # EVERY (spec,release) it lists at/above the floor is fetched — drafts (v0/v1/v2)
 # INCLUDED, so the index matches the site and nothing is silently dropped. Legacy
 # GSM (4-digit / series 00-13) is omitted by the report → archive enumeration,
@@ -307,7 +307,7 @@ fi
 
 # ----- enumerate (status-report-driven; the FIX for the chronic index gap) -----
 # The manifest is the FETCH worklist "<release> <url> <name>". We build it from the
-# 3GPP status report — the SAME source cmd/discover diffs the published index
+# 3GPP status report — the SAME source rust/discover diffs the published index
 # against — so the builder fetches EXACTLY every (spec,release) the site lists
 # (drafts v0/v1/v2 INCLUDED) and the index matches the site by construction. The
 # old archive-listing + version-major→release heuristic silently dropped ~72% of
@@ -320,7 +320,15 @@ if [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
   : > "$MANIFEST"
   wl_args=(--emit-worklist --floor "$SET")
   [[ -n "$SERIES_FILTER" ]] && wl_args+=(--series "$SERIES_FILTER")
-  if ( cd "$ROOT" && CGO_ENABLED=0 go run ./cmd/discover "${wl_args[@]}" ) >> "$MANIFEST"; then
+  # rust/discover is the sole discoverer (Phase 10/11b — Go cmd/discover retired).
+  # It reads the status report from a local file (no built-in fetch), so fetch it
+  # first, then run the binary. Any failure (no Rust toolchain, network) falls
+  # through to the archive enumeration below — the pre-existing safety net.
+  RB="$ROOT/rust/discover/target/release/discover"
+  source "$ROOT/scripts/lib/discover.sh"
+  if ( cd "$ROOT" && cargo build --release --manifest-path rust/discover/Cargo.toml ) >/dev/null 2>&1 \
+     && discover_fetch_status "https://www.3gpp.org/DynaReport/status-report.htm" "$WORKDIR/status.htm" 2>/dev/null \
+     && ( "$RB" --status-file "$WORKDIR/status.htm" "${wl_args[@]}" ) >> "$MANIFEST"; then
     log "worklist: $(wc -l < "$MANIFEST") (spec,release) entries from status report"
   else
     log "WARN: status-report worklist failed — falling back to archive enumeration"
