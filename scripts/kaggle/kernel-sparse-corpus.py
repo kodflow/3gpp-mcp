@@ -39,7 +39,11 @@ REPO = "https://github.com/kodflow/3gpp-mcp"
 BRANCH = os.environ.get("BRANCH", "main")
 OWNER = os.environ.get("GHCR_OWNER", "kodflow")
 GHCR_PAT = os.environ.get("GHCR_PAT", "").strip()
-ORT_VERSION = "1.26.0"
+# MUST match the onnxruntime ABI that `ort = 2.0.0-rc.9` expects (embed-core is built
+# load-dynamic and dlopens this via ORT_DYLIB_PATH). ort rc.9 targets onnxruntime 1.20.x;
+# pointing it at a newer lib (1.26.0) makes session.run hang at the first inference. Keep
+# this pinned in lockstep with the `ort` version in rust/embed-core/Cargo.toml.
+ORT_VERSION = "1.20.1"
 CRANE_VER = "v0.20.2"
 ORAS_VERSION = "1.2.0"  # pull the previously published sparse shard (resume input)
 DUCKDB_CLI_VER = "v1.1.3"  # storage-compatible with go-duckdb here (see kernel-embed.py)
