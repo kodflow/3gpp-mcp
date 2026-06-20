@@ -74,7 +74,7 @@ func ExtractLIX2Events(clauses []model.Clause) []X2NFEvents {
 
 // X2Events fetches TS 33.128 clause 6 from the store and extracts events.
 // specID defaults to "33.128"; an empty version resolves to the latest.
-func X2Events(ctx context.Context, st *store.Store, specID, version string) ([]X2NFEvents, string, error) {
+func X2Events(ctx context.Context, st store.Reader, specID, version string) ([]X2NFEvents, string, error) {
 	if specID == "" {
 		specID = "33.128"
 	}
