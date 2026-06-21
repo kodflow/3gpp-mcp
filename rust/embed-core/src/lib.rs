@@ -129,6 +129,22 @@ fn backend_embed_sparse(text: &str) -> Option<Vec<(u32, f32)>> {
     }
 }
 
+/// embed_sparse_batch is the BULK sparse path for the corpus pass (embed-core-sparse bin):
+/// one ONNX forward per batch instead of per-clause (per-clause is too slow for the campaign).
+/// Returns one Option per input text (None on per-row failure / no sparse head). rlib-only
+/// (the bin links embed-core as a crate; no C ABI needed for the variable-length postings).
+pub fn embed_sparse_batch(texts: &[&str], batch: usize) -> Vec<Option<Vec<(u32, f32)>>> {
+    #[cfg(feature = "ort")]
+    {
+        ort_backend::embed_sparse_batch(texts, batch)
+    }
+    #[cfg(not(feature = "ort"))]
+    {
+        let _ = batch;
+        texts.iter().map(|_| None).collect()
+    }
+}
+
 /// backend_embed routes to the active backend: the deterministic hash baseline (default) or
 /// the real BGE-M3 ONNX forward pass (`--features ort`). None ⇒ the backend could not embed.
 fn backend_embed(text: &str) -> Option<[f32; DENSE_DIM]> {
