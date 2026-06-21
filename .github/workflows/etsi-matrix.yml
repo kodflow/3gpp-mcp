@@ -81,7 +81,7 @@ jobs:
       # RESUME: the converted-HTML dir, keyed by the conversion code so a logic change
       # busts it but a re-run otherwise reuses every already-converted deliverable.
       - name: Restore converted-ETSI cache (resume)
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: data/sources/convert-etsi
           key: etsi-convert-v1-${{ hashFiles('scripts/etsi-corpus.sh', 'scripts/lib/convert.sh', 'cmd/discover-etsi/**', 'internal/etsicat/**') }}
