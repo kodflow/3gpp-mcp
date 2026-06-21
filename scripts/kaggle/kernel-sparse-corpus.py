@@ -244,36 +244,63 @@ try:
     if sh('git clone --depth 1 -b %s %s %s' % (BRANCH, REPO, src)).returncode != 0:
         res("fail clone")
         sys.exit(0)
-    # The Kaggle image ships Go but NOT cargo — install Rust before the store-rs +
-    # embed-core builds below (mirror the dense rust kernel). Without this the cargo
-    # builds fail with "cargo: not found".
-    if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
-        sh("curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal")
-    os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + os.environ.get("PATH", "")
-    if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
-        res("fail no_cargo")
-        sys.exit(0)
-    print("cargo:", (sh("cargo --version").stdout or "").strip()[:40], flush=True)
+
+    # --- 4a. PREBUILT FAST PATH: download the Rust bins built in CI (rust-bins release,
+    # glibc-2.35 base → run on Kaggle) instead of burning ~18 min of GPU re-compiling
+    # identical code. Use them ONLY when their COMMIT matches this clone's HEAD (else fall
+    # back to a from-source build, for correctness). All three bins are ort load-dynamic →
+    # portable; they dlopen the onnxruntime downloaded above at runtime.
+    prebuilt = False
+    head_sha = (sh("cd %s && git rev-parse HEAD" % src).stdout or "").strip()
+    rel = "%s/releases/download/rust-bins" % REPO
+    bins_commit = ""
+    if sh('curl -fsSL --retry 3 -o %s/BINS_COMMIT "%s/COMMIT"' % (TMP, rel)).returncode == 0 \
+            and os.path.exists(TMP + "/BINS_COMMIT"):
+        bins_commit = open(TMP + "/BINS_COMMIT").read().strip()
+    if bins_commit and bins_commit == head_sha:
+        ok = True
+        for name in ("overlay", "embed-io", "embed-core-sparse"):
+            if sh('curl -fsSL --retry 5 -o %s/%s "%s/%s"' % (TMP, name, rel, name)).returncode != 0:
+                ok = False
+                break
+        if ok:
+            sh("chmod +x %s/overlay %s/embed-io %s/embed-core-sparse" % (TMP, TMP, TMP))
+            sh("cp %s/embed-core-sparse %s/sparse-embed" % (TMP, TMP))
+            prebuilt = True
+            res("rust_bins=prebuilt sha=%s" % head_sha[:12])
+    if not prebuilt:
+        res("rust_bins=building_from_source bins_commit=%s head=%s"
+            % (bins_commit[:12] or "none", head_sha[:12]))
+        # The Kaggle image ships Go but NOT cargo — install Rust before the store-rs +
+        # embed-core builds below. Without this the cargo builds fail with "cargo: not found".
+        if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
+            sh("curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal")
+        os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + os.environ.get("PATH", "")
+        if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
+            res("fail no_cargo")
+            sys.exit(0)
+        print("cargo:", (sh("cargo --version").stdout or "").strip()[:40], flush=True)
     benv = os.environ.copy()
     benv["CGO_ENABLED"] = "1"
     benv["ONNXRUNTIME_SHARED_LIBRARY_PATH"] = ORT_LIB
     benv["LD_LIBRARY_PATH"] = ORT_DIR + ":" + benv.get("LD_LIBRARY_PATH", "")
-    # store-rs bins: overlay (RESUME carry-over) + embed-io (sparse worklist export +
-    # clause_sparse import). libduckdb is statically bundled (same engine the round-trip CI
-    # proves byte-compatible with the Go serve side).
-    bo = sh('cd %s && cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay --bin embed-io '
-            '&& cp rust/target/release/overlay rust/target/release/embed-io %s/' % (src, TMP), env=benv)
-    if bo.returncode != 0:
-        res("fail build_store_bins " + (bo.stderr or "")[-400:])
-        sys.exit(0)
-    # The bulk sparse embedder: embed-core-sparse drives the SAME proven dual-head sparse arm
-    # the serve path uses (embed_core_embed_sparse). Replaces the deleted Go cmd/embed
-    # --sparse-only (Phase 11b). load-dynamic ort dlopens libonnxruntime via ORT_DYLIB_PATH.
-    bs = sh('cd %s && cargo build --release --manifest-path rust/embed-core/Cargo.toml --bin embed-core-sparse --features ort,cuda '
-            '&& cp rust/embed-core/target/release/embed-core-sparse %s/sparse-embed' % (src, TMP), env=benv)
-    if bs.returncode != 0:
-        res("fail build_sparse_embed " + (bs.stderr or "")[-400:])
-        sys.exit(0)
+    if not prebuilt:
+        # store-rs bins: overlay (RESUME carry-over) + embed-io (sparse worklist export +
+        # clause_sparse import). libduckdb is statically bundled (same engine the round-trip CI
+        # proves byte-compatible with the Go serve side).
+        bo = sh('cd %s && cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay --bin embed-io '
+                '&& cp rust/target/release/overlay rust/target/release/embed-io %s/' % (src, TMP), env=benv)
+        if bo.returncode != 0:
+            res("fail build_store_bins " + (bo.stderr or "")[-400:])
+            sys.exit(0)
+        # The bulk sparse embedder: embed-core-sparse drives the SAME proven dual-head sparse arm
+        # the serve path uses (embed_core_embed_sparse). Replaces the deleted Go cmd/embed
+        # --sparse-only (Phase 11b). load-dynamic ort dlopens libonnxruntime via ORT_DYLIB_PATH.
+        bs = sh('cd %s && cargo build --release --manifest-path rust/embed-core/Cargo.toml --bin embed-core-sparse --features ort,cuda '
+                '&& cp rust/embed-core/target/release/embed-core-sparse %s/sparse-embed' % (src, TMP), env=benv)
+        if bs.returncode != 0:
+            res("fail build_sparse_embed " + (bs.stderr or "")[-400:])
+            sys.exit(0)
     with open(TMP + "/models.yaml", "w") as mf:
         mf.write(
             "active: bge-m3-sparse\nmodels:\n"
