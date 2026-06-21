@@ -52,5 +52,7 @@ jobs:
           # serve flip (publish=true) is left to an explicit operator run. The slice
           # resumes from the published shard, so revisiting is cheap and it converges.
           echo "no sparse run active — dispatching the next bounded slice (publish=false)"
+          # primary first = makingcodes (the account with GPU quota); extazy937 (fallback)
+          # is nearly exhausted, so the workflow's auto-fallback only uses it if needed.
           gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" \
-            -f embed_limit=100000 -f publish=false -f kaggle_account=fallback
+            -f embed_limit=100000 -f publish=false -f kaggle_account=primary
