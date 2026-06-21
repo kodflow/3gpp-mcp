@@ -2,17 +2,17 @@
 //! Rust pipeline. It replaces the deleted Go `cmd/embed --sparse-only` (Phase 11b): read a
 //! clause work-list (JSONL, same shape `embed-io --export-sparse-worklist` emits) and emit
 //! one per-clause posting line, computed by the SAME proven dual-head sparse arm the serve
-//! path uses (`embed_core_embed_sparse`, byte-exact vs FlagEmbedding). The store-rs
-//! `embed-io --import-sparse` then writes the postings into `clause_sparse`.
+//! path uses (`embed_core::embed_sparse_batch`). The store-rs `embed-io --import-sparse`
+//! then writes the postings into `clause_sparse`.
 //!
 //!   in : {"chunk_id":U64,"heading":S,"text":S}                        (one per line)
 //!   out: {"chunk_id":U64,"terms":[[term_id,weight],…]}                (one per line)
 //!
-//! Resumable: chunk_ids already present in --out are skipped, so a killed/bounded run
-//! continues. --limit caps NEW clauses this session. The model is loaded lazily from
-//! $EMBED_MODEL_DIR on the first embed (CPU by default; build --features ort,cuda for GPU).
+//! BATCHED: clauses are embedded `--batch` at a time (one ONNX forward per batch) — per-clause
+//! is far too slow for the corpus campaign. Resumable: chunk_ids already present in --out are
+//! skipped, so a killed/bounded run continues. --limit caps NEW clauses this session. The model
+//! is loaded lazily from $EMBED_MODEL_DIR on the first embed (build --features ort,cuda for GPU).
 use std::collections::HashSet;
-use std::ffi::CString;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use serde::{Deserialize, Serialize};
@@ -45,10 +45,51 @@ fn arg(name: &str) -> Option<String> {
         .and_then(|i| a.get(i + 1).cloned())
 }
 
+/// flush_batch embeds the buffered clauses in ONE forward pass and writes a posting line each.
+fn flush_batch(
+    ids: &mut Vec<u64>,
+    txt: &mut Vec<String>,
+    w: &mut BufWriter<std::fs::File>,
+    embedded: &mut usize,
+    skipped: &mut usize,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let refs: Vec<&str> = txt.iter().map(|s| s.as_str()).collect();
+    let res = embed_core::embed_sparse_batch(&refs, refs.len());
+    for (k, postings) in res.into_iter().enumerate() {
+        match postings {
+            Some(terms) => {
+                if serde_json::to_writer(
+                    &mut *w,
+                    &Posting {
+                        chunk_id: ids[k],
+                        terms,
+                    },
+                )
+                .is_ok()
+                {
+                    let _ = w.write_all(b"\n");
+                    *embedded += 1;
+                } else {
+                    *skipped += 1;
+                }
+            }
+            None => *skipped += 1, // backend error on this row — left for the next pass
+        }
+    }
+    let _ = w.flush();
+    eprintln!("embed-core-sparse: {} embedded …", *embedded);
+    ids.clear();
+    txt.clear();
+}
+
 fn main() {
     let in_path = arg("--in").expect("--in <worklist.jsonl> required");
     let out_path = arg("--out").expect("--out <postings.jsonl> required");
     let limit: usize = arg("--limit").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let batch: usize = arg("--batch").and_then(|s| s.parse().ok()).unwrap_or(64);
 
     // The dual-head model must carry the sparse head, else this pass cannot run.
     // has_sparse() lazy-loads the ONNX model; log around it so a slow/hung model load
@@ -61,7 +102,9 @@ fn main() {
         eprintln!("embed-core-sparse: loaded model has NO sparse head (set EMBED_MODEL_DIR to the dual-head export) — nothing to do");
         std::process::exit(1);
     }
-    eprintln!("embed-core-sparse: model loaded ✓ (sparse head present) — starting embed");
+    eprintln!(
+        "embed-core-sparse: model loaded ✓ (sparse head present) — starting embed (batch={batch})"
+    );
 
     // Resume: skip chunk_ids already written to --out by a prior (bounded/killed) run.
     let mut done: HashSet<u64> = HashSet::new();
@@ -88,10 +131,9 @@ fn main() {
         .expect("open --out (append)");
     let mut w = BufWriter::new(outf);
 
-    let cap = 16384usize;
-    let mut ids = vec![0u32; cap];
-    let mut wt = vec![0f32; cap];
     let (mut embedded, mut skipped) = (0usize, 0usize);
+    let mut buf_ids: Vec<u64> = Vec::with_capacity(batch);
+    let mut buf_txt: Vec<String> = Vec::with_capacity(batch);
 
     for line in BufReader::new(inf).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -108,51 +150,27 @@ fn main() {
             continue;
         }
         // Match the dense EmbedText join exactly (embedder hash::embed_text).
-        let text = format!("{}\n{}", item.heading, item.text);
-        let c = match CString::new(text.replace('\0', " ")) {
-            Ok(c) => c,
-            Err(_) => {
-                skipped += 1;
-                continue;
+        buf_ids.push(item.chunk_id);
+        buf_txt.push(format!("{}\n{}", item.heading, item.text).replace('\0', " "));
+        if buf_ids.len() >= batch {
+            flush_batch(
+                &mut buf_ids,
+                &mut buf_txt,
+                &mut w,
+                &mut embedded,
+                &mut skipped,
+            );
+            if limit > 0 && embedded >= limit {
+                break;
             }
-        };
-        let n = embed_core::embed_core_embed_sparse(
-            c.as_ptr(),
-            ids.as_mut_ptr(),
-            wt.as_mut_ptr(),
-            cap as i32,
-        );
-        if n < 0 {
-            // Backend error on this clause — leave it for the next pass (don't write it).
-            skipped += 1;
-            continue;
-        }
-        let k = (n as usize).min(cap);
-        let terms: Vec<(u32, f32)> = (0..k).map(|j| (ids[j], wt[j])).collect();
-        if serde_json::to_writer(
-            &mut w,
-            &Posting {
-                chunk_id: item.chunk_id,
-                terms,
-            },
-        )
-        .is_err()
-        {
-            skipped += 1;
-            continue;
-        }
-        let _ = w.write_all(b"\n");
-        embedded += 1;
-        // Log the very first success immediately (proves the model + inference path work,
-        // not hung), then every 32 — early, frequent signal for the bounded GPU runs.
-        if embedded == 1 || embedded % 32 == 0 {
-            let _ = w.flush();
-            eprintln!("embed-core-sparse: {embedded} embedded …");
-        }
-        if limit > 0 && embedded >= limit {
-            break;
         }
     }
-    let _ = w.flush();
+    flush_batch(
+        &mut buf_ids,
+        &mut buf_txt,
+        &mut w,
+        &mut embedded,
+        &mut skipped,
+    );
     eprintln!("embed-core-sparse: done — embedded={embedded} skipped={skipped}");
 }
