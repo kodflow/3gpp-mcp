@@ -277,7 +277,29 @@ fn embed_sparse_batch_res(texts: &[&str], batch: usize) -> Result<Vec<Option<Vec
         }
     }
 
-    for chunk in short.chunks(batch) {
+    // Group into TOKEN-BUDGET sub-batches to bound the padded [count, maxseq] tensor: a
+    // fixed count×512 OOMs the T4 (rc=137). Sort by length so similar-length clauses batch
+    // with minimal padding; close a group when count×maxseq would exceed the budget (or the
+    // count cap `batch`). The budget (≈16×512) keeps each forward well within 16 GB VRAM.
+    const TOKEN_BUDGET: usize = 8192;
+    short.sort_by_key(|&i| encoded[i].len());
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_max = 0usize;
+    for &i in &short {
+        let new_max = cur_max.max(encoded[i].len());
+        if !cur.is_empty() && ((cur.len() + 1) * new_max > TOKEN_BUDGET || cur.len() >= batch) {
+            groups.push(std::mem::take(&mut cur));
+            cur_max = 0;
+        }
+        cur_max = cur_max.max(encoded[i].len());
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+
+    for chunk in &groups {
         let bsz = chunk.len();
         let maxseq = chunk.iter().map(|&i| encoded[i].len()).max().unwrap_or(0);
         if maxseq == 0 {
