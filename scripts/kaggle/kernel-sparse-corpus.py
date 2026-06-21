@@ -88,6 +88,32 @@ def sh_live(c, env=None, timeout=None):
         return 124
 
 
+def run_parallel_live(cmds, env=None, timeout=None):
+    """Launch all cmds CONCURRENTLY with stdout/stderr inherited (live), share one deadline.
+    Returns the list of exit codes (124 for any process killed by the timeout). Used to fan the
+    sparse embed across every GPU (one process per device) — works for 1, 2 or N GPUs."""
+    import time
+    for c in cmds:
+        print("+ (parallel)", c, flush=True)
+    procs = [subprocess.Popen(c, shell=True, text=True, env=env or os.environ.copy()) for c in cmds]
+    rcs = [None] * len(procs)
+    deadline = (time.monotonic() + timeout) if timeout else None
+    while any(r is None for r in rcs):
+        for i, p in enumerate(procs):
+            if rcs[i] is None and p.poll() is not None:
+                rcs[i] = p.returncode
+        if deadline and time.monotonic() > deadline:
+            print("TIMEOUT: killing %d embed process(es) after %ss" % (len(procs), timeout), flush=True)
+            for i, p in enumerate(procs):
+                if rcs[i] is None:
+                    p.kill()
+                    rcs[i] = 124
+            break
+        if any(r is None for r in rcs):
+            time.sleep(2)
+    return rcs
+
+
 def res(m):
     print("RESULT " + m, flush=True)
     try:
@@ -370,14 +396,46 @@ try:
     # 12 h cap). On timeout we keep going: embed-core-sparse writes postings incrementally, so
     # the partial --out is valid and publish=false accumulates it; the next slice resumes.
     EMBED_TIMEOUT = int(os.environ.get("SPARSE_EMBED_TIMEOUT", "32400"))
-    rc = sh_live('%s/sparse-embed --in %s/sparse-wl.jsonl --out %s/sparse-post.jsonl'
-                 % (TMP, TMP, TMP), env=eenv, timeout=EMBED_TIMEOUT)
-    if rc == 124:
-        res("warn sparse_embed_timeout_partial")  # import whatever was written, don't abort
-    elif rc != 0:
-        res("fail sparse_embed rc=%d" % rc)
+    POST = "%s/sparse-post.jsonl" % TMP
+    # AUTO multi-GPU: one embed-core-sparse process per GPU (ONNX Runtime uses a single device
+    # per process, so N GPUs need N processes). nvidia-smi -L lists the devices; we round-robin
+    # the worklist into N shards and pin each process to one GPU via CUDA_VISIBLE_DEVICES, then
+    # concat the shard outputs. ngpu=1 → exactly the old single-process path. Scales to any N.
+    ngpu = 1
+    try:
+        ngpu = max(1, int(sh("nvidia-smi -L 2>/dev/null | wc -l").stdout.strip() or "1"))
+    except Exception:
+        ngpu = 1
+    if ngpu <= 1:
+        rc = sh_live('%s/sparse-embed --in %s/sparse-wl.jsonl --out %s'
+                     % (TMP, TMP, POST), env=eenv, timeout=EMBED_TIMEOUT)
+        rcs = [rc]
+    else:
+        # Round-robin split (balances long/short clauses across GPUs).
+        shards = ["%s/sparse-wl.%d.jsonl" % (TMP, i) for i in range(ngpu)]
+        wf = [open(s, "w") for s in shards]
+        with open("%s/sparse-wl.jsonl" % TMP) as f:
+            for n, line in enumerate(f):
+                wf[n % ngpu].write(line)
+        for h in wf:
+            h.close()
+        posts = ["%s/sparse-post.%d.jsonl" % (TMP, i) for i in range(ngpu)]
+        cmds = ['CUDA_VISIBLE_DEVICES=%d %s/sparse-embed --in %s --out %s'
+                % (i, TMP, shards[i], posts[i]) for i in range(ngpu)]
+        print("multi-GPU sparse: %d process(es), one per GPU" % ngpu, flush=True)
+        rcs = run_parallel_live(cmds, env=eenv, timeout=EMBED_TIMEOUT)
+        # Concat shard outputs into the single POST the importer reads.
+        with open(POST, "w") as out:
+            for p in posts:
+                if os.path.exists(p):
+                    with open(p) as pf:
+                        out.write(pf.read())
+    if any(r == 124 for r in rcs):
+        res("warn sparse_embed_timeout_partial rcs=%s" % rcs)  # import what was written
+    elif all(r not in (0,) for r in rcs) and (not os.path.exists(POST) or os.path.getsize(POST) == 0):
+        res("fail sparse_embed rcs=%s" % rcs)
         sys.exit(0)
-    ri = sh('%s/embed-io --db %s --import-sparse %s/sparse-post.jsonl --sparse-model "%s"' % (TMP, DB, TMP, sid), env=eenv)
+    ri = sh('%s/embed-io --db %s --import-sparse %s --sparse-model "%s"' % (TMP, DB, POST, sid), env=eenv)
     print("IMPORT-SPARSE STDERR:", (ri.stderr or "")[-400:], flush=True)
     if ri.returncode != 0:
         res("fail import_sparse rc=%d" % ri.returncode)
