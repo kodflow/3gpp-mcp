@@ -48,8 +48,19 @@ fn load() -> Result<Model> {
     let model_onnx = dir.join("model.onnx");
     let tokenizer_json = dir.join("tokenizer.json");
 
-    let session = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
+    #[allow(unused_mut)]
+    let mut builder =
+        Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
+    // Register the CUDA execution provider when built with --features cuda (bulk embed on a
+    // GPU box). Without this the session is CPU-only — the bulk sparse pass crawled at ~0.5
+    // clause/s (a GPU forward is ~100x faster). Best-effort: ort falls back to CPU if CUDA
+    // can't initialise, so this never breaks the CPU serve path.
+    #[cfg(feature = "cuda")]
+    {
+        use ort::execution_providers::CUDAExecutionProvider;
+        builder = builder.with_execution_providers([CUDAExecutionProvider::default().build()])?;
+    }
+    let session = builder
         .commit_from_file(&model_onnx)
         .with_context(|| format!("commit onnx {model_onnx:?}"))?;
     let needs_token_type = session.inputs.iter().any(|i| i.name == "token_type_ids");

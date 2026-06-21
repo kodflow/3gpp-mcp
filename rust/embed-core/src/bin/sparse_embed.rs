@@ -46,12 +46,15 @@ fn arg(name: &str) -> Option<String> {
 }
 
 /// flush_batch embeds the buffered clauses in ONE forward pass and writes a posting line each.
+#[allow(clippy::too_many_arguments)]
 fn flush_batch(
     ids: &mut Vec<u64>,
     txt: &mut Vec<String>,
     w: &mut BufWriter<std::fs::File>,
     embedded: &mut usize,
     skipped: &mut usize,
+    total: usize,
+    start: std::time::Instant,
 ) {
     if ids.is_empty() {
         return;
@@ -80,7 +83,30 @@ fn flush_batch(
         }
     }
     let _ = w.flush();
-    eprintln!("embed-core-sparse: {} embedded …", *embedded);
+    // Progress bar: count, %, throughput, ETA — so a multi-hour run is legible (and a GPU vs
+    // CPU regression is obvious from cl/s).
+    let el = start.elapsed().as_secs_f64();
+    let rate = if el > 0.0 { *embedded as f64 / el } else { 0.0 };
+    let pct = if total > 0 {
+        100.0 * *embedded as f64 / total as f64
+    } else {
+        0.0
+    };
+    let eta = if rate > 0.0 {
+        ((total.saturating_sub(*embedded)) as f64 / rate) as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "embed-core-sparse: {}/{} ({:.1}%) {:.1} cl/s ETA {}h{:02}m (skipped {})",
+        *embedded,
+        total,
+        pct,
+        rate,
+        eta / 3600,
+        (eta % 3600) / 60,
+        *skipped
+    );
     ids.clear();
     txt.clear();
 }
@@ -131,6 +157,18 @@ fn main() {
         .expect("open --out (append)");
     let mut w = BufWriter::new(outf);
 
+    // Pre-count the worklist for the progress bar's denominator (cheap single scan).
+    let total = std::fs::File::open(&in_path)
+        .map(|f| {
+            BufReader::new(f)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    let start = std::time::Instant::now();
+
     let (mut embedded, mut skipped) = (0usize, 0usize);
     let mut fail_streak = 0usize; // consecutive batches that embedded nothing (broken-model guard)
     let mut buf_ids: Vec<u64> = Vec::with_capacity(batch);
@@ -161,6 +199,8 @@ fn main() {
                 &mut w,
                 &mut embedded,
                 &mut skipped,
+                total,
+                start,
             );
             // Fast-abort guard: if many consecutive batches embed NOTHING while the total is
             // still 0, the model/inference is broken (e.g. a batch-static ONNX export → every
@@ -186,6 +226,11 @@ fn main() {
         &mut w,
         &mut embedded,
         &mut skipped,
+        total,
+        start,
     );
-    eprintln!("embed-core-sparse: done — embedded={embedded} skipped={skipped}");
+    eprintln!(
+        "embed-core-sparse: done — embedded={embedded}/{total} skipped={skipped} in {:.0}s",
+        start.elapsed().as_secs_f64()
+    );
 }
