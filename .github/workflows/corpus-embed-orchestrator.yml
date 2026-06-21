@@ -61,4 +61,6 @@ jobs:
           idx=$(( ( $(date +%s) / 3600 ) % ${#series[@]} ))
           s=${series[$idx]}
           echo "no dense run active — dispatching series $s (idx $idx of ${#series[@]})"
-          gh workflow run "$wf" --ref "$REF" -f series="$s" -f kaggle_account=fallback
+          # primary first = makingcodes (has GPU quota); extazy937 (fallback) is nearly
+          # exhausted, so the workflow's auto-fallback only uses it if primary is out.
+          gh workflow run "$wf" --ref "$REF" -f series="$s" -f kaggle_account=primary
