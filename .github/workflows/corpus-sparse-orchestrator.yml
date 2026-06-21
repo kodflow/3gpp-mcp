@@ -20,7 +20,7 @@ name: Corpus · Sparse orchestrator
 
 on:
   schedule:
-    - cron: "47 */4 * * *" # every 4h, offset from the dense orchestrator (:23)
+    - cron: "47 * * * *" # hourly — re-dispatch promptly after each run ends (active-guard skips while one runs), so the campaign chains to FULL coverage instead of idling 4h between slices
   workflow_dispatch: {}
 
 permissions:
@@ -54,8 +54,11 @@ jobs:
           # publish=false: accumulate the private resume shard + converge the data; the
           # serve flip (publish=true) is left to an explicit operator run. The slice
           # resumes from the published shard, so revisiting is cheap and it converges.
-          echo "no sparse run active — dispatching the next bounded slice (publish=false)"
+          # embed_limit=0 = the WHOLE remaining gap this run (full coverage, not a 100k sample).
+          # On GPU+multi-GPU one run can converge the corpus (~6h < the 12h cap); if it hits the
+          # watchdog/cap, the resume shard lets the next hourly run continue → marches to 100%.
+          echo "no sparse run active — dispatching the WHOLE remaining gap (publish=false)"
           # primary first = makingcodes (the account with GPU quota); extazy937 (fallback)
           # is nearly exhausted, so the workflow's auto-fallback only uses it if needed.
           gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" \
-            -f embed_limit=100000 -f publish=false -f kaggle_account=primary
+            -f embed_limit=0 -f publish=false -f kaggle_account=primary
