@@ -247,17 +247,18 @@ try:
 
     # --- 4a. PREBUILT FAST PATH: download the Rust bins built in CI (rust-bins release,
     # glibc-2.35 base → run on Kaggle) instead of burning ~18 min of GPU re-compiling
-    # identical code. Use them ONLY when their COMMIT matches this clone's HEAD (else fall
-    # back to a from-source build, for correctness). All three bins are ort load-dynamic →
-    # portable; they dlopen the onnxruntime downloaded above at runtime.
+    # identical code. Match on the git TREE sha of rust/ (content of the whole rust/ subtree)
+    # so unrelated commits don't force a rebuild — only an actual rust/ change does. Fall back
+    # to from-source if absent/mismatched (correctness never depends on the artifact). All
+    # three bins are ort load-dynamic → portable; they dlopen the onnxruntime downloaded above.
     prebuilt = False
-    head_sha = (sh("cd %s && git rev-parse HEAD" % src).stdout or "").strip()
+    rust_tree = (sh("cd %s && git rev-parse HEAD:rust" % src).stdout or "").strip()
     rel = "%s/releases/download/rust-bins" % REPO
-    bins_commit = ""
-    if sh('curl -fsSL --retry 3 -o %s/BINS_COMMIT "%s/COMMIT"' % (TMP, rel)).returncode == 0 \
-            and os.path.exists(TMP + "/BINS_COMMIT"):
-        bins_commit = open(TMP + "/BINS_COMMIT").read().strip()
-    if bins_commit and bins_commit == head_sha:
+    bins_tree = ""
+    if sh('curl -fsSL --retry 3 -o %s/RUST_TREE "%s/RUST_TREE"' % (TMP, rel)).returncode == 0 \
+            and os.path.exists(TMP + "/RUST_TREE"):
+        bins_tree = open(TMP + "/RUST_TREE").read().strip()
+    if bins_tree and bins_tree == rust_tree:
         ok = True
         for name in ("overlay", "embed-io", "embed-core-sparse"):
             if sh('curl -fsSL --retry 5 -o %s/%s "%s/%s"' % (TMP, name, rel, name)).returncode != 0:
@@ -267,10 +268,10 @@ try:
             sh("chmod +x %s/overlay %s/embed-io %s/embed-core-sparse" % (TMP, TMP, TMP))
             sh("cp %s/embed-core-sparse %s/sparse-embed" % (TMP, TMP))
             prebuilt = True
-            res("rust_bins=prebuilt sha=%s" % head_sha[:12])
+            res("rust_bins=prebuilt rust_tree=%s" % rust_tree[:12])
     if not prebuilt:
-        res("rust_bins=building_from_source bins_commit=%s head=%s"
-            % (bins_commit[:12] or "none", head_sha[:12]))
+        res("rust_bins=building_from_source bins_tree=%s rust_tree=%s"
+            % (bins_tree[:12] or "none", rust_tree[:12]))
         # The Kaggle image ships Go but NOT cargo — install Rust before the store-rs +
         # embed-core builds below. Without this the cargo builds fail with "cargo: not found".
         if sh("command -v cargo >/dev/null 2>&1").returncode != 0:
