@@ -1,0 +1,56 @@
+# =============================================================================
+#  Corpus · Sparse orchestrator — autonomous sparse campaign convergence
+# =============================================================================
+#  The sparse workflow (Corpus · Sparse) embeds a BOUNDED slice per run (embed_limit)
+#  and resumes from the private GHCR 3gpp-sparse shard that every successful pass now
+#  persists (corpus-sparse-kaggle: the resume-shard push is decoupled from the
+#  publish=true serve flip, PR #216). With batched + token-budget inference (PR
+#  #217/#218) a slice is viable on a T4. So converging all ~2.28M clauses needs
+#  something to dispatch the NEXT slice when the current one is done. This cron does
+#  that, autonomously, bounded THREE ways so it can never run away:
+#    1. cron fires at most every 4h;
+#    2. it SKIPS if a sparse run is already in_progress/queued (active guard);
+#    3. the target workflow's own concurrency (cancel-in-progress:false) caps fan-out.
+#  Runs are publish=false → they ACCUMULATE the private resume shard and converge the
+#  data WITHOUT flipping serve to the sparse arm. The serve flip (publish=true, which
+#  uploads sparse-index.json to the public `latest` release) stays a single explicit,
+#  operator-run deploy once the data has converged.
+#  Scheduled runs fire only from the default branch (GitHub rule).
+name: Corpus · Sparse orchestrator
+
+on:
+  schedule:
+    - cron: "47 */4 * * *" # every 4h, offset from the dense orchestrator (:23)
+  workflow_dispatch: {}
+
+permissions:
+  actions: write # dispatch the sparse workflow
+  contents: read
+
+concurrency:
+  group: corpus-sparse-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Dispatch the next sparse slice if none is active
+        run: |
+          set -euo pipefail
+          wf="corpus-sparse-kaggle.yml"
+          active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
+            echo "a sparse run is active ($active) / queued ($queued) — skip this tick"
+            exit 0
+          fi
+          # publish=false: accumulate the private resume shard + converge the data; the
+          # serve flip (publish=true) is left to an explicit operator run. The slice
+          # resumes from the published shard, so revisiting is cheap and it converges.
+          echo "no sparse run active — dispatching the next bounded slice (publish=false)"
+          gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" \
+            -f embed_limit=100000 -f publish=false -f kaggle_account=fallback
