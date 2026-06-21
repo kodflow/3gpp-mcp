@@ -60,8 +60,11 @@ jobs:
           mkdir -p out
           cp rust/target/release/overlay rust/target/release/embed-io out/
           cp rust/embed-core/target/release/embed-core-sparse out/
-          printf '%s' "${{ github.sha }}" > out/COMMIT
-          echo "=== staged ==="; ls -la out; file out/overlay out/embed-io out/embed-core-sparse || true
+          # Marker = the git TREE sha of rust/ (content hash of the whole rust/ subtree), NOT
+          # the repo HEAD sha — so unrelated commits (docs, workflows) don't invalidate the
+          # prebuilt match; only an actual rust/ change rebuilds + re-marks.
+          git rev-parse "HEAD:rust" > out/RUST_TREE
+          echo "=== staged (rust tree $(cat out/RUST_TREE)) ==="; ls -la out; file out/overlay out/embed-io out/embed-core-sparse || true
       - name: Publish to the rolling `rust-bins` release
         run: |
           set -euo pipefail
@@ -70,6 +73,6 @@ jobs:
             retry gh release create rust-bins --repo "$GITHUB_REPOSITORY" --prerelease \
               --title "Rust bins (Kaggle prebuilt)" \
               --notes "Prebuilt overlay + embed-io + embed-core-sparse for the Kaggle sparse kernel (glibc 2.35). The COMMIT asset pins the source SHA; the kernel uses these only when COMMIT == the commit it cloned, else builds from source."
-          retry gh release upload rust-bins out/overlay out/embed-io out/embed-core-sparse out/COMMIT \
+          retry gh release upload rust-bins out/overlay out/embed-io out/embed-core-sparse out/RUST_TREE \
             --repo "$GITHUB_REPOSITORY" --clobber
           echo "published rust-bins @ ${{ github.sha }}"
