@@ -1,0 +1,75 @@
+# =============================================================================
+#  Rust bins — prebuild the Kaggle sparse-kernel binaries (no GPU wasted on cargo)
+# =============================================================================
+#  The Kaggle sparse kernel used to `cargo build` overlay + embed-io + embed-core-sparse
+#  ON the T4 every run — ~18 min of GPU quota burned compiling identical code while the GPU
+#  sat idle. This job builds those three binaries here (free CPU runner, NO GPU) on a
+#  glibc-2.35 base (Ubuntu 22.04) so they run on the Kaggle container (also Ubuntu 22.04;
+#  a 2.35 binary is forward-compatible with any newer glibc anyway), and publishes them to
+#  a rolling `rust-bins` release. The kernel downloads them (seconds) when their COMMIT
+#  asset matches the commit it cloned, and falls back to building from source otherwise —
+#  so correctness never depends on the artifact being fresh.
+#
+#  Portability: all three bins use `ort` in LOAD-DYNAMIC mode (they dlopen libonnxruntime
+#  at runtime via ORT_DYLIB_PATH) and the `cuda` sub-feature links nothing at build time
+#  (the CUDA EP is resolved from the GPU onnxruntime on Kaggle). So a CPU/CUDA-less CI box
+#  builds binaries that run on the Kaggle GPU. Verified: `--features ort,cuda` compiles with
+#  no CUDA toolkit present.
+name: Rust bins (Kaggle prebuilt)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/store/**"
+      - "rust/embed-core/**"
+      - "rust/Cargo.lock"
+      - ".github/workflows/rust-bins.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # upload assets to the rolling `rust-bins` release
+
+concurrency:
+  group: rust-bins
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Ubuntu 22.04 = glibc 2.35 → binaries run on the Kaggle container (>= 2.35).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Toolchain + glibc
+        run: |
+          rustup show || true
+          cargo --version
+          ldd --version | head -1
+      - name: Build store bins (overlay, embed-io)
+        run: cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay --bin embed-io
+      - name: Build embed-core-sparse (--features ort,cuda — load-dynamic, no CUDA at build)
+        run: cargo build --release --manifest-path rust/embed-core/Cargo.toml --bin embed-core-sparse --features ort,cuda
+      - name: Stage binaries + COMMIT marker
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp rust/target/release/overlay rust/target/release/embed-io out/
+          cp rust/embed-core/target/release/embed-core-sparse out/
+          printf '%s' "${{ github.sha }}" > out/COMMIT
+          echo "=== staged ==="; ls -la out; file out/overlay out/embed-io out/embed-core-sparse || true
+      - name: Publish to the rolling `rust-bins` release
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh 2>/dev/null || retry() { "$@"; }
+          gh release view rust-bins --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            retry gh release create rust-bins --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Rust bins (Kaggle prebuilt)" \
+              --notes "Prebuilt overlay + embed-io + embed-core-sparse for the Kaggle sparse kernel (glibc 2.35). The COMMIT asset pins the source SHA; the kernel uses these only when COMMIT == the commit it cloned, else builds from source."
+          retry gh release upload rust-bins out/overlay out/embed-io out/embed-core-sparse out/COMMIT \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          echo "published rust-bins @ ${{ github.sha }}"
