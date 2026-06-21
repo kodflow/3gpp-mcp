@@ -35,7 +35,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Key on the BRANCH (head_ref for pull_request events, ref_name for push) so the
+  # push-triggered run and the pull_request-triggered run for the same commit share
+  # ONE group and cancel-in-progress dedupes them (instead of running twice).
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -147,7 +150,7 @@ jobs:
           rustup component add rustfmt clippy
           rustc --version && cargo --version
       - name: Cache cargo
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
