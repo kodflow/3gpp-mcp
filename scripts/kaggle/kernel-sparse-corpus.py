@@ -73,6 +73,21 @@ def sh(c, env=None, check=False):
     return r
 
 
+def sh_live(c, env=None, timeout=None):
+    """Run a long command with stdout/stderr INHERITED (streamed live to the kernel log,
+    not buffered like sh()'s capture_output) and a hard timeout self-watchdog. Returns the
+    exit code, or 124 if the timeout fired (process killed). Used for the multi-hour embed
+    so its per-batch progress is visible AND a stalled/overrunning run self-terminates
+    instead of burning the full 12 h Kaggle cap — Kaggle has no external stop API."""
+    print("+", c, "(streamed, timeout=%ss)" % timeout, flush=True)
+    try:
+        return subprocess.run(c, shell=True, text=True, env=env or os.environ.copy(),
+                              timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        print("TIMEOUT: killed after %ss — proceeding to import partial postings" % timeout, flush=True)
+        return 124
+
+
 def res(m):
     print("RESULT " + m, flush=True)
     try:
@@ -314,10 +329,17 @@ try:
     if we.returncode != 0:
         res("fail export_sparse_worklist " + (we.stderr or "")[-400:])
         sys.exit(0)
-    rs = sh('%s/sparse-embed --in %s/sparse-wl.jsonl --out %s/sparse-post.jsonl' % (TMP, TMP, TMP), env=eenv)
-    print("SPARSE-EMBED STDERR:", (rs.stderr or "")[-600:], flush=True)
-    if rs.returncode != 0:
-        res("fail sparse_embed rc=%d" % rs.returncode)
+    # STREAMED live (per-batch progress is visible — a buffered capture made past runs look
+    # "stuck" though they were working) + a hard timeout self-watchdog (default 9 h, under the
+    # 12 h cap). On timeout we keep going: embed-core-sparse writes postings incrementally, so
+    # the partial --out is valid and publish=false accumulates it; the next slice resumes.
+    EMBED_TIMEOUT = int(os.environ.get("SPARSE_EMBED_TIMEOUT", "32400"))
+    rc = sh_live('%s/sparse-embed --in %s/sparse-wl.jsonl --out %s/sparse-post.jsonl'
+                 % (TMP, TMP, TMP), env=eenv, timeout=EMBED_TIMEOUT)
+    if rc == 124:
+        res("warn sparse_embed_timeout_partial")  # import whatever was written, don't abort
+    elif rc != 0:
+        res("fail sparse_embed rc=%d" % rc)
         sys.exit(0)
     ri = sh('%s/embed-io --db %s --import-sparse %s/sparse-post.jsonl --sparse-model "%s"' % (TMP, DB, TMP, sid), env=eenv)
     print("IMPORT-SPARSE STDERR:", (ri.stderr or "")[-400:], flush=True)
