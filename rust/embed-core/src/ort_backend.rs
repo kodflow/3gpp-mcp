@@ -230,3 +230,99 @@ fn embed_sparse_res(text: &str) -> Result<Vec<(u32, f32)>> {
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     Ok(out)
 }
+
+/// embed_sparse_batch runs the sparse head on a BATCH of clauses per session.run (padded to
+/// the batch's max length) — ~batch× faster than per-clause, which is too slow for the corpus
+/// campaign. Clauses longer than SPARSE_MAX_SEQ fall back to the windowed per-clause path.
+/// Returns one Option per input (None on a per-row failure), same extraction as
+/// embed_sparse_one (specials dropped, weight>0, max-per-id, sorted desc).
+pub fn embed_sparse_batch(texts: &[&str], batch: usize) -> Vec<Option<Vec<(u32, f32)>>> {
+    match embed_sparse_batch_res(texts, batch.max(1)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("embed-core: sparse batch failed: {e:#}");
+            texts.iter().map(|_| None).collect()
+        }
+    }
+}
+
+fn embed_sparse_batch_res(texts: &[&str], batch: usize) -> Result<Vec<Option<Vec<(u32, f32)>>>> {
+    let m = model().as_ref().map_err(|e| anyhow!("model load: {e}"))?;
+    let sparse_out = m
+        .sparse_output
+        .as_deref()
+        .ok_or_else(|| anyhow!("model has no sparse head ({SPARSE_OUTPUT})"))?;
+    let special = |id: u32| matches!(id, 0 | 1 | 2 | 3);
+
+    let mut encoded: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+    for t in texts {
+        let enc = m
+            .tokenizer
+            .encode(*t, true)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        encoded.push(enc.get_ids().to_vec());
+    }
+    let mut out: Vec<Option<Vec<(u32, f32)>>> = vec![None; texts.len()];
+
+    // Short clauses (one window) take the batched path; long ones fall back to the windowed
+    // per-clause path (rare); empty → empty posting set.
+    let mut short: Vec<usize> = Vec::new();
+    for (i, ids) in encoded.iter().enumerate() {
+        if ids.is_empty() {
+            out[i] = Some(Vec::new());
+        } else if ids.len() <= SPARSE_MAX_SEQ {
+            short.push(i);
+        } else {
+            out[i] = Some(embed_sparse_res(texts[i])?);
+        }
+    }
+
+    for chunk in short.chunks(batch) {
+        let bsz = chunk.len();
+        let maxseq = chunk.iter().map(|&i| encoded[i].len()).max().unwrap_or(0);
+        if maxseq == 0 {
+            continue;
+        }
+        let mut id_arr = Array2::<i64>::zeros((bsz, maxseq));
+        let mut mask = Array2::<i64>::zeros((bsz, maxseq));
+        for (r, &gi) in chunk.iter().enumerate() {
+            for (j, &id) in encoded[gi].iter().enumerate() {
+                id_arr[[r, j]] = i64::from(id);
+                mask[[r, j]] = 1;
+            }
+        }
+        let mut inputs = ort::inputs![
+            "input_ids" => Tensor::from_array(id_arr)?,
+            "attention_mask" => Tensor::from_array(mask)?,
+        ]?;
+        if m.needs_token_type {
+            inputs.push((
+                "token_type_ids".into(),
+                Tensor::from_array(Array2::<i64>::zeros((bsz, maxseq)))?.into(),
+            ));
+        }
+        let outputs = m.session.run(inputs)?;
+        let view = outputs[sparse_out].try_extract_tensor::<f32>()?;
+        let w = view.into_dimensionality::<Ix2>()?; // [bsz, maxseq]
+        for (r, &gi) in chunk.iter().enumerate() {
+            let mut merged: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+            for (j, &id) in encoded[gi].iter().enumerate() {
+                if special(id) {
+                    continue;
+                }
+                let weight = w[[r, j]];
+                if weight <= 0.0 {
+                    continue;
+                }
+                let e = merged.entry(id).or_insert(0.0);
+                if weight > *e {
+                    *e = weight;
+                }
+            }
+            let mut v: Vec<(u32, f32)> = merged.into_iter().collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            out[gi] = Some(v);
+        }
+    }
+    Ok(out)
+}
