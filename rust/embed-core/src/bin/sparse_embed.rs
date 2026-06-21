@@ -132,6 +132,7 @@ fn main() {
     let mut w = BufWriter::new(outf);
 
     let (mut embedded, mut skipped) = (0usize, 0usize);
+    let mut fail_streak = 0usize; // consecutive batches that embedded nothing (broken-model guard)
     let mut buf_ids: Vec<u64> = Vec::with_capacity(batch);
     let mut buf_txt: Vec<String> = Vec::with_capacity(batch);
 
@@ -153,6 +154,7 @@ fn main() {
         buf_ids.push(item.chunk_id);
         buf_txt.push(format!("{}\n{}", item.heading, item.text).replace('\0', " "));
         if buf_ids.len() >= batch {
+            let before = embedded;
             flush_batch(
                 &mut buf_ids,
                 &mut buf_txt,
@@ -160,6 +162,19 @@ fn main() {
                 &mut embedded,
                 &mut skipped,
             );
+            // Fast-abort guard: if many consecutive batches embed NOTHING while the total is
+            // still 0, the model/inference is broken (e.g. a batch-static ONNX export → every
+            // batch fails with a MatMul dim mismatch). Bail out in seconds instead of burning
+            // hours of GPU producing 0 (the failure is already streamed above).
+            if embedded == before {
+                fail_streak += 1;
+            } else {
+                fail_streak = 0;
+            }
+            if embedded == 0 && fail_streak >= 8 {
+                eprintln!("embed-core-sparse: ABORT — {fail_streak} consecutive batches embedded 0 (model/inference broken); stopping early");
+                std::process::exit(2);
+            }
             if limit > 0 && embedded >= limit {
                 break;
             }

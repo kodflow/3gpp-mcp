@@ -136,13 +136,21 @@ try:
             sparse = F.relu(self.sparse_linear(h)).squeeze(-1) * attention_mask.to(h.dtype)
             return dense, sparse
 
-    enc = m3.tokenizer(["AMF SMF N4 registration"], return_tensors="pt", padding=True, truncation=True, max_length=8192)
+    # Example with batch=2 + two DIFFERENT lengths so the exporter sees both axes vary.
+    enc = m3.tokenizer(["AMF SMF N4 registration procedure", "short"],
+                       return_tensors="pt", padding=True, truncation=True, max_length=8192)
     args = (enc["input_ids"], enc["attention_mask"])
+    # dynamo=True IGNORES dynamic_axes (it warns and bakes the example's batch=1 → batched
+    # inference then dies with 'MatMul dimension mismatch'). Declare DYNAMIC batch+seq the
+    # dynamo-native way via dynamic_shapes (torch.export.Dim), shared across both inputs.
+    from torch.export import Dim
+    _batch = Dim("batch", min=1, max=512)
+    _seq = Dim("seq", min=1, max=8192)
     common = dict(
         input_names=["input_ids", "attention_mask"],
         output_names=["sentence_embedding", "sparse_weights"],
-        dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"},
-                      "sentence_embedding": {0: "batch"}, "sparse_weights": {0: "batch", 1: "seq"}},
+        dynamic_shapes={"input_ids": {0: _batch, 1: _seq},
+                        "attention_mask": {0: _batch, 1: _seq}},
         opset_version=18)
     # BGE-M3 fp32 weights are ~2.2 GB, OVER the 2 GB ONNX protobuf limit → they MUST be
     # written as external data (model.onnx_data). An inline export produces a corrupt model
