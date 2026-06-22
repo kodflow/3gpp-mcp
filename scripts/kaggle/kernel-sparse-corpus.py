@@ -137,7 +137,7 @@ try:
         sys.exit(0)
 
     # --- 1. Export the dense+sparse model (validated recipe) ------------------
-    pi = sh("pip -q install FlagEmbedding onnx onnxruntime onnxscript")
+    pi = sh("pip -q install FlagEmbedding onnx onnxruntime onnxscript onnxconverter-common")
     if pi.returncode != 0:
         res("fail pip_install " + (pi.stderr or pi.stdout or "")[-300:])
         sys.exit(0)
@@ -204,6 +204,25 @@ try:
                             all_tensors_to_one_file=True, location="model.onnx_data", size_threshold=1024)
         except Exception as e:
             print("external-data rewrite failed (%s)" % e, flush=True)
+    # fp16: BGE-M3 sparse (lexical) weights are robust to half precision and the T4 has fp16
+    # tensor cores → ~2-4x faster than fp32 (fp32 was only chosen to de-risk the export). Convert
+    # the ONNX weights to fp16 with keep_io_types=True so the model I/O STAYS fp32 — embed-core
+    # reads fp32 unchanged, only the internal compute is fp16. Halves the model to ~1.1 GB too.
+    # GRACEFUL: any conversion failure keeps the working fp32 model untouched (degrade-not-block).
+    try:
+        from onnxconverter_common import float16
+        m16 = float16.convert_float_to_float16(
+            onnx.load(onnx_path), keep_io_types=True, disable_shape_infer=True)
+        os.remove(onnx_path)
+        try:
+            os.remove(MDIR + "/model.onnx_data")
+        except OSError:
+            pass
+        onnx.save_model(m16, onnx_path, save_as_external_data=True,
+                        all_tensors_to_one_file=True, location="model.onnx_data", size_threshold=1024)
+        res("model_fp16=ok")
+    except Exception as e:
+        res("model_fp16=skipped(%s)_keeping_fp32" % str(e)[:100].replace(" ", "_"))
     m3.tokenizer.save_pretrained(MDIR)
     has_data = os.path.exists(MDIR + "/model.onnx_data")
     res("model_exported has_data=%s" % has_data)
