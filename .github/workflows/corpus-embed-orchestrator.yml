@@ -23,7 +23,7 @@ on:
       ref:
         description: "Branch the embed kernel clones/builds from."
         required: false
-        default: "perf/embedder-dynamic-batch"
+        default: "main"
 
 permissions:
   actions: write # dispatch the embed workflow
@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
-      REF: ${{ github.event.inputs.ref || 'perf/embedder-dynamic-batch' }}
+      REF: ${{ github.event.inputs.ref || 'main' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
