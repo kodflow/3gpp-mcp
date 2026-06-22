@@ -14,7 +14,7 @@ on:
       branch:
         description: "branch the kernel clones + builds"
         required: false
-        default: perf/embedder-dynamic-batch
+        default: main
       queries:
         description: "pipe-separated test queries"
         required: false
@@ -33,7 +33,7 @@ jobs:
       KAGGLE_USERNAME: ${{ vars.KAGGLE_USERNAME || secrets.KAGGLE_USERNAME }}
       KAGGLE_USERNAME_FALLBACK: ${{ vars.KAGGLE_USERNAME_FALLBACK || secrets.KAGGLE_USERNAME_FALLBACK }}
       KAGGLE_ACCOUNT: ${{ github.event.inputs.kaggle_account || 'primary' }}
-      BRANCH: ${{ github.event.inputs.branch || 'perf/embedder-dynamic-batch' }}
+      BRANCH: ${{ github.event.inputs.branch || 'main' }}
       FFI_QUERIES: ${{ github.event.inputs.queries }}
     steps:
       - uses: actions/checkout@v4
