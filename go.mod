@@ -5,16 +5,15 @@ go 1.26.3
 require (
 	github.com/klauspost/compress v1.18.6
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
-	github.com/mark3labs/mcp-go v0.54.1
+	github.com/mark3labs/mcp-go v0.55.0
 	github.com/sugarme/tokenizer v0.3.0
 	github.com/yalue/onnxruntime_go v1.30.1
-	golang.org/x/net v0.55.0
+	golang.org/x/net v0.56.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/apache/arrow-go/v18 v18.6.0 // indirect
-	github.com/daulet/tokenizers v1.27.0 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.10503.0 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-amd64 v0.1.24 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-arm64 v0.1.24 // indirect
@@ -46,6 +45,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20260527015227-08cc5374adb3 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 )
