@@ -21,7 +21,14 @@ name: Corpus · Sparse orchestrator
 on:
   schedule:
     - cron: "47 * * * *" # hourly — re-dispatch promptly after each run ends (active-guard skips while one runs), so the campaign chains to FULL coverage instead of idling 4h between slices
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "GPU backend: kaggle (free T4x2) | vastai (rented 4090). Overrides the GPU_PROVIDER repo var."
+        required: false
+        default: ""
+        type: choice
+        options: ["", kaggle, vastai]
 
 permissions:
   actions: write # dispatch the sparse workflow
@@ -44,7 +51,9 @@ jobs:
       - name: Dispatch the next sparse slice if none is active
         run: |
           set -euo pipefail
-          wf="corpus-sparse-kaggle.yml"
+          prov="${{ github.event.inputs.provider }}"; prov="${prov:-${{ vars.GPU_PROVIDER }}}"; prov="${prov:-kaggle}"
+          if [ "$prov" = vastai ]; then wf="corpus-vastai-sparse.yml"; else wf="corpus-sparse-kaggle.yml"; fi
+          echo "provider=$prov wf=$wf"
           active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
           queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
           if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
@@ -57,8 +66,12 @@ jobs:
           # embed_limit=0 = the WHOLE remaining gap this run (full coverage, not a 100k sample).
           # On GPU+multi-GPU one run can converge the corpus (~6h < the 12h cap); if it hits the
           # watchdog/cap, the resume shard lets the next hourly run continue → marches to 100%.
-          echo "no sparse run active — dispatching the WHOLE remaining gap (publish=false)"
-          # primary first = makingcodes (the account with GPU quota); extazy937 (fallback)
-          # is nearly exhausted, so the workflow's auto-fallback only uses it if needed.
-          gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" \
-            -f embed_limit=0 -f publish=false -f kaggle_account=primary
+          echo "no sparse run active — dispatching the WHOLE remaining gap (publish=false) via $prov"
+          if [ "$prov" = vastai ]; then
+            gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" -f embed_limit=0
+          else
+            # primary first = makingcodes (the account with GPU quota); extazy937 (fallback)
+            # is nearly exhausted, so the workflow's auto-fallback only uses it if needed.
+            gh workflow run "$wf" --ref "${GITHUB_REF_NAME}" \
+              -f embed_limit=0 -f publish=false -f kaggle_account=primary
+          fi

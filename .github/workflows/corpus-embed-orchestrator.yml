@@ -24,6 +24,12 @@ on:
         description: "Branch the embed kernel clones/builds from."
         required: false
         default: "main"
+      provider:
+        description: "GPU backend: kaggle (free T4x2) | vastai (rented 4090). Overrides the GPU_PROVIDER repo var."
+        required: false
+        default: ""
+        type: choice
+        options: ["", kaggle, vastai]
 
 permissions:
   actions: write # dispatch the embed workflow
@@ -47,7 +53,10 @@ jobs:
       - name: Dispatch the next dense series if none is active
         run: |
           set -euo pipefail
-          wf="corpus-rust-embed-kaggle.yml"
+          # GPU backend: the per-run input wins, else the GPU_PROVIDER repo var, else kaggle.
+          prov="${{ github.event.inputs.provider }}"; prov="${prov:-${{ vars.GPU_PROVIDER }}}"; prov="${prov:-kaggle}"
+          if [ "$prov" = vastai ]; then wf="corpus-vastai-embed.yml"; else wf="corpus-rust-embed-kaggle.yml"; fi
+          echo "provider=$prov wf=$wf"
           active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
           queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
           if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
@@ -60,7 +69,13 @@ jobs:
           # the list; with per-series resume this revisits each until it converges.
           idx=$(( ( $(date +%s) / 3600 ) % ${#series[@]} ))
           s=${series[$idx]}
-          echo "no dense run active — dispatching series $s (idx $idx of ${#series[@]})"
-          # primary first = makingcodes (has GPU quota); extazy937 (fallback) is nearly
-          # exhausted, so the workflow's auto-fallback only uses it if primary is out.
-          gh workflow run "$wf" --ref "$REF" -f series="$s" -f kaggle_account=primary
+          echo "no dense run active — dispatching series $s (idx $idx of ${#series[@]}) via $prov"
+          if [ "$prov" = vastai ]; then
+            # vast.ai: rent a 4090, embed this series, publish 3gpp-vec. Costs money — only
+            # when GPU_PROVIDER=vastai is set explicitly.
+            gh workflow run "$wf" --ref "$REF" -f series="$s"
+          else
+            # primary first = makingcodes (has GPU quota); extazy937 (fallback) is nearly
+            # exhausted, so the workflow's auto-fallback only uses it if primary is out.
+            gh workflow run "$wf" --ref "$REF" -f series="$s" -f kaggle_account=primary
+          fi
