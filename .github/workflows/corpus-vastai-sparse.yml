@@ -1,0 +1,75 @@
+# =============================================================================
+#  Corpus · vast.ai sparse embed (rented 4090) — alternative to corpus-sparse-kaggle
+# =============================================================================
+#  Rents a cheap on-demand 4090, runs the SPARSE pass over the whole remaining gap
+#  (resume from 3gpp-sparse), pulls the cumulative shard back, and publishes it to
+#  3gpp-sparse:latest. Dispatched by corpus-sparse-orchestrator only when GPU_PROVIDER=vastai.
+# =============================================================================
+name: Corpus · vast.ai sparse embed (rented 4090)
+
+on:
+  workflow_dispatch:
+    inputs:
+      embed_limit:
+        description: "Cap clauses this run (0 = whole remaining gap)."
+        required: false
+        default: "0"
+      ceil_dph:
+        description: "Hard $/hr ceiling for the 4090 rental."
+        required: false
+        default: "0.55"
+      max_hours:
+        description: "Wall-clock watchdog hours."
+        required: false
+        default: "9"
+
+concurrency:
+  group: vastai-sparse
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sparse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      GHCR_OWNER: ${{ github.repository_owner }}
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+      SERIES: sparse # label only (vastai.sh labels the box embed-ssparse)
+      REF: ${{ github.ref_name }}
+      EMBED_LIMIT: ${{ github.event.inputs.embed_limit || '0' }}
+      CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}
+      MAX_HOURS: ${{ github.event.inputs.max_hours || '9' }}
+      RUN_SCRIPT: scripts/vastai/run_sparse.sh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Preflight — required secrets
+        run: |
+          [ -n "$VAST_API_KEY" ]  || { echo "::error::VAST_API_KEY not set — see docs/ci/vastai-secrets.md"; exit 1; }
+          [ -n "$GHCR_READ_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set"; exit 1; }
+      - name: Rent 4090, run sparse pass, pull shard, destroy
+        run: bash scripts/ci/vastai.sh
+      - name: Publish sparse shard to 3gpp-sparse (runner-side, write PAT)
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          command -v oras >/dev/null 2>&1 || { curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz" | sudo tar -xz -C /usr/local/bin oras; }
+          z="$(find ./shard -name 'sparse-shard.duckdb.zst' | head -1)"
+          [ -n "$z" ] || { echo "::error::no sparse-shard.duckdb.zst pulled back — nothing to publish"; exit 1; }
+          dir="$(dirname "$z")"
+          printf %s "$GHCR_PAT" | oras login ghcr.io -u "$GHCR_OWNER" --password-stdin
+          ( cd "$dir" && oras push "ghcr.io/${GHCR_OWNER}/3gpp-sparse:latest" \
+              --artifact-type application/vnd.kodflow.3gpp-sparse.v1 \
+              --annotation "org.opencontainers.image.source=https://github.com/${GHCR_OWNER}/3gpp-mcp" \
+              "sparse-shard.duckdb.zst:application/zstd" )
+          # anti-leak: 3gpp-sparse carries verbatim clause text → keep PRIVATE.
+          vis="$(GH_TOKEN=$GHCR_PAT gh api "/users/${GHCR_OWNER}/packages/container/3gpp-sparse" --jq .visibility 2>/dev/null || echo absent)"
+          [ "$vis" = public ] && GH_TOKEN=$GHCR_PAT gh api -X PATCH "/user/packages/container/3gpp-sparse/visibility" -f visibility=private >/dev/null 2>&1 || true
+          echo "published sparse shard → 3gpp-sparse:latest"
