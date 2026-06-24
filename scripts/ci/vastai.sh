@@ -40,14 +40,18 @@ vastai_cheapest_4090() {
 
 # vastai_launch <offer> → echoes instance id. VAST_API_KEY is deliberately NOT in --env.
 vastai_launch() {
-  local offer="$1" onstart
+  local offer="$1" onstart qref qsha qrun qowner
+  # Shell-escape every interpolated value (printf %q) before embedding it in the remote
+  # onstart string — a branch name can legally contain an apostrophe/space, which would
+  # otherwise break (or inject into) the shell command on the rented host.
+  qref=$(printf %q "$REF"); qsha=$(printf %q "$REF_SHA"); qrun=$(printf %q "$RUN_SCRIPT"); qowner=$(printf %q "$GHCR_OWNER")
   # Clone the branch, then pin to the EXACT commit the workflow ran from (immutable —
   # no floating ref on the box). Falls back to the branch tip only if REF_SHA is empty.
   onstart="set -e; exec >>/var/log/onstart.log 2>&1
-git clone -b '${REF}' https://github.com/${GHCR_OWNER}/3gpp-mcp /workspace/repo
+git clone -b $qref https://github.com/$qowner/3gpp-mcp /workspace/repo
 cd /workspace/repo
-[ -n '${REF_SHA}' ] && git checkout --quiet '${REF_SHA}'
-bash ${RUN_SCRIPT}
+[ -n $qsha ] && git checkout --quiet $qsha
+bash $qrun
 touch /root/onstart-done"
   vastai create instance "$offer" --image "$IMG" --disk 80 --ssh --direct --raw \
     --label "embed-s${SERIES}" \
