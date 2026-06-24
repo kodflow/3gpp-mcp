@@ -1,23 +1,25 @@
 # =============================================================================
-#  Corpus · Sync (single-runner, bounded)   — SIMPLE alternative to Corpus·Build
+#  Corpus · Sync (single-runner, bounded)   — artifact-only smoke of the chain
 # =============================================================================
 #
 #  WHEN it runs   MANUAL ONLY (workflow_dispatch).
 #
 #  WHAT it does   The same chain as "Corpus · Build" but in ONE job (no matrix,
 #                 no per-series parallelism, no embed): download → convert →
-#                 lexical ingest → publish. Scope-bounded (a 14 GB runner can't
+#                 lexical ingest → package. Scope-bounded (a 14 GB runner can't
 #                 hold the full ~20 GB corpus), so it's for a SMALL series subset
 #                 or a quick end-to-end smoke of the chain.
 #
+#  WHAT it PUBLISHES   NOTHING. ARTIFACT-ONLY (retention 7d). The ability to
+#                 clobber the canonical DB on the `latest` release was REMOVED
+#                 (2026-06 CI cleanup): a secondary, bounded workflow that can
+#                 overwrite the served DB is a footgun. The ONLY publisher of the
+#                 lexical channel is "Corpus · Build" (corpus-matrix.yml).
+#
 #  WHEN to use which:
 #                 • Corpus · Build  → the real pipeline (parallel, delta-aware,
-#                                     embed-capable, auto-resumed). Use this.
-#                 • Corpus · Sync   → a quick bounded one-shot when you don't need
-#                                     the matrix machinery.
-#
-#  WHAT it PUBLISHES   publish_to_latest=false (default) → artifact only, so a
-#                 small/test run never shrinks the canonical DB on `latest`.
+#                                     embed-capable, auto-resumed, PUBLISHES). Use this.
+#                 • Corpus · Sync   → a quick bounded smoke; produces an artifact only.
 
 name: Corpus · Sync (bounded, single-runner)
 
@@ -29,18 +31,12 @@ on:
         type: string
         default: "23 24 29 33 38"
       release_floor:
-        description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen; not frozen)."
+        description: "Lowest release to ingest (default Rel-99 = all real 3GPP releases (Rel-99..latest); not frozen)."
         type: string
         default: "Rel-99"
-      publish_to_latest:
-        description: "Clobber the DB on the 'latest' release (else: artifact only)."
-        type: boolean
-        default: false
-  # schedule:
-  #   - cron: "17 4 * * 1"  # weekly, off-peak, non-round minute
 
 permissions:
-  contents: write # to clobber the DB asset on the 'latest' release
+  contents: read # artifact-only — never writes a release
 
 concurrency:
   group: corpus-sync
@@ -85,11 +81,9 @@ jobs:
             # Fast, bounded validation: vocabulary series only, newest releases.
             echo "series=21"        >> "$GITHUB_OUTPUT"
             echo "floor=Rel-19"     >> "$GITHUB_OUTPUT"
-            echo "publish=false"    >> "$GITHUB_OUTPUT"
           else
             echo "series=${{ github.event.inputs.series }}"            >> "$GITHUB_OUTPUT"
             echo "floor=${{ github.event.inputs.release_floor }}"      >> "$GITHUB_OUTPUT"
-            echo "publish=${{ github.event.inputs.publish_to_latest }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build ingest (Rust)
@@ -118,9 +112,8 @@ jobs:
           sha256sum data/3gpp.duckdb | awk '{print $1"  3gpp.duckdb"}' > data/3gpp.duckdb.sha256
           ls -lh data/3gpp.duckdb.zst
 
-      # Test/bounded run → artifact only (never shrink the canonical 'latest' DB).
+      # ARTIFACT-ONLY (unconditional): this workflow never writes a release.
       - name: Upload DB artifact
-        if: steps.scope.outputs.publish != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: 3gpp-duckdb
@@ -128,15 +121,3 @@ jobs:
             data/3gpp.duckdb.zst
             data/3gpp.duckdb.sha256
           retention-days: 7
-
-      # Real run → clobber the single DB asset on 'latest'.
-      - name: Publish DB to 'latest' (clobber)
-        if: steps.scope.outputs.publish == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          source scripts/lib/retry.sh
-          gh release view latest >/dev/null 2>&1 || \
-            retry gh release create latest --latest --title "latest" \
-              --notes "Rolling release — mcp-3gpp binaries + indexed 3GPP DB."
-          retry gh release upload latest data/3gpp.duckdb.zst data/3gpp.duckdb.sha256 --clobber
