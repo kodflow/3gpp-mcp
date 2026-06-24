@@ -1,0 +1,71 @@
+# =============================================================================
+#  Corpus · vast.ai BLAST (rented 4090) — embed the WHOLE dense corpus in one session
+# =============================================================================
+#  Manual, deliberate, paid. Rents ONE on-demand 4090 and runs every series' dense embed
+#  on it (run_blast.sh), then publishes each shard to 3gpp-vec. Hard cost guards: CEIL_DPH
+#  ceiling + MAX_HOURS watchdog + the reconcile cron. Use this to collapse a full re-embed
+#  into an afternoon (~$2-5); the per-series vastai/Kaggle paths remain for the trickle.
+# =============================================================================
+name: Corpus · vast.ai BLAST (full dense, rented 4090)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ceil_dph:
+        description: "Hard $/hr ceiling (on-demand only)."
+        required: false
+        default: "0.55"
+      max_hours:
+        description: "Wall-clock watchdog — destroy the box after this many hours."
+        required: false
+        default: "9"
+      confirm:
+        description: "Type RENT to confirm this spends money."
+        required: true
+        default: ""
+
+concurrency:
+  group: vastai-blast
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  blast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 700
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      GHCR_OWNER: ${{ github.repository_owner }}
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+      SERIES: all # label only → box labelled embed-sall
+      REF: ${{ github.ref_name }}
+      CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}
+      MAX_HOURS: ${{ github.event.inputs.max_hours || '9' }}
+      RUN_SCRIPT: scripts/vastai/run_blast.sh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Preflight — confirmation + secrets
+        run: |
+          [ "${{ github.event.inputs.confirm }}" = "RENT" ] || { echo "::error::type RENT to confirm — this spends money"; exit 1; }
+          [ -n "$VAST_API_KEY" ]  || { echo "::error::VAST_API_KEY not set — see docs/ci/vastai-secrets.md"; exit 1; }
+          [ -n "$GHCR_READ_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set"; exit 1; }
+      - name: Rent ONE 4090, embed all series, pull shards, destroy
+        run: bash scripts/ci/vastai.sh
+      - name: Publish every dense shard to 3gpp-vec (runner-side, write PAT)
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          n=0
+          for z in ./shard/**/s[0-9][0-9].duckdb.zst; do
+            d="$(mktemp -d)"; cp "$z" "$d/"
+            bash scripts/ci/publish-vec.sh "$d" && n=$((n+1)) || echo "::warning::publish failed for $z"
+          done
+          echo "published $n dense shard(s) to 3gpp-vec"
+          [ "$n" -gt 0 ] || { echo "::error::no shards published"; exit 1; }
