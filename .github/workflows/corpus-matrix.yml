@@ -91,8 +91,8 @@ on:
   # (no published index yet), then only the changed series on later merges. discover
   # diffs the live 3GPP status + the build identities vs the published `latest`, so a
   # no-op merge produces an empty matrix and costs ~1 min. Publishes to `latest` and
-  # includes Phase 1/2 (legacy GSM). Embedding is NOT done here — it is the separate,
-  # manual Kaggle job (corpus-embed-kaggle.yml).
+  # includes Phase 1/2 (legacy GSM). Embedding is NOT done here — it is the separate
+  # Kaggle GPU job (corpus-rust-embed-kaggle.yml), dispatched per changed series below.
   push:
     branches: [main]
     # Only auto-run when something that actually affects the corpus changes — so an
@@ -1415,11 +1415,16 @@ jobs:
             echo "::notice::no changed series — nothing to embed"; exit 0
           fi
           echo "dispatching GPU embed for changed series: $series (floor=${FLOOR:-Rel-99})"
-          retry gh workflow run corpus-embed-kaggle.yml \
-            -f series_list="$series" \
-            -f embed_floor="${FLOOR:-Rel-99}" \
-            -f precision=fp16 \
-            -f publish=true
+          # The Go embed path (corpus-embed-kaggle.yml) was RETIRED in Phase 11b and deleted;
+          # embed now runs in Rust (corpus-rust-embed-kaggle.yml), ONE 2-digit series per run,
+          # publishing fp16 to 3gpp-vec. Dispatch one run per changed series — the target's
+          # concurrency (1 running + 1 pending) serialises them, each is resumable, and the
+          # dense orchestrator's rotation converges any the concurrency cap drops.
+          for s in $series; do
+            retry gh workflow run corpus-rust-embed-kaggle.yml \
+              -f series="$s" -f kaggle_account=primary -f publish=true \
+              && echo "dispatched series $s" || echo "::warning::dispatch for series $s failed"
+          done
 
   # ---- 5b. dispatch-sparse: produce the SPARSE (learned-lexical) layer when the
   # published sparse-index differs from what this build expects (discover
