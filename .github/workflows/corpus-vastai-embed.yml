@@ -1,0 +1,60 @@
+# =============================================================================
+#  Corpus · vast.ai dense embed (rented 4090) — alternative to corpus-rust-embed-kaggle
+# =============================================================================
+#  Rents a cheap on-demand RTX 4090, runs the dense embed of ONE series on it, pulls the
+#  shard back to the runner, and publishes it to 3gpp-vec:latest-fp16. Kaggle stays the
+#  default; the orchestrator dispatches THIS only when GPU_PROVIDER=vastai. The box only
+#  ever holds a READ-ONLY GHCR PAT; the WRITE PAT + VAST_API_KEY stay on the runner.
+# =============================================================================
+name: Corpus · vast.ai dense embed (rented 4090)
+
+on:
+  workflow_dispatch:
+    inputs:
+      series:
+        description: "2-digit series to embed (e.g. 23)."
+        required: true
+      ceil_dph:
+        description: "Hard $/hr ceiling for the 4090 rental."
+        required: false
+        default: "0.55"
+      max_hours:
+        description: "Wall-clock watchdog — destroy the box after this many hours."
+        required: false
+        default: "9"
+
+concurrency:
+  group: vastai-embed-${{ github.event.inputs.series }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write # publish-vec pushes 3gpp-vec
+
+jobs:
+  embed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 600 # backstop only; the driver's wall-clock watchdog is the real kill
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }} # stays on the runner, NEVER in --env
+      GHCR_OWNER: ${{ github.repository_owner }}
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }} # read-only on the box
+      SERIES: ${{ github.event.inputs.series }}
+      REF: ${{ github.ref_name }}
+      CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}
+      MAX_HOURS: ${{ github.event.inputs.max_hours || '9' }}
+      RUN_SCRIPT: scripts/vastai/run_embed.sh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Preflight — required secrets
+        run: |
+          [ -n "$VAST_API_KEY" ]  || { echo "::error::VAST_API_KEY not set — see docs/ci/vastai-secrets.md"; exit 1; }
+          [ -n "$GHCR_READ_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set"; exit 1; }
+      - name: Rent 4090, run dense embed, pull shard, destroy
+        run: bash scripts/ci/vastai.sh
+      - name: Publish shard to 3gpp-vec (runner-side, write PAT)
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: bash scripts/ci/publish-vec.sh ./shard
