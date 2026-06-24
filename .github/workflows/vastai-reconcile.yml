@@ -1,0 +1,54 @@
+# =============================================================================
+#  vast.ai · Reconcile — cost backstop: destroy orphaned rented instances
+# =============================================================================
+#  The vastai.sh driver destroys its box via an EXIT trap + a wall-clock watchdog. But if
+#  the GitHub RUNNER itself dies (OOM, the 6h job cap, a manual cancel), the trap never
+#  fires and a rented 4090 keeps billing. This cron is the third, independent teardown:
+#  every 20 min it destroys any `embed-*`-labelled instance older than MAX_AGE_HOURS.
+#  A normal run lasts < MAX_HOURS (default 9) and is destroyed by the driver well before
+#  MAX_AGE_HOURS, so this only ever catches true orphans.
+# =============================================================================
+name: vast.ai · Reconcile (cost backstop)
+
+on:
+  schedule:
+    - cron: "13,33,53 * * * *" # every 20 min, off the round minute
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Destroy embed-* instances older than this many hours."
+        required: false
+        default: "11"
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      MAX_AGE_HOURS: ${{ github.event.inputs.max_age_hours || '11' }}
+    steps:
+      - name: Destroy orphaned embed-* instances
+        run: |
+          set -euo pipefail
+          [ -n "$VAST_API_KEY" ] || { echo "VAST_API_KEY not set — nothing to reconcile"; exit 0; }
+          pip install -q vastai
+          vastai set api-key "$VAST_API_KEY" >/dev/null
+          now="$(date +%s)"
+          # Each instance: id, label, start_date (epoch). Destroy embed-* older than the cap.
+          vastai show instances --raw 2>/dev/null \
+            | jq -r '.[] | [(.id|tostring), (.label // ""), ((.start_date // 0)|floor|tostring)] | @tsv' \
+            | while IFS=$'\t' read -r id label start; do
+                case "$label" in embed-*) ;; *) continue ;; esac
+                age_h=$(( (now - ${start:-$now}) / 3600 ))
+                if [ "$age_h" -ge "$MAX_AGE_HOURS" ]; then
+                  echo "::warning::orphan instance $id (label=$label age=${age_h}h) — destroying"
+                  vastai destroy instance "$id" >/dev/null 2>&1 || true
+                else
+                  echo "instance $id (label=$label age=${age_h}h) within cap — leaving"
+                fi
+              done
+          echo "reconcile done"
