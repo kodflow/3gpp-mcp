@@ -99,6 +99,7 @@ jobs:
           EMBED_LIMIT: ${{ github.event.inputs.limit }}
         run: |
           set -euo pipefail
+          source scripts/ci/kaggle.sh # shared account/auth/poll/pull helpers
           # Two-account GPU fallback: try each account's GPU; if one is out of its weekly
           # quota (no GPU allocated) the kernel logs gpu=absent / yields no output, and
           # scripts/kaggle-gpu-check.sh reports "quota" → fall back to the other account.
@@ -106,10 +107,7 @@ jobs:
           # swaps the exported KAGGLE_API_TOKEN/KAGGLE_USER per attempt.
           PRIM_TOK="${KAGGLE_API_TOKEN:-}"; PRIM_USER="${KAGGLE_USERNAME:-}"
           FB_TOK="${KAGGLE_API_TOKEN_FALLBACK:-}"; FB_USER="${KAGGLE_USERNAME_FALLBACK:-}"
-          case "${KAGGLE_ACCOUNT:-primary}" in
-            fallback) ORDER="fallback primary" ;;
-            *) ORDER="primary fallback" ;;
-          esac
+          ORDER="$(kaggle_account_order "${KAGGLE_ACCOUNT:-primary}")"
           dispatch() {
           dir="$RUNNER_TEMP/rust-embed-kernel"; rm -rf "$dir"; mkdir -p "$dir"
           # Kaggle slugifies the TITLE (lowercase + dashes) and REQUIRES it to resolve to
@@ -144,49 +142,17 @@ jobs:
           fi
           printf '{\n "id": "%s",\n "title": "3gpp rust embed %s",\n "code_file": "kernel.py",\n "language": "python",\n "kernel_type": "script",\n "is_private": true,\n "enable_gpu": true,\n "enable_internet": true,\n "dataset_sources": [%s],\n "competition_sources": [],\n "kernel_sources": []\n}\n' "$slug" "$shard" "$ds_src" > "$dir/kernel-metadata.json"
           kaggle kernels push -p "$dir" --accelerator NvidiaTeslaT4
-          # Let the NEW version enter "running" before polling: re-pushing an existing
-          # slug leaves the PRIOR version's terminal status visible for a few seconds, so
-          # an immediate poll sees a stale "complete"/"error", breaks, and pulls the old
-          # (or empty) output — the 7-second false-failure we hit. Wait it out first.
-          echo "waiting 90s for the new kernel version to start…"; sleep 90
-          # Poll until terminal. The CLI exit code is unreliable, so parse the status and
-          # ECHO it every iteration (a stuck poll must be diagnosable — the first version
-          # hung 40 min because no pattern matched). running/queued → wait; complete → done;
-          # error/cancel/fail/not-found → stop; unknown → wait but BOUNDED by the cap.
-          done_poll=""
-          for i in $(seq 1 400); do
-            st="$(kaggle kernels status "$slug" 2>&1 || true)"
-            echo "poll $i: $st"
-            case "$st" in
-              *running*|*RUNNING*|*queued*|*QUEUED*) sleep 30; continue ;;
-              *complete*|*COMPLETE*) echo "kernel complete"; done_poll=1; break ;;
-              *error*|*ERROR*|*cancel*|*CANCEL*|*fail*|*FAIL*|*"not found"*|*404*) echo "::warning::kernel ended: $st"; done_poll=1; break ;;
-              *) sleep 30 ;;
-            esac
-          done
-          [ -n "$done_poll" ] || echo "::warning::poll cap reached without a terminal status — pulling output anyway"
-          mkdir -p out
-          for a in 1 2 3 4; do
-            kaggle kernels output "$slug" -p out && break
-            echo "output pull attempt $a failed — retrying"; sleep 15
-          done
-          echo "=== KERNEL LOG (tail) ==="; tail -n 120 out/*.log 2>/dev/null || echo "(no .log pulled)"
-          echo "=== RESULT ==="; cat out/RESULT.txt 2>/dev/null || echo "(no RESULT.txt — see log above)"
+          kaggle_poll_until_terminal "$slug" 400
+          kaggle_pull_output "$slug" out
           }
           # Try each account until one is granted a GPU. quota (no GPU) → fall back to the
           # next; gpu → keep that account and proceed. dispatch is best-effort (|| true):
           # a failed push/pull leaves no usable output → gpu-check reports quota → fall back.
           got_gpu=0
           for acct in $ORDER; do
-            case "$acct" in
-              primary)  export KAGGLE_API_TOKEN="$PRIM_TOK" KAGGLE_USER="$PRIM_USER" ;;
-              fallback) export KAGGLE_API_TOKEN="$FB_TOK"   KAGGLE_USER="$FB_USER" ;;
-            esac
-            if [ -z "$KAGGLE_API_TOKEN" ] || [ -z "$KAGGLE_USER" ]; then
-              echo "account '$acct' not configured (token/username empty) — skipping"; continue
-            fi
+            kaggle_use_account "$acct" || { echo "account '$acct' not configured (token/username empty) — skipping"; continue; }
             echo "::group::Kaggle account=$acct user=$KAGGLE_USER"
-            if ! kaggle kernels list -m -p 1 >/dev/null 2>&1; then
+            if ! kaggle_auth_ok; then
               echo "::warning::account '$acct' auth failed — trying next"; echo "::endgroup::"; continue
             fi
             rm -rf out
