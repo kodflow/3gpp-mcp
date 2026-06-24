@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$VAST_API_KEY" ] || { echo "VAST_API_KEY not set — nothing to reconcile"; exit 0; }
-          pip install -q vastai
+          pip install -q "vastai==1.1.2"
           vastai set api-key "$VAST_API_KEY" >/dev/null
           now="$(date +%s)"
           # Each instance: id, label, start_date (epoch). Destroy embed-* older than the cap.

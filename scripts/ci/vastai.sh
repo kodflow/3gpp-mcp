@@ -21,12 +21,13 @@ set -euo pipefail
 : "${VAST_API_KEY:?}" "${GHCR_READ_PAT:?}" "${SERIES:?}"
 GHCR_OWNER="${GHCR_OWNER:-kodflow}"
 REF="${REF:-main}"
+REF_SHA="${REF_SHA:-}" # immutable commit the box checks out (the workflow passes github.sha)
 IMG="${IMG:-nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04}" # glibc 2.35 + cuDNN9 ⇒ ORT 1.20.1 CUDA EP, 4090 = CC 8.9
 CEIL_DPH="${CEIL_DPH:-0.55}"                               # hard $/hr ceiling
 MAX_HOURS="${MAX_HOURS:-9}"                                # wall-clock kill
 RUN_SCRIPT="${RUN_SCRIPT:-scripts/vastai/run_embed.sh}"
 
-command -v vastai >/dev/null 2>&1 || pip install -q vastai
+command -v vastai >/dev/null 2>&1 || pip install -q "vastai==1.1.2"
 vastai set api-key "$VAST_API_KEY" >/dev/null
 
 # vastai_cheapest_4090 → cheapest VERIFIED on-demand single-4090 offer id under the ceiling,
@@ -40,14 +41,17 @@ vastai_cheapest_4090() {
 # vastai_launch <offer> → echoes instance id. VAST_API_KEY is deliberately NOT in --env.
 vastai_launch() {
   local offer="$1" onstart
+  # Clone the branch, then pin to the EXACT commit the workflow ran from (immutable —
+  # no floating ref on the box). Falls back to the branch tip only if REF_SHA is empty.
   onstart="set -e; exec >>/var/log/onstart.log 2>&1
-git clone --depth 1 -b '${REF}' https://github.com/${GHCR_OWNER}/3gpp-mcp /workspace/repo
+git clone -b '${REF}' https://github.com/${GHCR_OWNER}/3gpp-mcp /workspace/repo
 cd /workspace/repo
+[ -n '${REF_SHA}' ] && git checkout --quiet '${REF_SHA}'
 bash ${RUN_SCRIPT}
 touch /root/onstart-done"
   vastai create instance "$offer" --image "$IMG" --disk 80 --ssh --direct --raw \
     --label "embed-s${SERIES}" \
-    --env "-e GHCR_PAT=${GHCR_READ_PAT} -e GHCR_OWNER=${GHCR_OWNER} -e SERIES=${SERIES} -e REF=${REF}" \
+    --env "-e GHCR_PAT=${GHCR_READ_PAT} -e GHCR_OWNER=${GHCR_OWNER} -e SERIES=${SERIES} -e REF=${REF} -e REF_SHA=${REF_SHA}" \
     --onstart-cmd "$onstart" | jq -r '.new_contract'
 }
 

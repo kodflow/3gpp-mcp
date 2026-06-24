@@ -40,6 +40,7 @@ jobs:
       GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT }} # READ-ONLY on the box — never fall back to the write PAT
       SERIES: ${{ github.event.inputs.series }}
       REF: ${{ github.ref_name }}
+      REF_SHA: ${{ github.sha }} # immutable commit the rented box checks out
       CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}
       MAX_HOURS: ${{ github.event.inputs.max_hours || '9' }}
       RUN_SCRIPT: scripts/vastai/run_embed.sh
