@@ -8,7 +8,9 @@
 #                  then embed-io export → embedder (live progress bar) → embed-io import
 #                  --build-hnsw, and versions the embedded DB + the vecs.jsonl RESUME
 #                  ledger back to a per-shard Kaggle Dataset. This is the Rust path the
-#                  mandate asks for; the Go corpus-embed-kaggle.yml stays for fallback.
+#                  mandate asks for, and now the SOLE dense path: the Go corpus-embed-kaggle.yml
+#                  was RETIRED (its embed driver hard-exits "RETIRED (Phase 11b)") and deleted;
+#                  its 3gpp-vec publish step was ported here (publish-vec job, fp16).
 #
 #  WHEN it runs    MANUAL (workflow_dispatch) ONLY. One dispatch = one shard, BOUNDED and
 #                  RESUMABLE (the vecs.jsonl ledger skips already-embedded chunk_ids), so
@@ -50,6 +52,10 @@ on:
         default: "primary"
         type: choice
         options: [primary, fallback]
+      publish:
+        description: "Publish the embedded sub-base to GHCR 3gpp-vec:latest-fp16 (additive). Default true. Only a single 2-digit series dispatch publishes; lot/release runs persist to the Kaggle Dataset only."
+        required: false
+        default: "true"
 
 concurrency:
   group: corpus-rust-embed-kaggle
@@ -213,6 +219,34 @@ jobs:
           else
             echo "::error::no embedded DB in kernel output — vectors NOT persisted (resume impossible)"; exit 1
           fi
+      # Stage the embedded sub-base as a SERIES-KEYED vec artifact so publish-vec can
+      # ORAS-push it to 3gpp-vec — the SAME contract the (now-retired) corpus-embed-kaggle
+      # used. ONLY for a single 2-digit series dispatch (the orchestrator's mode); lot/release
+      # runs keep their multi-series sub-base in the Kaggle Dataset only (not series-keyable).
+      - name: Stage sub-base under its series-keyed name (if any)
+        if: always()
+        run: |
+          s="${{ github.event.inputs.series }}"
+          if ! printf '%s' "$s" | grep -qE '^[0-9]{2}$'; then
+            echo "not a single 2-digit series ($s) — no vec artifact (Dataset-only)"; exit 0
+          fi
+          src="$(find out -name '3gpp-embedded.duckdb' 2>/dev/null | head -1 || true)"
+          if [ -n "$src" ] && [ -s "$src" ]; then
+            mkdir -p stage-vec
+            ln "$src" "stage-vec/s$s.duckdb" 2>/dev/null || cp "$src" "stage-vec/s$s.duckdb"
+            ls -la stage-vec/
+          else
+            echo "no embedded sub-base found for series $s (nothing to stage)"
+          fi
+      - name: Upload vec sub-base artifact (if any)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vec-s${{ github.event.inputs.series }}
+          path: stage-vec/s${{ github.event.inputs.series }}.duckdb
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload RESULT + log
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -223,3 +257,115 @@ jobs:
             out/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # ---- publish-vec: ORAS-push the staged sub-base to GHCR 3gpp-vec (ADDITIVE, never
+  # clobber) — the proven contract ported from the now-RETIRED corpus-embed-kaggle, so the
+  # autonomous dense campaign actually reaches the served channel. fp16 is FIXED: the Rust
+  # kernel always converts the model to fp16 in-kernel and the served data-image bake is
+  # fp16, so the EmbedIdentity matches (an fp16 corpus + fp32 query is refused at serve). ----
+  publish-vec:
+    needs: rust-embed
+    if: ${{ github.event.inputs.publish != 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    env:
+      ORAS_VERSION: "1.2.0"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: shards
+          pattern: vec-s*
+      - name: Install zstd + jq + ORAS (pinned)
+        run: |
+          source scripts/lib/retry.sh
+          retry sudo apt-get update -y
+          retry sudo apt-get install -y --no-install-recommends zstd jq
+          retry bash -c "curl -fsSL 'https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz' | sudo tar -xz -C /usr/local/bin oras"
+          oras version
+      - name: Merge with the existing channel, then push (ADDITIVE — never clobber)
+        run: |
+          set -euo pipefail
+          source scripts/lib/retry.sh
+          retry bash -c 'echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin'
+          # fp16 FIXED (see job header): publish to the fp16 channel the bake consumes.
+          PREC="fp16"; TAG="latest-$PREC"; MODEL="bge-m3-$PREC"
+          REF="ghcr.io/${GITHUB_REPOSITORY_OWNER}/3gpp-vec:$TAG"
+          echo "publishing to $REF (embedding_model=$MODEL)"
+          mkdir -p vec
+          # 1) Seed vec/ from the EXISTING channel so OTHER series' sub-bases survive a
+          #    single-series re-publish (absent → first publish, start empty).
+          if RETRY_MAX=2 retry oras pull "$REF" -o vec 2>/dev/null; then
+            echo "pulled existing channel:"; ls -1 vec || true
+          else
+            echo "no existing channel — first publish"
+          fi
+          existing='[]'
+          if [ -f vec/vec-manifest.json ]; then
+            existing="$(jq -c '[(.sub_bases // [])[] | select(. != "3gpp-embedded.duckdb")]' vec/vec-manifest.json)"
+          fi
+          rm -f vec/3gpp-embedded.duckdb.zst vec/vec-manifest.json
+          # 2) Overlay THIS run's shard as s<series>.duckdb.zst (series from the filename).
+          new='[]'
+          found=0
+          while IFS= read -r f; do
+            found=$((found+1))
+            base="$(basename "$f" .duckdb)"
+            if printf '%s' "$base" | grep -qE '^s[0-9]{2}$'; then
+              s="${base#s}"
+            else
+              d="$(basename "$(dirname "$f")")"
+              s="${d#vec-s}"
+              if ! printf '%s' "$s" | grep -qE '^[0-9]{2}$'; then
+                echo "::warning::cannot derive a series for $f — skipped"; continue
+              fi
+            fi
+            # Refuse to fold an invalid/empty artifact (DUCK magic at offset 8); the existing
+            # channel copy survives via the union below.
+            if [ "$(dd if="$f" bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ]; then
+              echo "::warning::series $s artifact is not a valid DuckDB ($f) — NOT published"; continue
+            fi
+            zstd -19 -T0 -f "$f" -o "vec/s$s.duckdb.zst"
+            new="$(printf '%s' "$new" | jq --arg n "s$s.duckdb" '. + [$n]')"
+          done < <(find shards -name '*.duckdb' 2>/dev/null | sort)
+          processed="$(printf '%s' "$new" | jq 'length')"
+          echo "shards found=$found processed=$processed"
+          if [ "$found" -eq 0 ]; then
+            echo "::notice::no fresh sub-bases in this run — channel left untouched (no re-push)"; exit 0
+          fi
+          if [ "$processed" -eq 0 ]; then
+            echo "::error::$found shard artifact(s) downloaded but NONE processed — refusing to silently re-push"; exit 1
+          fi
+          # 3) Union existing ∪ new (new wins), keeping only entries whose .zst exists.
+          subs="$(jq -cn --argjson e "$existing" --argjson n "$new" '($e + $n) | unique')"
+          present="$(cd vec && ls -1 ./*.duckdb.zst 2>/dev/null | sed 's#^\./##; s#\.zst$##' | jq -R . | jq -cs .)"
+          subs="$(jq -cn --argjson s "$subs" --argjson p "$present" '[ $s[] | select(. as $x | $p | any(. == $x)) ]')"
+          printf '%s' "$subs" | jq --arg model "$MODEL" '{embedding_model:$model, embed_floor:"", sub_bases:.}' > vec/vec-manifest.json
+          cat vec/vec-manifest.json
+          test "$(jq '.sub_bases|length' vec/vec-manifest.json)" -gt 0 || { echo "::error::no sub-bases to publish"; exit 1; }
+          # 4) Push the MERGED set (existing survivors + this run's series).
+          cd vec
+          args="vec-manifest.json:application/json"
+          for z in *.duckdb.zst; do args="$args $z:application/zstd"; done
+          retry oras push "$REF" \
+            --artifact-type application/vnd.kodflow.3gpp-vec.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            $args
+      # ANTI-LEAK, fail-loud: 3gpp-vec sub-bases carry verbatim clause TEXT → must be PRIVATE.
+      - name: Assert 3gpp-vec is PRIVATE (self-heal then fail-loud)
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-vec" --jq '.visibility' 2>/dev/null || echo absent)"
+          echo "3gpp-vec visibility: $vis"
+          if [ "$vis" = "public" ]; then
+            echo "::warning::3gpp-vec is PUBLIC — attempting self-heal to private"
+            gh api -X PATCH "/user/packages/container/3gpp-vec/visibility" -f visibility=private >/dev/null 2>&1 || true
+            vis="$(gh api "/users/${{ github.repository_owner }}/packages/container/3gpp-vec" --jq '.visibility' 2>/dev/null || echo absent)"
+          fi
+          [ "$vis" = "private" ] || { echo "::error::3gpp-vec is '$vis' (must be private — verbatim 3GPP clause text). Fix in UI: Packages → 3gpp-vec → Settings → Change visibility."; exit 1; }
