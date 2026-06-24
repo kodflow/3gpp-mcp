@@ -33,6 +33,7 @@ need() { command -v "$1" >/dev/null 2>&1; }
 export DEBIAN_FRONTEND=noninteractive
 need curl || { apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates git; }
 need zstd || apt-get install -y --no-install-recommends zstd
+need unzip || apt-get install -y --no-install-recommends unzip # duckdb CLI ships as a .zip
 bins=/usr/local/bin
 need crane || curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" | tar -xz -C "$bins" crane
 need oras  || curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz" | tar -xz -C "$bins" oras
@@ -79,7 +80,8 @@ python3 -m pip install -q huggingface_hub onnx onnxconverter-common 2>/dev/null 
 python3 - "$BGE" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
-snapshot_download("BAAI/bge-m3", local_dir=sys.argv[1], allow_patterns=["*.onnx","*.onnx_data","tokenizer*","*.json","sentencepiece*","*.model"])
+# Pinned revision (matches models.yaml identity in kernel-rust-embed.py) — immutable fetch.
+snapshot_download("BAAI/bge-m3", revision="5617a9f", local_dir=sys.argv[1], allow_patterns=["*.onnx","*.onnx_data","tokenizer*","*.json","sentencepiece*","*.model"])
 PY
 mkdir -p "$BGE16"
 python3 - "$BGE" "$BGE16" <<'PY'

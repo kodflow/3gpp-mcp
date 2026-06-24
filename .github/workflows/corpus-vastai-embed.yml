@@ -28,8 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  packages: write # publish-vec pushes 3gpp-vec
+  contents: read # publish-vec authenticates to GHCR with GHCR_PAT (a secret), not GITHUB_TOKEN
 
 jobs:
   embed:
@@ -38,7 +37,7 @@ jobs:
     env:
       VAST_API_KEY: ${{ secrets.VAST_API_KEY }} # stays on the runner, NEVER in --env
       GHCR_OWNER: ${{ github.repository_owner }}
-      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }} # read-only on the box
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT }} # READ-ONLY on the box — never fall back to the write PAT
       SERIES: ${{ github.event.inputs.series }}
       REF: ${{ github.ref_name }}
       CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}

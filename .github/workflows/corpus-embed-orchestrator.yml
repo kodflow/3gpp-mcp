@@ -25,11 +25,11 @@ on:
         required: false
         default: "main"
       provider:
-        description: "GPU backend: kaggle (free T4x2) | vastai (rented 4090). Overrides the GPU_PROVIDER repo var."
+        description: "GPU backend: auto (use the GPU_PROVIDER var, else kaggle) | kaggle | vastai."
         required: false
-        default: ""
+        default: "auto"
         type: choice
-        options: ["", kaggle, vastai]
+        options: [auto, kaggle, vastai]
 
 permissions:
   actions: write # dispatch the embed workflow
@@ -46,6 +46,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REF: ${{ github.event.inputs.ref || 'main' }}
+      # Bind GitHub expressions to env (zizmor: no inline ${{ }} in run: blocks).
+      PROV_INPUT: ${{ github.event.inputs.provider }}
+      GPU_PROVIDER_VAR: ${{ vars.GPU_PROVIDER }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -54,11 +57,20 @@ jobs:
         run: |
           set -euo pipefail
           # GPU backend: the per-run input wins, else the GPU_PROVIDER repo var, else kaggle.
-          prov="${{ github.event.inputs.provider }}"; prov="${prov:-${{ vars.GPU_PROVIDER }}}"; prov="${prov:-kaggle}"
-          if [ "$prov" = vastai ]; then wf="corpus-vastai-embed.yml"; else wf="corpus-rust-embed-kaggle.yml"; fi
+          prov="$PROV_INPUT"; [ "$prov" = auto ] && prov=""; prov="${prov:-$GPU_PROVIDER_VAR}"; prov="${prov:-kaggle}"
+          case "$prov" in
+            vastai) wf="corpus-vastai-embed.yml" ;;
+            kaggle) wf="corpus-rust-embed-kaggle.yml" ;;
+            *) echo "::error::unsupported provider: $prov"; exit 1 ;;
+          esac
           echo "provider=$prov wf=$wf"
-          active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
-          queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          # Guard against BOTH dense backends: a provider flip must not dispatch duplicate
+          # work while the other backend's run is still active.
+          active=0; queued=0
+          for c in corpus-vastai-embed.yml corpus-rust-embed-kaggle.yml; do
+            active=$((active + $(gh run list --workflow "$c" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)))
+            queued=$((queued + $(gh run list --workflow "$c" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)))
+          done
           if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
             echo "a dense embed run is active ($active) / queued ($queued) — skip this tick"
             exit 0

@@ -29,8 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  packages: write
+  contents: read # publish-vec authenticates to GHCR with GHCR_PAT (a secret), not GITHUB_TOKEN
 
 jobs:
   blast:
@@ -39,7 +38,8 @@ jobs:
     env:
       VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
       GHCR_OWNER: ${{ github.repository_owner }}
-      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT }} # READ-ONLY on the box — never fall back to the write PAT
+      CONFIRM: ${{ github.event.inputs.confirm }} # bound to env (no inline ${{ }} in run:)
       SERIES: all # label only → box labelled embed-sall
       REF: ${{ github.ref_name }}
       CEIL_DPH: ${{ github.event.inputs.ceil_dph || '0.55' }}
@@ -51,7 +51,7 @@ jobs:
           persist-credentials: false
       - name: Preflight — confirmation + secrets
         run: |
-          [ "${{ github.event.inputs.confirm }}" = "RENT" ] || { echo "::error::type RENT to confirm — this spends money"; exit 1; }
+          [ "$CONFIRM" = "RENT" ] || { echo "::error::type RENT to confirm — this spends money"; exit 1; }
           [ -n "$VAST_API_KEY" ]  || { echo "::error::VAST_API_KEY not set — see docs/ci/vastai-secrets.md"; exit 1; }
           [ -n "$GHCR_READ_PAT" ] || { echo "::error::GHCR_READ_PAT/GHCR_PAT not set"; exit 1; }
       - name: Rent ONE 4090, embed all series, pull shards, destroy
@@ -62,10 +62,13 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
-          n=0
+          n=0; failed=0
           for z in ./shard/**/s[0-9][0-9].duckdb.zst; do
             d="$(mktemp -d)"; cp "$z" "$d/"
-            bash scripts/ci/publish-vec.sh "$d" && n=$((n+1)) || echo "::warning::publish failed for $z"
+            if bash scripts/ci/publish-vec.sh "$d"; then n=$((n+1)); else failed=$((failed+1)); echo "::error::publish failed for $z"; fi
           done
-          echo "published $n dense shard(s) to 3gpp-vec"
+          echo "published $n dense shard(s) to 3gpp-vec ($failed failed)"
           [ "$n" -gt 0 ] || { echo "::error::no shards published"; exit 1; }
+          # Fail the blast if ANY shard failed to publish — a silently-dropped series would
+          # leave the served channel incomplete (data-integrity).
+          [ "$failed" -eq 0 ] || { echo "::error::$failed shard(s) failed to publish — blast incomplete"; exit 1; }

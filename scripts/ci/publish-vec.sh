@@ -71,8 +71,14 @@ cat "$work/vec-manifest.json"
     --artifact-type application/vnd.kodflow.3gpp-vec.v1 "s${SERIES}.duckdb.zst:application/zstd" || true )
 
 # anti-leak: 3gpp-vec carries verbatim clause text → must stay PRIVATE.
-vis="$(GH_TOKEN=$GHCR_PAT gh api "/users/${GHCR_OWNER}/packages/container/3gpp-vec" --jq .visibility 2>/dev/null || echo absent)"
+# Read visibility under BOTH the user and org scope (the owner may be either).
+vis=absent
+for scope in "users/${GHCR_OWNER}" "orgs/${GHCR_OWNER}"; do
+  v="$(GH_TOKEN=$GHCR_PAT gh api "/${scope}/packages/container/3gpp-vec" --jq .visibility 2>/dev/null || true)"
+  [ -n "$v" ] && { vis="$v"; break; }
+done
 if [ "$vis" = public ]; then
-  GH_TOKEN=$GHCR_PAT gh api -X PATCH "/user/packages/container/3gpp-vec/visibility" -f visibility=private >/dev/null 2>&1 || true
+  GH_TOKEN=$GHCR_PAT gh api -X PATCH "/user/packages/container/3gpp-vec/visibility" -f visibility=private >/dev/null 2>&1 ||
+    GH_TOKEN=$GHCR_PAT gh api -X PATCH "/orgs/${GHCR_OWNER}/packages/container/3gpp-vec/visibility" -f visibility=private >/dev/null 2>&1 || true
 fi
 echo "published s${SERIES} → ${REF} (+ per-series tag)"

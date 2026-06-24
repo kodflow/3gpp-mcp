@@ -40,10 +40,15 @@ jobs:
           now="$(date +%s)"
           # Each instance: id, label, start_date (epoch). Destroy embed-* older than the cap.
           vastai show instances --raw 2>/dev/null \
-            | jq -r '.[] | [(.id|tostring), (.label // ""), ((.start_date // 0)|floor|tostring)] | @tsv' \
+            | jq -r '.[] | [(.id|tostring), (.label // ""), ((.start_date // empty)|floor|tostring)] | @tsv' \
             | while IFS=$'\t' read -r id label start; do
                 case "$label" in embed-*) ;; *) continue ;; esac
-                age_h=$(( (now - ${start:-$now}) / 3600 ))
+                # No start_date yet = freshly launched / still booting → NEVER destroy (the
+                # bug CR flagged: start_date//0 made fresh boxes look infinitely old).
+                if [ -z "$start" ] || [ "$start" = 0 ]; then
+                  echo "instance $id (label=$label) has no start_date yet — skipping"; continue
+                fi
+                age_h=$(( (now - start) / 3600 ))
                 if [ "$age_h" -ge "$MAX_AGE_HOURS" ]; then
                   echo "::warning::orphan instance $id (label=$label age=${age_h}h) — destroying"
                   vastai destroy instance "$id" >/dev/null 2>&1 || true

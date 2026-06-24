@@ -27,6 +27,7 @@ say() { echo "RESULT $*"; }
 export DEBIAN_FRONTEND=noninteractive
 command -v curl >/dev/null || { apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates git python3 python3-pip; }
 command -v zstd >/dev/null || apt-get install -y --no-install-recommends zstd
+command -v unzip >/dev/null || apt-get install -y --no-install-recommends unzip # duckdb CLI ships as a .zip
 b=/usr/local/bin
 command -v crane >/dev/null || curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" | tar -xz -C "$b" crane
 command -v oras  >/dev/null || curl -fsSL "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz" | tar -xz -C "$b" oras
@@ -42,8 +43,12 @@ import torch.nn as nn, torch.nn.functional as F
 from torch.export import Dim
 from FlagEmbedding import BGEM3FlagModel
 from onnxconverter_common import float16
+from huggingface_hub import snapshot_download
 MDIR = sys.argv[1]
-m3 = BGEM3FlagModel("BAAI/bge-m3", use_fp16=False)
+# Pin the model to an immutable revision (matches models.yaml identity) by pre-downloading
+# that snapshot and loading FlagEmbedding from the local path — no floating 'main'.
+LOCAL = snapshot_download("BAAI/bge-m3", revision="5617a9f")
+m3 = BGEM3FlagModel(LOCAL, use_fp16=False)
 backbone = m3.model.model; sparse_linear = m3.model.sparse_linear
 class DenseSparse(nn.Module):
     def __init__(self, b, s): super().__init__(); self.backbone, self.sparse_linear = b, s
@@ -85,8 +90,14 @@ if printf %s "$GHCR_PAT" | oras login ghcr.io -u "$GHCR_OWNER" --password-stdin 
   && oras pull "ghcr.io/${GHCR_OWNER}/3gpp-sparse:latest" -o "$WORK/resume" 2>/dev/null \
   && [ -f "$WORK/resume/sparse-shard.duckdb.zst" ]; then
   zstd -d -f "$WORK/resume/sparse-shard.duckdb.zst" -o "$WORK/resume/sparse-shard.duckdb"
-  "$OVERLAY" --base "$DB" --vec "$WORK/resume/sparse-shard.duckdb"
-  say "resume_carried=$(duckdb "$DB" -noheader -list 'SELECT count(*) FROM clause_sparse;' 2>/dev/null || echo 0)"
+  # Validate the resume blob before overlaying (DUCK magic at offset 8) — parity with
+  # run_embed.sh; a flaky oras pull once shipped an empty blob that poisoned downstream.
+  if [ "$(dd if="$WORK/resume/sparse-shard.duckdb" bs=1 skip=8 count=4 2>/dev/null)" = DUCK ]; then
+    "$OVERLAY" --base "$DB" --vec "$WORK/resume/sparse-shard.duckdb"
+    say "resume_carried=$(duckdb "$DB" -noheader -list 'SELECT count(*) FROM clause_sparse;' 2>/dev/null || echo 0)"
+  else
+    say "prior sparse shard invalid (no DUCK magic) — fresh sparse pass"
+  fi
 else
   say "no prior 3gpp-sparse shard — fresh sparse pass"
 fi

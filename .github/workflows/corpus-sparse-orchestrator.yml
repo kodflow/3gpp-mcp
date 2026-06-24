@@ -24,11 +24,11 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "GPU backend: kaggle (free T4x2) | vastai (rented 4090). Overrides the GPU_PROVIDER repo var."
+        description: "GPU backend: auto (use the GPU_PROVIDER var, else kaggle) | kaggle | vastai."
         required: false
-        default: ""
+        default: "auto"
         type: choice
-        options: ["", kaggle, vastai]
+        options: [auto, kaggle, vastai]
 
 permissions:
   actions: write # dispatch the sparse workflow
@@ -47,15 +47,26 @@ jobs:
       # No actions/checkout here, so give gh the repo explicitly — without GH_REPO (or a
       # git checkout) `gh run list` / `gh workflow run` fail with "not a git repository".
       GH_REPO: ${{ github.repository }}
+      # Bind GitHub expressions to env (zizmor: no inline ${{ }} in run: blocks).
+      PROV_INPUT: ${{ github.event.inputs.provider }}
+      GPU_PROVIDER_VAR: ${{ vars.GPU_PROVIDER }}
     steps:
       - name: Dispatch the next sparse slice if none is active
         run: |
           set -euo pipefail
-          prov="${{ github.event.inputs.provider }}"; prov="${prov:-${{ vars.GPU_PROVIDER }}}"; prov="${prov:-kaggle}"
-          if [ "$prov" = vastai ]; then wf="corpus-vastai-sparse.yml"; else wf="corpus-sparse-kaggle.yml"; fi
+          prov="$PROV_INPUT"; [ "$prov" = auto ] && prov=""; prov="${prov:-$GPU_PROVIDER_VAR}"; prov="${prov:-kaggle}"
+          case "$prov" in
+            vastai) wf="corpus-vastai-sparse.yml" ;;
+            kaggle) wf="corpus-sparse-kaggle.yml" ;;
+            *) echo "::error::unsupported provider: $prov"; exit 1 ;;
+          esac
           echo "provider=$prov wf=$wf"
-          active=$(gh run list --workflow "$wf" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)
-          queued=$(gh run list --workflow "$wf" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)
+          # Guard against BOTH sparse backends so a provider flip can't double-dispatch.
+          active=0; queued=0
+          for c in corpus-vastai-sparse.yml corpus-sparse-kaggle.yml; do
+            active=$((active + $(gh run list --workflow "$c" --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo 0)))
+            queued=$((queued + $(gh run list --workflow "$c" --status queued --json databaseId --jq 'length' 2>/dev/null || echo 0)))
+          done
           if [ "${active:-0}" -gt 0 ] || [ "${queued:-0}" -gt 0 ]; then
             echo "a sparse run is active ($active) / queued ($queued) — skip this tick"
             exit 0

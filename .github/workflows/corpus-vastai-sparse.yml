@@ -28,8 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  packages: write
+  contents: read # the publish step authenticates to GHCR with GHCR_PAT (a secret), not GITHUB_TOKEN
 
 jobs:
   sparse:
@@ -38,7 +37,7 @@ jobs:
     env:
       VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
       GHCR_OWNER: ${{ github.repository_owner }}
-      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT || secrets.GHCR_PAT }}
+      GHCR_READ_PAT: ${{ secrets.GHCR_READ_PAT }} # READ-ONLY on the box — never fall back to the write PAT
       SERIES: sparse # label only (vastai.sh labels the box embed-ssparse)
       REF: ${{ github.ref_name }}
       EMBED_LIMIT: ${{ github.event.inputs.embed_limit || '0' }}
