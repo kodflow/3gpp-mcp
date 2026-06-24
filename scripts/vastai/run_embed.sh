@@ -104,6 +104,29 @@ EOF
 ID="$(EMBED_MODEL=bge-m3-fp16 EMBED_MODELS_CONFIG="$WORK/models.yaml" CGO_ENABLED=0 go run ./cmd/embedid)"
 say "embed_identity=$ID"
 
+# ---- 4b. RESUME from GHCR 3gpp-vec (gap-only re-embed) ---------------------------
+# Pull the prior dense shard for this series and overlay its vectors onto the freshly
+# sliced base, so export-worklist below emits ONLY the still-unembedded clauses. This is
+# the dense analogue of the sparse overlay-resume; it survives an interrupted box without
+# re-embedding done work. NB: the GHCR union (post-job, runner side) is where the shard
+# came from — on vast.ai the box resumes from GHCR directly, not a Kaggle Dataset.
+OVERLAY="$SRC/rust/target/release/overlay"
+PRIOR="$WORK/prior.duckdb"
+if printf %s "$GHCR_PAT" | oras login ghcr.io -u "$GHCR_OWNER" --password-stdin 2>/dev/null \
+  && oras pull "ghcr.io/${GHCR_OWNER}/3gpp-vec:latest-fp16" -o "$WORK/vec" 2>/dev/null \
+  && [ -f "$WORK/vec/s${SERIES}.duckdb.zst" ]; then
+  zstd -d -f "$WORK/vec/s${SERIES}.duckdb.zst" -o "$PRIOR"
+  # Reject a non-DuckDB blob (DUCK magic at offset 8) before overlaying.
+  if [ "$(dd if="$PRIOR" bs=1 skip=8 count=4 2>/dev/null)" = DUCK ]; then
+    "$OVERLAY" --base "$EMBEDDED_DB" --vec "$PRIOR" --embedding-model bge-m3-fp16
+    say "resume_overlaid=$(duckdb "$EMBEDDED_DB" -noheader -list 'SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;')"
+  else
+    say "prior s${SERIES} shard invalid (no DUCK magic) — fresh embed"
+  fi
+else
+  say "no prior s${SERIES} shard on 3gpp-vec — fresh embed"
+fi
+
 # ---- 5. export worklist → embed (single GPU) → import + HNSW ---------------------
 WL="$WORK/work.jsonl"
 "$EMBED_IO" --db "$EMBEDDED_DB" --export-worklist "$WL"
