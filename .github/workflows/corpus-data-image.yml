@@ -334,10 +334,25 @@ jobs:
           done < /tmp/subs.txt
           echo "sub-bases skipped: $skipped"
           echo "=== sizes ==="; du -sh image-data image-data/* image-data/*/* 2>/dev/null || true
-          vectorised="$(grep -oE 'done: [0-9]+ clauses vectorised' /tmp/overlay.log | tail -1 | grep -oE '[0-9]+' || echo 0)"
+          # Parse the RUST overlay's report. Phase 11b replaced Go cmd/overlay with
+          # rust/store/src/bin/overlay.rs, which prints
+          #   overlay: done — <N> clauses vectorised, embedding_model="<id>". …
+          # where the Go bin printed "[overlay] done: <N> clauses vectorised (+…)"
+          # and a separate "[overlay] embedding_model stamped: <id>". The two greps
+          # below were never repointed, so since Phase 11b they matched NOTHING:
+          # $vectorised was hardcoded-by-accident to 0 and this guard failed EVERY
+          # run with "0 vectorised clauses" regardless of how well the fuse went.
+          # Anchor on the stable "<N> clauses vectorised" tail so the separator
+          # (': ' vs ' — ') can drift again without silently zeroing the count.
+          # tail -1 is deliberate: overlay reports the CUMULATIVE total in the base
+          # after each sub-base, so the last line is the final figure, not a summand.
+          vectorised="$(grep -oE '[0-9]+ clauses vectorised' /tmp/overlay.log | tail -1 | grep -oE '[0-9]+' || echo 0)"
           echo "fused vectorised clauses: $vectorised"
           [ "$vectorised" -ge 2000000 ] || { echo "::error::fused DB has only $vectorised vectorised clauses (< 2,000,000) — channel incomplete or overlay mis-matched"; exit 1; }
-          grep -q 'embedding_model stamped:' /tmp/overlay.log || { echo "::error::embedding_model not stamped — serve would refuse semantic"; exit 1; }
+          # Same repoint: the model id now rides in the done line as
+          # embedding_model="<id>" (Debug of a String → an EMPTY stamp prints as
+          # embedding_model=""), so require at least one character between quotes.
+          grep -qE 'embedding_model="[^"]+"' /tmp/overlay.log || { echo "::error::embedding_model not stamped — serve would refuse semantic"; exit 1; }
           test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
           test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
