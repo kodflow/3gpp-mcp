@@ -34,8 +34,9 @@ on:
         description: "Push the etsi-corpus image to GHCR (private). Default true."
         required: false
         default: "true"
-  schedule:
-    - cron: "37 5 * * 1" # weekly (Mon 05:37 UTC) — ETSI moves slowly; the cache makes re-runs cheap
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "37 5 * * 1" # weekly (Mon 05:37 UTC) — ETSI moves slowly; the cache makes re-runs cheap
   push:
     branches: [main]
     paths:
