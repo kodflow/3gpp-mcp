@@ -45,8 +45,10 @@ func run() error {
 		embedFloor = fs.String("embed-floor", env("GOAL_EMBED_FLOOR", "Rel-99"), "embed clauses at or above this release")
 		dataDir    = fs.String("data", env("GOAL_DATA", ""), "corpus/DB directory (default <repo>/data)")
 		full       = fs.Bool("full", false, "ignore the delta anchor and reindex everything")
+		repair     = fs.Bool("repair", false, "fetch only the repair set: upstream drift UNION corpus holes (proportionate, ~1k specs vs ~20k)")
 		dry        = fs.Bool("dry-run", false, "decide but do not execute")
-		only       = fs.String("only", "", "restrict to these steps, comma separated")
+		only       = fs.String("only", "", "restrict to these steps, comma separated (preconditions are still checked)")
+		forceOnly  = fs.Bool("force-only", false, "run the selected steps even when their preconditions are unmet — loudly, and the result is not reproducible")
 		from       = fs.String("from", "", "run this step and everything after it")
 	)
 	fs.Usage = func() {
@@ -103,6 +105,7 @@ func run() error {
 			"model_dir":      filepath.Join(data, "models", "bge-m3"),
 			"contract_flags": dataContractFlags(root),
 			"full":           boolStr(*full),
+			"repair":         boolStr(*repair),
 		},
 	}
 
@@ -112,6 +115,7 @@ func run() error {
 		return err
 	}
 
+	runner.ForceOnly = *forceOnly
 	selection, err := selectSteps(runner, *only, *from)
 	if err != nil {
 		return err

@@ -41,7 +41,7 @@ func exe(name string) string {
 
 // goBins are the Go commands the pipeline needs on disk. cmd/server is the
 // product; the others are the offline tools the steps call.
-var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench"}
+var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi"}
 
 // rustBins maps a cargo manifest to the binaries built from it. The embedder is
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own
@@ -75,10 +75,18 @@ func Pipeline() []*Step {
 		stepFetch(),
 		stepIngest(),
 		stepMerge(),
-		stepEmbed(),
+		stepEmbed(corpus3GPP()),
 		stepEnrich(),
-		stepIndex(),
+		stepIndex(corpus3GPP()),
 		stepValidate(),
+		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment: not
+		// just ingest + FTS, but vectors and an HNSW index too. An opt-in — or a
+		// lexical-only ETSI — would let one corpus fall silently behind, which is
+		// precisely the state the tooling was in.
+		stepDiscoverETSI(),
+		stepCorpusETSI(),
+		stepEmbed(corpusETSI()),
+		stepIndex(corpusETSI()),
 		stepSmoke(),
 	}
 }
@@ -230,7 +238,7 @@ func stepBuildRust() *Step {
 					_ = os.Chmod(c.rbin(b), 0o755)
 				}
 			}
-			return nil
+			return stageRuntimeDLLs(c)
 		},
 	}
 }
@@ -284,9 +292,70 @@ func stepSeed() *Step {
 				}
 				_ = os.Remove(zst)
 			}
-			return seedAnchor(c, db)
+			if err := seedAnchor(c, db); err != nil {
+				return err
+			}
+			reportAnchorHoles(c, db)
+			return nil
 		},
 	}
+}
+
+// reportAnchorHoles makes the anchor's over-claims visible at the moment the
+// anchor is installed, which is the only moment anyone is looking at it.
+//
+// It REPORTS and does not fail. The 56 known holes are a property of the
+// published snapshot, not of this build, so gating `seed` on them would block the
+// supported path for a defect the operator cannot fix here. But leaving them
+// unmentioned is how they stayed invisible for months: discover trusts the
+// anchor, and so does every step after it, so a hole has no other chance to be
+// noticed. `anchorcheck` exits 1 on a hole, which is what makes it usable as a
+// real gate elsewhere (CI, pre-publish) — here the count in the log is the point.
+func reportAnchorHoles(c *Ctx, db string) {
+	idx := filepath.Join(c.Local, "corpus-index.json")
+	if !fileNonEmpty(idx) {
+		return
+	}
+	// anchorcheck exits 1 to REPORT holes. `c.Output` discards stdout on a non-zero
+	// exit, so reading its result made a successful check that found 56 holes look
+	// like a check that never ran — the log said "unverified" when the answer was
+	// sitting in the discarded stdout. Reading the emitted state file instead makes
+	// the finding independent of the exit code.
+	state := c.statePath("corpus-state.json")
+	_, runErr := c.Output(Cmd{Name: c.bin("anchorcheck"), Args: []string{
+		"--db", db, "--index", idx, "--quiet", "--emit-state", state,
+	}})
+	counts, err := readCorpusStateCounts(state)
+	if err != nil {
+		c.Log.Printf("anchor consistency UNVERIFIED: anchorcheck produced no state file (%v)", runErr)
+		return
+	}
+	c.Log.Printf("anchor: indexed=%d non_content=%d missing_content=%d over_claim=%d",
+		counts["indexed"], counts["non_content"], counts["missing_content"], counts["over_claim"])
+	if counts["missing_content"]+counts["over_claim"] > 0 {
+		c.Log.Printf("anchor: %d key(s) claim text the corpus does not hold — discover will SKIP them. "+
+			"`goal run --repair` folds them into the fetch plan.",
+			counts["missing_content"]+counts["over_claim"])
+	}
+}
+
+// readCorpusStateCounts reads the counters anchorcheck persisted, so the finding
+// survives the tool's exit code rather than depending on it.
+func readCorpusStateCounts(path string) (map[string]int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st struct {
+		Counts map[string]int `json:"counts"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	if st.Counts == nil {
+		return nil, fmt.Errorf("no counts in %s", path)
+	}
+	return st.Counts, nil
 }
 
 // ----------------------------------------------------------------- discover
@@ -389,6 +458,18 @@ func seedAnchor(c *Ctx, db string) error {
 		c.Log.Printf("published anchor unavailable — leaving it absent (FULL pass)")
 		return nil
 	}
+	// The DB was verified against its own sidecar above; the anchor had no
+	// checksum at all, so a corpus proven authentic could still be paired with an
+	// anchor from another generation. The manifest asserts both in one document.
+	// Its absence is tolerated (older publishes predate it) but SAID, because a
+	// silent fallback to the unverified path is indistinguishable from a verified
+	// one in the log — and that is the whole failure pattern of this pipeline.
+	if err := verifyAnchorAgainstManifest(c, tmp); err != nil {
+		_ = os.Remove(tmp)
+		c.Log.Printf("anchor rejected: %v", err)
+		c.Log.Printf("leaving the anchor absent; the next discover is a FULL pass, which is slow and correct")
+		return nil
+	}
 	// Publish only after it parses: a truncated anchor is worse than none.
 	b, err := os.ReadFile(tmp)
 	if err != nil {
@@ -449,5 +530,111 @@ func stepTest() *Step {
 			return WriteAtomic(c.statePath("test-report.txt"),
 				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n", os.Getenv("GOTAGS"))))
 		},
+	}
+}
+
+// stageRuntimeDLLs copies the compiler runtime next to the Rust binaries on
+// Windows.
+//
+// A Rust binary built for the *-pc-windows-gnu target links libstdc++ and
+// libgcc DYNAMICALLY. They live in the mingw toolchain's bin directory, which is
+// on PATH inside the shell that built them and absent everywhere else — so the
+// binaries ran fine from the build shell and died with 0xC0000139
+// (STATUS_ENTRYPOINT_NOT_FOUND) the moment anything else launched them. Windows
+// searches the executable's own directory first, so staging the DLLs beside them
+// makes the binaries self-contained wherever they are invoked from.
+func stageRuntimeDLLs(c *Ctx) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	// The mingw bin directory sits next to the cargo home the bootstrap created.
+	candidates := []string{
+		filepath.Join(c.Local, "toolchain", "ucrt64", "bin"),
+		filepath.Join(c.Local, "toolchain", "w64devkit", "bin"),
+	}
+	needed := []string{"libstdc++-6.dll", "libgcc_s_seh-1.dll", "libwinpthread-1.dll"}
+	staged := 0
+	for _, dll := range needed {
+		for _, dir := range candidates {
+			src := filepath.Join(dir, dll)
+			b, err := os.ReadFile(src)
+			if err != nil {
+				continue
+			}
+			if err := WriteAtomic(filepath.Join(c.Local, "rust-bin", dll), b); err != nil {
+				return err
+			}
+			staged++
+			break
+		}
+	}
+	if staged > 0 {
+		c.Log.Printf("staged %d mingw runtime DLL(s) next to the Rust binaries", staged)
+	}
+	return nil
+}
+
+// gpuEnv returns the environment additions the GPU embedder needs, and ONLY it.
+//
+// Two hard-won details:
+//
+//   - The CUDA directory must NOT be on the PATH of the other tools. Putting it
+//     there made embed-io die with 0xC0000139: the loader picked a shadowing
+//     export out of the CUDA set. The runtime is therefore scoped to the one
+//     process that needs it.
+//   - The paths must be in NATIVE Windows form. A POSIX-style PATH inherited
+//     from a bash shell is invisible to the Windows loader, which is why
+//     onnxruntime_providers_cuda.dll failed with error 126 ("module not found")
+//     while the file was plainly there.
+func gpuEnv(c *Ctx) []string {
+	ort, cuda := c.Cfg("ort_dir"), c.Cfg("cuda_dir")
+	if ort == "" {
+		// The bootstrap unpacks one versioned ONNX Runtime under
+		// .local/toolchain/ort/<pkg>/lib; glob rather than hard-code the version.
+		if m, _ := filepath.Glob(filepath.Join(c.Local, "toolchain", "ort", "*", "lib")); len(m) > 0 {
+			ort = m[0]
+		}
+	}
+	if cuda == "" {
+		d := filepath.Join(c.Local, "toolchain", "cuda", "dll")
+		if dirExists(d) {
+			cuda = d
+		}
+	}
+	if ort == "" && cuda == "" {
+		return nil
+	}
+	var prefix []string
+	if cuda != "" {
+		prefix = append(prefix, filepath.FromSlash(cuda))
+	}
+	if ort != "" {
+		prefix = append(prefix, filepath.FromSlash(ort))
+	}
+	env := []string{"PATH=" + strings.Join(prefix, string(os.PathListSeparator)) + string(os.PathListSeparator) + os.Getenv("PATH")}
+	if ort != "" {
+		env = append(env, "ORT_DYLIB_PATH="+filepath.Join(filepath.FromSlash(ort), ortLibName()))
+	}
+	// rust/embedder defaults its tracing filter to "warn,ort=debug" when RUST_LOG
+	// is unset. That is the right default for ONE diagnostic run — it is how a
+	// silent CPU fallback becomes visible — and the wrong one for a multi-hour
+	// bulk campaign, where ONNX Runtime emits DEBUG continuously and the log
+	// becomes the bottleneck rather than the GPU. Keep the EP-registration
+	// messages (they are INFO/ERROR) and drop the per-graph chatter. Set RUST_LOG
+	// explicitly to get the verbose behaviour back.
+	if os.Getenv("RUST_LOG") == "" {
+		env = append(env, "RUST_LOG=warn,ort=info")
+	}
+	return env
+}
+
+func ortLibName() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "onnxruntime.dll"
+	case "darwin":
+		return "libonnxruntime.dylib"
+	default:
+		return "libonnxruntime.so"
 	}
 }

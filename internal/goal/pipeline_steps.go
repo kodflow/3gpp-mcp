@@ -73,9 +73,29 @@ func runDiscover(c *Ctx) error {
 		return err
 	}
 
-	wlArgs := []string{"--status-file", report, "--floor", c.Cfg("floor"), "--emit-worklist"}
+	// Two work-lists, and they are NOT the same set.
+	//
+	// `--emit-worklist` applies no version comparison at all: it emits every spec
+	// of every selected series, 20 225 entries against the 986 that actually moved.
+	// That 20x over-fetch is wasteful, and it is also the only reason the anchor's
+	// over-claims currently get repaired — it re-acquires them by accident.
+	//
+	// `--repair-plan` is the proportionate set, drift UNION corpus-holes, and it is
+	// only safe BECAUSE it takes the holes as an explicit input. Asking for the
+	// precise set without supplying them would freeze every over-claimed spec as a
+	// permanent gap, so the holes are computed here rather than left to the caller.
+	wlArgs := []string{"--status-file", report, "--floor", c.Cfg("floor")}
 	if s := c.Cfg("scope"); s != "" {
 		wlArgs = append(wlArgs, "--series", s)
+	}
+	if c.Cfg("repair") == "1" {
+		holes, err := repairKeys(c)
+		if err != nil {
+			return fmt.Errorf("repair mode needs the corpus holes and could not get them: %w", err)
+		}
+		wlArgs = append(wlArgs, "--repair-plan", "--holes", holes, "--index", idx)
+	} else {
+		wlArgs = append(wlArgs, "--emit-worklist")
 	}
 	wl, err := c.Output(Cmd{Name: c.rbin("discover"), Args: wlArgs})
 	if err != nil {
@@ -129,7 +149,14 @@ func stepFetch() *Step {
 			return []string{c.statePath("series.json"), c.statePath("worklist.txt")}, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
-			return map[string]string{"floor": c.Cfg("floor"), "jobs": c.Cfg("jobs")}, nil
+			// `repair` belongs in the fingerprint: the two modes acquire genuinely
+			// different sets, so switching between them must replay the step rather
+			// than reuse whichever one happened to run first.
+			return map[string]string{
+				"floor":  c.Cfg("floor"),
+				"jobs":   c.Cfg("jobs"),
+				"repair": c.Cfg("repair"),
+			}, nil
 		},
 		Heavy: true,
 		Run: func(c *Ctx) error {
@@ -141,15 +168,23 @@ func stepFetch() *Step {
 			if _, err := c.Output(Cmd{Name: "soffice", Args: []string{"--version"}}); err != nil {
 				return fmt.Errorf("LibreOffice (soffice) is required to convert 3GPP .doc/.docx to HTML and is not on PATH: %w", err)
 			}
-			c.Log.Printf("converting %d series: %s", len(series), strings.Join(series, " "))
 			// corpus.sh is already incremental and flock-guarded; it is the
 			// per-resource checkpoint for this step (one file at a time, skipping
 			// whatever is already downloaded and converted).
-			if err := c.Run(Cmd{
-				Name: "bash",
-				Args: []string{"scripts/corpus.sh", "--set", c.Cfg("floor"), "--jobs", c.Cfg("jobs"), "--series", strings.Join(series, " ")},
-				Echo: true,
-			}); err != nil {
+			args := []string{"scripts/corpus.sh", "--set", c.Cfg("floor"), "--jobs", c.Cfg("jobs")}
+			if c.Cfg("repair") == "1" {
+				// discover already wrote the exact set (drift ∪ corpus holes). Hand it
+				// over verbatim instead of letting corpus.sh re-enumerate the series,
+				// which is what turns 1 000 specs back into 20 225.
+				wl := c.statePath("worklist.txt")
+				n := countLines(wl)
+				c.Log.Printf("repair mode: fetching %d specs from the repair plan (not %d series wholesale)", n, len(series))
+				args = append(args, "--worklist", wl)
+			} else {
+				c.Log.Printf("converting %d series: %s", len(series), strings.Join(series, " "))
+				args = append(args, "--series", strings.Join(series, " "))
+			}
+			if err := c.Run(Cmd{Name: "bash", Args: args, Echo: true}); err != nil {
 				return err
 			}
 			return purgeConvertedZips(c)
@@ -409,4 +444,32 @@ func ensureCorpusIndex(c *Ctx) error {
 	}
 	_ = os.RemoveAll(filepath.Join(c.Local, "tmp", "index-only.duckdb"))
 	return os.Rename(tmp, idx)
+}
+
+// repairKeys asks anchorcheck for the (spec|release) keys the anchor claims and
+// the corpus cannot back, and returns the path to that list.
+//
+// It is computed here, inside the step, rather than accepted as a caller-supplied
+// file. A repair plan is only proportionate BECAUSE it carries the holes; letting
+// an operator pass a stale or absent hole list would produce a plan that looks
+// precise and is quietly incomplete — the same shape of failure the holes came
+// from. anchorcheck exits 1 when it finds holes, which is a finding here, not an
+// error: the file is written either way and only a missing file is fatal.
+func repairKeys(c *Ctx) (string, error) {
+	out := c.statePath("repair-keys.txt")
+	idx := filepath.Join(c.Local, "corpus-index.json")
+	db := c.dataPath("3gpp.duckdb")
+	if !fileNonEmpty(db) {
+		return "", fmt.Errorf("no corpus at %s to compute holes from", db)
+	}
+	_, _ = c.Output(Cmd{Name: c.bin("anchorcheck"), Args: []string{
+		"--db", db, "--index", idx, "--quiet",
+		"--emit-repair", out,
+		"--emit-state", c.statePath("corpus-state.json"),
+	}})
+	if _, err := os.Stat(out); err != nil {
+		return "", fmt.Errorf("anchorcheck produced no hole list: %w", err)
+	}
+	c.Log.Printf("repair mode: %d corpus hole(s) folded into the work list", countLines(out))
+	return out, nil
 }

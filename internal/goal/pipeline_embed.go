@@ -30,7 +30,7 @@ func stepBuildEmbedder() *Step {
 			if err := c.Run(Cmd{
 				Name: "cargo",
 				Args: []string{"build", "--release", "--manifest-path", "rust/embedder/Cargo.toml", "--bin", "embedder"},
-				Env:  []string{"CARGO_TARGET_DIR=" + target},
+				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
 				Echo: true,
 			}); err != nil {
 				return err
@@ -42,22 +42,34 @@ func stepBuildEmbedder() *Step {
 			if err := WriteAtomic(c.rbin("embedder"), b); err != nil {
 				return err
 			}
-			return os.Chmod(c.rbin("embedder"), 0o755)
+			if err := os.Chmod(c.rbin("embedder"), 0o755); err != nil {
+				return err
+			}
+			// Also staged by build-rust, but this step does NOT depend on it: a
+			// `--only build-embedder,embed` on a clean .local/rust-bin would otherwise
+			// produce a binary that dies with 0xC0000139 before printing a line.
+			// stageRuntimeDLLs is idempotent, so staging twice costs a file copy.
+			return stageRuntimeDLLs(c)
 		},
 	}
 }
 
 // -------------------------------------------------------------------- embed
 
-func stepEmbed() *Step {
+func stepEmbed(t corpusTarget) *Step {
 	return &Step{
-		Name:    "embed",
+		Name:    "embed" + t.Suffix,
 		Version: 1,
 		Doc:     "vectorise the corpus on the GPU, reusing every already-seen content hash",
-		Deps:    []string{"merge", "build-embedder"},
+		Deps:    append([]string{"build-embedder"}, t.singleProducer()...),
+		// data/3gpp.duckdb has two producers, not one: `merge` folds local shards
+		// into it, `seed` downloads the published snapshot. Both are supported
+		// paths to a vectorisable corpus. ETSI has a single producer, so it goes
+		// through Deps instead (AnyDeps rejects a one-element set on purpose).
+		AnyDeps: t.multiProducer(),
 		Impl:    []string{"rust/embedder/src", "rust/store/src/bin/embed_io.rs", "internal/embed/identity.go", "internal/embed/models.yaml"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			return []string{t.dbPath(c)}, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The embed identity is THE determinant: model family, revision,
@@ -66,15 +78,15 @@ func stepEmbed() *Step {
 			// invalidate the vectors and the vector index — and nothing else.
 			return map[string]string{
 				"embed_identity": embedIdentityForPlan(c),
-				"embed_floor":    c.Cfg("embed_floor"),
+				"embed_floor":    t.Floor(c),
 			}, nil
 		},
 		Heavy:   true,
-		Outputs: func(c *Ctx) []string { return []string{filepath.Join(c.Local, "vecs", "ledger.jsonl")} },
+		Outputs: func(c *Ctx) []string { return []string{t.ledgerPath(c)} },
 		Validate: func(c *Ctx) error {
 			// The authoritative check is the DB's own report: no clause at or
 			// above the floor may be missing a vector.
-			rep, err := embedReport(c)
+			rep, err := embedReport(c, t)
 			if err != nil {
 				return err
 			}
@@ -82,11 +94,11 @@ func stepEmbed() *Step {
 				return fmt.Errorf("the DB carries no embedding_model — vectors were never imported")
 			}
 			if rep.NullAtFloor > 0 {
-				return fmt.Errorf("%d clause(s) at/above %s still have no vector", rep.NullAtFloor, c.Cfg("embed_floor"))
+				return fmt.Errorf("%d clause(s) at/above %q still have no vector", rep.NullAtFloor, t.Floor(c))
 			}
 			return nil
 		},
-		Run: func(c *Ctx) error { return runEmbed(c) },
+		Run: func(c *Ctx) error { return runEmbed(c, t) },
 	}
 }
 
@@ -128,9 +140,9 @@ type embedIOReport struct {
 	NullAtFloor int    `json:"null_embeddings_at_floor"`
 }
 
-func embedReport(c *Ctx) (*embedIOReport, error) {
+func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 	out, err := c.Output(Cmd{Name: c.rbin("embed-io"), Args: []string{
-		"--db", c.dataPath("3gpp.duckdb"), "--report", "--embed-floor", c.Cfg("embed_floor"),
+		"--db", t.dbPath(c), "--report", "--embed-floor", t.Floor(c),
 	}})
 	if err != nil {
 		return nil, err
@@ -152,13 +164,12 @@ func embedReport(c *Ctx) (*embedIOReport, error) {
 // measured corpus that is a 2.74x reduction — 833 924 distinct texts for
 // 2 282 337 embeddable clauses, with 79.8% of clauses duplicated verbatim across
 // releases.
-func runEmbed(c *Ctx) error {
-	db := c.dataPath("3gpp.duckdb")
-	vecDir := filepath.Join(c.Local, "vecs")
-	if err := os.MkdirAll(vecDir, 0o755); err != nil {
+func runEmbed(c *Ctx, t corpusTarget) error {
+	db := t.dbPath(c)
+	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
 		return err
 	}
-	ledger := filepath.Join(vecDir, "ledger.jsonl")
+	ledger := t.ledgerPath(c)
 
 	id, err := embedIdentity(c)
 	if err != nil {
@@ -169,7 +180,7 @@ func runEmbed(c *Ctx) error {
 	// A changed identity makes every cached vector meaningless: clause_hash folds
 	// the identity in, so by_hash would match nothing anyway. Archive rather than
 	// delete — reverting a model bump should not cost another full GPU pass.
-	idFile := filepath.Join(vecDir, ".identity")
+	idFile := t.ledgerPath(c) + ".identity"
 	if prev, err := os.ReadFile(idFile); err == nil && strings.TrimSpace(string(prev)) != id {
 		old := strings.TrimSpace(string(prev))
 		c.Log.Printf("embed identity changed (%s -> %s): archiving the previous ledger", old, id)
@@ -183,10 +194,10 @@ func runEmbed(c *Ctx) error {
 		return err
 	}
 
-	worklist := filepath.Join(vecDir, "worklist.jsonl")
-	c.Log.Printf("exporting the work list (clauses with no vector, floor=%s)", c.Cfg("embed_floor"))
+	worklist := t.ledgerPath(c) + ".worklist"
+	c.Log.Printf("exporting the work list for %s (clauses with no vector, floor=%q)", t.DB, t.Floor(c))
 	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
-		"--db", db, "--export-worklist", worklist, "--embed-floor", c.Cfg("embed_floor"),
+		"--db", db, "--export-worklist", worklist, "--embed-floor", t.Floor(c),
 	}}); err != nil {
 		return err
 	}
@@ -211,7 +222,7 @@ func runEmbed(c *Ctx) error {
 		"--require-cuda",
 		"--vram-fraction", "0.8",
 		"--max-batch", "512",
-	}, Echo: true}); err != nil {
+	}, Env: gpuEnv(c), Echo: true}); err != nil {
 		// The ledger is append-only and flushed per batch, so a failure here is
 		// resumable: report where we got to rather than losing the position.
 		c.Checkpoint("ledger_lines", strconv.Itoa(countLines(ledger)))
@@ -340,12 +351,12 @@ func findASN(c *Ctx) string {
 
 // -------------------------------------------------------------------- index
 
-func stepIndex() *Step {
+func stepIndex(t corpusTarget) *Step {
 	return &Step{
-		Name:    "index",
+		Name:    "index" + t.Suffix,
 		Version: 1,
-		Doc:     "build and freeze the HNSW cosine index over the vectors",
-		Deps:    []string{"embed", "enrich"},
+		Doc:     "build and freeze the HNSW cosine index over the vectors of " + t.DB,
+		Deps:    t.indexDeps(),
 		Impl:    []string{"rust/store/src/bin/freeze_hnsw.rs"},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The vector index is a DERIVED CACHE of the vectors. Its identity is
@@ -359,7 +370,7 @@ func stepIndex() *Step {
 		},
 		Heavy: true,
 		Validate: func(c *Ctx) error {
-			rep, err := embedReport(c)
+			rep, err := embedReport(c, t)
 			if err != nil {
 				return err
 			}
@@ -369,15 +380,15 @@ func stepIndex() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			rep, err := embedReport(c)
+			rep, err := embedReport(c, t)
 			if err != nil {
 				return err
 			}
 			if rep.Embedded == 0 {
-				return fmt.Errorf("refusing to build a vector index over zero vectors")
+				return fmt.Errorf("refusing to build a vector index over zero vectors in %s", t.DB)
 			}
-			c.Log.Printf("freezing the HNSW index over %d vectors", rep.Embedded)
-			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}, Echo: true})
+			c.Log.Printf("freezing the HNSW index over %d vectors in %s", rep.Embedded, t.DB)
+			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Echo: true})
 		},
 	}
 }
@@ -390,7 +401,7 @@ func stepValidate() *Step {
 		Version: 1,
 		Doc:     "run the data-completeness contract against the finished corpus",
 		Deps:    []string{"index"},
-		Impl:    []string{"cmd/validate", "scripts/data-contract.sh"},
+		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			return []string{c.dataPath("3gpp.duckdb")}, nil
 		},
@@ -398,7 +409,10 @@ func stepValidate() *Step {
 			args := []string{"--db", c.dataPath("3gpp.duckdb"), "--report", "text"}
 			args = append(args, strings.Fields(c.Cfg("contract_flags"))...)
 			c.Log.Printf("contract: %s", c.Cfg("contract_flags"))
-			return c.Run(Cmd{Name: c.bin("validate"), Args: args, Echo: true})
+			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Echo: true}); err != nil {
+				return err
+			}
+			return validateAnchor(c)
 		},
 	}
 }
@@ -577,4 +591,131 @@ func tailString(s string, lines int) string {
 		parts = parts[len(parts)-lines:]
 	}
 	return strings.Join(parts, "\n")
+}
+
+// validateAnchor turns the runbook's "check the anchor" instruction into an
+// invariant the pipeline enforces.
+//
+// A rule that lives only in documentation is a rule somebody will skip. The
+// specific rule here — the anchor must not claim text the corpus does not hold —
+// went unchecked long enough to accumulate 56 violations, every one of them
+// invisible to `cmd/validate`, which asks whether the clauses that EXIST are
+// complete and never whether the ones the anchor promises exist at all.
+//
+// Failing is the point, and it is actionable: `goal run --repair` folds these
+// keys into the fetch plan. The keys that genuinely cannot be acquired — the
+// status report does not list them, so there is no URL — belong in
+// contracts/accepted-absences.txt with a reason, which is a decision on the
+// record rather than a number that stopped mattering.
+func validateAnchor(c *Ctx) error {
+	idx := filepath.Join(c.Local, "corpus-index.json")
+	if !fileNonEmpty(idx) {
+		c.Log.Printf("no delta anchor to verify")
+		return nil
+	}
+	out, err := c.Output(Cmd{Name: c.bin("anchorcheck"), Args: []string{
+		"--db", c.dataPath("3gpp.duckdb"),
+		"--index", idx,
+		"--accept", filepath.Join(c.Root, "contracts", "accepted-absences.txt"),
+		"--quiet",
+	}})
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line != "" {
+			c.Log.Printf("anchor: %s", line)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("the delta anchor claims specs the corpus holds no text for; "+
+			"run `goal run --repair` to fetch them, or record the unfetchable ones in "+
+			"contracts/accepted-absences.txt: %w", err)
+	}
+	return nil
+}
+
+// corpusTarget is the per-corpus parameterisation of embed + index.
+//
+// 3GPP and ETSI get the SAME treatment — vectors and an HNSW index, not just the
+// lexical FTS the ingest already builds. Anything less makes one of them a
+// second-class corpus: a natural-language question would reach 3GPP clauses by
+// vector and ETSI clauses only when the wording happens to match literally. For
+// lawful interception, where 3GPP's 33.127/33.128 PROFILE ETSI's 103 221-1 and
+// 103 280, that asymmetry is the difference between an answer and half an answer.
+type corpusTarget struct {
+	// Suffix is appended to the step names ("" for 3GPP, "-etsi").
+	Suffix string
+	// DB is the file name under data/.
+	DB string
+	// Ledger is the file name under .local/vecs/.
+	//
+	// SEPARATE PER CORPUS, and this is not a preference. The ledger keys resume on
+	// chunk_id, and chunk_id is only unique WITHIN one database — both corpora
+	// number their clauses from ~0. Sharing one ledger would make the second
+	// corpus's clause 42 look already-embedded because the first corpus wrote a
+	// clause 42, and the vector would be silently skipped. That is the same
+	// collision that forced merge-before-embed on the 3GPP side.
+	Ledger string
+	// Floor returns the release floor to pass to embed-io. EMPTY means no floor.
+	//
+	// ETSI must pass empty. `clauses_needing_embedding` skips any clause whose
+	// release has no ordinal when a floor is set, and `release_ordinal("ETSI")` is
+	// None — so any non-empty floor would silently select ZERO ETSI clauses and the
+	// step would report success over an unvectorised corpus.
+	Floor func(c *Ctx) string
+	// Producer names the step that writes DB (for AnyDeps / Deps).
+	Producers []string
+}
+
+func corpus3GPP() corpusTarget {
+	return corpusTarget{
+		Suffix:    "",
+		DB:        "3gpp.duckdb",
+		Ledger:    "ledger.jsonl",
+		Floor:     func(c *Ctx) string { return c.Cfg("embed_floor") },
+		Producers: []string{"merge", "seed"},
+	}
+}
+
+func corpusETSI() corpusTarget {
+	return corpusTarget{
+		Suffix:    "-etsi",
+		DB:        "etsi.duckdb",
+		Ledger:    "etsi-ledger.jsonl",
+		Floor:     func(c *Ctx) string { return "" },
+		Producers: []string{"corpus-etsi"},
+	}
+}
+
+func (t corpusTarget) dbPath(c *Ctx) string     { return c.dataPath(t.DB) }
+func (t corpusTarget) ledgerPath(c *Ctx) string { return filepath.Join(c.Local, "vecs", t.Ledger) }
+
+// singleProducer / multiProducer split the producer list between Deps and AnyDeps.
+//
+// AnyDeps deliberately rejects a one-element set — one alternative is a Dep in
+// disguise and would lose the ordinary dependency semantics. 3GPP has two
+// producers (merge OR seed) and belongs in AnyDeps; ETSI has one and belongs in
+// Deps. Encoding that here keeps the rule in one place instead of at each call.
+func (t corpusTarget) singleProducer() []string {
+	if len(t.Producers) == 1 {
+		return t.Producers
+	}
+	return nil
+}
+
+func (t corpusTarget) multiProducer() []string {
+	if len(t.Producers) > 1 {
+		return t.Producers
+	}
+	return nil
+}
+
+// indexDeps: the vector index needs the vectors, and for 3GPP it also waits on
+// `enrich` — the catalogue overlay rewrites rows, and rebuilding the index before
+// it would index a corpus that is about to change. ETSI has no catalogue overlay
+// (DynaReport describes 3GPP specs, not ETSI deliverables), so it depends on its
+// embed alone.
+func (t corpusTarget) indexDeps() []string {
+	if t.Suffix == "" {
+		return []string{"embed", "enrich"}
+	}
+	return []string{"embed" + t.Suffix}
 }
