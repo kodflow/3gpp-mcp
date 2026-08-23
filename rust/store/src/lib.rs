@@ -448,6 +448,69 @@ impl Store {
         Ok(())
     }
 
+    /// import_ledger loads a whole JSONL vector ledger in ONE statement, letting
+    /// DuckDB read the file itself.
+    ///
+    /// The row-by-row path above makes the same numbers cross the text boundary three
+    /// times: serde parses the JSON into `Vec<f32>`, `set_embeddings_batch` turns each
+    /// f32 back into decimal with `to_string()` and glues 1024 of them into an
+    /// `UPDATE … SET embedding = [0.0076,…]`, and DuckDB then parses those decimals
+    /// back into f32. Over a full corpus that is ~2.3 billion float↔text conversions
+    /// and tens of gigabytes of generated SQL; measured, it took ~70 minutes to import
+    /// 2.2 M vectors — longer than fetch's ingest and merge combined.
+    ///
+    /// `read_json` parses once, in DuckDB's own reader, straight into a FLOAT[] column,
+    /// and the write becomes a single set-based join instead of one statement per row.
+    ///
+    /// Returns (staged, embedded_total). Malformed rows are counted out, not fatal: a
+    /// killed embedder leaves a half-written final line, and one truncated line must
+    /// never cost the whole ledger — `ignore_errors` skips them exactly as the
+    /// hand-rolled loop did, and the width filter drops any vector that is not
+    /// DENSE_DIM wide rather than letting one bad cast abort the import.
+    pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
+        let p = path.replace('\\', "/").replace('\'', "''");
+        self.conn
+            .execute_batch(&format!(
+                "BEGIN;
+                 CREATE OR REPLACE TEMP TABLE _ledger AS
+                   SELECT chunk_id, hash AS embedding_hash, vec
+                   FROM read_json('{p}',
+                                  format='newline_delimited',
+                                  ignore_errors=true,
+                                  columns={{chunk_id:'UBIGINT', hash:'VARCHAR', vec:'FLOAT[]'}})
+                   WHERE vec IS NOT NULL AND len(vec) = {DENSE_DIM};"
+            ))
+            .with_context(|| format!("read ledger {path}"))?;
+
+        let staged: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM _ledger", [], |r| r.get(0))
+            .context("count staged ledger rows")?;
+
+        // The cast to the FIXED width happens only here: staging is FLOAT[] (variable),
+        // the column is FLOAT[1024], and the filter above has already guaranteed every
+        // surviving row is exactly that wide.
+        self.conn
+            .execute_batch(&format!(
+                "UPDATE clauses SET embedding = l.vec::FLOAT[{DENSE_DIM}],
+                                    embedding_hash = l.embedding_hash
+                 FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;
+                 DROP TABLE _ledger;
+                 COMMIT;"
+            ))
+            .context("apply ledger to clauses")?;
+
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .context("count embedded clauses")?;
+        Ok((staged, embedded))
+    }
+
     /// set_sparse replaces the sparse posting for one clause (idempotent: stale terms
     /// deleted first). `terms` are (term_id, weight) pairs. == Go SetSparse.
     pub fn set_sparse(&self, chunk_id: u64, terms: &[(u32, f32)]) -> Result<()> {
@@ -1322,5 +1385,155 @@ mod tests {
             "fresh clauses need vectors"
         );
         assert_eq!(done, "done");
+    }
+}
+
+#[cfg(test)]
+mod import_via_read_json {
+    use super::*;
+
+    /// Can DuckDB ingest the ledger DIRECTLY, without Rust parsing it and without
+    /// generating SQL text? If so the import collapses from
+    ///   serde parse -> 1024 f32::to_string -> 28 GB of SQL -> DuckDB re-parses
+    /// to a single statement over the file. This test decides it on real syntax
+    /// rather than on hope.
+    #[test]
+    fn duckdb_reads_a_jsonl_ledger_into_a_float_array() {
+        let store = Store::in_memory().expect("open");
+        store
+            .raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text,is_normative)
+                 VALUES (1,'23.501','Rel-19','19.5.0','5.1','A','alpha',true),
+                        (2,'23.501','Rel-19','19.5.0','5.2','B','beta',true);",
+            )
+            .expect("seed");
+
+        // A ledger with a SHORT vector so the fixture stays readable; the cast target
+        // is what matters, not the width.
+        let dir = std::env::temp_dir().join(format!("rj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let led = dir.join("ledger.jsonl");
+        std::fs::write(
+            &led,
+            "{\"chunk_id\":1,\"hash\":\"aaaa\",\"vec\":[0.5,0.25,0.125,0.0625]}\n\
+             {\"chunk_id\":2,\"hash\":\"bbbb\",\"vec\":[1.0,2.0,3.0,4.0]}\n",
+        )
+        .unwrap();
+
+        let p = led.to_str().unwrap().replace('\\', "/");
+        let sql = format!(
+            "CREATE OR REPLACE TEMP TABLE _l AS
+               SELECT chunk_id::UBIGINT AS chunk_id,
+                      hash::VARCHAR      AS embedding_hash,
+                      vec                AS vec
+               FROM read_json('{p}', format='newline_delimited',
+                              columns={{chunk_id:'UBIGINT', hash:'VARCHAR', vec:'FLOAT[]'}});"
+        );
+        store.raw().execute_batch(&sql).expect("read_json");
+
+        let n: i64 = store
+            .raw()
+            .query_row("SELECT count(*) FROM _l", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "read_json must see both ledger lines");
+
+        let v: f32 = store
+            .raw()
+            .query_row("SELECT vec[2] FROM _l WHERE chunk_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!((v - 0.25).abs() < 1e-6, "vec[2] came back {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod import_bench {
+    use super::*;
+
+    fn seed(store: &Store, n: u64) {
+        let mut sql = String::from("BEGIN;");
+        for i in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text,is_normative) \
+                 VALUES ({i},'23.501','Rel-19','19.5.0','5.{i}','H','body {i}',true);"
+            ));
+        }
+        sql.push_str("COMMIT;");
+        store.raw().execute_batch(&sql).unwrap();
+    }
+
+    fn ledger(path: &std::path::Path, n: u64) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        let v: Vec<String> = (0..DENSE_DIM).map(|i| format!("{:.6}", i as f32 * 1e-4)).collect();
+        let joined = v.join(",");
+        for i in 1..=n {
+            writeln!(w, "{{\"chunk_id\":{i},\"hash\":\"h{i}\",\"vec\":[{joined}]}}").unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    /// A/B on the SAME ledger and the same row count. The point is not a precise
+    /// speed-up figure -- an in-memory DB is not the 8 GB corpus -- but whether the
+    /// set-based path is faster at all, and by roughly how much, before it replaces a
+    /// working import on a multi-hour pipeline.
+    #[test]
+    fn set_based_import_beats_the_row_loop() {
+        const N: u64 = 3000;
+        let dir = std::env::temp_dir().join(format!("imp-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let led = dir.join("l.jsonl");
+        ledger(&led, N);
+
+        // OLD: parse in Rust, format back to decimal, generate SQL.
+        let a = Store::in_memory().unwrap();
+        seed(&a, N);
+        let t0 = std::time::Instant::now();
+        {
+            let txt = std::fs::read_to_string(&led).unwrap();
+            let (mut ids, mut vecs, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+            for line in txt.lines() {
+                let j: serde_json::Value = serde_json::from_str(line).unwrap();
+                ids.push(j["chunk_id"].as_u64().unwrap());
+                vecs.push(
+                    j["vec"].as_array().unwrap().iter()
+                        .map(|x| x.as_f64().unwrap() as f32).collect::<Vec<f32>>(),
+                );
+                hs.push(j["hash"].as_str().unwrap().to_string());
+                if ids.len() >= 512 {
+                    a.set_embeddings_batch(&ids, &vecs, &hs).unwrap();
+                    ids.clear(); vecs.clear(); hs.clear();
+                }
+            }
+            if !ids.is_empty() { a.set_embeddings_batch(&ids, &vecs, &hs).unwrap(); }
+        }
+        let old = t0.elapsed();
+
+        // NEW: DuckDB reads the file.
+        let b = Store::in_memory().unwrap();
+        seed(&b, N);
+        let t1 = std::time::Instant::now();
+        let (staged, embedded) = b.import_ledger(led.to_str().unwrap()).unwrap();
+        let new = t1.elapsed();
+
+        assert_eq!(staged, N as i64, "every ledger row must be staged");
+        assert_eq!(embedded, N as i64, "every clause must end up embedded");
+
+        // Same result, not just same count: spot-check a value survived.
+        let av: f32 = a.raw()
+            .query_row("SELECT embedding[3] FROM clauses WHERE chunk_id = 7", [], |r| r.get(0)).unwrap();
+        let bv: f32 = b.raw()
+            .query_row("SELECT embedding[3] FROM clauses WHERE chunk_id = 7", [], |r| r.get(0)).unwrap();
+        assert!((av - bv).abs() < 1e-6, "paths disagree: {av} vs {bv}");
+
+        eprintln!(
+            "IMPORT BENCH n={N}: row-loop {:?}, set-based {:?}  ({:.1}x)",
+            old, new, old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

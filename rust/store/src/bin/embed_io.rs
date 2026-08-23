@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use store_rs::{Store, DENSE_DIM};
+use store_rs::Store;
 
 #[derive(Parser)]
 #[command(
@@ -119,44 +119,19 @@ fn main() -> Result<()> {
     }
 
     if let Some(inp) = args.import_vectors.as_deref() {
-        let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
-        let mut ids: Vec<u64> = Vec::new();
-        let mut vecs: Vec<Vec<f32>> = Vec::new();
-        let mut hashes: Vec<String> = Vec::new();
-        let mut total = 0usize;
-        let mut skipped = 0usize;
-        for line in BufReader::new(f).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let r: VecRecord = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(_) => {
-                    // truncated/garbled line (killed worker) — skip, the clause stays NULL.
-                    skipped += 1;
-                    continue;
-                }
-            };
-            if r.vec.len() != DENSE_DIM {
-                skipped += 1;
-                continue;
-            }
-            ids.push(r.chunk_id);
-            vecs.push(r.vec);
-            hashes.push(r.hash);
-            if ids.len() >= args.batch {
-                store.set_embeddings_batch(&ids, &vecs, &hashes)?;
-                total += ids.len();
-                ids.clear();
-                vecs.clear();
-                hashes.clear();
-            }
-        }
-        if !ids.is_empty() {
-            store.set_embeddings_batch(&ids, &vecs, &hashes)?;
-            total += ids.len();
-        }
+        // ONE statement for the whole ledger: DuckDB reads the JSONL itself.
+        //
+        // This used to parse each line with serde, then hand the f32s to
+        // set_embeddings_batch, which formatted every one of them back into decimal
+        // and glued 1024 per row into generated SQL that DuckDB then re-parsed. Three
+        // crossings of the text boundary for numbers that never needed to leave
+        // binary; measured at ~70 minutes for 2.2 M vectors. See Store::import_ledger.
+        //
+        // Malformed lines stay tolerated: `ignore_errors` inside the reader plus a
+        // width filter drop them exactly as the loop's `skipped` counter did, so a
+        // killed embedder's half-written final line still cannot cost the ledger.
+        let (staged, _) = store.import_ledger(inp)?;
+        let total = staged;
 
         if !args.embed_identity.is_empty() {
             store.set_meta("embedding_model", &args.embed_identity)?;
@@ -174,9 +149,6 @@ fn main() -> Result<()> {
                 store.build_and_freeze_hnsw(&args.embed_identity)?;
                 built = true;
             }
-        }
-        if skipped > 0 {
-            eprintln!("embed-io: skipped {skipped} malformed/truncated line(s) — affected clauses stay NULL and resume next pass");
         }
         eprintln!("embed-io: wrote {total} vector(s) (hnsw={built})");
         return Ok(());
