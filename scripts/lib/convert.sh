@@ -38,18 +38,80 @@ _CONV_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # lock would abort its write (Io/Abort Code:27) while soffice still exits 0 —
 # i.e. a silent empty conversion. A pristine dir per call removes that trap and
 # also isolates parallel workers.
+# _conv_native / _conv_url — hand soffice paths its own platform understands.
+#
+# soffice is a NATIVE Windows binary. Given the POSIX paths this shell deals in
+# it exits 0 and writes nothing: no error, no output, and `--convert-to` reports
+# success. The caller then finds no HTML, and the whole document falls through
+# four increasingly desperate fallbacks — 900 s of timeout each — for a file that
+# converts in seconds once the path is right. Measured: 1 000 specs, four
+# workers, ten minutes, zero conversions.
+#
+# The same trap is already documented for CUDA in docs/local-pipeline.md: a
+# POSIX-style path is invisible to the Windows loader. It applies to every native
+# binary this pipeline drives, not just the one where it was first noticed.
+#
+# cygpath -m produces `C:/dir/file` (forward slashes), which soffice accepts both
+# as an argument and inside a file:// URL. Absent cygpath (Linux, WSL) the paths
+# pass through untouched.
+_conv_native() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+_conv_url() {
+  if command -v cygpath >/dev/null 2>&1; then
+    printf 'file:///%s' "$(cygpath -m "$1")"   # file:///C:/...
+  else
+    printf 'file://%s' "$1"                     # file:///tmp/... (path is absolute)
+  fi
+}
+
+# _soffice_profile returns this worker's REUSED LibreOffice profile, creating it
+# on first use.
+#
+# The profile used to be a fresh mktemp per document, and that was 80% of the cost
+# of a conversion. Measured on a 6-byte text file — no layout work at all:
+#
+#     fresh profile ........ 24.0 s
+#     reused, 2nd call ...... 5.9 s
+#
+# Across 1 218 documents on four workers that is roughly 8 worker-hours, ~39% of
+# the whole fetch step, spent building the same user profile over and over.
+#
+# The fresh-per-call rule existed for a real reason, but it protected the wrong
+# directory: a crashing soffice leaves a `.~lock.<out>.html#` behind in the OUTPUT
+# directory, and reusing THAT makes the next write abort while soffice still exits
+# 0 — a silent empty conversion. The outdir therefore stays fresh per call. The
+# profile is per WORKER: parallel workers still never share one (BASHPID differs
+# in every xargs subshell), and a crash deletes it so the next call rebuilds a
+# clean one rather than inheriting a wedged state.
+# Keyed on $$ (the WORKER shell), never $BASHPID.
+#
+# `_soffice_html` is called from a command substitution, so it runs in a subshell
+# and $BASHPID is different on every single call — keying on it silently recreated
+# the profile each time and the optimisation did nothing. $$ stays the worker's
+# pid across its subshells, which is exactly the granularity wanted: one profile
+# per parallel worker, shared by all the documents that worker converts.
+_soffice_profile() {
+  local d="${TMPDIR:-/tmp}/3gpp-soffice-prof-$$"
+  [ -d "$d" ] || mkdir -p "$d"
+  printf '%s' "$d"
+}
+
 _soffice_html() {
   local doc="$1" base outdir prof rc html
   base="$(basename "$doc")"; base="${base%.*}"
-  outdir="$(mktemp -d)"; prof="$(mktemp -d)"
+  outdir="$(mktemp -d)"; prof="$(_soffice_profile)"
   timeout -k "$CONV_KILL" "$CONV_TIMEOUT" soffice --headless --norestore \
-    -env:UserInstallation="file://$prof" \
-    --convert-to html --outdir "$outdir" "$doc" >/dev/null 2>&1
+    -env:UserInstallation="$(_conv_url "$prof")" \
+    --convert-to html --outdir "$(_conv_native "$outdir")" "$(_conv_native "$doc")" >/dev/null 2>&1
   rc=$?
-  pkill -9 -f "$prof" 2>/dev/null || true
-  rm -rf "$prof" 2>/dev/null || true
   html="$outdir/$base.html"
   if [[ $rc -eq 0 && -s "$html" ]]; then printf '%s\n' "$html"; return 0; fi
+  # FAILURE PATH ONLY. A crashed soffice can leave its profile wedged, so drop it
+  # and let the next call rebuild a clean one. On SUCCESS the profile is kept —
+  # that reuse is the whole optimisation (24.0 s -> 5.9 s per document).
+  pkill -9 -f "$prof" 2>/dev/null || true
+  rm -rf "$prof" 2>/dev/null || true
   rm -rf "$outdir" 2>/dev/null || true   # drop crash leftovers (partial gifs, stale lock)
   return 1
 }
@@ -94,13 +156,35 @@ convert_pdf() {
       # real heading deeper in the document and would create a bogus, body-less clause
       # that pollutes retrieval. Drop any line carrying a 3+ dot leader entirely.
       /\.\.\.+/ { next }
+      # RUNNING HEADERS AND FOOTERS ARE NOT CLAUSES.
+      #
+      # pdftotext -layout keeps the page furniture, and ETSI stamps every single page
+      # with "<page-number>    ETSI TS 103 280 V2.19.1 (2026-08)". The clause-number
+      # heuristic below sees a leading integer and promotes each one to a heading:
+      # measured on TS 103 280, that produced 151 headings of which only ~11 were real
+      # clauses. Retrieval would then cite "clause 47" for what is page 47 — the exact
+      # opposite of the cite-exactly rule. Drop the furniture before the heuristic runs.
+      /^[[:space:]]*[0-9]*[[:space:]]*ETSI[[:space:]]+T[SR][[:space:]]+[0-9]/ { next }
+      /^[[:space:]]*ETSI[[:space:]]*$/                                       { next }
+      /^[[:space:]]*[0-9]+[[:space:]]+ETSI[[:space:]]*$/                     { next }
+      /^[[:space:]]*[0-9]*[[:space:]]*(Final[[:space:]]+draft[[:space:]]+)?ETSI[[:space:]]+E[SN][[:space:]]+[0-9]/ { next }
       /^[[:space:]]*[0-9]+(\.[0-9]+)*[[:space:]]+[^[:space:]].*/ {
         line=$0; sub(/^[[:space:]]+/, "", line)
         n=line; sub(/[[:space:]].*$/, "", n)           # the clause number
         t=line; sub(/^[^[:space:]]+[[:space:]]+/, "", t) # the title
+        # A TOP-LEVEL clause number is small. ETSI and 3GPP never reach 100 at the
+        # first level, so a bare 3-digit integer is page furniture or an address —
+        # "650  Route des Lucioles" is ETSI’s own postal address in the boilerplate,
+        # and it was being indexed as clause 650.
+        if (n !~ /\./ && n+0 >= 100) { printf "<p>%s</p>\n", line; next }
         printf "<h1>%s\t%s</h1>\n", n, t; next
       }
-      /^[[:space:]]*Annex[[:space:]]+[A-Z][0-9]*/ {
+      # An annex HEADING is "Annex A", "Annex A:" or "Annex A (normative):" — the
+      # letter is followed by punctuation or nothing. A SENTENCE that opens with the
+      # same words ("Annex D gives a translation for…") is prose, and indexing it as a
+      # clause heading attaches the whole following passage to a clause that does not
+      # exist. Require the punctuation.
+      /^[[:space:]]*Annex[[:space:]]+[A-Z][0-9]*[[:space:]]*([(:]|$)/ {
         line=$0; sub(/^[[:space:]]+/, "", line); printf "<h1>%s</h1>\n", line; next
       }
       /[^[:space:]]/ { line=$0; sub(/^[[:space:]]+/, "", line); printf "<p>%s</p>\n", line }
