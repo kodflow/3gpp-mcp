@@ -16,8 +16,9 @@
 name: Corpus · Embed orchestrator
 
 on:
-  schedule:
-    - cron: "23 */4 * * *" # every 4h
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "23 */4 * * *" # every 4h
   workflow_dispatch:
     inputs:
       ref:
