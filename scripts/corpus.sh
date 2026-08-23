@@ -31,7 +31,12 @@
 #   17 3 * * *  /workspace/scripts/corpus.sh >> /workspace/data/sources/.cron.log 2>&1
 #
 # Flags: --set Rel-N  --jobs N  --enum-jobs N  --series "23 33"
-#        --no-download  --no-convert  --quick  --help
+#        --worklist FILE  --no-download  --no-convert  --quick  --help
+#
+# --worklist FILE fetches exactly those "<release> <url> <name>" lines instead of
+# enumerating. Produce it with `discover --repair-plan --holes ...`, which is
+# drift ∪ corpus-holes; a worklist built from drift alone leaves every spec the
+# anchor over-claims permanently missing.
 #
 set -uo pipefail
 
@@ -58,6 +63,7 @@ SET="${SET:-Rel-99}"          # release floor (env-overridable). Rel-99 = every 
 JOBS=4                        # per-spec workers (soffice is RAM-heavy)
 ENUM_JOBS=8                   # enumeration workers (network-bound)
 SERIES_FILTER=""
+WORKLIST_IN=""                # exact fetch worklist to use instead of enumerating
 DO_DOWNLOAD=1
 DO_CONVERT=1
 QUICK=0
@@ -69,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     --jobs)        JOBS="$2"; shift 2;;
     --enum-jobs)   ENUM_JOBS="$2"; shift 2;;
     --series)      SERIES_FILTER="$2"; shift 2;;
+    --worklist)    WORKLIST_IN="$2"; shift 2;;
     --no-download) DO_DOWNLOAD=0; shift;;
     --no-convert)  DO_CONVERT=0; shift;;
     --quick)       QUICK=1; shift;;
@@ -94,15 +101,49 @@ LEGACY_GSM="${INCLUDE_LEGACY_GSM:-0}"
 
 mkdir -p "$ORIGIN" "$CONVERT"
 
-LOCK="$ROOT/data/sources/.corpus.lock"
-exec 9>"$LOCK"
-if ! flock -n 9; then echo "$(date -Is) [corpus] another run in progress — exiting" >&2; exit 0; fi
+# Single-writer lock, portable.
+#
+# This used to be `flock -n 9` with the failure branch saying "another run in
+# progress". Git Bash on Windows ships no flock, so the command failed with 127
+# and the script announced contention that did not exist — then exited 0, which
+# made "I did nothing" indistinguishable from "I succeeded" to everything except
+# the caller's own output validation. Two separate causes collapsed into one
+# reassuring message.
+#
+# mkdir is atomic on every filesystem this runs on and needs no external tool, so
+# the lock now works the same way everywhere. A lock whose owning PID is gone is
+# stale and is reclaimed; a lock held by a LIVE process is never stolen, because
+# the thing it protects is a multi-hour download.
+LOCKDIR="$ROOT/data/sources/.corpus.lock.d"
+acquire_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    echo $$ > "$LOCKDIR/pid"
+    return 0
+  fi
+  local owner
+  owner="$(cat "$LOCKDIR/pid" 2>/dev/null || echo '')"
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  echo "$(date -Is) [corpus] reclaiming a stale lock (owner pid ${owner:-unknown} is gone)" >&2
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  echo $$ > "$LOCKDIR/pid"
+  return 0
+}
+if ! acquire_lock; then
+  echo "$(date -Is) [corpus] another run holds the lock (pid $(cat "$LOCKDIR/pid" 2>/dev/null)) — exiting" >&2
+  exit 0
+fi
 
 log() { echo "$(date -Is) [corpus] $*" >&2; }
 rm -f "$DONE"
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+# One EXIT trap for both: a second `trap ... EXIT` REPLACES the first, so the
+# lock and the scratch directory have to be released by the same handler or one
+# of them leaks — and a leaked lock is a corpus build that refuses to start.
+trap 'rm -rf "$WORKDIR" "$LOCKDIR"' EXIT
 
 fetch() { curl -fsSL -A "$UA" --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 900 "$@"; }
 export -f fetch; export UA
@@ -284,12 +325,38 @@ process_spec() {
   fi
   rm -rf "$tmp"
 }
-export -f process_spec convert_doc _soffice_html
+# _conv_native/_conv_url are used INSIDE _soffice_html, which runs in the xargs
+# worker subshell — exporting the caller without its helpers gives
+# "command not found" per conversion and no HTML at all.
+export -f process_spec convert_doc _soffice_html _conv_native _conv_url
 export ORIGIN CONVERT DO_DOWNLOAD DO_CONVERT CONV_TIMEOUT CONV_KILL DEGRADED_TSV
 
 # ----- disk guard -----
-free_gb=$(df -BG --output=avail "$ROOT/data/sources" | tail -1 | tr -dc '0-9')
-if (( free_gb < MIN_FREE_GB )); then log "ERROR: only ${free_gb}G free (< ${MIN_FREE_GB}G), abort"; exit 1; fi
+# Free space, measured portably — and "could not measure" kept DISTINCT from
+# "not enough".
+#
+# This was one GNU-only invocation whose output was scraped with `tr -dc '0-9'`.
+# When it produced nothing the arithmetic saw an empty string, and the script
+# announced `ERROR: only G free (< 5G), abort` — a threshold violation that had
+# not been observed, with the number conspicuously missing from its own message.
+# An unmeasurable disk and a full disk demand opposite reactions, and reporting
+# both as the second is how a portability problem gets diagnosed as a capacity
+# problem.
+free_gb=""
+if v=$(df -BG --output=avail "$ROOT/data/sources" 2>/dev/null | tail -1 | tr -dc '0-9') && [[ -n "$v" ]]; then
+  free_gb="$v"                                    # GNU coreutils
+elif v=$(df -P -k "$ROOT/data/sources" 2>/dev/null | awk 'NR==2{print int($4/1048576)}') && [[ -n "$v" ]]; then
+  free_gb="$v"                                    # POSIX df, kB -> GiB
+fi
+if [[ -z "$free_gb" ]]; then
+  log "WARNING: cannot measure free space here — proceeding UNGUARDED."
+  log "         The archive purge still runs, but nothing will stop a full disk."
+elif (( free_gb < MIN_FREE_GB )); then
+  log "ERROR: ${free_gb}G free, below the ${MIN_FREE_GB}G floor — abort"
+  exit 1
+else
+  log "disk: ${free_gb}G free (floor ${MIN_FREE_GB}G)"
+fi
 
 # ----- soffice presence (needed only if converting) -----
 # Normally provided at build by the libreoffice devcontainer feature; this is a
@@ -315,7 +382,21 @@ fi
 # mis-filed under Rel-99); driving from the report closes that. Legacy GSM 4-digit
 # specs are omitted by the report, so they keep the archive enumeration (opt-in).
 MANIFEST="$ORIGIN/.manifest.tsv"
-if [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
+# An explicit worklist wins over enumeration. This is how a REPAIR pass stays
+# proportionate: `discover --repair-plan` emits drift ∪ corpus-holes (1 000 specs
+# on the measured corpus) in exactly this format, against the 20 225 that
+# enumerating every spec of every affected series produces. The two are not
+# interchangeable — see the warning below.
+if [[ -n "$WORKLIST_IN" ]]; then
+  [[ -s "$WORKLIST_IN" ]] || { log "ERROR: --worklist $WORKLIST_IN is missing or empty"; exit 1; }
+  mkdir -p "$ORIGIN"
+  cp "$WORKLIST_IN" "$MANIFEST"
+  log "worklist: $(wc -l < "$MANIFEST") entries supplied via --worklist (enumeration skipped)"
+  log "NOTE: a supplied worklist is fetched VERBATIM. Anything it omits is not"
+  log "      acquired and nothing downstream will notice — build it with"
+  log "      'discover --repair-plan --holes <anchorcheck --emit-repair>', never"
+  log "      from drift alone, or specs the anchor already over-claims stay missing."
+elif [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
   log "building fetch worklist from the 3GPP status report (release floor $SET) ..."
   : > "$MANIFEST"
   wl_args=(--emit-worklist --floor "$SET")
