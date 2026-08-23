@@ -33,9 +33,18 @@ dense+sparse)
 	flags="$flags --require-sparse"
 	;;
 dense+sparse+etsi)
-	# NOTE: --require-etsi must exist in cmd/validate AND check-data (Phase C) before
-	# selecting this level, or the gate binaries will reject the unknown flag.
-	flags="$flags --require-sparse --require-etsi"
+	# NOT SELECTABLE YET, and it says so instead of emitting a phantom flag.
+	#
+	# This branch used to append --require-etsi, which NEITHER gate binary
+	# declares: cmd/validate and `mcp-3gpp check-data` both reject it as an unknown
+	# flag. Choosing this level therefore did not tighten the contract — it broke
+	# the bake, with Go's opaque "flag provided but not defined" as the only clue.
+	# Failing here, with the reason, is strictly better than failing there without.
+	#
+	# Restore the original line once --require-etsi exists in BOTH binaries
+	# (ETSI ingestion, Phase C); the ratchet in ADR 0002 then continues.
+	echo "data-contract: DATA_CONTRACT=dense+sparse+etsi is not implementable yet — neither cmd/validate nor 'mcp-3gpp check-data' declares --require-etsi (Phase C). Use dense or dense+sparse." >&2
+	exit 2
 	;;
 *)
 	echo "data-contract: unknown DATA_CONTRACT=$level (want: dense | dense+sparse | dense+sparse+etsi)" >&2
