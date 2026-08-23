@@ -33,6 +33,7 @@ struct Args {
     embed_model_id: String,
     embed_identity: String,
     subject_index: String,
+    holes: String,
 }
 
 enum Mode {
@@ -41,6 +42,7 @@ enum Mode {
     DraftLedger,
     ListDrift,
     SparseCheck,
+    RepairPlan,
 }
 
 fn parse_args() -> Args {
@@ -59,6 +61,7 @@ fn parse_args() -> Args {
         embed_model_id: String::new(),
         embed_identity: String::new(),
         subject_index: String::new(),
+        holes: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -86,6 +89,8 @@ fn parse_args() -> Args {
             "--emit-draft-ledger" => a.mode = Mode::DraftLedger,
             "--list-drift" => a.mode = Mode::ListDrift,
             "--sparse-check" => a.mode = Mode::SparseCheck,
+            "--repair-plan" => a.mode = Mode::RepairPlan,
+            "--holes" => a.holes = next(),
             other => {
                 eprintln!("discover: unknown flag {other}");
                 exit(2);
@@ -151,6 +156,33 @@ fn main() {
             eprintln!(
                 "drift: total={} missing={missing} stale={stale}",
                 missing + stale
+            );
+        }
+        Mode::RepairPlan => {
+            let have = build_have(&a);
+            let holes = load_holes(&a.holes);
+            // "no holes supplied" and "no holes found" produce the same plan and
+            // only one of them is good news. Say which this is.
+            if a.holes.is_empty() {
+                eprintln!(
+                    "repair-plan: WARNING no --holes given — corpus holes are NOT covered. \
+                     Run `anchorcheck --emit-repair` first, or this plan is drift-only."
+                );
+            } else if holes.is_empty() {
+                eprintln!("repair-plan: --holes {} listed no keys", a.holes);
+            }
+            let (lines, c) = emit_repair_worklist(&site, &have, &holes, floor_major, &a.series);
+            print!("{lines}");
+            eprintln!(
+                "repair-plan: upstream_missing={} upstream_stale={} corpus_holes={} overlap={} -> repair_specs={} \
+                 ({} un-encodable, {} holes absent from the status report)",
+                c.upstream_missing,
+                c.upstream_stale,
+                c.corpus_holes,
+                c.overlap,
+                c.emitted,
+                c.unencodable,
+                c.holes_not_in_report
             );
         }
         Mode::Delta => {
