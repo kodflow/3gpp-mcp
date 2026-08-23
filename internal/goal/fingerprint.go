@@ -57,7 +57,7 @@ func (x *hasher) sum() string     { return hex.EncodeToString(x.h.Sum(nil))[:16]
 // error, not a silently-empty hash: a typo in a step's Impl list would otherwise
 // produce a stable fingerprint that never changes, and the step would never be
 // replayed again.
-func implHash(root string, patterns []string) (string, map[string]string, error) {
+func implHash(root string, patterns []string, excludeTests bool) (string, map[string]string, error) {
 	per := map[string]string{}
 	var files []string
 
@@ -90,6 +90,9 @@ func implHash(root string, patterns []string) (string, map[string]string, error)
 					if skipDirs[d.Name()] {
 						return filepath.SkipDir
 					}
+					return nil
+				}
+				if excludeTests && isTestArtefact(path) {
 					return nil
 				}
 				files = append(files, path)
@@ -188,7 +191,7 @@ func (r *Runner) Fingerprint(s *Step, ctx *Ctx) (string, *Record, error) {
 	x.add("step", s.Name)
 	x.add("version", fmt.Sprint(s.Version))
 
-	ih, per, err := implHash(ctx.Root, s.Impl)
+	ih, per, err := implHash(ctx.Root, s.Impl, s.ExcludeTests)
 	if err != nil {
 		return "", nil, fmt.Errorf("step %s: implementation hash: %w", s.Name, err)
 	}
@@ -248,4 +251,16 @@ func (r *Runner) Fingerprint(s *Step, ctx *Ctx) (string, *Record, error) {
 	fp := x.sum()
 	rec.Fingerprint = fp
 	return fp, rec, nil
+}
+
+// isTestArtefact reports whether a path is test-only material. `go build` never
+// compiles _test.go, and testdata/ holds fixtures for tests — so for a build step
+// neither can change the produced binary. Counting them would relink every binary
+// on a test edit, which is exactly the over-invalidation fingerprints exist to
+// avoid. The `test` step, which DOES depend on them, simply does not set the flag.
+func isTestArtefact(path string) bool {
+	if strings.HasSuffix(filepath.Base(path), "_test.go") {
+		return true
+	}
+	return strings.Contains(filepath.ToSlash(path), "/testdata/")
 }
