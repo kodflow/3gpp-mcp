@@ -1,8 +1,11 @@
 package goal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -64,6 +67,7 @@ func Pipeline() []*Step {
 	return []*Step{
 		stepToolchain(),
 		stepBuildGo(),
+		stepTest(),
 		stepBuildRust(),
 		stepBuildEmbedder(),
 		stepSeed(),
@@ -126,12 +130,15 @@ func stepToolchain() *Step {
 
 func stepBuildGo() *Step {
 	return &Step{
-		Name:      "build-go",
-		Version:   1,
-		Doc:       "build the Go read-side binaries (server + offline tools)",
-		Deps:      []string{"toolchain"},
-		Impl:      []string{"cmd", "internal", "go.mod", "go.sum"},
-		Toolchain: true,
+		Name:    "build-go",
+		Version: 1,
+		Doc:     "build the Go read-side binaries (server + offline tools)",
+		Deps:    []string{"toolchain"},
+		Impl:    []string{"cmd", "internal", "go.mod", "go.sum"},
+		// go build ignores _test.go and testdata, so a test edit must not relink
+		// eight binaries. The `test` step deliberately does NOT set this.
+		ExcludeTests: true,
+		Toolchain:    true,
 		Outputs: func(c *Ctx) []string {
 			out := make([]string, 0, len(goBins))
 			for _, b := range goBins {
@@ -175,12 +182,13 @@ func stepBuildGo() *Step {
 
 func stepBuildRust() *Step {
 	return &Step{
-		Name:      "build-rust",
-		Version:   1,
-		Doc:       "build the Rust write-side binaries (ingest, merge, overlay, embed-io, discover)",
-		Deps:      []string{"toolchain"},
-		Impl:      []string{"rust", "contracts", "internal/store/schema.sql"},
-		Toolchain: true,
+		Name:         "build-rust",
+		Version:      1,
+		Doc:          "build the Rust write-side binaries (ingest, merge, overlay, embed-io, discover)",
+		Deps:         []string{"toolchain"},
+		Impl:         []string{"rust", "contracts", "internal/store/schema.sql"},
+		ExcludeTests: true,
+		Toolchain:    true,
 		Outputs: func(c *Ctx) []string {
 			var out []string
 			for _, bins := range rustBins {
@@ -259,31 +267,24 @@ func stepSeed() *Step {
 			// The snapshot is a starting point, not an authority.
 			if st, err := os.Stat(db); err == nil && st.Size() > 0 {
 				c.Log.Printf("a local corpus already exists (%d bytes) — not overwriting it with the published snapshot", st.Size())
-				return nil
+			} else {
+				if err := os.MkdirAll(c.Data, 0o755); err != nil {
+					return err
+				}
+				zst := db + ".zst"
+				c.Log.Printf("downloading the published lexical snapshot (~670 MB)")
+				if err := c.Retry(RetryNetwork, "seed download", func() error {
+					return c.Run(Cmd{Name: "curl", Args: []string{"-fL", "--retry", "3", "-o", zst, seedURL}, Echo: true})
+				}); err != nil {
+					return err
+				}
+				c.Log.Printf("decompressing")
+				if err := c.Run(Cmd{Name: "zstd", Args: []string{"-d", "--long=27", "-f", zst, "-o", db}}); err != nil {
+					return err
+				}
+				_ = os.Remove(zst)
 			}
-			if err := os.MkdirAll(c.Data, 0o755); err != nil {
-				return err
-			}
-			zst := db + ".zst"
-			c.Log.Printf("downloading the published lexical snapshot (~670 MB)")
-			if err := c.Retry(RetryNetwork, "seed download", func() error {
-				return c.Run(Cmd{Name: "curl", Args: []string{"-fL", "--retry", "3", "-o", zst, seedURL}, Echo: true})
-			}); err != nil {
-				return err
-			}
-			c.Log.Printf("decompressing")
-			if err := c.Run(Cmd{Name: "zstd", Args: []string{"-d", "--long=27", "-f", zst, "-o", db}}); err != nil {
-				return err
-			}
-			_ = os.Remove(zst)
-
-			// The published index anchors the delta. Fetching it is best-effort:
-			// without it the first discover is simply a full pass.
-			idx := filepath.Join(c.Local, "corpus-index.json")
-			if err := c.Run(Cmd{Name: "curl", Args: []string{"-fsSL", "-o", idx, idxURL}}); err != nil {
-				c.Log.Printf("published corpus-index.json unavailable — the first discover will be a FULL pass")
-			}
-			return nil
+			return seedAnchor(c, db)
 		},
 	}
 }
@@ -338,5 +339,115 @@ func stepDiscover() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error { return runDiscover(c) },
+	}
+}
+
+// seedAnchor makes sure the delta anchor describes the corpus that is actually
+// on disk.
+//
+// The anchor (corpus-index.json, "spec|Rel -> highest indexed version") is what
+// lets discover ask for only what moved. Getting it WRONG in the optimistic
+// direction is the dangerous failure: an anchor that over-claims makes discover
+// skip specs that were never ingested, and no later step notices — the corpus
+// simply has a hole. So the published anchor is used only when the local DB is
+// PROVABLY the published snapshot, byte for byte.
+//
+// When it cannot be proven, the anchor is deliberately left absent: discover then
+// does a full pass, which is slow but never silently incomplete. Erring towards
+// "do too much" is the only acceptable direction here.
+func seedAnchor(c *Ctx, db string) error {
+	idx := filepath.Join(c.Local, "corpus-index.json")
+	if fileNonEmpty(idx) {
+		c.Log.Printf("delta anchor already present")
+		return nil
+	}
+
+	const shaURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.sha256"
+	const idxURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/corpus-index.json"
+
+	want, err := c.Output(Cmd{Name: "curl", Args: []string{"-fsSL", "--max-time", "60", shaURL}})
+	if err != nil {
+		c.Log.Printf("published checksum unavailable — leaving the anchor absent (next discover is a FULL pass)")
+		return nil
+	}
+	want = strings.Fields(strings.TrimSpace(want))[0]
+
+	c.Log.Printf("hashing the local corpus to decide whether the published anchor describes it")
+	got, err := sha256File(db)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, want) {
+		c.Log.Printf("local corpus (%s) is NOT the published snapshot (%s) — the published anchor would over-claim, so it is not used", got[:12], want[:12])
+		c.Log.Printf("the next discover will be a FULL pass; the first merge then writes a correct anchor")
+		return nil
+	}
+
+	c.Log.Printf("local corpus matches the published snapshot — adopting its anchor")
+	tmp := idx + ".new"
+	if err := c.Run(Cmd{Name: "curl", Args: []string{"-fsSL", "--max-time", "120", "-o", tmp, idxURL}}); err != nil {
+		c.Log.Printf("published anchor unavailable — leaving it absent (FULL pass)")
+		return nil
+	}
+	// Publish only after it parses: a truncated anchor is worse than none.
+	b, err := os.ReadFile(tmp)
+	if err != nil {
+		return err
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(b, &probe); err != nil {
+		_ = os.Remove(tmp)
+		c.Log.Printf("published anchor is not valid JSON — ignored")
+		return nil
+	}
+	c.Checkpoint("anchor_entries", strconv.Itoa(len(probe)))
+	c.Log.Printf("anchor adopted: %d (spec, release) entries", len(probe))
+	return os.Rename(tmp, idx)
+}
+
+// sha256File streams a file through SHA-256. The corpus is multi-gigabyte, so it
+// is read in chunks rather than loaded.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// stepTest keeps the unit and contract suites inside the goal, not beside it.
+//
+// "The tests pass" is a condition of the goal, so it belongs in the DAG with a
+// fingerprint like everything else: it re-runs when any Go source OR test
+// changes, and skips otherwise. Its Impl deliberately INCLUDES test files — the
+// exact opposite of the build steps, and the reason ExcludeTests exists.
+func stepTest() *Step {
+	return &Step{
+		Name:      "test",
+		Version:   1,
+		Doc:       "run the Go unit and contract suites",
+		Deps:      []string{"build-go"},
+		Impl:      []string{"cmd", "internal", "go.mod", "go.sum"},
+		Toolchain: true,
+		Outputs:   func(c *Ctx) []string { return []string{c.statePath("test-report.txt")} },
+		Run: func(c *Ctx) error {
+			args := []string{"test", "-count=1"}
+			if tags := os.Getenv("GOTAGS"); tags != "" {
+				args = append(args, "-tags", tags)
+			}
+			args = append(args, "./...")
+			if err := c.Run(Cmd{Name: "go", Args: args, Echo: true}); err != nil {
+				return err
+			}
+			// Keep the evidence on disk: the final report cites this file rather
+			// than asking the reader to take "tests passed" on trust.
+			return WriteAtomic(c.statePath("test-report.txt"),
+				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n", os.Getenv("GOTAGS"))))
+		},
 	}
 }

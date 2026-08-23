@@ -493,12 +493,12 @@ func TestWriteAtomicLeavesNoPartialFile(t *testing.T) {
 func TestImplHashIgnoresLineEndings(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "f.go"), "package a\nfunc main() {}\n")
-	lf, _, err := implHash(root, []string{"f.go"})
+	lf, _, err := implHash(root, []string{"f.go"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(root, "f.go"), "package a\r\nfunc main() {}\r\n")
-	crlf, _, err := implHash(root, []string{"f.go"})
+	crlf, _, err := implHash(root, []string{"f.go"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func TestImplHashIgnoresLineEndings(t *testing.T) {
 // replay again.
 func TestImplPathTypoIsAnError(t *testing.T) {
 	root := t.TempDir()
-	if _, _, err := implHash(root, []string{"does/not/exist"}); err == nil {
+	if _, _, err := implHash(root, []string{"does/not/exist"}, false); err == nil {
 		t.Fatal("a non-existent Impl path was accepted")
 	}
 }

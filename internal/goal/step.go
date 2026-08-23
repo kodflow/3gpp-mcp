@@ -90,6 +90,12 @@ type Step struct {
 	// vendored, generated and state directories are skipped (see implHash).
 	Impl []string
 
+	// ExcludeTests drops _test.go files and testdata/ from the implementation
+	// hash. `go build` does not compile them, so for a BUILD step they are not
+	// determinants: editing a test must not relink eight binaries. The `test`
+	// step deliberately leaves this off.
+	ExcludeTests bool
+
 	// Inputs returns the data files this step consumes. Unlike Impl these are
 	// large and numerous, so they are fingerprinted by size+mtime rather than by
 	// content — hashing ~37 GB of converted HTML would cost more than the
