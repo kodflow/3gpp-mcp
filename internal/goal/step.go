@@ -83,6 +83,31 @@ type Step struct {
 	// invalidation transitive without any extra bookkeeping.
 	Deps []string
 
+	// AnyDeps are ALTERNATIVE producers of the same artefact: at least one must
+	// have succeeded, and it does not matter which.
+	//
+	// This exists because `data/3gpp.duckdb` has two legitimate producers. `merge`
+	// folds locally-ingested shards into it; `seed` downloads the published
+	// snapshot instead, which is the whole point of seeding — it buys the corpus
+	// without 37 GB of archives and ~30 h of LibreOffice. Declaring only `merge`
+	// made the graph state something false: that a seeded corpus can never be
+	// vectorised. The practical consequence was worse than the inaccuracy —
+	// operators reached `embed` with `--only`, which does not merely reorder the
+	// plan, it skips dependency checking entirely. The state file recorded
+	// `"merge": "missing"` and nothing objected. A graph that has to be bypassed
+	// to do a supported thing trains people to bypass it.
+	//
+	// Semantics, deliberately narrow:
+	//   - ordering: every alternative sorts before this step, as a Dep would;
+	//   - satisfaction: at least one must have SUCCEEDED, else the step refuses
+	//     to run rather than operating on an artefact nobody produced;
+	//   - dirtiness: any alternative re-running makes this step dirty, because
+	//     any of them can rewrite the shared artefact;
+	//   - fingerprint: ALL of them fold in, exactly as Deps do. A seeded corpus
+	//     and a merged one are different corpora, so switching producer must
+	//     replay the step.
+	AnyDeps []string
+
 	// Impl lists the repo-relative files and directories whose CONTENT defines
 	// this step. This is the precision the mission demands: the embed step must
 	// not be invalidated by a change to the MCP server, and the fetch step must
