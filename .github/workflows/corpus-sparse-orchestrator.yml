@@ -19,8 +19,9 @@
 name: Corpus · Sparse orchestrator
 
 on:
-  schedule:
-    - cron: "47 * * * *" # hourly — re-dispatch promptly after each run ends (active-guard skips while one runs), so the campaign chains to FULL coverage instead of idling 4h between slices
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "47 * * * *" # hourly — re-dispatch promptly after each run ends (active-guard skips while one runs), so the campaign chains to FULL coverage instead of idling 4h between slices
   workflow_dispatch: {}
 
 permissions:

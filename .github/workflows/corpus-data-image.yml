@@ -43,9 +43,10 @@ on:
   # re-pull) for ZERO real change. The `guard` job below skips the bake unless
   # 3gpp-corpus:latest actually moved since the current 3gpp-data was built —
   # so the labs only ever re-pulls the data layer when the corpus truly changed.
-  schedule:
-    - cron: "37 3 * * *" # ~04:37 Europe/Paris, after the corpus/embed converge
-
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "37 3 * * *" # ~04:37 Europe/Paris, after the corpus/embed converge
+#
 permissions:
   contents: read
 

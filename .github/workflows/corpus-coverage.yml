@@ -16,9 +16,10 @@ name: Corpus · Coverage ledger
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "23 2 * * 0" # Sundays ~02:23 UTC
-
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "23 2 * * 0" # Sundays ~02:23 UTC
+#
 permissions:
   contents: write # upload absent-index.json to the `latest` Release
 
