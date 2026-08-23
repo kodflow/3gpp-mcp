@@ -14,9 +14,22 @@ import (
 
 // The rolling "latest" GitHub release is the single source of the indexed DB.
 // There is no version history: the DB's identity is its sha256 sidecar.
+//
+// NOTE THE PATH SHAPE: `/releases/download/latest/…`, not
+// `/releases/latest/download/…`.
+//
+// The second form looks equivalent and is not. `/releases/latest/` is a GitHub
+// ALIAS that resolves to the most recent NON-PRERELEASE release, which in this
+// repository is the `models` tag (it carries the ORT and BGE-M3 bundles) — not
+// the release literally tagged `latest`. So the alias redirected to a release
+// that does not hold the DB and every bootstrap ended in a 404. The project knew
+// (corpus-image.yml records "the runtime DB-bootstrap URL … 404s") and worked
+// around it by baking the DB into the image instead of correcting two constants.
+//
+// Pinned by TestBootstrapURLsTargetTheLatestTag.
 const (
-	defaultDBURL    = "https://github.com/kodflow/3gpp-mcp/releases/latest/download/3gpp.duckdb.zst"
-	defaultDBSHAURL = "https://github.com/kodflow/3gpp-mcp/releases/latest/download/3gpp.duckdb.sha256"
+	defaultDBURL    = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.zst"
+	defaultDBSHAURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.sha256"
 )
 
 // remoteSHA fetches the published sha256 sidecar and returns its hash field

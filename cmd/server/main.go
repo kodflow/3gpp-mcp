@@ -120,6 +120,8 @@ func serve(args []string) error {
 	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
 	vecGHCR := fs.String("vec-ghcr", "", "Option B: pull vector sub-bases from ghcr.io/<owner>/3gpp-vec:latest into the cache and serve them (empty = off)")
 	httpAddr := fs.String("http", "", "serve MCP over Streamable HTTP on this addr (e.g. 127.0.0.1:8765) + a landing page at /; empty = stdio (the default, unchanged). A non-loopback bind exposes the corpus — gate it.")
+	allowLexicalFallback := fs.Bool("allow-lexical-fallback", os.Getenv("MCP3GPP_ALLOW_LEXICAL_FALLBACK") != "",
+		"serve lexical-only when the DB's embedding model does not match this binary's, instead of refusing to start")
 	_ = fs.Parse(args)
 
 	// Let the (onnx) embedder/reranker transparently use cache-bootstrapped
@@ -189,11 +191,31 @@ func serve(args []string) error {
 	// silently wrong. Disable vector search (lexical still serves) and say why.
 	// (A lexical/disabled client embedder can't emit a query vector, so there is
 	// nothing to guard — the engine never calls the vector path.)
+	// A MISMATCH IS FATAL BY DEFAULT.
+	//
+	// Degrading silently to lexical is how this shipped broken for months: the DB
+	// was full of valid vectors, the guard fired on every correctly-built corpus
+	// because of an unrelated identity bug, and the only trace was one stderr line
+	// nobody reads in a stdio MCP server. The user got plausible lexical answers to
+	// semantic questions and had no way to know.
+	//
+	// Refusing to start is the honest behaviour: the operator asked for a vector
+	// server and cannot have one. `--allow-lexical-fallback` (or
+	// MCP3GPP_ALLOW_LEXICAL_FALLBACK) accepts the degraded mode explicitly, which is
+	// the difference between a decision and an accident.
 	if st.VSSAvailable() {
 		if emb := embed.New(); emb.Enabled() {
 			if dbModel := st.GetMeta(ctx, "embedding_model"); dbModel != emb.ModelID() {
+				if !*allowLexicalFallback {
+					return fmt.Errorf(
+						"embedding model mismatch: the corpus was vectorised with %q but this binary embeds queries as %q.\n"+
+							"  Cosine scores between the two are meaningless, so vector search cannot be served.\n"+
+							"  Rebuild the corpus with this binary, fetch a matching snapshot, or pass\n"+
+							"  --allow-lexical-fallback to serve lexical-only on purpose.",
+						dbModel, emb.ModelID())
+				}
 				st.DisableVSS()
-				fmt.Fprintf(os.Stderr, "[3gpp-mcp] semantic disabled: DB embedding_model=%q, client=%q (mismatch)\n", dbModel, emb.ModelID())
+				fmt.Fprintf(os.Stderr, "[3gpp-mcp] semantic disabled by --allow-lexical-fallback: DB embedding_model=%q, client=%q (mismatch)\n", dbModel, emb.ModelID())
 			}
 		}
 	}
