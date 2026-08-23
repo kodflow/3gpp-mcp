@@ -19,6 +19,12 @@ type Runner struct {
 	order   []string
 	toolID  func() string
 	Verbose bool
+	// ForceOnly downgrades precondition FAILURES to loud warnings. It exists so
+	// that deliberately operating on unverified state stays possible AND stays
+	// visibly different from ordinary operation — the previous arrangement, where
+	// `--only` quietly implied both, is what let two sessions embed against a
+	// corpus no producer had made.
+	ForceOnly bool
 }
 
 // NewRunner validates the pipeline shape and returns a ready runner. It fails
@@ -38,6 +44,16 @@ func NewRunner(steps []*Step, ctx *Ctx, store *Store, toolID func() string) (*Ru
 			if _, ok := r.byName[d]; !ok {
 				return nil, fmt.Errorf("step %q depends on unknown step %q", s.Name, d)
 			}
+		}
+		for _, d := range s.AnyDeps {
+			if _, ok := r.byName[d]; !ok {
+				return nil, fmt.Errorf("step %q has unknown alternative dependency %q", s.Name, d)
+			}
+		}
+		if len(s.AnyDeps) == 1 {
+			// One alternative is not an alternative; it is a Dep wearing a
+			// disguise, and it would silently lose the satisfaction check.
+			return nil, fmt.Errorf("step %q declares a single AnyDeps %q — use Deps", s.Name, s.AnyDeps[0])
 		}
 	}
 	order, err := topoSort(steps)
@@ -66,7 +82,9 @@ func topoSort(steps []*Step) ([]string, error) {
 		if _, ok := indeg[s.Name]; !ok {
 			indeg[s.Name] = 0
 		}
-		for _, d := range s.Deps {
+		// Alternatives order exactly like Deps: any of them may write the shared
+		// artefact, so all must be decided before this step is.
+		for _, d := range append(append([]string(nil), s.Deps...), s.AnyDeps...) {
 			adj[d] = append(adj[d], s.Name)
 			indeg[s.Name]++
 		}
@@ -117,6 +135,12 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	for _, dep := range s.Deps {
 		if dirty[dep] {
 			d.Reason = "dependency " + dep + " is re-running"
+			return d, nil
+		}
+	}
+	for _, dep := range s.AnyDeps {
+		if dirty[dep] {
+			d.Reason = "producer " + dep + " is re-running"
 			return d, nil
 		}
 	}
@@ -324,6 +348,21 @@ func (r *Runner) Execute(only map[string]bool, dryRun bool) (*Result, error) {
 // verify the outputs, and only then record success. The ordering is the point —
 // a success written before validation would make the next run skip broken work.
 func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
+	// Selecting a step is not the same as vouching for it. `--only` restricts what
+	// RUNS; it must not also decide that the things the step depends on are fine.
+	// Before AnyDeps existed, `--only embed` reached a step whose producer had never
+	// run and left `"merge": "missing"` in the state file as the only trace.
+	if err := r.checkPreconditions(s); err != nil {
+		if !r.ForceOnly {
+			return err
+		}
+		fmt.Fprintf(os.Stderr,
+			"\n\033[1;31mgoal: --force-only OVERRIDES A FAILED PRECONDITION on %q\033[0m\n  %v\n"+
+				"  The step is running against state nothing verified. Whatever it produces\n"+
+				"  is not reproducible from this repository's own definition of done.\n\n",
+			s.Name, err)
+	}
+
 	log, err := NewStepLog(r.ctx.Local, s.Name)
 	if err != nil {
 		return err
@@ -434,3 +473,51 @@ func (r *Runner) Steps() []*Step { return r.steps }
 
 // Order exposes the resolved dependency order.
 func (r *Runner) Order() []string { return r.order }
+
+// checkPreconditions verifies, at EXECUTION time, that everything this step is
+// declared to stand on actually exists. Planning time is too early: `--only` and
+// `--from` bypass the plan, and those are exactly the paths that need checking.
+//
+// An Optional dependency is exempt. `build-embedder` is Optional by design — a
+// machine with no GPU completes every other step — so requiring it would make the
+// declared graceful path impossible.
+func (r *Runner) checkPreconditions(s *Step) error {
+	for _, name := range s.Deps {
+		if dep := r.byName[name]; dep != nil && dep.Optional {
+			continue
+		}
+		prev, _ := r.store.Load(name)
+		if prev == nil {
+			return fmt.Errorf("step %q requires %q, which has never run", s.Name, name)
+		}
+		if prev.Status != StatusSuccess {
+			return fmt.Errorf("step %q requires %q, whose last run is %s", s.Name, name, prev.Status)
+		}
+	}
+	return r.checkAnyDeps(s)
+}
+
+// checkAnyDeps enforces the satisfaction half of AnyDeps: at least one of the
+// alternative producers must have SUCCEEDED. It is checked at execution time
+// rather than at planning time on purpose — `--only` bypasses the plan, and this
+// is precisely the case the guard exists for.
+func (r *Runner) checkAnyDeps(s *Step) error {
+	if len(s.AnyDeps) == 0 {
+		return nil
+	}
+	states := make([]string, 0, len(s.AnyDeps))
+	for _, name := range s.AnyDeps {
+		prev, _ := r.store.Load(name)
+		switch {
+		case prev == nil:
+			states = append(states, name+"=never run")
+		case prev.Status == StatusSuccess:
+			return nil
+		default:
+			states = append(states, name+"="+string(prev.Status))
+		}
+	}
+	return fmt.Errorf(
+		"step %q needs one of [%s] to have produced its artefact, and none has (%s)",
+		s.Name, strings.Join(s.AnyDeps, " | "), strings.Join(states, ", "))
+}

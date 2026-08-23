@@ -201,7 +201,9 @@ func (r *Runner) Fingerprint(s *Step, ctx *Ctx) (string, *Record, error) {
 	// Dependencies: their fingerprint, from their persisted record. A dependency
 	// that has never run contributes "missing", which correctly makes this step
 	// dirty.
-	deps := append([]string(nil), s.Deps...)
+	// Alternatives fold in exactly like Deps: a seeded corpus and a merged one
+	// are different corpora, so switching producer must replay the step.
+	deps := append(append([]string(nil), s.Deps...), s.AnyDeps...)
 	sort.Strings(deps)
 	for _, d := range deps {
 		prev, _ := r.store.Load(d)

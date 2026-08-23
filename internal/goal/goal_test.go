@@ -516,3 +516,192 @@ func TestImplPathTypoIsAnError(t *testing.T) {
 		t.Fatal("a non-existent Impl path was accepted")
 	}
 }
+
+// anyDepStep builds a consumer whose artefact has two alternative producers.
+func anyDepStep(name string, anyDeps []string, out string, runs *int) *Step {
+	s := counter(name, nil, nil, out, runs)
+	s.AnyDeps = anyDeps
+	return s
+}
+
+// TestAnyDepsIsSatisfiedByEitherProducer pins the reason AnyDeps exists:
+// data/3gpp.duckdb is produced by `merge` OR by `seed`, and `embed` must be able
+// to run on whichever one actually ran. Declaring only `merge` made the graph
+// claim a seeded corpus can never be vectorised, which pushed operators onto
+// `--only` — and `--only` skips dependency checking altogether.
+func TestAnyDepsIsSatisfiedByEitherProducer(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var seedRuns, mergeRuns, consumerRuns int
+	seed := counter("seed", nil, nil, "out-seed", &seedRuns)
+	merge := counter("merge", nil, nil, "out-merge", &mergeRuns)
+	consumer := anyDepStep("consumer", []string{"merge", "seed"}, "out-consumer", &consumerRuns)
+
+	// Only `seed` is selected: `merge` never runs, yet the consumer must.
+	r, err := NewRunner([]*Step{seed, merge, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Execute(map[string]bool{"seed": true, "consumer": true}, false); err != nil {
+		t.Fatalf("seed-only run: %v", err)
+	}
+	if mergeRuns != 0 {
+		t.Fatalf("merge ran %d times; the seeded path must not require it", mergeRuns)
+	}
+	if consumerRuns != 1 {
+		t.Fatalf("consumer ran %d times on a seeded corpus, want 1", consumerRuns)
+	}
+}
+
+// TestAnyDepsRefusesWhenNoProducerRan is the half that makes it a guard rather
+// than a relaxation. Before AnyDeps, `--only embed` ran happily against a DB
+// nobody had produced and left `"merge": "missing"` in the state file as the only
+// trace. Bypassing the ORDER must not also buy the right to skip the artefact.
+func TestAnyDepsRefusesWhenNoProducerRan(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var seedRuns, mergeRuns, consumerRuns int
+	seed := counter("seed", nil, nil, "out-seed", &seedRuns)
+	merge := counter("merge", nil, nil, "out-merge", &mergeRuns)
+	consumer := anyDepStep("consumer", []string{"merge", "seed"}, "out-consumer", &consumerRuns)
+
+	r, err := NewRunner([]*Step{seed, merge, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Execute(map[string]bool{"consumer": true}, false)
+	if err == nil {
+		t.Fatal("consumer ran with neither producer materialised; the guard did not fire")
+	}
+	if consumerRuns != 0 {
+		t.Fatalf("consumer body executed %d times despite the refusal", consumerRuns)
+	}
+	for _, want := range []string{"merge", "seed", "never run"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q — it must say what is missing", err, want)
+		}
+	}
+}
+
+// TestAnyDepsFoldsIntoTheFingerprint: a seeded corpus and a merged one are
+// different corpora. Switching producer must replay the consumer, or the vectors
+// would describe a corpus that no longer exists.
+func TestAnyDepsFoldsIntoTheFingerprint(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var seedRuns, mergeRuns, consumerRuns int
+	seed := counter("seed", nil, nil, "out-seed", &seedRuns)
+	merge := counter("merge", nil, nil, "out-merge", &mergeRuns)
+	consumer := anyDepStep("consumer", []string{"merge", "seed"}, "out-consumer", &consumerRuns)
+
+	r, err := NewRunner([]*Step{seed, merge, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Execute(map[string]bool{"seed": true, "consumer": true}, false); err != nil {
+		t.Fatal(err)
+	}
+	if consumerRuns != 1 {
+		t.Fatalf("consumer runs=%d after seeding, want 1", consumerRuns)
+	}
+	// Now the other producer materialises: the corpus changed underneath.
+	if _, err := r.Execute(nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if mergeRuns != 1 {
+		t.Fatalf("merge runs=%d, want 1", mergeRuns)
+	}
+	if consumerRuns != 2 {
+		t.Fatalf("consumer runs=%d after the other producer ran, want 2 — a merged corpus is not the seeded one", consumerRuns)
+	}
+}
+
+// TestSingleAnyDepIsRejected: one alternative is a Dep wearing a disguise, and it
+// would quietly lose the ordinary dependency semantics.
+func TestSingleAnyDepIsRejected(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var a, b int
+	seed := counter("seed", nil, nil, "out-seed", &a)
+	consumer := anyDepStep("consumer", []string{"seed"}, "out-consumer", &b)
+	if _, err := NewRunner([]*Step{seed, consumer}, ctx, store, func() string { return "tc" }); err == nil {
+		t.Fatal("a single AnyDeps entry was accepted; it must be rejected in favour of Deps")
+	}
+}
+
+// TestUnknownAnyDepIsRejected keeps the same fail-closed contract Deps has.
+func TestUnknownAnyDepIsRejected(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var a int
+	consumer := anyDepStep("consumer", []string{"ghost", "phantom"}, "out-consumer", &a)
+	if _, err := NewRunner([]*Step{consumer}, ctx, store, func() string { return "tc" }); err == nil {
+		t.Fatal("an unknown alternative dependency was accepted")
+	}
+}
+
+// TestOnlyStillChecksPreconditions: selecting a step restricts what RUNS. It must
+// not also assert that what the step stands on is fine. Two sessions reached
+// `embed` past `merge` with `--only` and nothing objected.
+func TestOnlyStillChecksPreconditions(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var producerRuns, consumerRuns int
+	producer := counter("producer", nil, nil, "out-producer", &producerRuns)
+	consumer := counter("consumer", []string{"producer"}, nil, "out-consumer", &consumerRuns)
+
+	r, err := NewRunner([]*Step{producer, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Execute(map[string]bool{"consumer": true}, false)
+	if err == nil {
+		t.Fatal("--only reached a step whose dependency never ran")
+	}
+	if consumerRuns != 0 {
+		t.Fatalf("consumer body ran %d times despite the unmet precondition", consumerRuns)
+	}
+	if !strings.Contains(err.Error(), "producer") {
+		t.Errorf("error %q must name the unmet dependency", err)
+	}
+}
+
+// TestForceOnlyOverridesPreconditionsLoudly keeps the escape hatch usable while
+// making it a different act from ordinary selection.
+func TestForceOnlyOverridesPreconditionsLoudly(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var producerRuns, consumerRuns int
+	producer := counter("producer", nil, nil, "out-producer", &producerRuns)
+	consumer := counter("consumer", []string{"producer"}, nil, "out-consumer", &consumerRuns)
+
+	r, err := NewRunner([]*Step{producer, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.ForceOnly = true
+	if _, err := r.Execute(map[string]bool{"consumer": true}, false); err != nil {
+		t.Fatalf("--force-only must still run the step: %v", err)
+	}
+	if consumerRuns != 1 {
+		t.Fatalf("consumer runs=%d under --force-only, want 1", consumerRuns)
+	}
+	if producerRuns != 0 {
+		t.Fatalf("--force-only must not silently run the dependency (runs=%d)", producerRuns)
+	}
+}
+
+// TestOptionalDependencyIsNotAPrecondition guards the declared graceful path: a
+// machine with no GPU never builds the embedder, and requiring it would turn the
+// designed degradation into a hard stop.
+func TestOptionalDependencyIsNotAPrecondition(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	var optRuns, consumerRuns int
+	opt := counter("optional-producer", nil, nil, "out-opt", &optRuns)
+	opt.Optional = true
+	consumer := counter("consumer", []string{"optional-producer"}, nil, "out-consumer", &consumerRuns)
+
+	r, err := NewRunner([]*Step{opt, consumer}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Execute(map[string]bool{"consumer": true}, false); err != nil {
+		t.Fatalf("an Optional dependency must not block the consumer: %v", err)
+	}
+	if consumerRuns != 1 {
+		t.Fatalf("consumer runs=%d, want 1", consumerRuns)
+	}
+}
