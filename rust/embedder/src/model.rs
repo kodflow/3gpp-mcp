@@ -10,7 +10,9 @@
 //! the same binary uses the GPU on Kaggle (T4) and falls back to CPU on CI/local. The
 //! CUDA arena uses `kSameAsRequested` so it grows by exactly what each batch needs
 //! instead of doubling (the log showed it leaping to 2 GB+ chunks), which both wastes
-//! VRAM and makes peak memory unpredictable for the dynamic batcher.
+//! VRAM and makes peak memory unpredictable for the dynamic batcher. That arena is also
+//! capped (`mem_limit`), which is what keeps its monotonic growth from silently spilling
+//! into WDDM shared memory — see the comment on the limit in `load`.
 //!
 //! ## Tokenise once, embed from ids
 //!
@@ -75,15 +77,35 @@ impl Bge {
         tokenizer_json: &Path,
         require_cuda: bool,
         device_id: i32,
+        mem_limit: Option<usize>,
     ) -> Result<Self> {
         // CUDA first, CPU fallback. `kSameAsRequested` stops the arena from doubling
         // (predictable peak for the dynamic batcher). `device_id` selects the GPU so the
         // multi-GPU launcher runs one process per card. With require_cuda the CUDA EP is
         // set to error_on_failure so a misconfigured GPU runtime is a LOUD error rather
         // than a silent ~13 clause/s CPU run.
+        //
+        // MEMORY LIMIT: this is not tuning, it is what makes the OOM backoff reachable.
+        //
+        // `SameAsRequested` keeps a single batch predictable, but the arena never
+        // RELEASES a block, and the work-list is length-sorted — so every successive
+        // batch asks for a strictly larger block that no freed block can satisfy and the
+        // arena grows monotonically. Uncapped, that growth sails past physical VRAM: on
+        // Linux the next allocation fails and `run_adaptive` shrinks the model and
+        // retries, but under Windows WDDM the driver satisfies it out of SHARED system
+        // memory instead. No error is raised, so the backoff never fires and the campaign
+        // silently collapses from ~1500 clause/s to zero, thrashing over PCIe — observed
+        // here as a 41-minute hang with the arena at 21.4 GB on a 20 GB card.
+        //
+        // Capping the arena turns that overshoot back into an ordinary OOM, which the
+        // adaptive batcher already knows how to absorb.
         let cuda = CUDAExecutionProvider::default()
             .with_device_id(device_id)
             .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested);
+        let cuda = match mem_limit {
+            Some(bytes) if bytes > 0 => cuda.with_memory_limit(bytes),
+            _ => cuda,
+        };
         let cuda = if require_cuda {
             cuda.build().error_on_failure()
         } else {
