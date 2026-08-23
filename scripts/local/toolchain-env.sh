@@ -114,6 +114,35 @@ else
   export GOTAGS="${GOTAGS:-}"
 fi
 
+# LibreOffice — le convertisseur .doc/.docx -> HTML de l'etape `fetch`.
+#
+# toolchain-bootstrap.sh l'extrait sous .local/toolchain/libreoffice (msiexec /a,
+# sans elevation) mais rien ne l'exportait : `soffice` restait introuvable et
+# `fetch` echouait au premier appel, apres avoir deja telecharge. Le binaire
+# etait la depuis le debut ; seul le PATH manquait.
+if [ -d "$_TE_LOCAL/libreoffice/program" ]; then
+  case ":$PATH:" in
+    *":$_TE_LOCAL/libreoffice/program:"*) ;;
+    *) PATH="$PATH:$_TE_LOCAL/libreoffice/program";;
+  esac
+  export PATH
+fi
+
+# pandoc — l'echelon 3 de la cascade de secours de lib/convert.sh.
+#
+# Sans lui la cascade n'a qu'UN echelon utile sur quatre pour un .docx : l'export
+# direct crashe sur les figures EMF/WMF, le strip EMF est le seul recours, et
+# l'echelon 4 (antiword/catdoc) ne lit que le .doc binaire. C'est ce qui a fait
+# perdre TS 33.501 sur Rel-17/18/19/20, TS 28.552 et TS 26.253 — des specs
+# centrales, pas des cas limites.
+if [ -x "$_TE_LOCAL/pandoc/pandoc.exe" ] || [ -x "$_TE_LOCAL/pandoc/pandoc" ]; then
+  case ":$PATH:" in
+    *":$_TE_LOCAL/pandoc:"*) ;;
+    *) PATH="$PATH:$_TE_LOCAL/pandoc";;
+  esac
+  export PATH
+fi
+
 # gobuild / gotest — wrappers qui appliquent GOTAGS sans le dupliquer partout.
 gobuild() { if [ -n "$GOTAGS" ]; then go build -tags "$GOTAGS" "$@"; else go build "$@"; fi; }
 gotest()  { if [ -n "$GOTAGS" ]; then go test  -tags "$GOTAGS" "$@"; else go test  "$@"; fi; }
