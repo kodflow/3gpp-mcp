@@ -550,6 +550,37 @@ func TestCargoBinarySourcesAreFingerprinted(t *testing.T) {
 	}
 }
 
+// TestPublishingTheCorpusDropsTheReplacedWAL pins the sidecar rule: a DuckDB WAL
+// belongs to the FILE it was written for, and publishing a new corpus over that
+// path orphans it. Leaving it made merge fail its own output validation with
+// "Conflict on tuple deletion!" while the freshly merged DB sat on disk, intact
+// and unopenable.
+func TestPublishingTheCorpusDropsTheReplacedWAL(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "3gpp.duckdb")
+	tmp := db + ".new"
+	write(t, db, "the old database")
+	write(t, db+".wal", "a WAL describing the OLD database")
+	write(t, tmp, "the freshly merged database")
+
+	if err := publishCorpus(tmp, db); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(db); err != nil || string(b) != "the freshly merged database" {
+		t.Fatalf("the merged corpus was not published: %q %v", b, err)
+	}
+	if _, err := os.Stat(db + ".wal"); !os.IsNotExist(err) {
+		t.Fatal("the replaced database's WAL survived — the next open replays it against a corpus it never belonged to")
+	}
+
+	// The common case is no WAL at all (a cleanly checkpointed corpus). That must
+	// publish silently, not error on the missing sidecar.
+	write(t, tmp, "a later merge")
+	if err := publishCorpus(tmp, db); err != nil {
+		t.Fatalf("publishing with no WAL beside the corpus must succeed: %v", err)
+	}
+}
+
 // anyDepStep builds a consumer whose artefact has two alternative producers.
 func anyDepStep(name string, anyDeps []string, out string, runs *int) *Step {
 	s := counter(name, nil, nil, out, runs)
