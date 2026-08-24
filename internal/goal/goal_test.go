@@ -517,6 +517,39 @@ func TestImplPathTypoIsAnError(t *testing.T) {
 	}
 }
 
+// TestCargoBinarySourcesAreFingerprinted pins the narrowing of skipDirs["bin"].
+// A directory named bin holds build OUTPUT at ./bin and .local/bin, but Cargo
+// puts the SOURCE of a crate's extra binaries in src/bin. Pruning by basename
+// hid rust/store/src/bin/embed_io.rs, so a fix to the vector import left
+// build-rust reporting VALID, cargo never re-ran, and the stale .exe kept being
+// launched for another six hours.
+func TestCargoBinarySourcesAreFingerprinted(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "rust", "store", "src", "lib.rs"), "pub fn a() {}\n")
+	write(t, filepath.Join(root, "rust", "store", "src", "bin", "embed_io.rs"), "fn main() {}\n")
+	write(t, filepath.Join(root, "rust", "bin", "prebuilt.exe"), "output, not source\n")
+
+	before, per, err := implHash(root, []string{"rust"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := per["rust/store/src/bin/embed_io.rs"]; !ok {
+		t.Fatalf("src/bin was pruned — a binary's source is invisible to the fingerprint; hashed %v", per)
+	}
+	if _, ok := per["rust/bin/prebuilt.exe"]; ok {
+		t.Fatal("an output bin/ directory was folded into the fingerprint — every build would dirty the step")
+	}
+
+	write(t, filepath.Join(root, "rust", "store", "src", "bin", "embed_io.rs"), "fn main() { let _ = 1; }\n")
+	after, _, err := implHash(root, []string{"rust"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("changing a Cargo binary source did NOT change the fingerprint — the step stays VALID with a stale binary")
+	}
+}
+
 // anyDepStep builds a consumer whose artefact has two alternative producers.
 func anyDepStep(name string, anyDeps []string, out string, runs *int) *Step {
 	s := counter(name, nil, nil, out, runs)
