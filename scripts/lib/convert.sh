@@ -101,6 +101,16 @@ _soffice_html() {
   local doc="$1" base outdir prof rc html
   base="$(basename "$doc")"; base="${base%.*}"
   outdir="$(mktemp -d)"; prof="$(_soffice_profile)"
+  # An EMPTY profile path is not a degraded conversion, it is a broken worker:
+  # -env:UserInstallation=file:// makes soffice refuse with "the user installation
+  # could not be completed", and since its output goes to /dev/null the step then
+  # reports successful downloads and produces no HTML at all. Fail loudly here
+  # rather than let 251 specs pass through as silent no-ops.
+  if [[ -z "$prof" ]]; then
+    echo "$(date -Is) FATAL soffice profile path is empty — the worker is missing convert.sh helpers; the caller must use convert_export_fns" >&2
+    rm -rf "$outdir" 2>/dev/null || true
+    return 1
+  fi
   timeout -k "$CONV_KILL" "$CONV_TIMEOUT" soffice --headless --norestore \
     -env:UserInstallation="$(_conv_url "$prof")" \
     --convert-to html --outdir "$(_conv_native "$outdir")" "$(_conv_native "$doc")" >/dev/null 2>&1
@@ -114,6 +124,26 @@ _soffice_html() {
   rm -rf "$prof" 2>/dev/null || true
   rm -rf "$outdir" 2>/dev/null || true   # drop crash leftovers (partial gifs, stale lock)
   return 1
+}
+
+# convert_export_fns exports EVERY function a worker subshell needs, as ONE unit.
+#
+# xargs/parallel workers are fresh bash processes: they see only what `export -f`
+# put in their environment. A caller that exports convert_doc and _soffice_html
+# but not their helpers produces "helper: command not found" per document, an
+# empty result where a path was expected, and NO HTML — while downloads keep
+# reporting success.
+#
+# This list was maintained by hand at three call sites and drifted twice. The
+# second time, 97dfcc9 added _soffice_profile and corpus.sh's list was not
+# updated: a 2h20 fetch converted exactly zero documents before anyone noticed,
+# because soffice's own complaint is sent to /dev/null.
+#
+# So the list lives HERE, beside the functions it names, and callers ask for it
+# by name. Adding a helper to this file is now the only place it must be
+# remembered.
+convert_export_fns() {
+  export -f convert_doc _soffice_html _soffice_profile _conv_native _conv_url
 }
 
 # convert_pdf <pdf> <target_html> [label] — ETSI deliverables are PUBLISHED as
