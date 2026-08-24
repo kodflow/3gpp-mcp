@@ -15,7 +15,7 @@ JOBS="${JOBS:-4}"
 # shellcheck source=lib/convert.sh
 source "$ROOT/scripts/lib/convert.sh"
 export CONV_TIMEOUT CONV_KILL DEGRADED_TSV CONVERT
-export -f convert_doc _soffice_html
+convert_export_fns
 
 command -v soffice >/dev/null 2>&1 || {
   echo "$(date -Is) soffice missing — installing libreoffice-writer ..." >&2

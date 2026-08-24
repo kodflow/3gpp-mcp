@@ -325,10 +325,12 @@ process_spec() {
   fi
   rm -rf "$tmp"
 }
-# _conv_native/_conv_url are used INSIDE _soffice_html, which runs in the xargs
-# worker subshell — exporting the caller without its helpers gives
-# "command not found" per conversion and no HTML at all.
-export -f process_spec convert_doc _soffice_html _conv_native _conv_url
+# The conversion helpers run INSIDE _soffice_html, in the xargs worker subshell —
+# exporting the caller without them gives "command not found" per conversion and
+# no HTML at all. The list is no longer restated here: convert.sh owns it, so it
+# cannot drift again. It already did, twice — see convert_export_fns.
+convert_export_fns
+export -f process_spec
 export ORIGIN CONVERT DO_DOWNLOAD DO_CONVERT CONV_TIMEOUT CONV_KILL DEGRADED_TSV
 
 # ----- disk guard -----
