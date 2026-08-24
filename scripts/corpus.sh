@@ -199,8 +199,9 @@ export -f emit_spec; export BASE WORKDIR SET_MAJOR LEGACY_GSM
 # download_zip <rel> <url> <name> — robustly fetch one spec zip. Prints the local
 # path on success (rc 0); rc 1 + a FAILDL log on genuine absence. Strategy:
 #   1. the worklist URL, with AGGRESSIVE retry: transient (000/429/5xx) up to 6×
-#      with backoff; 403/404 twice (a momentary edge miss) — measured ~0.8% of
-#      URLs are genuinely absent, so we don't burn long backoff on them.
+#      with backoff; 403/404 twice (a momentary edge miss). On a REPAIR worklist
+#      absence is the common case, not the ~0.8% a drift worklist sees: it aims at
+#      old anchors and withdrawn drafts, and 177 of 251 URLs came back absent.
 #   2. FALLBACK (the auto-fix): if the exact version is absent, list the spec's
 #      archive dir and take the HIGHEST version actually present at/above the floor
 #      — recovers "status report ahead of the archive" cases. The release stays the
@@ -219,8 +220,23 @@ download_zip() {
     j=$(( RANDOM % 3 ))
     case "$code" in
       000|429|5*) [[ $t -ge 6 ]] && break; sleep $(( (t*3 < 30 ? t*3 : 30) + j ));;  # transient: long backoff
-      403)        [[ $t -ge 5 ]] && break; sleep $(( (t*t < 20 ? t*t : 20) + j ));;  # 403 is often transient WAF/rate here: quadratic backoff + jitter, MORE tries before giving up
-      404)        [[ $t -ge 2 ]] && break; sleep 1;;                                 # 404 = genuine absent: don't hammer
+      # 403 IS THIS HOST'S "NOT FOUND". www.3gpp.org answers 403 — never 404 — for
+      # a missing file in an existing directory, for a nonsense name (zzz.zip), and
+      # for a directory that does not exist at all; all three verified, while a file
+      # that IS present answers 200 with or without a browser UA. There is no WAF to
+      # wait out.
+      #
+      # It was classed as transient and given five tries with quadratic backoff:
+      # measured 35 s per absent spec, against 2 s for the same verdict. A repair
+      # worklist targets old anchors and drafts, so absence is the COMMON case, not
+      # the ~0.8% assumed above — 177 of 251 URLs in one repair run. That is over an
+      # hour of pure sleeping per campaign, for nothing.
+      #
+      # A genuinely transient 403 is still recovered: the FALLBACK below lists the
+      # archive directory (which answers 200) and re-fetches through a different
+      # path, including the requested file itself when it is the highest of its
+      # release. Cheap here, recoverable there.
+      403|404)    [[ $t -ge 2 ]] && break; sleep 1;;                                 # absent: don't hammer
       *) break;;
     esac
   done
