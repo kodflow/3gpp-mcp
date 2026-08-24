@@ -405,7 +405,7 @@ func stepMerge() *Step {
 			// merge succeeded. Publishing the index first would let a crash leave
 			// an anchor claiming a corpus state that was never written — the next
 			// discover would then believe it is up to date and silently skip work.
-			if err := os.Rename(tmp, db); err != nil {
+			if err := publishCorpus(tmp, db); err != nil {
 				return err
 			}
 			for _, n := range []string{"corpus-index.json", "subject-index.json", "build-index.json"} {
@@ -420,6 +420,33 @@ func stepMerge() *Step {
 			return nil
 		},
 	}
+}
+
+// publishCorpus puts the freshly merged database at its final path and DROPS THE
+// WAL OF THE DATABASE IT REPLACES.
+//
+// DuckDB keeps <db>.wal beside the file and removes it only on a clean
+// checkpoint, so a writer that was killed leaves one behind. That WAL describes
+// the OLD database. Once the rename puts a DIFFERENT file at the same path, the
+// next open replays it against a corpus it never belonged to and fails with
+// "Failure while replaying WAL file …: Conflict on tuple deletion!". The merge
+// itself is perfectly good — the corpus is simply unopenable, which is worse than
+// a plain failure because it reads as corruption.
+//
+// Seen for real: a vector import killed at 04:59 left a 9 MB WAL; merge
+// republished the corpus 19 hours later and the step failed its OWN output
+// validation, with the just-written DB on disk and intact.
+//
+// Removing the sidecar is part of publishing, not cleanup — the freshly merged DB
+// is checkpointed and has no WAL of its own to lose.
+func publishCorpus(tmp, db string) error {
+	if err := os.Rename(tmp, db); err != nil {
+		return err
+	}
+	if err := os.Remove(db + ".wal"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing the replaced corpus WAL: %w", err)
+	}
+	return nil
 }
 
 // ensureCorpusIndex regenerates the anchor from the current DB when it is
