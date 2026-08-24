@@ -17,6 +17,9 @@ import (
 // fingerprint would make every step dirty on every run (a cargo build writes
 // into target/, the pipeline writes into .local/), which defeats the whole
 // mechanism. This is also the exclusion list any code index must honour.
+//
+// Matching is by directory NAME, at any depth — see skipDir for the one place
+// that is wrong and why.
 var skipDirs = map[string]bool{
 	".git":         true,
 	".local":       true, // runtime state + portable toolchain
@@ -28,6 +31,29 @@ var skipDirs = map[string]bool{
 	"dist":         true,
 	"vendor":       true,
 	"__pycache__":  true,
+}
+
+// skipDir decides whether a walked directory is pruned. It exists because
+// skipDirs matches a BASENAME at any depth, and exactly one entry — "bin" — is
+// ambiguous: ./bin and .local/bin hold built artefacts, but Cargo puts the
+// SOURCE of every extra binary of a crate in src/bin.
+//
+// Pruning src/bin made rust/store/src/bin/{embed_io,merge,overlay,freeze_hnsw}.rs
+// invisible to build-rust's fingerprint. A fix confined to one of those files
+// left the step reporting VALID, so cargo never re-ran and the stale .exe kept
+// being launched — a build that is wrong while the state machine swears it is
+// right. That is the failure this whole mechanism exists to prevent, so the
+// exclusion is narrowed rather than the file being added to some allow-list.
+func skipDir(path, name string) bool {
+	if !skipDirs[name] {
+		return false
+	}
+	// A "bin" whose parent is "src" is Cargo's binary-source directory, not an
+	// output directory. Everything else named "bin" is still pruned.
+	if name == "bin" && filepath.Base(filepath.Dir(path)) == "src" {
+		return false
+	}
+	return true
 }
 
 // hashableExt is the set of extensions whose line endings are normalised before
@@ -87,7 +113,7 @@ func implHash(root string, patterns []string, excludeTests bool) (string, map[st
 					return err
 				}
 				if d.IsDir() {
-					if skipDirs[d.Name()] {
+					if skipDir(path, d.Name()) {
 						return filepath.SkipDir
 					}
 					return nil
