@@ -552,10 +552,19 @@ func stepTest() *Step {
 // bash for corpus.sh and etsi-corpus.sh, so "no bash" means the run was never
 // going to work, and quietly passing a test step would say the opposite.
 func runShellTests(c *Ctx) (int, error) {
-	pattern := filepath.Join(c.Root, "scripts", "*_test.sh")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		return 0, err
+	// Both levels: scripts/ and scripts/<pkg>/. A single-level glob would have
+	// silently ignored scripts/lib/convert_test.sh, which is the very failure mode
+	// this function exists to end.
+	var files []string
+	for _, pat := range []string{
+		filepath.Join(c.Root, "scripts", "*_test.sh"),
+		filepath.Join(c.Root, "scripts", "*", "*_test.sh"),
+	} {
+		found, err := filepath.Glob(pat)
+		if err != nil {
+			return 0, err
+		}
+		files = append(files, found...)
 	}
 	sort.Strings(files)
 	if len(files) == 0 {
