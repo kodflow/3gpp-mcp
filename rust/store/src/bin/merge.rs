@@ -75,14 +75,27 @@ fn main() -> Result<()> {
         for s in store.shard_series(shard)? {
             rebuilt.insert(s);
         }
+        // KEEP THE VECTORS OF TEXT THAT DID NOT CHANGE.
+        //
+        // A bucket replacement is delete-then-insert, and the shard carries no
+        // embeddings — so without this every re-ingested spec loses its vectors even
+        // when its wording is untouched, and the next embed pass pays the GPU for work
+        // already done (211 511 clauses on the 2026-08-25 repair). Stash before the
+        // delete, hand back after the fold.
+        let mut carried = 0usize;
         if !args.base.is_empty() {
-            for (spec, rel) in store.shard_spec_releases(shard)? {
-                store.delete_spec_release(&spec, &rel)?;
+            let buckets = store.shard_spec_releases(shard)?;
+            store.stash_bucket_vectors(&buckets)?;
+            for (spec, rel) in &buckets {
+                store.delete_spec_release(spec, rel)?;
             }
         }
         let offset = store.max_chunk_id()?;
         store.fold_shard(shard, offset)?;
-        eprintln!("merge: folded {shard} (chunk_id offset {offset})");
+        if !args.base.is_empty() {
+            carried = store.restore_stashed_vectors()?;
+        }
+        eprintln!("merge: folded {shard} (chunk_id offset {offset}, {carried} vector(s) carried)");
     }
 
     if args.strip_embeddings {
