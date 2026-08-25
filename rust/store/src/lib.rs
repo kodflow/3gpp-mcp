@@ -81,6 +81,48 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// copy_database_compact builds `dst` as a COMPACT copy of `src`.
+    ///
+    /// merge used to clone the base with std::fs::copy — a byte-for-byte copy, so it
+    /// carried the previous run's dead space AND the stale HNSW index that the merge is
+    /// about to rebuild anyway. A bucket replacement is delete-then-insert and DuckDB
+    /// does not reclaim in place, so the file grew on every incremental run and, because
+    /// each run started from the last run's file, the growth COMPOUNDED: 38.5 GB in,
+    /// 133 GB out on the 2026-08-25 repair, and the next run would have started at 133.
+    ///
+    /// COPY FROM DATABASE rebuilds the storage rather than cloning it: no dead space
+    /// carried, and custom indexes are not copied (internal/store/CLAUDE.md) — which is
+    /// exactly right here, since merge rebuilds FTS and freeze-hnsw rebuilds the index.
+    ///
+    /// Both databases are attached under explicit aliases from a scratch in-memory
+    /// connection, so neither catalog name has to be guessed from a file stem — "3gpp.
+    /// duckdb.new" does not yield an identifier anyone should have to predict.
+    pub fn copy_database_compact(src: &str, dst: &str) -> Result<()> {
+        let conn = Connection::open_in_memory().context("scratch connection")?;
+        // The source carries an HNSW index; without vss its catalog cannot even be bound.
+        // Best-effort, exactly as open_rw does it.
+        let _ = conn.execute_batch(
+            "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
+        );
+        // The copy streams, but give the buffer manager a fixed budget anyway: the
+        // default is a share of physical RAM, and this runs on a box where the HNSW
+        // build already has to be told not to take the whole machine.
+        let buf = std::env::var("MERGE_COPY_MEMORY_LIMIT").unwrap_or_else(|_| "4GB".into());
+        let esc = |p: &str| p.replace('\'', "''");
+        conn.execute_batch(&format!(
+            "SET memory_limit = '{buf}';
+             ATTACH '{}' AS copy_src (READ_ONLY);
+             ATTACH '{}' AS copy_dst;
+             COPY FROM DATABASE copy_src TO copy_dst;
+             DETACH copy_dst;
+             DETACH copy_src;",
+            esc(src),
+            esc(dst)
+        ))
+        .with_context(|| format!("compact copy {src} -> {dst}"))?;
+        Ok(())
+    }
+
     /// in_memory opens a transient DB (tests).
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory duckdb")?;
@@ -1654,6 +1696,70 @@ mod tests {
         let s = Store::in_memory().unwrap();
         assert_eq!(s.stash_bucket_vectors(&[]).unwrap(), 0);
         assert_eq!(s.restore_stashed_vectors().unwrap(), 0);
+    }
+
+    // The base copy must RECLAIM, not clone.
+    //
+    // std::fs::copy carried the previous run's dead space forward, so an incremental
+    // merge grew the corpus every time and the growth compounded across runs — 38.5 GB
+    // in, 133 GB out, and the next run would have started from 133. COPY FROM DATABASE
+    // rebuilds the storage, so the copy is sized by the DATA, not by the file it came
+    // from.
+    #[test]
+    fn the_base_copy_reclaims_dead_space_instead_of_cloning_it() {
+        let dir = std::env::temp_dir().join(format!("storers-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bloated.duckdb");
+        let dst = dir.join("compact.duckdb");
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+        let srcs = src.to_str().unwrap().to_string();
+        let dsts = dst.to_str().unwrap().to_string();
+
+        // Bloat the source the way a bucket replacement does: write a lot, delete most
+        // of it, and let DuckDB keep the file it already grew to.
+        {
+            let s = Store::open_rw(&srcs).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                       SELECT i, '23.501', 'Rel-19', 'h' || i, repeat('x', 4000)
+                       FROM range(60000) t(i);",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+            s.raw()
+                .execute_batch("DELETE FROM clauses WHERE chunk_id >= 200;")
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let bloated = std::fs::metadata(&src).unwrap().len();
+
+        Store::copy_database_compact(&srcs, &dsts).unwrap();
+        let compact = std::fs::metadata(&dst).unwrap().len();
+
+        // Same rows on the other side — compaction must not be lossy.
+        let s = Store::open_rw(&dsts).unwrap();
+        let n: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 200, "every surviving row must make the trip");
+        let specs: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(specs, 1, "the catalogue travels too");
+
+        assert!(
+            compact < bloated,
+            "the copy must be sized by the DATA, not by the file: {compact} vs {bloated}"
+        );
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
