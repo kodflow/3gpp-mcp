@@ -30,6 +30,20 @@ mkdir -p "$BUCKET" "$ORIGIN"
 
 retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; sleep $((n * 3)); done; }
 
+# tmpfile_ext <ext> — a temp file that actually ends in ".<ext>".
+#
+# `mktemp --suffix=` is GNU coreutils only. On Windows the toolchain's mktemp is
+# w64devkit's BUSYBOX build, which takes nothing but a TEMPLATE ending in XXXXXX
+# and exits 1 on --suffix — so the very first deliverable killed the whole step.
+# The extension is not cosmetic here: convert_pdf dispatches on it, and pdftotext
+# refuses a file it cannot recognise. Make the name ourselves and stay portable.
+tmpfile_ext() {
+	local t
+	t="$(mktemp)" || return 1
+	mv "$t" "$t.$1" || { rm -f "$t"; return 1; }
+	printf '%s\n' "$t.$1"
+}
+
 # Binaries: supplied by the caller, or built here as a fallback.
 #
 # internal/goal already builds every tool with the pinned local toolchain and knows
@@ -80,7 +94,7 @@ while IFS=$'\t' read -r id url version; do
 		ok=$((ok + 1))
 		continue
 	fi
-	pdf="$(mktemp --suffix=.pdf)"
+	pdf="$(tmpfile_ext pdf)"
 	# ETSI's /deliver CDN WAF 403s a bare curl User-Agent from datacenter IPs (GitHub
 	# Actions): discover-etsi works on the same runner ONLY because it sends a browser
 	# UA. Mirror that here (+ Accept/timeout) or every PDF download fails in CI.
@@ -93,7 +107,7 @@ while IFS=$'\t' read -r id url version; do
 		fail=$((fail + 1))
 		continue
 	fi
-	tmp_html="$(mktemp --suffix=.html)"
+	tmp_html="$(tmpfile_ext html)"
 	if convert_pdf "$pdf" "$tmp_html" "$id v$version"; then
 		# Prepend the provenance header htmlparse keys on, then the converted body.
 		{
