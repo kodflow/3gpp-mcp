@@ -834,3 +834,44 @@ func TestHasFlagAcceptsEverySpellingGoDoes(t *testing.T) {
 		t.Error("hasFlag matched a different flag by prefix")
 	}
 }
+
+// What the repair ACQUIRES must be what ingest READS.
+//
+// series.json (from the delta) and worklist.txt (from the repair plan) are two
+// independent computations, and ingest walks series.json. On 2026-08-25 the repair
+// work list carried six 34.123-1 entries, the series list carried no "34", and the
+// six converted HTML files sat on disk unread — a fully "successful" repair that
+// closed none of those holes, with nothing in any log to say so.
+func TestTheSeriesListCoversWhatTheWorkListReaches(t *testing.T) {
+	wl := "Rel-10 https://www.3gpp.org/ftp/Specs/archive/34_series/34.123-1/34123-1-a70.zip 34123-1-a70.zip\n" +
+		"Rel-19 https://www.3gpp.org/ftp/Specs/archive/23_series/23.501/23501-j50.zip 23501-j50.zip\n"
+
+	reached := seriesInWorklist(wl)
+	if len(reached) != 2 || reached[0] != "23" || reached[1] != "34" {
+		t.Fatalf("series reached by the work list = %v, want [23 34]", reached)
+	}
+
+	// The delta flagged only 23. The repair reaches 34 as well, so 34 must be added.
+	extra := seriesNotIn([]string{"23"}, reached)
+	if len(extra) != 1 || extra[0] != "34" {
+		t.Fatalf("missing series = %v, want [34]", extra)
+	}
+
+	// And a series the delta already carries must not be duplicated.
+	if got := seriesNotIn([]string{"23", "34"}, reached); len(got) != 0 {
+		t.Fatalf("nothing should be added twice, got %v", got)
+	}
+}
+
+// The series number comes from the ARCHIVE DIRECTORY, never from the file name:
+// deciding where "34.123-1" ends is exactly the parsing that gets sub-part specs
+// wrong, and the directory already says it unambiguously.
+func TestTheSeriesComesFromTheArchiveDirectory(t *testing.T) {
+	wl := "Rel-10 https://www.3gpp.org/ftp/Specs/archive/38_series/38.760-1/38760-1-030.zip 38760-1-030.zip\n"
+	if got := seriesInWorklist(wl); len(got) != 1 || got[0] != "38" {
+		t.Fatalf("a sub-part spec must still resolve to its series, got %v", got)
+	}
+	if got := seriesInWorklist("garbage with no archive path\n"); len(got) != 0 {
+		t.Fatalf("a line with no archive path reaches no series, got %v", got)
+	}
+}
