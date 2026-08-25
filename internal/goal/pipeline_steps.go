@@ -373,12 +373,22 @@ func stepIngest() *Step {
 				// already-ingested (spec, version) pairs are skipped, and a parser
 				// or schema change invalidates the log wholesale. That is the
 				// per-unit checkpoint; we do not add a second ledger beside it.
-				if err := c.Run(Cmd{Name: c.rbin("ingest"), Args: []string{
+				//
+				// --corpus widens that question from "did THIS shard ingest it" to
+				// "does the corpus already hold it". ingest_log lives in the shard,
+				// and a shard is scratch: delete it and the ledger is empty, so a
+				// series is parsed and written again in full. That re-ingested
+				// ~300 000 clauses on 2026-08-25 to acquire five specs.
+				ingestArgs := []string{
 					"--series", s,
 					"--convert", c.dataPath("sources", "convert"),
 					"--db", db,
 					"--resume",
-				}, Echo: true}); err != nil {
+				}
+				if corpus := c.dataPath("3gpp.duckdb"); fileNonEmpty(corpus) {
+					ingestArgs = append(ingestArgs, "--corpus", corpus)
+				}
+				if err := c.Run(Cmd{Name: c.rbin("ingest"), Args: ingestArgs, Echo: true}); err != nil {
 					return err
 				}
 				c.Checkpoint("last_series", s)
