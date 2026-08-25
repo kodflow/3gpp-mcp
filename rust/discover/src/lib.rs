@@ -761,18 +761,10 @@ pub fn emit_repair_worklist(
 
     for (key, ver) in site {
         let (spec, rel) = split_key(key);
-        if rel.is_empty() || spec.len() < 2 || major(rel) < floor_major {
-            continue;
-        }
-        let pfx = match series_prefix(spec) {
+        let pfx = match in_scope(spec, rel, floor_major, &allow) {
             Some(p) => p,
             None => continue,
         };
-        if let Some(set) = &allow {
-            if !set.contains(&pfx) {
-                continue;
-            }
-        }
 
         let have = idx.get(key).map(String::as_str).unwrap_or("");
         let drifted = cmp_ver(ver, have) == Ordering::Greater;
@@ -804,28 +796,91 @@ pub fn emit_repair_worklist(
         // has nothing newer: fetching the site version would re-download something
         // the corpus already believes it has and leave the hole open.
         let want = if drifted { ver.as_str() } else { have };
-        match encode_ver_code(want) {
-            Some(code) => {
-                let num = spec.replacen('.', "", 1);
-                let name = format!("{num}-{code}.zip");
-                lines.push_str(&format!(
-                    "{rel} {STATUS_BASE}/{pfx}_series/{spec}/{name} {name}\n"
-                ));
+        match archive_line(spec, rel, &pfx, want) {
+            Some(line) => {
+                lines.push_str(&line);
                 counts.emitted += 1;
             }
             None => counts.unencodable += 1,
         }
     }
 
-    // A hole the status report does not list at all cannot be fetched from the
-    // report. Report it rather than dropping it: silence here is how the 56
-    // became invisible in the first place.
+    // A HOLE THE STATUS REPORT DOES NOT LIST IS STILL FETCHABLE.
+    //
+    // The report carries ONE row per spec — its current version — and the release is
+    // read off that version's major. So a hole at an OLDER version has no row to
+    // match: 29.558 reports 19.7.0, giving the key `29.558|Rel-19`, while the hole is
+    // `29.558|Rel-20` anchored at 19.5.0. The loop above can never see it.
+    //
+    // Counting it and moving on was the bug — the comment here used to say silence is
+    // how the 56 became invisible, then dropped the key anyway. The anchor already
+    // names the exact version and the archive keeps every version it ever published,
+    // so the URL needs no report: 29.558|Rel-20 -> 29.558/29558-j50.zip, which serves.
+    // All twelve such holes on the local corpus were verified to resolve to a real
+    // file, and re-acquiring the anchored version is precisely what flips a key from
+    // missing_content to non_content in cmd/anchorcheck.
+    //
+    // The count stays: it is the population the report cannot describe, and watching
+    // it grow says something the emitted total does not.
     for key in holes {
-        if !site.contains_key(key) {
-            counts.holes_not_in_report += 1;
+        if site.contains_key(key) {
+            continue;
+        }
+        counts.holes_not_in_report += 1;
+        let (spec, rel) = split_key(key);
+        let pfx = match in_scope(spec, rel, floor_major, &allow) {
+            Some(p) => p,
+            None => continue,
+        };
+        // With no anchor version there is nothing to ask for: the report has no row
+        // and the corpus makes no claim, so the key names no document at all.
+        let want = idx.get(key).map(String::as_str).unwrap_or("");
+        if want.is_empty() {
+            counts.unencodable += 1;
+            continue;
+        }
+        counts.corpus_holes += 1;
+        match archive_line(spec, rel, &pfx, want) {
+            Some(line) => {
+                lines.push_str(&line);
+                counts.emitted += 1;
+            }
+            None => counts.unencodable += 1,
         }
     }
     (lines, counts)
+}
+
+/// in_scope resolves the series prefix for `spec`, or None when the key falls below
+/// the release floor or outside the series filter. Shared so the two passes of
+/// emit_repair_worklist cannot drift apart on what they consider in range.
+fn in_scope(
+    spec: &str,
+    rel: &str,
+    floor_major: i64,
+    allow: &Option<BTreeSet<String>>,
+) -> Option<String> {
+    if rel.is_empty() || spec.len() < 2 || major(rel) < floor_major {
+        return None;
+    }
+    let pfx = series_prefix(spec)?;
+    if let Some(set) = allow {
+        if !set.contains(&pfx) {
+            return None;
+        }
+    }
+    Some(pfx)
+}
+
+/// archive_line renders one "<release> <url> <name>" entry, or None when the version
+/// cannot be encoded into an archive file name.
+fn archive_line(spec: &str, rel: &str, pfx: &str, version: &str) -> Option<String> {
+    let code = encode_ver_code(version)?;
+    let num = spec.replacen('.', "", 1);
+    let name = format!("{num}-{code}.zip");
+    Some(format!(
+        "{rel} {STATUS_BASE}/{pfx}_series/{spec}/{name} {name}\n"
+    ))
 }
 
 /// RepairCounts breaks the repair set into its populations so the operator can see
@@ -952,15 +1007,74 @@ mod repair_tests {
         assert_eq!(c2.emitted, 1, "with holes it is one spec");
     }
 
-    /// A hole the status report does not list cannot be fetched from the report.
-    /// It must be counted and reported, never dropped.
+    /// A hole the status report does not list is STILL fetchable, because the anchor
+    /// names the version and the archive keeps every version it published.
+    ///
+    /// This is the real shape, taken from the corpus: the report carries one row per
+    /// spec — 29.558 at 19.7.0, which reads as Rel-19 — while the hole is Rel-20
+    /// anchored at 19.5.0. No report row can ever match it, and counting it and
+    /// moving on left the corpus permanently short.
     #[test]
-    fn a_hole_absent_from_the_report_is_counted_not_dropped() {
+    fn a_hole_absent_from_the_report_is_fetched_at_the_anchored_version() {
+        let site = m(&[("29.558|Rel-19", "19.7.0")]);
+        let idx = m(&[("29.558|Rel-19", "19.7.0"), ("29.558|Rel-20", "19.5.0")]);
+        let holes: BTreeSet<String> = ["29.558|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.holes_not_in_report, 1, "the population must stay visible");
+        assert_eq!(c.emitted, 1, "and it must actually be fetched");
+        assert!(
+            lines.contains("29558-j50.zip"),
+            "expected the ANCHOR's version (19.5.0 -> j50), not the report's 19.7.0; got: {lines}"
+        );
+        assert!(
+            lines.starts_with("Rel-20 "),
+            "the line must carry the hole's release, got: {lines}"
+        );
+    }
+
+    /// A hole in neither the report nor the anchor names no document at all: there is
+    /// no version to ask the archive for. Count it, do not invent a URL.
+    #[test]
+    fn a_hole_with_no_anchor_names_no_document() {
         let site = m(&[("23.501|Rel-19", "19.5.0")]);
         let idx = m(&[("23.501|Rel-19", "19.5.0")]);
         let holes: BTreeSet<String> = ["99.999|Rel-20".to_string()].into_iter().collect();
-        let (_, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
         assert_eq!(c.holes_not_in_report, 1);
+        assert_eq!(c.emitted, 0, "nothing to fetch without a version");
+        assert_eq!(c.unencodable, 1, "and it must be reported, not silently gone");
+        assert!(lines.is_empty());
+    }
+
+    /// The series filter and the release floor apply to anchor-recovered holes too.
+    /// The second pass must not become a hole in the scoping the first pass enforces.
+    #[test]
+    fn an_anchor_recovered_hole_still_obeys_scope() {
+        // 23.501 is anchored at what the site serves, so it neither drifts nor holes
+        // and contributes nothing — leaving 29.558 as the only candidate.
+        let site = m(&[("23.501|Rel-19", "19.5.0")]);
+        let idx = m(&[("23.501|Rel-19", "19.5.0"), ("29.558|Rel-20", "19.5.0")]);
+        let holes: BTreeSet<String> = ["29.558|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "23");
+        assert!(
+            !lines.contains("29558"),
+            "series 29 is outside the '23' filter, got: {lines}"
+        );
         assert_eq!(c.emitted, 0);
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 99, "");
+        assert!(
+            !lines.contains("29558"),
+            "Rel-20 is below a Rel-99-major floor, got: {lines}"
+        );
+        assert_eq!(c.emitted, 0);
+
+        // And with neither restriction it IS emitted — otherwise the two assertions
+        // above would pass on a function that never emits anything.
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.emitted, 1);
+        assert!(lines.contains("29558-j50.zip"), "got: {lines}");
     }
 }
