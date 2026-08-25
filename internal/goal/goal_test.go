@@ -769,3 +769,68 @@ func TestOptionalDependencyIsNotAPrecondition(t *testing.T) {
 		t.Fatalf("consumer runs=%d, want 1", consumerRuns)
 	}
 }
+
+// The data contract must be checked against the SAME population `embed` was asked
+// to fill. --require-embed-complete is floor-aware, and validate defaults its floor
+// to "" (= every clause). Running embed at embed_floor="Rel-99" and then validating
+// at "" failed a complete corpus on 413 GSM-era LCS clauses that are deliberately
+// NULL — the contract was measuring rows nobody ever asked to vectorise.
+func TestValidateInheritsTheFloorEmbedRanWith(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	ctx.Config["contract_flags"] = "--require-fts --require-hnsw --require-embed-complete"
+	ctx.Config["embed_floor"] = "Rel-99"
+
+	args := validateArgs(ctx)
+	if !hasFlag(args, "--embed-floor") {
+		t.Fatalf("validate must pass the embed floor, got %v", args)
+	}
+	for i, a := range args {
+		if a == "--embed-floor" {
+			if i+1 >= len(args) || args[i+1] != "Rel-99" {
+				t.Fatalf("--embed-floor must carry embed's own floor, got %v", args)
+			}
+		}
+	}
+}
+
+// No floor configured means "vectorise everything", and there the contract's own
+// default ("" = count every clause) is already right. Passing an empty --embed-floor
+// would be noise at best and, if validate ever tightened its parsing, a failure.
+func TestValidateOmitsTheFloorWhenEmbedHasNone(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	ctx.Config["contract_flags"] = "--require-embed-complete"
+
+	if args := validateArgs(ctx); hasFlag(args, "--embed-floor") {
+		t.Fatalf("no embed_floor configured, so none should be passed, got %v", args)
+	}
+}
+
+// An operator who writes the floor into contract_flags is making a decision. The
+// step must not append a second one behind their back.
+func TestAnExplicitContractFloorIsNotOverridden(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	ctx.Config["contract_flags"] = "--require-embed-complete --embed-floor=Rel-15"
+	ctx.Config["embed_floor"] = "Rel-99"
+
+	args := validateArgs(ctx)
+	n := 0
+	for _, a := range args {
+		if strings.HasPrefix(strings.TrimLeft(a, "-"), "embed-floor") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the operator's floor must stand alone, found %d occurrences in %v", n, args)
+	}
+}
+
+func TestHasFlagAcceptsEverySpellingGoDoes(t *testing.T) {
+	for _, spelling := range []string{"-embed-floor", "--embed-floor", "-embed-floor=Rel-9", "--embed-floor=Rel-9"} {
+		if !hasFlag([]string{"--report", "text", spelling}, "--embed-floor") {
+			t.Errorf("hasFlag missed %q — the caller would pass the flag twice", spelling)
+		}
+	}
+	if hasFlag([]string{"--embed-floor-extra"}, "--embed-floor") {
+		t.Error("hasFlag matched a different flag by prefix")
+	}
+}
