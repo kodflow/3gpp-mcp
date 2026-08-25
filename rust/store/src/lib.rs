@@ -907,6 +907,35 @@ impl Store {
         Ok(out)
     }
 
+    /// corpus_versions_with_text returns the (spec_id, version) pairs the corpus at
+    /// `corpus_path` already holds actual CLAUSES for.
+    ///
+    /// `ingest --resume` consults the SHARD's own ingest_log, and a shard is scratch:
+    /// delete it, or start a series that never had one, and the ledger is empty, so
+    /// every converted file of that series is parsed and written again. The 2026-08-25
+    /// run re-ingested ~300 000 clauses that way to acquire five specs, and merge then
+    /// had to decide, bucket by bucket, that almost none of it had changed.
+    ///
+    /// The corpus is the durable record of what is already held, so let resume ask it.
+    /// The version is the key rather than the release: a spec is re-ingested when its
+    /// DOCUMENT changed, and that is what the version names.
+    pub fn corpus_versions_with_text(&self, corpus_path: &str) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS corp (READ_ONLY)",
+            corpus_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self
+                .conn
+                .prepare("SELECT DISTINCT spec_id, version FROM corp.clauses")?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH corp")?;
+        Ok(out)
+    }
+
     /// fold_shard_buckets folds a shard, optionally restricted to the given (spec,
     /// release) buckets. `None` folds everything (== the old behaviour).
     pub fn fold_shard_buckets(
@@ -1939,6 +1968,56 @@ mod tests {
         assert!(
             same.changed_buckets(&shard).unwrap().is_empty(),
             "an unchanged, fully textual shard must be skippable entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `--resume` must be able to ask the CORPUS what is already held, not only the
+    // scratch shard it happens to be writing.
+    //
+    // ingest_log lives in the shard. Delete the shard — or start a series that never
+    // had one — and the ledger is empty, so every converted file of that series is
+    // parsed and written again. That re-ingested ~300 000 clauses on 2026-08-25 to
+    // acquire five specs, and merge then had to decide bucket by bucket that almost
+    // none of it had moved.
+    #[test]
+    fn the_corpus_can_be_asked_what_it_already_holds() {
+        let dir = std::env::temp_dir().join(format!("storers-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cp = dir.join("corpus.duckdb");
+        let _ = std::fs::remove_file(&cp);
+        let corpus = cp.to_str().unwrap().to_string();
+        {
+            let c = Store::open_rw(&corpus).unwrap();
+            c.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,release,version,heading,text) VALUES
+                       (1,'23.501','Rel-19','19.7.0','h','t'),
+                       (2,'23.501','Rel-18','18.9.0','h','t');
+                     -- catalogued but textless: the corpus does NOT hold this one
+                     INSERT INTO spec_versions(spec_id,release,version)
+                       VALUES ('34.123-1','Rel-10','10.7.0');",
+                )
+                .unwrap();
+            c.checkpoint().unwrap();
+        }
+
+        let shard = Store::in_memory().unwrap();
+        let mut got = shard.corpus_versions_with_text(&corpus).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("23.501".to_string(), "18.9.0".to_string()),
+                ("23.501".to_string(), "19.7.0".to_string()),
+            ],
+            "only versions the corpus has TEXT for may be skipped"
+        );
+        assert!(
+            !got.contains(&("34.123-1".to_string(), "10.7.0".to_string())),
+            "a catalogued-but-textless version must still be re-ingested — it is a hole"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

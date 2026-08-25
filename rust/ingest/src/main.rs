@@ -55,6 +55,10 @@ struct Args {
     /// separate pass (ingest-li). No-op here.
     #[arg(long, default_value = "")]
     origin: String,
+    /// The published corpus, so --resume can ask what is ALREADY HELD rather than only
+    /// what this scratch shard happens to remember. Optional; absent = shard-only resume.
+    #[arg(long, default_value = "")]
+    corpus: String,
 }
 
 /// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
@@ -324,12 +328,35 @@ fn main() -> Result<()> {
             anyhow::bail!("ingest: pass --html <file> or --series <NN> --convert <dir>");
         };
         let files = collect_series_html(convert, series, &args.release)?;
+
+        // RESUME AGAINST THE CORPUS, NOT ONLY AGAINST THE SHARD.
+        //
+        // ingest_log lives in the SHARD, and a shard is scratch. Delete it, or start a
+        // series that never had one, and the ledger is empty — so every converted file
+        // of the series is parsed and written again. The 2026-08-25 run re-ingested
+        // ~300 000 clauses that way to acquire five specs, and merge then had to decide
+        // bucket by bucket that almost none of it had moved.
+        //
+        // The corpus is the durable record of what is already held. When the caller
+        // names it, a document it already carries is skipped whatever the shard
+        // remembers. --corpus is optional: without it the old behaviour stands.
+        let already: std::collections::HashSet<(String, String)> = match Some(args.corpus.as_str()) {
+            Some(c) if !c.is_empty() && std::path::Path::new(c).exists() => {
+                let v = store.corpus_versions_with_text(c)?;
+                eprintln!("ingest: corpus already holds {} (spec, version) pair(s)", v.len());
+                v.into_iter().collect()
+            }
+            _ => std::collections::HashSet::new(),
+        };
+
         let mut specs = 0usize;
         let mut clauses = 0usize;
         for f in &files {
             if args.resume {
                 if let Ok(m) = parse_filename_meta(f) {
-                    if store.ingest_done(&m.spec_id, &m.version, PIPELINE_VERSION)? {
+                    if store.ingest_done(&m.spec_id, &m.version, PIPELINE_VERSION)?
+                        || already.contains(&(m.spec_id.clone(), m.version.clone()))
+                    {
                         continue;
                     }
                 }
