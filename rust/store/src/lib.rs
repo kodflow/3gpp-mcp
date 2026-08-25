@@ -813,8 +813,9 @@ impl Store {
         self.fold_shard_buckets(shard_path, offset, None)
     }
 
-    /// changed_buckets returns the shard's (spec, release) pairs whose version DIFFERS
-    /// from what this database already holds — new specs included.
+    /// changed_buckets returns the shard's (spec, release) pairs this database does not
+    /// already hold in full: a different version, a spec it has never seen, OR a bucket
+    /// whose catalogue row is present while its TEXT is missing.
     ///
     /// A shard is rebuilt from every converted HTML of its series, so after one full
     /// pass it carries the whole series whether or not anything moved. Replaying all of
@@ -822,8 +823,12 @@ impl Store {
     /// the deleted blocks, so re-folding 745 unchanged specs to bring in 5 changed ones
     /// grew a 26 GB corpus past 43 GB on a single shard, and the run died on disk.
     ///
-    /// The version is the right key. It is what `spec_versions` records, what the delta
-    /// anchor compares, and what a re-ingest bumps when the document actually changes.
+    /// The version alone is NOT enough, and assuming it was skipped every shard on the
+    /// 2026-08-25 repair — including the one carrying the 6 209 clauses the repair
+    /// existed to acquire. A corpus hole is exactly the case where `spec_versions` holds
+    /// the right version and `clauses` holds nothing: that is what `anchorcheck` calls
+    /// missing_content, and skipping it makes the hole permanent. So the clause side is
+    /// checked too, which is also what makes this safe to use as the repair path.
     pub fn changed_buckets(&self, shard_path: &str) -> Result<Vec<(String, String)>> {
         self.conn.execute_batch(&format!(
             "ATTACH '{}' AS s (READ_ONLY)",
@@ -835,7 +840,11 @@ impl Store {
                    FROM s.spec_versions sv
                    LEFT JOIN spec_versions b
                      ON b.spec_id = sv.spec_id AND b.release = sv.release
-                  WHERE b.version IS NULL OR b.version <> sv.version",
+                   LEFT JOIN (SELECT DISTINCT spec_id, release FROM clauses) c
+                     ON c.spec_id = sv.spec_id AND c.release = sv.release
+                  WHERE b.version IS NULL      -- never seen
+                     OR b.version <> sv.version -- moved
+                     OR c.spec_id IS NULL       -- catalogued but textless: a HOLE",
             )?;
             let rows =
                 st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -1818,7 +1827,10 @@ mod tests {
             .execute_batch(
                 "INSERT INTO spec_versions(spec_id,release,version) VALUES
                    ('23.501','Rel-19','19.7.0'),
-                   ('24.501','Rel-19','19.2.0');",
+                   ('24.501','Rel-19','19.2.0');
+                 -- 23.501 is genuinely complete: catalogued AND textual.
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   VALUES (1,'23.501','Rel-19','h','t');",
             )
             .unwrap();
 
@@ -1830,19 +1842,50 @@ mod tests {
         ];
         assert_eq!(got, want, "a bucket at the SAME version must not be replaced");
 
-        // And a shard that moved nothing yields nothing, so merge can skip it whole.
+        // A CATALOGUED BUT TEXTLESS BUCKET IS A HOLE, AND MUST STILL BE FOLDED.
+        //
+        // This is the case a version check alone gets wrong, and getting it wrong
+        // skipped every shard of the 2026-08-25 repair — including the one carrying
+        // the 6 209 clauses the repair existed to acquire. spec_versions held the right
+        // version, clauses held nothing, and "same version" read as "nothing to do".
+        let holed = Store::in_memory().unwrap();
+        holed
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');
+                 -- every version matches the shard, but 34.123-1 has NO clauses
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t');",
+            )
+            .unwrap();
+        assert_eq!(
+            holed.changed_buckets(&shard).unwrap(),
+            vec![("34.123-1".to_string(), "Rel-10".to_string())],
+            "a catalogued bucket with no text is a hole and must be re-folded"
+        );
+
+        // And a shard that moved nothing AND is fully textual yields nothing, so merge
+        // can skip it whole — that is the optimisation this all exists for.
         let same = Store::in_memory().unwrap();
         same.raw()
             .execute_batch(
                 "INSERT INTO spec_versions(spec_id,release,version) VALUES
                    ('23.501','Rel-19','19.7.0'),
                    ('24.501','Rel-19','19.9.0'),
-                   ('34.123-1','Rel-10','10.7.0');",
+                   ('34.123-1','Rel-10','10.7.0');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t'),
+                   (3,'34.123-1','Rel-10','h','t');",
             )
             .unwrap();
         assert!(
             same.changed_buckets(&shard).unwrap().is_empty(),
-            "an unchanged shard must be skippable entirely"
+            "an unchanged, fully textual shard must be skippable entirely"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
