@@ -27,6 +27,36 @@
 : "${CONV_TIMEOUT:=900}"
 : "${CONV_KILL:=60}"
 
+# REMEMBER WHAT SOFFICE CANNOT CONVERT, OR PAY FOR IT ON EVERY RUN.
+#
+# A document soffice CRASHES on is cheap: it fails in seconds and falls through.
+# A document it HANGS on costs CONV_TIMEOUT twice — the straight attempt and the
+# EMF-stripped retry — which is 30 minutes for one file, every single run. TS
+# 38.141-1 did exactly that: 900 s, then 900 s again after the metafiles were
+# removed, to end at the pandoc fallback it was always going to end at.
+#
+# So record the timeouts and go straight to pandoc next time. This is a CACHE of
+# an observation, not a verdict: it lives under .local/state (operational, never
+# committed) and deleting the file simply makes the next run re-measure. A
+# LibreOffice upgrade is exactly the reason someone would want that.
+_CONV_STATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.local/state"
+: "${SOFFICE_TIMEOUT_LIST:=$_CONV_STATE_DIR/soffice-timeouts.txt}"
+
+# _conv_key <target_html> — the stable identity of a document across runs. The
+# source path is a throwaway temp dir; the target name is the spec and version.
+_conv_key() { local b; b="$(basename "$1")"; printf '%s' "${b%.html}"; }
+
+_soffice_known_hang() {
+  [[ -s "$SOFFICE_TIMEOUT_LIST" ]] || return 1
+  grep -qxF "$(_conv_key "$1")" "$SOFFICE_TIMEOUT_LIST" 2>/dev/null
+}
+
+_soffice_note_hang() {
+  mkdir -p "$(dirname "$SOFFICE_TIMEOUT_LIST")" 2>/dev/null || return 0
+  local k; k="$(_conv_key "$1")"
+  grep -qxF "$k" "$SOFFICE_TIMEOUT_LIST" 2>/dev/null || printf '%s\n' "$k" >> "$SOFFICE_TIMEOUT_LIST"
+}
+
 # Anchor the degraded manifest to the repo (…/scripts/lib -> …/data/sources)
 _CONV_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${DEGRADED_TSV:=$(cd "$_CONV_LIB_DIR/../.." && pwd)/data/sources/.degraded.tsv}"
@@ -115,6 +145,9 @@ _soffice_html() {
     -env:UserInstallation="$(_conv_url "$prof")" \
     --convert-to html --outdir "$(_conv_native "$outdir")" "$(_conv_native "$doc")" >/dev/null 2>&1
   rc=$?
+  # Published for the caller: 124 is `timeout` saying it killed soffice, which is
+  # the expensive failure worth remembering. Any other non-zero is a fast crash.
+  CONV_SOFFICE_RC=$rc
   html="$outdir/$base.html"
   if [[ $rc -eq 0 && -s "$html" ]]; then printf '%s\n' "$html"; return 0; fi
   # FAILURE PATH ONLY. A crashed soffice can leave its profile wedged, so drop it
@@ -232,11 +265,27 @@ convert_doc() {
   mkdir -p "$(dirname "$target")"
   export CONV_STATUS=fail   # output read by callers (corpus.sh / recover-fails.sh)
 
+  # A document soffice is KNOWN to hang on skips straight to pandoc: the two
+  # soffice attempts below would cost CONV_TIMEOUT each to reach the same place.
+  local skip_soffice=0
+  if _soffice_known_hang "$target"; then
+    echo "$(date -Is) SOFFICE-SKIP $(_conv_key "$target") :: known to hang; straight to pandoc" >&2
+    skip_soffice=1
+  fi
+
   # Attempt 1 — straight conversion (the common, clean path).
   # NB: no `local` on this line, or we'd capture local's rc, not soffice's.
-  if produced="$(_soffice_html "$inner")"; then
-    mv -f "$produced" "$target"; rm -rf "$(dirname "$produced")"
-    CONV_STATUS=clean; return 0
+  if [[ $skip_soffice -eq 0 ]]; then
+    if produced="$(_soffice_html "$inner")"; then
+      mv -f "$produced" "$target"; rm -rf "$(dirname "$produced")"
+      CONV_STATUS=clean; return 0
+    fi
+    # A timeout is the expensive failure: remember it so the next run does not
+    # re-buy the same 900 seconds.
+    if [[ "${CONV_SOFFICE_RC:-0}" -eq 124 ]]; then
+      _soffice_note_hang "$target"
+      skip_soffice=1
+    fi
   fi
 
   # A degraded conversion is tagged in two ways (HTML comment + .degraded.tsv).
@@ -253,7 +302,10 @@ convert_doc() {
     tmp="$(mktemp -d)"; base="$(basename "$inner")"; base="${base%.*}"
     work="$tmp/$base.docx"; cp -f "$inner" "$work"
     n_emf="$(unzip -l "$work" 2>/dev/null | grep -icE '\.(emf|wmf|x-emf)$' || true)"
-    if [[ "$n_emf" -gt 0 ]]; then
+    # Stripping the metafiles helps a soffice that CRASHES on them. It does not
+    # help a soffice that hangs: the second attempt would simply spend another
+    # CONV_TIMEOUT to arrive at pandoc anyway.
+    if [[ "$n_emf" -gt 0 && $skip_soffice -eq 0 ]]; then
       zip -dq "$work" 'word/media/*.emf' 'word/media/*.wmf' 'word/media/*.x-emf' 2>/dev/null || true
       if produced="$(_soffice_html "$work")"; then
         { printf '<!-- 3GPP-MCP-DEGRADED: emf-wmf-stripped; soffice HTML export crashed on embedded vector metafiles; %s figure(s) omitted; text+tables intact -->\n' "$n_emf"

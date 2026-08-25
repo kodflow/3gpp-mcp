@@ -957,3 +957,24 @@ func TestNoShellTestsIsNotAFailure(t *testing.T) {
 		t.Fatalf("an empty scripts/ must be silent, got n=%d err=%v", n, err)
 	}
 }
+
+// Shell tests live in scripts/ AND in scripts/<pkg>/. A single-level glob would
+// silently ignore scripts/lib/convert_test.sh — which is precisely the "written,
+// green, executed by nobody" failure the runner exists to end.
+func TestShellTestsAreFoundInSubdirectoriesToo(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	lib := filepath.Join(ctx.Root, "scripts", "lib")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(ctx.Root, "scripts", "top_test.sh"), "#!/usr/bin/env bash\nexit 0\n")
+	write(t, filepath.Join(lib, "nested_test.sh"), "#!/usr/bin/env bash\nexit 0\n")
+
+	n, err := runShellTests(ctx)
+	if err != nil {
+		t.Fatalf("both pass, so the step must: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("ran %d shell test(s), want 2 — the nested one must not be missed", n)
+	}
+}
