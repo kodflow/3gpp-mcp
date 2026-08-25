@@ -875,3 +875,35 @@ func TestTheSeriesComesFromTheArchiveDirectory(t *testing.T) {
 		t.Fatalf("a line with no archive path reaches no series, got %v", got)
 	}
 }
+
+// The index step must supply the ceilings freeze-hnsw reads, because the DuckDB
+// defaults are the slow path AND the failing one.
+//
+// Unset, the spill budget is 90% of whatever the disk happens to have free, which
+// races the corpus file it is being written into: the 2026-08-25 run reported
+// "Espace insuffisant sur le disque" with 57 GB free. With both ceilings set, the
+// same 2 748 971 vectors froze in 1m46 instead of 19m05.
+func TestTheIndexStepSuppliesItsOwnCeilings(t *testing.T) {
+	t.Setenv("HNSW_BUILD_MEMORY_LIMIT", "")
+	t.Setenv("HNSW_BUILD_TEMP_LIMIT", "")
+	if got := envOr("HNSW_BUILD_MEMORY_LIMIT", "8GB"); got != "8GB" {
+		t.Fatalf("unset must fall back to the step's own default, got %q", got)
+	}
+	if got := envOr("HNSW_BUILD_TEMP_LIMIT", "20GB"); got != "20GB" {
+		t.Fatalf("unset must fall back to the step's own default, got %q", got)
+	}
+}
+
+// An operator overriding a ceiling must win: the machine they are on is not
+// necessarily the one these defaults were measured for.
+func TestAnOperatorCeilingOverridesTheDefault(t *testing.T) {
+	t.Setenv("HNSW_BUILD_MEMORY_LIMIT", "24GB")
+	if got := envOr("HNSW_BUILD_MEMORY_LIMIT", "8GB"); got != "24GB" {
+		t.Fatalf("the operator's value must win, got %q", got)
+	}
+	// Whitespace is not a value — it is an unset variable that went through a shell.
+	t.Setenv("HNSW_BUILD_TEMP_LIMIT", "   ")
+	if got := envOr("HNSW_BUILD_TEMP_LIMIT", "20GB"); got != "20GB" {
+		t.Fatalf("a blank value must fall back, got %q", got)
+	}
+}
