@@ -126,24 +126,77 @@ impl Store {
         let buf = std::env::var("MERGE_COPY_MEMORY_LIMIT").unwrap_or_else(|_| "12GB".into());
 
         let esc = |p: &str| p.replace('\'', "''");
-        let sql = format!(
-            "SET temp_directory = '{}';
-             SET memory_limit = '{buf}';
-             SET preserve_insertion_order = false;
-             ATTACH '{}' AS copy_src (READ_ONLY);
-             ATTACH '{}' AS copy_dst;
-             COPY FROM DATABASE copy_src TO copy_dst;
-             DETACH copy_dst;
-             DETACH copy_src;",
-            esc(&tmp.to_string_lossy()),
-            esc(src),
-            esc(dst)
-        );
-        let res = conn
-            .execute_batch(&sql)
-            .with_context(|| format!("compact copy {src} -> {dst}"));
+
+        // COPY FROM DATABASE WOULD BRING THE FTS INDEX ACROSS, AND MERGE REBUILDS IT.
+        //
+        // It copies every schema, including the six internal tables DuckDB's fts
+        // extension keeps under fts_main_clauses — a BM25 index over 2.75 M clauses.
+        // merge then calls enable_fts(), whose PRAGMA is overwrite=1, so all of that is
+        // dropped and built again. The corpus pays for the same index twice and the
+        // copy carries gigabytes it will throw away.
+        //
+        // So copy the MAIN schema table by table instead. The table list is read from
+        // the source's own catalogue rather than hard-coded, so a new table cannot be
+        // silently left behind the way a stale list would leave it.
+        //
+        // The secondary indexes come off for the duration: maintaining three ART
+        // indexes across 2.75 M row-by-row inserts costs far more than building them
+        // once at the end over settled data.
+        {
+            let d = Self::open_rw(dst).context("bootstrap destination schema")?;
+            d.conn.execute_batch(
+                "DROP INDEX IF EXISTS clauses_spec;
+                 DROP INDEX IF EXISTS clauses_rel;
+                 DROP INDEX IF EXISTS clauses_path;",
+            )?;
+            d.checkpoint()?;
+        }
+
+        let res = (|| -> Result<()> {
+            conn.execute_batch(&format!(
+                "SET temp_directory = '{}';
+                 SET memory_limit = '{buf}';
+                 SET preserve_insertion_order = false;
+                 ATTACH '{}' AS copy_src (READ_ONLY);
+                 ATTACH '{}' AS copy_dst;",
+                esc(&tmp.to_string_lossy()),
+                esc(src),
+                esc(dst)
+            ))
+            .context("attach for compact copy")?;
+
+            let tables: Vec<String> = {
+                let mut st = conn.prepare(
+                    "SELECT table_name FROM duckdb_tables()
+                      WHERE database_name = 'copy_src' AND schema_name = 'main'
+                      ORDER BY table_name",
+                )?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.filter_map(std::result::Result::ok).collect()
+            };
+            for t in &tables {
+                // Column order is identical — both sides were bootstrapped from the same
+                // schema.sql — so SELECT * is the right shape, not a shortcut.
+                conn.execute_batch(&format!(
+                    "INSERT INTO copy_dst.main.\"{t}\" SELECT * FROM copy_src.main.\"{t}\";"
+                ))
+                .with_context(|| format!("copy table {t}"))?;
+            }
+            conn.execute_batch("DETACH copy_dst; DETACH copy_src;")?;
+            Ok(())
+        })();
+
         let _ = std::fs::remove_dir_all(&tmp);
-        res?;
+        res.with_context(|| format!("compact copy {src} -> {dst}"))?;
+
+        // Rebuild the secondary indexes once, over data that is now settled.
+        let d = Self::open_rw(dst).context("reopen destination")?;
+        d.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS clauses_spec ON clauses (spec_id);
+             CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release);
+             CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path);",
+        )?;
+        d.checkpoint()?;
         Ok(())
     }
 
@@ -1952,6 +2005,61 @@ mod tests {
         );
 
         drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The copy must NOT carry the FTS index, because merge rebuilds it.
+    //
+    // COPY FROM DATABASE copies every schema, including the six internal tables the fts
+    // extension keeps under fts_main_clauses. merge then calls enable_fts(), whose
+    // PRAGMA is overwrite=1 — so a BM25 index over 2.75 M clauses was copied at length
+    // and immediately thrown away. Measured on the real corpus: the copy is the whole
+    // cost of a merge (77 of 79 minutes).
+    #[test]
+    fn the_compact_copy_leaves_the_rebuildable_fts_behind() {
+        let dir = std::env::temp_dir().join(format!("storers-fts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.duckdb");
+        let dst = dir.join("dst.duckdb");
+        for p in [&src, &dst] { let _ = std::fs::remove_file(p); }
+        let (s1, d1) = (src.to_str().unwrap().to_string(), dst.to_str().unwrap().to_string());
+        {
+            let s = Store::open_rw(&s1).unwrap();
+            s.raw().execute_batch(
+                "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   SELECT i,'23.501','Rel-19','h'||i, 'the quick brown fox jumps over the lazy dog number '||i
+                   FROM range(2000) t(i);").unwrap();
+            s.enable_fts().unwrap();
+            s.checkpoint().unwrap();
+            let n: i64 = s.raw().query_row(
+                "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'", [], |r| r.get(0)).unwrap();
+            eprintln!("SOURCE: {n} table(s) internes FTS");
+            assert!(n > 0, "la source doit bien avoir un index FTS");
+        }
+        Store::copy_database_compact(&s1, &d1).unwrap();
+        let d = Store::open_rw(&d1).unwrap();
+
+        let n: i64 = d.raw().query_row(
+            "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "the FTS index must not be copied — merge rebuilds it");
+
+        // Everything that is NOT rebuildable must still make the trip.
+        let rows: i64 = d.raw().query_row("SELECT count(*) FROM clauses", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2000, "every clause must survive the copy");
+        let specs: i64 = d.raw().query_row("SELECT count(*) FROM specs", [], |r| r.get(0)).unwrap();
+        assert_eq!(specs, 1, "the catalogue travels too");
+
+        // And the secondary indexes, dropped for the bulk insert, must be back.
+        let idx: i64 = d.raw().query_row(
+            "SELECT count(*) FROM duckdb_indexes() WHERE index_name IN
+               ('clauses_spec','clauses_rel','clauses_path')", [], |r| r.get(0)).unwrap();
+        assert_eq!(idx, 3, "the secondary indexes must be rebuilt after the bulk insert");
+
+        // The rebuild itself must still work on the copy.
+        d.enable_fts().expect("FTS must be buildable on the copied corpus");
+
+        drop(d);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
