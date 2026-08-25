@@ -387,10 +387,35 @@ func stepIndex(t corpusTarget) *Step {
 			if rep.Embedded == 0 {
 				return fmt.Errorf("refusing to build a vector index over zero vectors in %s", t.DB)
 			}
-			c.Log.Printf("freezing the HNSW index over %d vectors in %s", rep.Embedded, t.DB)
-			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Echo: true})
+			// GIVE THE BUILD ITS CEILINGS. THE DEFAULTS ARE THE SLOW PATH.
+			//
+			// freeze-hnsw reads HNSW_BUILD_MEMORY_LIMIT and HNSW_BUILD_TEMP_LIMIT, and
+			// the step never set either — so DuckDB used its own defaults: a buffer
+			// sized from physical RAM, and a spill budget of 90% of whatever the disk
+			// happened to have free. That is not a guard, it is a race between the
+			// index and the file it is being written into: the 2026-08-25 run reported
+			// "Espace insuffisant sur le disque" with 57 GB free, because the spill was
+			// allowed to claim 51 of them while the corpus was still growing.
+			//
+			// With both set, the same 2 748 971 vectors froze in 1m46 instead of 19m05
+			// and without the failure. An operator can still override either.
+			env := []string{
+				"HNSW_BUILD_MEMORY_LIMIT=" + envOr("HNSW_BUILD_MEMORY_LIMIT", "8GB"),
+				"HNSW_BUILD_TEMP_LIMIT=" + envOr("HNSW_BUILD_TEMP_LIMIT", "20GB"),
+			}
+			c.Log.Printf("freezing the HNSW index over %d vectors in %s (%s)", rep.Embedded, t.DB, strings.Join(env, " "))
+			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
 		},
 	}
+}
+
+// envOr returns the process environment's value for `key`, or `def` when it is unset
+// or empty. Used for the tuning ceilings a step supplies but an operator may override.
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
 // ------------------------------------------------------------------ validate
