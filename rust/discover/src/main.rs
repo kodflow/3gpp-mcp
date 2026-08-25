@@ -175,7 +175,7 @@ fn main() {
             print!("{lines}");
             eprintln!(
                 "repair-plan: upstream_missing={} upstream_stale={} corpus_holes={} overlap={} -> repair_specs={} \
-                 ({} un-encodable, {} holes absent from the status report)",
+                 ({} un-encodable, {} holes absent from the status report, recovered from the anchor)",
                 c.upstream_missing,
                 c.upstream_stale,
                 c.corpus_holes,
