@@ -406,15 +406,54 @@ func stepValidate() *Step {
 			return []string{c.dataPath("3gpp.duckdb")}, nil
 		},
 		Run: func(c *Ctx) error {
-			args := []string{"--db", c.dataPath("3gpp.duckdb"), "--report", "text"}
-			args = append(args, strings.Fields(c.Cfg("contract_flags"))...)
-			c.Log.Printf("contract: %s", c.Cfg("contract_flags"))
+			args := validateArgs(c)
+			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg("contract_flags"), corpus3GPP().Floor(c))
 			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Echo: true}); err != nil {
 				return err
 			}
 			return validateAnchor(c)
 		},
 	}
+}
+
+// validateArgs builds the contract command line.
+//
+// --require-embed-complete is FLOOR-AWARE, and the only floor that makes it mean
+// anything is the one `embed` actually ran with: clauses below it are deliberately
+// left NULL (cmd/validate: "Below-floor/legacy clauses are intentionally NULL and
+// never counted"). Leaving the floor out made the contract demand vectors for a
+// population embed was never asked to cover, and it failed a corpus that was in
+// fact complete — 413 pre-Rel-99 LCS clauses (GSM-era 03.71) against
+// embed_floor="Rel-99", while validate counted at floor "".
+//
+// An explicit --embed-floor in contract_flags still wins: an operator overriding
+// the contract by hand is a decision, not an accident.
+func validateArgs(c *Ctx) []string {
+	args := []string{"--db", c.dataPath("3gpp.duckdb"), "--report", "text"}
+	flags := strings.Fields(c.Cfg("contract_flags"))
+	args = append(args, flags...)
+	if floor := corpus3GPP().Floor(c); floor != "" && !hasFlag(flags, "--embed-floor") {
+		args = append(args, "--embed-floor", floor)
+	}
+	return args
+}
+
+// hasFlag reports whether `name` (given as "--embed-floor") is already present in
+// a hand-written flag list. Go's flag package accepts one dash or two, and a value
+// either as the next argument or after "=", so all four spellings must match or the
+// caller would silently pass the flag twice.
+func hasFlag(args []string, name string) bool {
+	short := strings.TrimPrefix(name, "-") // "-embed-floor" -> "embed-floor"
+	for _, a := range args {
+		a = strings.TrimLeft(a, "-")
+		if i := strings.IndexByte(a, '='); i >= 0 {
+			a = a[:i]
+		}
+		if a == strings.TrimLeft(short, "-") {
+			return true
+		}
+	}
+	return false
 }
 
 // --------------------------------------------------------------------- smoke
