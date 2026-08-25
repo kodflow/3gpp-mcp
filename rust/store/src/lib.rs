@@ -178,6 +178,76 @@ impl Store {
 
     /// delete_spec_release purges one (spec_id, release) bucket from the merged DB so a
     /// fresher shard can replace it (== Go merge --base bucket replacement).
+    /// stash_bucket_vectors snapshots the vectors of the given (spec, release) buckets,
+    /// keyed by the TEXT they describe, so a bucket replacement can hand them back to
+    /// every clause whose wording did not change. Returns the number of distinct texts
+    /// kept. Call it BEFORE delete_spec_release, and restore_stashed_vectors after the
+    /// fold.
+    ///
+    /// Without it, re-ingesting a spec whose text is identical still throws its vectors
+    /// away: the shard carries no embeddings, the delete takes the base's with it, and
+    /// the next embed pass pays the GPU again for work already done. The 2026-08-25
+    /// repair re-embedded 211 511 clauses that way, on a corpus where almost nothing had
+    /// actually changed — the ledger normally hides this by matching content hashes from
+    /// a 31 GB sidecar, which is a lot of disk to solve a problem merge can avoid making.
+    ///
+    /// embedding_hash is sha(heading+text+model), so a row keyed by identical heading+text
+    /// keeps a hash that is still true — the model identity cannot change mid-merge.
+    pub fn stash_bucket_vectors(&self, buckets: &[(String, String)]) -> Result<usize> {
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS carry_vecs;")
+            .context("drop carry_vecs")?;
+        if buckets.is_empty() {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE carry_vecs (heading VARCHAR, text VARCHAR,
+                                               embedding FLOAT[1024], embedding_hash VARCHAR);",
+            )?;
+            return Ok(0);
+        }
+        // GROUP BY the key: one bucket can hold the same heading+text twice, and a
+        // duplicated join key would multiply rows on the way back.
+        let pairs = buckets
+            .iter()
+            .map(|(s, r)| format!("({}, {})", q(s), q(r)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE carry_vecs AS
+                 SELECT heading, text,
+                        any_value(embedding)      AS embedding,
+                        any_value(embedding_hash) AS embedding_hash
+                 FROM clauses
+                 WHERE embedding IS NOT NULL AND (spec_id, release) IN ({pairs})
+                 GROUP BY heading, text;"
+            ))
+            .context("stash_bucket_vectors")?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM carry_vecs", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// restore_stashed_vectors gives the stashed vectors back to every clause that still
+    /// lacks one and whose heading+text matches. Returns how many rows were revived.
+    pub fn restore_stashed_vectors(&self) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE clauses
+                    SET embedding      = c.embedding,
+                        embedding_hash = c.embedding_hash
+                   FROM carry_vecs c
+                  WHERE clauses.embedding IS NULL
+                    AND clauses.heading = c.heading
+                    AND clauses.text    = c.text",
+                [],
+            )
+            .context("restore_stashed_vectors")?;
+        self.conn.execute_batch("DROP TABLE IF EXISTS carry_vecs;")?;
+        Ok(n)
+    }
+
     pub fn delete_spec_release(&self, spec_id: &str, release: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM clauses WHERE spec_id = ? AND release = ?",
@@ -1508,6 +1578,82 @@ mod tests {
 
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A bucket replacement must not throw away the vectors of text that did not change.
+    //
+    // merge deletes a (spec, release) bucket and folds the shard's rows in its place, and
+    // the shard carries no embeddings. So a re-ingested spec whose wording is untouched
+    // came out unvectorised, and the next embed pass paid the GPU all over again — 211 511
+    // clauses on the 2026-08-25 repair, for a corpus where almost nothing had changed.
+    #[test]
+    fn replacing_a_bucket_keeps_the_vectors_of_unchanged_text() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h1','unchanged'),
+                   (2,'23.501','Rel-19','h2','will be rewritten');",
+            )
+            .unwrap();
+        s.raw()
+            .execute_batch(&format!(
+                "UPDATE clauses SET
+                   embedding = (SELECT list(CAST(i AS FLOAT)) FROM range({DENSE_DIM}) t(i))::FLOAT[{DENSE_DIM}],
+                   embedding_hash = 'sha-' || heading;"
+            ))
+            .unwrap();
+
+        let buckets = vec![("23.501".to_string(), "Rel-19".to_string())];
+        let stashed = s.stash_bucket_vectors(&buckets).unwrap();
+        assert_eq!(stashed, 2, "both texts must be kept");
+
+        // Replay what merge does: drop the bucket, then insert the shard's rows — same
+        // wording for h1, new wording for h2, and no embeddings on either.
+        s.delete_spec_release("23.501", "Rel-19").unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (10,'23.501','Rel-19','h1','unchanged'),
+                   (11,'23.501','Rel-19','h2','rewritten in the new revision');",
+            )
+            .unwrap();
+
+        let revived = s.restore_stashed_vectors().unwrap();
+        assert_eq!(revived, 1, "only the unchanged text may be revived");
+
+        let (id, hash): (u64, String) = s
+            .raw()
+            .query_row(
+                "SELECT chunk_id, embedding_hash FROM clauses WHERE embedding IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, 10, "the vector must land on the NEW row, not the deleted one");
+        assert_eq!(hash, "sha-h1", "the hash travels with the vector it describes");
+
+        // The rewritten clause must stay unvectorised: handing it a stale vector would be
+        // worse than the GPU cost this whole mechanism exists to avoid.
+        let nulls: i64 = s
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM clauses WHERE embedding IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+    }
+
+    /// Stashing nothing must still leave a usable table: merge calls restore
+    /// unconditionally, and a missing carry_vecs would abort a legitimate empty run.
+    #[test]
+    fn stashing_an_empty_bucket_set_is_not_an_error() {
+        let s = Store::in_memory().unwrap();
+        assert_eq!(s.stash_bucket_vectors(&[]).unwrap(), 0);
+        assert_eq!(s.restore_stashed_vectors().unwrap(), 0);
     }
 }
 
