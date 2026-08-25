@@ -403,6 +403,56 @@ impl Walker {
     }
 }
 
+/// salvage_numbered_text segments plain text on 3GPP clause numbering, for documents
+/// whose HTML carries no heading markup at all.
+///
+/// Used only as a last resort by `parse_html_clauses` when the structured walk found
+/// nothing — a document converted by the doc-text-salvage path, which dumps the text
+/// into one <pre>. The numbering is still there; only the markup is gone.
+///
+/// A table-of-contents line is NOT a heading: it ends with the page number the entry
+/// points at ("1<tab>Scope<tab>5"). Taking those would produce a duplicate, empty
+/// clause for every real one.
+fn salvage_numbered_text(text: &str) -> Vec<ParsedClause> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| Regex::new(r"^(\d+(?:\.\d+)*)[ \t]+(\S.*)$").unwrap());
+    static TOC: OnceLock<Regex> = OnceLock::new();
+    let toc = TOC.get_or_init(|| Regex::new(r"[ \t]+\d+$").unwrap());
+
+    let mut out: Vec<ParsedClause> = Vec::new();
+    let mut buf = String::new();
+    let mut id = 0u64;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if let Some(c) = re.captures(line) {
+            let heading = c[2].trim();
+            if !toc.is_match(heading) {
+                if let Some(cur) = out.last_mut() {
+                    cur.text = buf.trim().to_string();
+                }
+                buf.clear();
+                id += 1;
+                out.push(ParsedClause {
+                    chunk_id: id,
+                    clause_path: c[1].to_string(),
+                    heading: heading.to_string(),
+                    text: String::new(),
+                    is_normative: true,
+                });
+                continue;
+            }
+        }
+        if !line.trim().is_empty() {
+            buf.push_str(line.trim());
+            buf.push('\n');
+        }
+    }
+    if let Some(cur) = out.last_mut() {
+        cur.text = buf.trim().to_string();
+    }
+    out
+}
+
 /// contains_heading reports whether `n`'s subtree holds an h1-h6.
 ///
 /// Used to tell a text block that merely LOOKS like a leaf from one that wraps a
@@ -447,6 +497,25 @@ pub fn parse_html_clauses(
     w.flush();
     // silence unused-field warnings on the metadata the ingest will read off each clause.
     let _ = (&w.spec_id, &w.release, &w.version);
+
+    // A DOCUMENT THAT SEGMENTS INTO NOTHING IS A SALVAGE CASE, NOT AN EMPTY ONE.
+    //
+    // When soffice cannot render a legacy .doc at all, the conversion falls back to
+    // dumping the text into a single <pre>. There is no heading markup left, so the
+    // walk above yields zero clauses — while ingest still writes the catalogue row,
+    // which is exactly a missing_content hole. Six releases of TS 34.123-1 sat in that
+    // state.
+    //
+    // The 3GPP numbering survives in the TEXT ("4.1<tab>Test Methodology"), so segment
+    // on that instead of discarding the document. This runs ONLY when the structured
+    // walk found nothing, so it cannot change how a well-formed spec is parsed.
+    if w.clauses.is_empty() {
+        let salvaged = salvage_numbered_text(&node_text(doc.tree.root()));
+        if !salvaged.is_empty() {
+            return (salvaged, w.saw_change_history, true);
+        }
+    }
+
     (w.clauses, w.saw_change_history, w.degraded)
 }
 
@@ -632,5 +701,69 @@ mod nested_heading_tests {
         assert_eq!(clauses.len(), 1, "a bullet list must not split the clause");
         assert!(clauses[0].text.contains("the first requirement"));
         assert!(clauses[0].text.contains("the second requirement"));
+    }
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+
+    // A document with no heading markup at all must still segment.
+    //
+    // When soffice cannot render a legacy .doc, the conversion dumps the text into a
+    // single <pre>. The structured walk finds no heading and yields zero clauses, while
+    // ingest still writes the catalogue row — which is exactly a missing_content hole.
+    // Six releases of TS 34.123-1 sat in that state through four repair runs.
+    #[test]
+    fn a_headingless_salvage_still_segments_on_the_numbering() {
+        let html = "<html><body><pre>\n\
+            3GPP TS 34.123-1 V10.7.0 (2013-12)\n\
+            \n\
+            1\tScope\t5\n\
+            4\tOverview\t6\n\
+            \n\
+            3\tDefinitions and abbreviations\n\
+            Void\n\
+            \n\
+            4\tOverview\n\
+            \n\
+            4.1\tTest Methodology\n\
+            The requirements are provided in Release 11.\n\
+            </pre></body></html>";
+        let (clauses, _, degraded) = parse_html_clauses(html, "34.123-1", "Rel-10", "10.7.0");
+
+        assert!(degraded, "a salvaged parse must be flagged degraded");
+        let paths: Vec<&str> = clauses.iter().map(|c| c.clause_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["3", "4", "4.1"],
+            "the table of contents must not become clauses: {paths:?}"
+        );
+        assert_eq!(clauses[0].heading, "Definitions and abbreviations");
+        assert!(
+            clauses[2].text.contains("provided in Release 11"),
+            "prose must land under the clause that precedes it: {:?}",
+            clauses[2].text
+        );
+    }
+
+    // The salvage must NEVER pre-empt a document the structured walk can read: it runs
+    // only when that walk produced nothing.
+    #[test]
+    fn a_well_formed_document_is_not_salvaged() {
+        let html = "<html><body><h1>6.1 Requirements</h1><p>1 is not a heading here.</p></body></html>";
+        let (clauses, _, degraded) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert_eq!(clauses.len(), 1, "the structured walk owns this document");
+        assert!(!degraded, "a clean parse must not be flagged degraded");
+        assert!(clauses[0].text.contains("1 is not a heading here"));
+    }
+
+    // Text with no numbering at all yields nothing rather than one giant clause: a
+    // document we genuinely cannot segment must stay visible as a hole.
+    #[test]
+    fn unnumbered_text_is_not_forced_into_a_clause() {
+        let html = "<html><body><pre>just some prose\nand more prose\n</pre></body></html>";
+        let (clauses, _, _) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert!(clauses.is_empty(), "got {clauses:?}");
     }
 }
