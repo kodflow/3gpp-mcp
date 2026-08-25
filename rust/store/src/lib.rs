@@ -553,14 +553,70 @@ impl Store {
             anyhow::bail!("no embeddings to index");
         }
         self.set_meta("hnsw_state", "building")?;
-        self.conn
-            .execute_batch(
-                "CHECKPOINT;
-                 INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
-                 CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
-                 CHECKPOINT;",
-            )
-            .context("build hnsw")?;
+
+        // CAP THE BUFFER MANAGER FOR THE DURATION OF THE BUILD.
+        //
+        // A vss HNSW index lives OUTSIDE DuckDB's buffer manager: it is held whole
+        // in RAM for the entire build and never spills. At DENSE_DIM float32 that
+        // is 4 KB per row for the vectors alone — 2 443 844 rows is ~10 GB before
+        // the graph. Meanwhile memory_limit defaults to ~80% of physical RAM, so
+        // the buffer manager and the index each believe they may take most of the
+        // machine, and nothing arbitrates between them.
+        //
+        // On a 28 GB host that ended at 46.7 GB of committed virtual memory with
+        // 1.0 GB left, the pagefile eating the last 5 GB of free disk, and the
+        // build still unfinished after 1 h 54 of CPU — thrashing, not progressing.
+        //
+        // So give the buffer manager a fixed, modest budget and leave the rest of
+        // the machine to the structure that has nowhere else to go. What the buffer
+        // manager does NOT fit, it spills to temp_directory — the build materialises
+        // the whole embedding column, so the spill is measured in GB, not MB. That
+        // spill is the second ceiling, and it is a DISK one: see below.
+        let buf = std::env::var("HNSW_BUILD_MEMORY_LIMIT").unwrap_or_else(|_| "4GB".into());
+
+        // Operator overrides, unset by default so DuckDB keeps its own defaults
+        // wherever they are sane. HNSW_BUILD_TEMP_LIMIT is the escape hatch for the
+        // disk ceiling documented in the error path below; HNSW_BUILD_THREADS trades
+        // build speed for a smaller concurrent materialisation.
+        let mut knobs = String::new();
+        if let Ok(t) = std::env::var("HNSW_BUILD_TEMP_LIMIT") {
+            knobs.push_str(&format!("SET max_temp_directory_size = '{t}';"));
+        }
+        if let Ok(n) = std::env::var("HNSW_BUILD_THREADS") {
+            knobs.push_str(&format!("SET threads = {n};"));
+        }
+
+        // preserve_insertion_order is pure cost here: HNSW is an unordered structure
+        // and the scan feeding it has no ORDER BY, so holding the row order only
+        // widens the materialisation that has to spill.
+        let sql = format!(
+            "CHECKPOINT;
+             SET memory_limit = '{buf}';
+             SET preserve_insertion_order = false;
+             {knobs}
+             INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
+             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
+             CHECKPOINT;"
+        );
+        self.conn.execute_batch(&sql).map_err(|e| {
+            let cause = e.to_string();
+            // DuckDB reports the spill ceiling as "Out of Memory Error", which sends
+            // every reader after the RAM. It is not RAM. max_temp_directory_size
+            // defaults to 90% of the FREE SPACE on the temp drive, so a nearly-full
+            // disk silently caps the spill at a few GiB and the build dies against
+            // that cap twenty minutes in. Raising memory_limit only changes how fast
+            // it gets there. Say so, in the error, where it costs nothing to read.
+            if cause.contains("max_temp_directory_size") {
+                anyhow::anyhow!(
+                    "build hnsw ({count} vectors, buffer budget {buf}): out of TEMP DISK, not RAM. \
+                     'max_temp_directory_size' defaults to 90% of the free space on the drive \
+                     holding DuckDB's temp_directory, so a full disk caps the spill. Free space on \
+                     that drive, or set HNSW_BUILD_TEMP_LIMIT to pick the cap yourself.\n\ncaused by: {cause}"
+                )
+            } else {
+                anyhow::anyhow!("build hnsw (buffer budget {buf}, {count} vectors)\n\ncaused by: {cause}")
+            }
+        })?;
         for (k, v) in [
             ("hnsw_metric", "cosine"),
             ("embedding_dim", "1024"),
