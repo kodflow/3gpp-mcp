@@ -318,6 +318,25 @@ impl Walker {
                     return;
                 }
                 "p" | "li" | "pre" | "dd" | "dt" => {
+                    // A HEADING NESTED IN A TEXT BLOCK IS STILL A HEADING.
+                    //
+                    // LibreOffice renders Word's auto-numbered headings as an ordered
+                    // list — <ol><li><h1>Scope</h1></li></ol> — because that is what
+                    // Word's numbering IS. Treating <li> as a leaf swallowed the <h1>
+                    // into the running text, so the walker never opened a clause and
+                    // the document parsed to ZERO clauses.
+                    //
+                    // upsert_version still wrote the catalogue row, which is exactly a
+                    // missing_content hole: the corpus promises a spec it holds no text
+                    // for. TR 25.890, TR 25.933, TS 34.123-1 and a dozen more sat in
+                    // that state through four repair runs, re-fetched and re-converted
+                    // every time, because the file was always fine and the walk was not.
+                    if contains_heading(n) {
+                        for c in n.children() {
+                            self.walk(c);
+                        }
+                        return;
+                    }
                     let txt = node_text(n);
                     if !txt.is_empty() {
                         self.buf.push_str(&txt);
@@ -382,6 +401,22 @@ impl Walker {
             self.clauses.push(cur);
         }
     }
+}
+
+/// contains_heading reports whether `n`'s subtree holds an h1-h6.
+///
+/// Used to tell a text block that merely LOOKS like a leaf from one that wraps a
+/// heading. LibreOffice emits Word's auto-numbered headings as <ol><li><h1>…</h1></li>,
+/// so a walker that stops at <li> never sees them.
+fn contains_heading(n: ego_tree::NodeRef<scraper::Node>) -> bool {
+    for c in n.descendants() {
+        if let scraper::Node::Element(e) = c.value() {
+            if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// parse_html_clauses walks a converted spec's HTML into clause-leaf chunks, in the same
@@ -540,5 +575,62 @@ mod tests {
         );
         assert_eq!(clauses[0].text, "This document specifies the system.");
         assert_eq!(clauses[3].text, "Sub annex text.");
+    }
+}
+
+#[cfg(test)]
+mod nested_heading_tests {
+    use super::*;
+
+    // A heading wrapped in a list item is still a heading.
+    //
+    // LibreOffice renders Word's auto-numbered headings as an ordered list —
+    // <ol><li><h1>Scope</h1></li></ol> — because that is what Word's numbering IS.
+    // The walker treated <li> as a leaf and returned without descending, so the <h1>
+    // was swallowed into the running text, no clause was ever opened, and the whole
+    // document parsed to ZERO clauses. upsert_version still wrote the catalogue row,
+    // which is exactly a missing_content hole: the corpus promising text it does not
+    // hold. TR 25.890, TR 25.933 and TS 33.900 sat in that state through four repair
+    // runs — re-fetched and re-converted every time, because the file was always fine
+    // and the walk was not.
+    #[test]
+    fn a_heading_inside_a_list_item_still_opens_a_clause() {
+        let html = r#"<html><body>
+            <ol>
+              <li><h1><a name="x"></a>Scope</h1></li>
+              <li><h2>General</h2></li>
+            </ol>
+            <p>The purpose of this document is to capture the discussions.</p>
+        </body></html>"#;
+        let (clauses, _, _) = parse_html_clauses(html, "25.890", "Rel-5", "1.0.0");
+        assert!(
+            clauses.len() >= 2,
+            "both nested headings must open clauses, got {}: {:?}",
+            clauses.len(),
+            clauses.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            clauses.iter().any(|c| c.heading.contains("Scope")),
+            "the first heading must survive: {:?}",
+            clauses.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            clauses.iter().any(|c| c.text.contains("capture the discussions")),
+            "the prose after the headings must land in a clause"
+        );
+    }
+
+    // A list item that is only text must still behave as one: descending into every
+    // <li> would turn ordinary bullet lists into clause boundaries.
+    #[test]
+    fn a_plain_list_item_is_still_body_text() {
+        let html = r#"<html><body>
+            <h1>6.1 Requirements</h1>
+            <ul><li>the first requirement</li><li>the second requirement</li></ul>
+        </body></html>"#;
+        let (clauses, _, _) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert_eq!(clauses.len(), 1, "a bullet list must not split the clause");
+        assert!(clauses[0].text.contains("the first requirement"));
+        assert!(clauses[0].text.contains("the second requirement"));
     }
 }
