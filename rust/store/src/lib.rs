@@ -60,6 +60,24 @@ impl Store {
     pub fn open_rw(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open duckdb rw {path}"))?;
         conn.execute_batch(SCHEMA_SQL).context("bootstrap schema")?;
+
+        // A WRITER MUST BE ABLE TO BIND AN HNSW INDEX THAT IS ALREADY THERE.
+        //
+        // Once `clauses` carries a frozen HNSW, DuckDB refuses to modify the table
+        // — or even to CHECKPOINT — unless the extension providing that index type
+        // is loaded: "Cannot bind index 'clauses', unknown index type 'HNSW'. You
+        // need to load the extension ... before table 'clauses' can be modified."
+        //
+        // A first run never sees this: the index does not exist yet. It appears on
+        // the SECOND pass, which is exactly the incremental path this pipeline is
+        // built for — ETSI re-ingesting into an already-indexed etsi.duckdb hit it.
+        //
+        // Best-effort on purpose: a build without vss must still open a corpus that
+        // has no HNSW. If the index IS there and vss is missing, the later write
+        // fails with DuckDB's own message, which says precisely what is wrong.
+        let _ = conn.execute_batch(
+            "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
+        );
         Ok(Self { conn })
     }
 
@@ -1441,6 +1459,55 @@ mod tests {
             "fresh clauses need vectors"
         );
         assert_eq!(done, "done");
+    }
+
+    // A writer must be able to touch a corpus that ALREADY carries a frozen HNSW.
+    //
+    // DuckDB refuses to modify — or even CHECKPOINT — a table whose index type it
+    // cannot bind, so a Store that opens without vss works on the FIRST pass and
+    // fails on every incremental one. ETSI re-ingesting into an already-indexed
+    // etsi.duckdb is precisely that second pass, and it failed with
+    // "Cannot bind index 'clauses', unknown index type 'HNSW'".
+    #[test]
+    fn a_writer_can_modify_a_corpus_that_already_carries_a_frozen_hnsw() {
+        let dir = std::env::temp_dir().join(format!("storers-hnswrw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("corpus.duckdb");
+        let _ = std::fs::remove_file(&p);
+        let path = p.to_str().unwrap().to_string();
+
+        // First pass: build the corpus and freeze the index, then CLOSE it, so the
+        // second open sees the index on disk exactly as a later step would.
+        {
+            let s = Store::open_rw(&path).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES
+                       (1,'23.501','h1','t1'),(2,'23.501','h2','t2');",
+                )
+                .unwrap();
+            s.raw()
+                .execute_batch(&format!(
+                    "UPDATE clauses SET embedding =
+                       (SELECT list(CAST(i AS FLOAT)) FROM range({DENSE_DIM}) t(i))::FLOAT[{DENSE_DIM}];"
+                ))
+                .unwrap();
+            s.build_and_freeze_hnsw("test-model").unwrap();
+        }
+
+        // Second pass: the index exists. Both the write and the checkpoint must work.
+        let s = Store::open_rw(&path).unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES (3,'23.501','h3','t3');",
+            )
+            .expect("a writer must bind the existing HNSW before modifying clauses");
+        s.checkpoint()
+            .expect("checkpoint must not fail on a corpus that carries an HNSW");
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
