@@ -882,6 +882,11 @@ impl Store {
     /// the right version and `clauses` holds nothing: that is what `anchorcheck` calls
     /// missing_content, and skipping it makes the hole permanent. So the clause side is
     /// checked too, which is also what makes this safe to use as the repair path.
+    ///
+    /// And the clause COUNT is compared, not merely its existence, because the version
+    /// describes the DOCUMENT and not the parse. Fixing the walker so that a heading
+    /// wrapped in a list item opens a clause took TR 25.890 from 0 to 41 clauses at the
+    /// very same version — content a version check would have refused to let in.
     pub fn changed_buckets(&self, shard_path: &str) -> Result<Vec<(String, String)>> {
         self.conn.execute_batch(&format!(
             "ATTACH '{}' AS s (READ_ONLY)",
@@ -893,11 +898,18 @@ impl Store {
                    FROM s.spec_versions sv
                    LEFT JOIN spec_versions b
                      ON b.spec_id = sv.spec_id AND b.release = sv.release
-                   LEFT JOIN (SELECT DISTINCT spec_id, release FROM clauses) c
+                   LEFT JOIN (SELECT spec_id, release, count(*) AS n FROM clauses GROUP BY 1,2) c
                      ON c.spec_id = sv.spec_id AND c.release = sv.release
-                  WHERE b.version IS NULL      -- never seen
-                     OR b.version <> sv.version -- moved
-                     OR c.spec_id IS NULL       -- catalogued but textless: a HOLE",
+                   LEFT JOIN (SELECT spec_id, release, count(*) AS n FROM s.clauses GROUP BY 1,2) sc
+                     ON sc.spec_id = sv.spec_id AND sc.release = sv.release
+                  WHERE b.version IS NULL          -- never seen
+                     OR b.version <> sv.version    -- the document moved
+                     OR c.spec_id IS NULL          -- catalogued but textless: a HOLE
+                     -- The PARSE moved at the same version. Guarded by sc.n IS NOT NULL:
+                     -- a shard holding NO clauses for a bucket the corpus does hold text
+                     -- for must never trigger a fold, because the fold would delete that
+                     -- text and insert nothing in its place.
+                     OR (sc.n IS NOT NULL AND c.n IS DISTINCT FROM sc.n)",
             )?;
             let rows =
                 st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -1971,6 +1983,106 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+
+        // A REPARSE AT THE SAME VERSION MUST STILL BE FOLDED.
+        //
+        // The version describes the DOCUMENT, not the parse. Fixing the walker so a
+        // heading wrapped in a list item opens a clause took TR 25.890 from 0 to 41
+        // clauses at the very same version — content a version check would have
+        // refused to let in, leaving the hole open after the bug that caused it was
+        // fixed.
+        //
+        // Its own directory: the assertions above end by removing theirs.
+        let dir2 = std::env::temp_dir().join(format!("storers-reparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let sp2 = dir2.join("shard.duckdb");
+        let _ = std::fs::remove_file(&sp2);
+        let shard = sp2.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                       ('23.501','Rel-19','19.7.0'),
+                       ('24.501','Rel-19','19.9.0'),
+                       ('34.123-1','Rel-10','10.7.0');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let reparsed = Store::in_memory().unwrap();
+        reparsed
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');
+                 -- 23.501 is at the same version but the corpus holds FEWER clauses
+                 -- than the shard now produces: the parse moved.
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t'),
+                   (3,'34.123-1','Rel-10','h','t');",
+            )
+            .unwrap();
+        // The shard holds TWO clauses for 23.501 where the corpus holds one.
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                       (10,'23.501','Rel-19','h1','t1'),
+                       (11,'23.501','Rel-19','h2','t2'),
+                       (12,'24.501','Rel-19','h','t'),
+                       (13,'34.123-1','Rel-10','h','t');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        assert_eq!(
+            reparsed.changed_buckets(&shard).unwrap(),
+            vec![("23.501".to_string(), "Rel-19".to_string())],
+            "a bucket whose PARSE produced more clauses must be re-folded"
+        );
+
+        // AND THE COUNT RULE MUST NEVER DESTROY TEXT.
+        //
+        // A shard that holds no clauses for a bucket the corpus DOES hold text for must
+        // not trigger a fold: the fold deletes the bucket and inserts the shard's rows,
+        // so folding an empty one would replace a good spec with nothing. The very
+        // first assertion in this test is that case — a shard carrying only catalogue
+        // rows — and it stays skipped.
+        let empty_shard_dir = dir2.join("empty");
+        std::fs::create_dir_all(&empty_shard_dir).unwrap();
+        let esp = empty_shard_dir.join("shard.duckdb");
+        let empty_shard = esp.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&empty_shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version)
+                       VALUES ('23.501','Rel-19','19.7.0');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let holder = Store::in_memory().unwrap();
+        holder
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version)
+                   VALUES ('23.501','Rel-19','19.7.0');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   VALUES (1,'23.501','Rel-19','h','t');",
+            )
+            .unwrap();
+        assert!(
+            holder.changed_buckets(&empty_shard).unwrap().is_empty(),
+            "an empty shard must never replace a bucket the corpus holds text for"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     // `--resume` must be able to ask the CORPUS what is already held, not only the
