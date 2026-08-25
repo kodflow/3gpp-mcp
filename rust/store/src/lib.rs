@@ -810,6 +810,68 @@ impl Store {
     /// Vectors are copied as-is; the caller rebuilds FTS + HNSW once on the merged DB
     /// (per-shard HNSW indexes are not concatenable — internal/store/CLAUDE.md).
     pub fn fold_shard(&self, shard_path: &str, offset: u64) -> Result<()> {
+        self.fold_shard_buckets(shard_path, offset, None)
+    }
+
+    /// changed_buckets returns the shard's (spec, release) pairs whose version DIFFERS
+    /// from what this database already holds — new specs included.
+    ///
+    /// A shard is rebuilt from every converted HTML of its series, so after one full
+    /// pass it carries the whole series whether or not anything moved. Replaying all of
+    /// it through delete-then-insert is not merely wasted time: DuckDB does not reclaim
+    /// the deleted blocks, so re-folding 745 unchanged specs to bring in 5 changed ones
+    /// grew a 26 GB corpus past 43 GB on a single shard, and the run died on disk.
+    ///
+    /// The version is the right key. It is what `spec_versions` records, what the delta
+    /// anchor compares, and what a re-ingest bumps when the document actually changes.
+    pub fn changed_buckets(&self, shard_path: &str) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS s (READ_ONLY)",
+            shard_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self.conn.prepare(
+                "SELECT sv.spec_id, sv.release
+                   FROM s.spec_versions sv
+                   LEFT JOIN spec_versions b
+                     ON b.spec_id = sv.spec_id AND b.release = sv.release
+                  WHERE b.version IS NULL OR b.version <> sv.version",
+            )?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH s")?;
+        Ok(out)
+    }
+
+    /// fold_shard_buckets folds a shard, optionally restricted to the given (spec,
+    /// release) buckets. `None` folds everything (== the old behaviour).
+    pub fn fold_shard_buckets(
+        &self,
+        shard_path: &str,
+        offset: u64,
+        only: Option<&[(String, String)]>,
+    ) -> Result<()> {
+        // The row filter is applied to the clause-bearing tables only. The catalogue
+        // inserts are ON CONFLICT DO NOTHING, so replaying them costs nothing and keeps
+        // a spec's catalogue row present even when its text did not move.
+        let (clause_where, sparse_where) = match only {
+            None => (String::new(), String::new()),
+            Some(bs) => {
+                let pairs = bs
+                    .iter()
+                    .map(|(s, r)| format!("({}, {})", q(s), q(r)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(" WHERE (spec_id, release) IN ({pairs})"),
+                    format!(
+                        " WHERE chunk_id IN (SELECT chunk_id FROM s.clauses WHERE (spec_id, release) IN ({pairs}))"
+                    ),
+                )
+            }
+        };
         let sql = format!(
             "ATTACH '{shard_path}' AS s (READ_ONLY);
              INSERT INTO specs SELECT * FROM s.specs ON CONFLICT DO NOTHING;
@@ -819,8 +881,9 @@ impl Store {
              INSERT INTO clauses
                SELECT chunk_id + {offset}, spec_id, release, version, clause_path, heading, text,
                       is_normative, embedding, embedding_hash
-               FROM s.clauses;
-             INSERT INTO clause_sparse SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse;
+               FROM s.clauses{clause_where};
+             INSERT INTO clause_sparse
+               SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse{sparse_where};
              INSERT INTO changes SELECT * FROM s.changes;
              INSERT INTO evolutions SELECT * FROM s.evolutions;
              DETACH s;"
@@ -1720,6 +1783,69 @@ mod tests {
         let s = Store::in_memory().unwrap();
         assert_eq!(s.stash_bucket_vectors(&[]).unwrap(), 0);
         assert_eq!(s.restore_stashed_vectors().unwrap(), 0);
+    }
+
+    // A merge must replace only what MOVED.
+    //
+    // A shard is rebuilt from every converted HTML of its series, so after one full pass
+    // it carries the whole series whether or not anything changed. Replacing every
+    // bucket is delete-then-insert, DuckDB does not reclaim the deleted blocks, and
+    // re-folding 745 unchanged specs to bring in 5 changed ones took a 26 GB corpus past
+    // 43 GB on ONE shard. Three merges died on disk before the cause turned out to be
+    // the work itself rather than the machine.
+    #[test]
+    fn only_the_buckets_whose_version_moved_are_replaced() {
+        let dir = std::env::temp_dir().join(format!("storers-changed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = dir.join("shard.duckdb");
+        let _ = std::fs::remove_file(&sp);
+        let shard = sp.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                       ('23.501','Rel-19','19.7.0'),   -- same as base  -> untouched
+                       ('24.501','Rel-19','19.9.0'),   -- newer than base -> changed
+                       ('34.123-1','Rel-10','10.7.0'); -- absent from base -> new",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        let base = Store::in_memory().unwrap();
+        base.raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.2.0');",
+            )
+            .unwrap();
+
+        let mut got = base.changed_buckets(&shard).unwrap();
+        got.sort();
+        let want = vec![
+            ("24.501".to_string(), "Rel-19".to_string()),
+            ("34.123-1".to_string(), "Rel-10".to_string()),
+        ];
+        assert_eq!(got, want, "a bucket at the SAME version must not be replaced");
+
+        // And a shard that moved nothing yields nothing, so merge can skip it whole.
+        let same = Store::in_memory().unwrap();
+        same.raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');",
+            )
+            .unwrap();
+        assert!(
+            same.changed_buckets(&shard).unwrap().is_empty(),
+            "an unchanged shard must be skippable entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The base copy must RECLAIM, not clone.
