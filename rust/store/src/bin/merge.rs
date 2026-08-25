@@ -59,7 +59,11 @@ fn main() -> Result<()> {
     let mut base_fps: HashMap<String, String> = HashMap::new();
     let _ = std::fs::remove_file(&args.out);
     if !args.base.is_empty() {
-        std::fs::copy(&args.base, &args.out).with_context(|| format!("copy base {}", args.base))?;
+        // COMPACT copy, not std::fs::copy — see Store::copy_database_compact. A byte
+        // clone carried the previous run's dead space and the stale HNSW into the new
+        // file, so the corpus grew on every incremental merge and the growth compounded.
+        Store::copy_database_compact(&args.base, &args.out)
+            .with_context(|| format!("copy base {}", args.base))?;
         let b = Store::open_rw(&args.out).context("open base copy")?;
         for (name, _, _, _) in identity::SUBJECTS {
             base_fps.insert(name.to_string(), b.get_meta(&format!("subject_fp_{name}"))?);
