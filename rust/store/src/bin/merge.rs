@@ -86,19 +86,56 @@ fn main() -> Result<()> {
         // when its wording is untouched, and the next embed pass pays the GPU for work
         // already done (211 511 clauses on the 2026-08-25 repair). Stash before the
         // delete, hand back after the fold.
+        // ONLY REPLACE WHAT ACTUALLY MOVED.
+        //
+        // A shard is rebuilt from every converted HTML of its series, so after one full
+        // pass it carries the whole series whether or not anything changed. Replacing
+        // every bucket it holds is not just wasted work: the replacement is
+        // delete-then-insert, DuckDB does not reclaim the deleted blocks, and re-folding
+        // 745 unchanged specs to bring in 5 changed ones took a 26 GB corpus past 43 GB
+        // on ONE shard and killed the run on disk. Three merges died that way before the
+        // cause was the work itself rather than the machine it ran on.
         let mut carried = 0usize;
+        let mut buckets: Vec<(String, String)> = Vec::new();
         if !args.base.is_empty() {
-            let buckets = store.shard_spec_releases(shard)?;
+            buckets = store.changed_buckets(shard)?;
+            if buckets.is_empty() {
+                eprintln!("merge: skipped {shard} (nothing changed)");
+                continue;
+            }
             store.stash_bucket_vectors(&buckets)?;
             for (spec, rel) in &buckets {
                 store.delete_spec_release(spec, rel)?;
             }
         }
         let offset = store.max_chunk_id()?;
-        store.fold_shard(shard, offset)?;
+        let only = if args.base.is_empty() {
+            None
+        } else {
+            Some(buckets.as_slice())
+        };
+        store.fold_shard_buckets(shard, offset, only)?;
         if !args.base.is_empty() {
             carried = store.restore_stashed_vectors()?;
         }
+
+        // CHECKPOINT PER SHARD, NOT ONCE AT THE END.
+        //
+        // A bucket replacement is delete-then-insert, and DuckDB only reclaims the
+        // deleted blocks at a CHECKPOINT. Folding twenty shards with a single
+        // checkpoint at the end therefore accumulates every shard's dead space for
+        // the whole run and hands it back too late — the file has already peaked.
+        //
+        // Measured: a base compacted to 25.9 GB reached 43.8 GB after two small
+        // shards and part of a third, and only the final checkpoint would have given
+        // any of it back (the 2026-08-25 run's end-of-merge checkpoint returned 9 GB
+        // in one go, which is the same effect arriving uselessly late).
+        //
+        // Checkpointing per shard costs a flush each time and keeps the file near the
+        // size of what it actually holds, which is the difference between a merge
+        // that fits on the disk and one that does not.
+        store.checkpoint()?;
+
         eprintln!("merge: folded {shard} (chunk_id offset {offset}, {carried} vector(s) carried)");
     }
 
