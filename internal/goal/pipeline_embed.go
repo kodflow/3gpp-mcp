@@ -397,11 +397,19 @@ func stepIndex(t corpusTarget) *Step {
 			// "Espace insuffisant sur le disque" with 57 GB free, because the spill was
 			// allowed to claim 51 of them while the corpus was still growing.
 			//
-			// With both set, the same 2 748 971 vectors froze in 1m46 instead of 19m05
-			// and without the failure. An operator can still override either.
+			// The values are the ones a real build was measured at: 2 748 971 vectors
+			// froze in 19m05 with a 10 GB buffer and a 16 GB spill cap.
+			//
+			// They were briefly 8 GB, taken from a 1m46 run — which was a no-op, since
+			// that corpus already carried the index and CREATE INDEX IF NOT EXISTS did
+			// nothing. Calibrating on it produced a budget too small for the real thing:
+			// "could not allocate block of size 256.0 KiB (7.4 GiB/7.4 GiB used)". A
+			// timing taken from a step that skipped its own work is not a measurement.
+			//
+			// An operator can still override either.
 			env := []string{
-				"HNSW_BUILD_MEMORY_LIMIT=" + envOr("HNSW_BUILD_MEMORY_LIMIT", "8GB"),
-				"HNSW_BUILD_TEMP_LIMIT=" + envOr("HNSW_BUILD_TEMP_LIMIT", "20GB"),
+				"HNSW_BUILD_MEMORY_LIMIT=" + envOr("HNSW_BUILD_MEMORY_LIMIT", "10GB"),
+				"HNSW_BUILD_TEMP_LIMIT=" + envOr("HNSW_BUILD_TEMP_LIMIT", "16GB"),
 			}
 			c.Log.Printf("freezing the HNSW index over %d vectors in %s (%s)", rep.Embedded, t.DB, strings.Join(env, " "))
 			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
