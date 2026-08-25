@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -511,9 +512,9 @@ func stepTest() *Step {
 	return &Step{
 		Name:      "test",
 		Version:   1,
-		Doc:       "run the Go unit and contract suites",
+		Doc:       "run the Go unit and contract suites, and the shell tests",
 		Deps:      []string{"build-go"},
-		Impl:      []string{"cmd", "internal", "go.mod", "go.sum"},
+		Impl:      []string{"cmd", "internal", "go.mod", "go.sum", "scripts"},
 		Toolchain: true,
 		Outputs:   func(c *Ctx) []string { return []string{c.statePath("test-report.txt")} },
 		Run: func(c *Ctx) error {
@@ -525,12 +526,54 @@ func stepTest() *Step {
 			if err := c.Run(Cmd{Name: "go", Args: args, Echo: true}); err != nil {
 				return err
 			}
+			shells, err := runShellTests(c)
+			if err != nil {
+				return err
+			}
 			// Keep the evidence on disk: the final report cites this file rather
 			// than asking the reader to take "tests passed" on trust.
 			return WriteAtomic(c.statePath("test-report.txt"),
-				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n", os.Getenv("GOTAGS"))))
+				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n%d shell test(s): PASS\n",
+					os.Getenv("GOTAGS"), shells)))
 		},
 	}
+}
+
+// runShellTests runs every scripts/*_test.sh and returns how many passed.
+//
+// They existed and nothing ran them. `scripts/etsi-corpus_test.sh` and
+// `scripts/kaggle-gpu-check_test.sh` were both written, both green, and both
+// invisible to `go test ./...` — which is to say they protected nothing. The
+// mktemp break they now guard against is precisely the kind that only shows on
+// one platform, so leaving their execution to whoever remembers is leaving it to
+// nobody.
+//
+// A missing bash is FATAL here rather than skipped: the pipeline already requires
+// bash for corpus.sh and etsi-corpus.sh, so "no bash" means the run was never
+// going to work, and quietly passing a test step would say the opposite.
+func runShellTests(c *Ctx) (int, error) {
+	pattern := filepath.Join(c.Root, "scripts", "*_test.sh")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return 0, err
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		c.Log.Printf("no scripts/*_test.sh found")
+		return 0, nil
+	}
+	for _, f := range files {
+		rel, relErr := filepath.Rel(c.Root, f)
+		if relErr != nil {
+			rel = f
+		}
+		c.Log.Printf("shell test: %s", filepath.ToSlash(rel))
+		if err := c.Run(Cmd{Name: "bash", Args: []string{filepath.ToSlash(rel)}, Echo: true}); err != nil {
+			return 0, fmt.Errorf("shell test %s failed: %w", filepath.ToSlash(rel), err)
+		}
+	}
+	c.Log.Printf("%d shell test(s) passed", len(files))
+	return len(files), nil
 }
 
 // stageRuntimeDLLs copies the compiler runtime next to the Rust binaries on

@@ -907,3 +907,53 @@ func TestAnOperatorCeilingOverridesTheDefault(t *testing.T) {
 		t.Fatalf("a blank value must fall back, got %q", got)
 	}
 }
+
+// Shell tests must be RUN, not merely written.
+//
+// scripts/etsi-corpus_test.sh and scripts/kaggle-gpu-check_test.sh were both
+// written, both green, and both invisible to `go test ./...` — so they protected
+// nothing. The mktemp break one of them guards is exactly the sort that only
+// appears on one platform, which is the sort a forgotten test never catches.
+func TestShellTestsAreDiscoveredAndRun(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	scripts := filepath.Join(ctx.Root, "scripts")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(scripts, "a_test.sh"), "#!/usr/bin/env bash\nexit 0\n")
+	write(t, filepath.Join(scripts, "b_test.sh"), "#!/usr/bin/env bash\nexit 0\n")
+	// Not a test: must be ignored rather than executed.
+	write(t, filepath.Join(scripts, "helper.sh"), "#!/usr/bin/env bash\nexit 1\n")
+
+	n, err := runShellTests(ctx)
+	if err != nil {
+		t.Fatalf("both shell tests pass, so the step must: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("ran %d shell test(s), want 2 (helper.sh is not one)", n)
+	}
+}
+
+// A failing shell test must FAIL the step. A runner that swallows the result is
+// worse than no runner: it reports green over a broken script.
+func TestAFailingShellTestFailsTheStep(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	scripts := filepath.Join(ctx.Root, "scripts")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(scripts, "broken_test.sh"), "#!/usr/bin/env bash\nexit 1\n")
+
+	if _, err := runShellTests(ctx); err == nil {
+		t.Fatal("a failing shell test must fail the step")
+	}
+}
+
+// No shell tests at all is not an error — it is a repository that has none yet.
+func TestNoShellTestsIsNotAFailure(t *testing.T) {
+	ctx, _ := newTestCtx(t)
+	n, err := runShellTests(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("an empty scripts/ must be silent, got n=%d err=%v", n, err)
+	}
+}
