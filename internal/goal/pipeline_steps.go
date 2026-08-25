@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -69,9 +71,9 @@ func runDiscover(c *Ctx) error {
 	if strings.TrimSpace(series) == "" {
 		series = "[]"
 	}
-	if err := WriteAtomic(c.statePath("series.json"), []byte(series+"\n")); err != nil {
-		return err
-	}
+	// series.json is written AFTER the work list, not here: in repair mode the work
+	// list can reach series the delta never flagged, and ingest walks series.json.
+	// See the union below.
 
 	// Two work-lists, and they are NOT the same set.
 	//
@@ -105,7 +107,32 @@ func runDiscover(c *Ctx) error {
 		return err
 	}
 
+	// WHAT IS ACQUIRED MUST BE WHAT IS READ.
+	//
+	// series.json (from the DELTA) and worklist.txt (from the repair plan) are two
+	// independent computations, and `ingest` walks series.json. So a hole in a series
+	// the delta did not flag was fetched, converted — and then never ingested, with
+	// nothing in any log to say so. Six 34.123-1 holes survived a fully successful
+	// repair exactly that way on 2026-08-25: the work list carried all six, the
+	// series list carried no "34", and the converted HTML sat on disk unread.
+	//
+	// Union the work list's own series in. A series that appears only in the delta
+	// still belongs (that is the ordinary path), and one that appears only in the
+	// repair set now belongs too.
 	names := parseSeries(series)
+	if extra := seriesNotIn(names, seriesInWorklist(wl)); len(extra) > 0 {
+		c.Log.Printf("repair reaches %d series the delta did not flag — %s", len(extra), strings.Join(extra, " "))
+		names = append(names, extra...)
+		sort.Strings(names)
+	}
+	merged, err := json.Marshal(names)
+	if err != nil {
+		return err
+	}
+	if err := WriteAtomic(c.statePath("series.json"), append(merged, '\n')); err != nil {
+		return err
+	}
+
 	c.Log.Printf("delta: %d series to (re)index — %s", len(names), strings.Join(names, " "))
 	c.Log.Printf("worklist: %d (spec, release) pairs", strings.Count(wl, "\n")+1)
 	c.Checkpoint("series", strconv.Itoa(len(names)))
@@ -116,6 +143,42 @@ func parseSeries(s string) []string {
 	var out []string
 	if err := json.Unmarshal([]byte(s), &out); err != nil {
 		return nil
+	}
+	return out
+}
+
+// seriesRe pulls the series number out of an archive URL: the "34" of
+// ".../archive/34_series/34.123-1/34123-1-a70.zip". The directory is the
+// authority — deriving it from the file name means re-deciding where a spec id
+// ends, which is the kind of parsing that gets 34.123-1 wrong.
+var seriesRe = regexp.MustCompile(`/(\d{2})_series/`)
+
+// seriesInWorklist returns the DISTINCT series a "<release> <url> <name>" work
+// list actually reaches, sorted.
+func seriesInWorklist(wl string) []string {
+	seen := map[string]bool{}
+	for _, m := range seriesRe.FindAllStringSubmatch(wl, -1) {
+		seen[m[1]] = true
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// seriesNotIn returns the members of `want` that `have` does not already carry.
+func seriesNotIn(have, want []string) []string {
+	in := make(map[string]bool, len(have))
+	for _, s := range have {
+		in[s] = true
+	}
+	var out []string
+	for _, s := range want {
+		if !in[s] {
+			out = append(out, s)
+		}
 	}
 	return out
 }

@@ -104,22 +104,46 @@ impl Store {
         let _ = conn.execute_batch(
             "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
         );
-        // The copy streams, but give the buffer manager a fixed budget anyway: the
-        // default is a share of physical RAM, and this runs on a box where the HNSW
-        // build already has to be told not to take the whole machine.
-        let buf = std::env::var("MERGE_COPY_MEMORY_LIMIT").unwrap_or_else(|_| "4GB".into());
+
+        // A MEMORY LIMIT WITHOUT A TEMP DIRECTORY IS A GUARANTEED OOM, NOT A GUARD.
+        //
+        // This connection is in-memory, and an in-memory DuckDB has NOWHERE to spill:
+        // capping the buffer manager without giving it a temp directory does not make
+        // the copy careful, it makes the copy die. That is exactly what happened —
+        // 70 minutes of CPU, nothing written, then
+        //
+        //   Failed to create checkpoint: Out of Memory Error: could not allocate block
+        //   of size 256.0 KiB (3.7 GiB/3.7 GiB used)
+        //
+        // against a 4 GB cap. So point temp_directory at the DESTINATION's own folder
+        // (the volume that must have room for the result anyway) before capping
+        // anything, and give the cap enough headroom that spilling is the exception.
+        let tmp = std::path::Path::new(dst)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("compact-copy.tmp"))
+            .unwrap_or_else(|| std::path::PathBuf::from("compact-copy.tmp"));
+        let buf = std::env::var("MERGE_COPY_MEMORY_LIMIT").unwrap_or_else(|_| "12GB".into());
+
         let esc = |p: &str| p.replace('\'', "''");
-        conn.execute_batch(&format!(
-            "SET memory_limit = '{buf}';
+        let sql = format!(
+            "SET temp_directory = '{}';
+             SET memory_limit = '{buf}';
+             SET preserve_insertion_order = false;
              ATTACH '{}' AS copy_src (READ_ONLY);
              ATTACH '{}' AS copy_dst;
              COPY FROM DATABASE copy_src TO copy_dst;
              DETACH copy_dst;
              DETACH copy_src;",
+            esc(&tmp.to_string_lossy()),
             esc(src),
             esc(dst)
-        ))
-        .with_context(|| format!("compact copy {src} -> {dst}"))?;
+        );
+        let res = conn
+            .execute_batch(&sql)
+            .with_context(|| format!("compact copy {src} -> {dst}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        res?;
         Ok(())
     }
 
