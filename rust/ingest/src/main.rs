@@ -191,7 +191,26 @@ fn write_spec(store: &Store, meta: &SpecMeta, html: &str, offset: u64) -> Result
             )?;
         }
     }
-    store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
+    // A DOCUMENT THAT YIELDED NO CLAUSE DOES NOT GET TO CLAIM THE SPEC.
+    //
+    // One archive can hold several documents for the same (spec, version): TR 30.531
+    // v1.64.0 ships a 6 KB plenary cover note beside two 1.6 MB drafts. They are walked
+    // in name order, the cover sorts first, it parses to nothing — and marking it
+    // "done" made --resume skip the drafts that carry the actual text. The spec was
+    // then catalogued with no clauses behind it, which is a missing_content hole
+    // produced by the ingest itself.
+    //
+    // Marking "done" only when something was parsed lets the next candidate for the
+    // same (spec, version) have its turn, and leaves the slot open if none of them
+    // works — which is the honest outcome, and a visible one.
+    if rows.is_empty() {
+        eprintln!(
+            "ingest: {} {} produced no clause — leaving the slot open for another document",
+            meta.spec_id, meta.version
+        );
+    } else {
+        store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
+    }
     Ok(rows.len())
 }
 
@@ -452,5 +471,53 @@ mod tests {
         // Outside that block the byte IS the code point.
         assert_eq!(cp1252_char(0x41), 'A');
         assert_eq!(cp1252_char(0xE9), 'é');
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    // A document that yielded no clause must not claim the (spec, version) slot.
+    //
+    // One archive can hold several documents for the same version: TR 30.531 v1.64.0
+    // ships a 6 KB plenary cover note beside two 1.6 MB drafts. They are walked in name
+    // order, the cover sorts first, it parses to nothing — and marking it "done" made
+    // --resume skip the drafts carrying the actual text. The spec was catalogued with
+    // no clauses behind it: a missing_content hole produced by the ingest itself.
+    #[test]
+    fn an_empty_parse_leaves_the_slot_open() {
+        let store = Store::in_memory().unwrap();
+        let meta = SpecMeta {
+            spec_id: "30.531".into(),
+            series: "30".into(),
+            doc_type: "TR".into(),
+            working_group: "RAN3".into(),
+            release: "Rel-10".into(),
+            version: "1.64.0".into(),
+            docx_url: String::new(),
+        };
+
+        // The cover note: valid HTML, no clause structure at all.
+        let cover = "<html><body><p>Presentation of TR 30.531 for information</p></body></html>";
+        let n = write_spec(&store, &meta, cover, 0).unwrap();
+        assert_eq!(n, 0, "the cover carries no clause");
+        assert!(
+            !store
+                .ingest_done("30.531", "1.64.0", PIPELINE_VERSION)
+                .unwrap(),
+            "an empty parse must NOT mark the version done, or the real draft is skipped"
+        );
+
+        // The real draft, next in the walk, now gets its turn.
+        let draft = "<html><body><h1>4.1 Architecture</h1><p>the actual text</p></body></html>";
+        let n = write_spec(&store, &meta, draft, 100).unwrap();
+        assert!(n > 0, "the draft carries clauses");
+        assert!(
+            store
+                .ingest_done("30.531", "1.64.0", PIPELINE_VERSION)
+                .unwrap(),
+            "a parse that produced clauses DOES claim the version"
+        );
     }
 }
