@@ -243,6 +243,22 @@ fn main() -> Result<()> {
         store.set_meta("producer", "rust-writeside")?;
         store.set_meta("schema_version", "1")?;
         store.checkpoint()?;
+
+        // BUILD THE BM25 INDEX HERE — nothing downstream will.
+        //
+        // The corpus carries TWO indexes: dense HNSW and lexical BM25/FTS. On the
+        // 3GPP side `merge` builds the FTS because merge is what publishes the
+        // corpus; the per-series shards ingest writes are throwaway inputs.
+        //
+        // ETSI has no merge: `ingest --etsi` IS the publish. Leaving the FTS to a
+        // step that never runs shipped an ETSI corpus with only half its indexes —
+        // `validate --require-fts` on etsi.duckdb reported fts_available=false while
+        // the HNSW was frozen and green. Best-effort like merge: a missing extension
+        // degrades search to LIKE, it does not invalidate the corpus.
+        if let Err(e) = store.enable_fts() {
+            eprintln!("ingest: FTS build skipped ({e})");
+        }
+        store.checkpoint()?;
         return Ok(());
     }
 
