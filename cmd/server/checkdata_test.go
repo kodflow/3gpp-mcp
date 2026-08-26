@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -40,5 +41,44 @@ func TestCheckDataContract(t *testing.T) {
 	// No floor: the two clauses are un-embedded → dense incomplete → FAIL.
 	if err := checkData([]string{"--db", db, "--require-fts=false", "--require-hnsw=false", "--require-embed-complete"}); err == nil {
 		t.Error("check-data require-embed-complete on an un-embedded DB should fail, got nil")
+	}
+}
+
+// The gate that fails a `full` image build must ask what the server asks.
+//
+// It compared hnsw_state to "frozen" and stopped there — it never checked the
+// index existed. hnsw_state is a schema_meta row, and rows travel: `merge`
+// compacts with COPY FROM DATABASE, which deliberately leaves custom indexes
+// behind, so a corpus can carry the word "frozen" over nothing at all. This gate
+// is the LAST thing between a data layer and production, and it was the weakest
+// of the three checks of the same property.
+func TestCheckDataRefusesAFrozenFlagOverNoIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liar.duckdb")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-18", Version: "18.6.0", ClausePath: "1", Heading: "h", Text: "t"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Everything a corpus needs to CLAIM a usable index, and no index.
+	for k, v := range map[string]string{
+		"embedding_model": "bge-m3", "hnsw_state": "frozen",
+		"hnsw_metric": "cosine", "embedding_dim": "1024", "embedding_count": "1",
+	} {
+		if err := db.SetMeta(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = db.Close()
+
+	err = checkData([]string{"--db", path, "--require-fts=false", "--require-hnsw"})
+	if err == nil {
+		t.Fatal("check-data passed a corpus whose index does not exist — a full image would ship exact-scan")
+	}
+	if !strings.Contains(err.Error(), "REFUSE") {
+		t.Errorf("the failure must say the server would refuse it, got %q", err)
 	}
 }

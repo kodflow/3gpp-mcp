@@ -28,6 +28,19 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// SchemaSQL is the corpus schema, verbatim. It is exported for the one caller
+// that recreates a table this file declares WITHOUT going through Open:
+// cmd/migrate-paragraphs --restore, which drops the `clauses` compatibility view
+// and has to put back a table whose columns are in exactly the declared order —
+// rust/store copies databases with `INSERT INTO dst SELECT * FROM src`, and that
+// is correct only while both sides agree on that order.
+//
+// Handing out the schema is what keeps them agreeing. A second copy of the DDL
+// written into the tool would be one more place to forget, and this repository
+// has already been bitten three times by a duplicated definition drifting away
+// from its original.
+func SchemaSQL() string { return schemaSQL }
+
 // arraySep separates list elements packed into a single bound parameter before
 // DuckDB string_split() turns them back into a VARCHAR[] (avoids array binding).
 const arraySep = "\x1f"
@@ -38,6 +51,15 @@ type Store struct {
 	ftsAvailable    bool
 	vssAvailable    bool
 	sparseAvailable bool
+	// contentAddressed: this corpus stores paragraphs once and points at them
+	// (ADR 0004). A capability, not an assumption — etsi.duckdb and any
+	// published lexical snapshot still carry the old `clauses` table, and the
+	// same Store serves both.
+	contentAddressed bool
+	// paraFTS: BM25 exists over `paragraphs`. A separate fact from
+	// ftsAvailable, which is about `clauses` — a corpus can be migrated and not
+	// yet re-indexed, and search must degrade rather than fail on it.
+	paraFTS bool
 }
 
 // Open opens (or creates) the DuckDB file at path and applies the schema.
@@ -53,6 +75,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	s.probeContentAddressed(context.Background())
 	return s, nil
 }
 
@@ -66,9 +89,69 @@ func (s *Store) DB() *sql.DB { return s.db }
 // and index built). When false, SearchClauses falls back to LIKE scoring.
 func (s *Store) FTSAvailable() bool { return s.ftsAvailable }
 
+// clauseIndexMarkers bracket the three `CREATE INDEX ... ON clauses` statements
+// in schema.sql. They are the only part of the schema that cannot be applied to
+// a converted corpus, and the marker is in the file itself so the Rust side
+// (Store::open_rw) strips exactly the same statements from exactly the same
+// source.
+const (
+	clauseIndexBegin = "-- @clauses-indexes-begin"
+	clauseIndexEnd   = "-- @clauses-indexes-end"
+)
+
+// schemaFor returns the schema to apply to this database. It is the whole file,
+// minus the `clauses` indexes when that name resolves to a VIEW.
+//
+// After ADR 0004's --drop-clauses the corpus serves `clauses` as a view over the
+// occurrences, and DuckDB refuses `CREATE INDEX ... ON <view>`:
+//
+//	Binder Error: can only create an index on a base table
+//
+// execute_batch is all-or-nothing, so a tool that bootstraps this schema
+// read-write against a converted corpus dies there — before it has read a single
+// row. It is a loud failure rather than a silent one, which is the good news;
+// the bad news is that it stops `freeze-hnsw`, whose whole job is to index a
+// corpus in exactly that state.
+func schemaFor(clausesIsAView bool) string {
+	if !clausesIsAView {
+		return schemaSQL
+	}
+	return SchemaForView()
+}
+
+// clausesIsView reports whether the corpus serves `clauses` as a VIEW, which is
+// what ADR 0004's --drop-clauses leaves behind. Several pieces of DDL are legal
+// against a table and rejected against a view, and each rejection takes down the
+// whole bootstrap.
+func clausesIsView(db *sql.DB) bool {
+	var isView bool
+	if err := db.QueryRow(`SELECT count(*) > 0 FROM duckdb_views()
+		WHERE database_name = current_database() AND schema_name = 'main' AND view_name = 'clauses'`).
+		Scan(&isView); err != nil {
+		return false
+	}
+	return isView
+}
+
+// SchemaForView is the schema with the `clauses` indexes removed — what a corpus
+// serving `clauses` as a view can actually have applied to it. Exported so a test
+// can assert the difference between this and SchemaSQL, which is the whole point
+// of the markers.
+func SchemaForView() string {
+	i := strings.Index(schemaSQL, clauseIndexBegin)
+	j := strings.Index(schemaSQL, clauseIndexEnd)
+	if i < 0 || j < i {
+		return schemaSQL
+	}
+	return schemaSQL[:i] + schemaSQL[j+len(clauseIndexEnd):]
+}
+
 // migrate applies the embedded schema idempotently and records the version.
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(schemaSQL); err != nil {
+	// Asked once, because two statements below depend on it and a converted
+	// corpus answers yes to both.
+	clausesIsAView := clausesIsView(s.db)
+	if _, err := s.db.Exec(schemaFor(clausesIsAView)); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if _, err := s.db.Exec(
@@ -82,9 +165,16 @@ func (s *Store) migrate() error {
 	// column is already present (fresh DBs created from schema.sql above). This
 	// is metadata ABOUT embeddings, so it deliberately does NOT bump
 	// schema_version / SchemaVersion (lexical content is unchanged).
-	if _, err := s.db.Exec(
-		`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
-		return fmt.Errorf("add embedding_hash column: %w", err)
+	// Not on a converted corpus: `clauses` is a view there, DuckDB answers an
+	// ALTER TABLE against it with "Can only modify view with ALTER VIEW
+	// statement", and the view already exposes embedding_hash off `bodies`. The
+	// upgrade is for a lexical snapshot from an older binary, which is by
+	// definition not converted.
+	if !clausesIsAView {
+		if _, err := s.db.Exec(
+			`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
+			return fmt.Errorf("add embedding_hash column: %w", err)
+		}
 	}
 	// Additive upgrade (plan PR-4): provenance on the subject-owned global
 	// `acronyms` table. Without an owning-series column the incremental merge
@@ -753,6 +843,13 @@ func (s *Store) SearchClauses(ctx context.Context, q SearchQuery) ([]model.Searc
 	if q.TopK <= 0 {
 		q.TopK = 10
 	}
+	// Ranking `clauses` ranks VERSIONS: on this corpus the whole twelve-hit
+	// window for "CHECK_IMEI" was one clause repeated across twelve releases,
+	// and the spec that answers it never entered the window. Scoring
+	// deduplicated paragraphs and collapsing to one hit per clause is the fix.
+	if s.contentAddressed {
+		return s.searchClausesCA(ctx, q)
+	}
 	filterSQL, filterArgs := filterClause(q.Filter)
 
 	var sql string
@@ -816,6 +913,14 @@ func (s *Store) ClauseAvailability(ctx context.Context, specID, prefix string) (
 	ordered, err := s.releasesOrdered(ctx, specID)
 	if err != nil {
 		return nil, nil, err
+	}
+	// On a content-addressed corpus this question never touches the text: which
+	// releases carry a clause IS clause_occ. Strictly less work than the scan
+	// below, and the reason the migration makes lineage exact rather than
+	// derived.
+	if s.contentAddressed {
+		out, aErr := s.availabilityCA(ctx, specID, prefix)
+		return out, ordered, aErr
 	}
 	q := `SELECT clause_path, max(heading), list(DISTINCT release)
 	      FROM clauses WHERE spec_id = ?`
@@ -942,6 +1047,9 @@ func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, e
 // GetClauses returns clauses for a spec/version, optionally restricted to a
 // clause-path prefix (e.g. "6.2" for one NF section), ordered by clause path.
 func (s *Store) GetClauses(ctx context.Context, specID, version, clausePrefix string) ([]model.Clause, error) {
+	if s.contentAddressed {
+		return s.getClausesCA(ctx, specID, version, clausePrefix)
+	}
 	q := `SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative
 	      FROM clauses WHERE spec_id = ?`
 	args := []any{specID}
@@ -1234,6 +1342,12 @@ const (
 // a Go post-filter over an over-fetched neighbour set instead. NULL-embedding
 // rows are dropped in Go (they sort last and carry a NULL distance).
 func (s *Store) SearchVectors(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
+	// On a content-addressed corpus the vectors live on `bodies`, one per
+	// distinct text, so the nearest-neighbour scan sees 897 556 rows instead of
+	// 2 752 688 copies of them.
+	if s.contentAddressed {
+		return s.searchVectorsCA(ctx, vec, f, topK)
+	}
 	if topK <= 0 {
 		topK = 10
 	}

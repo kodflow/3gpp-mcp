@@ -77,8 +77,29 @@ func TestMCPTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 11 { // 8 core (CLAUDE.md §5) + li_events + search_api + server_info
-		t.Errorf("want 11 tools, got %d", len(tools.Tools))
+	// A count alone reports that the surface changed but not how, and every time
+	// it fails somebody has to go and look. Name them instead: the 8 core tools
+	// (CLAUDE.md §5) + search_api + server_info + trace_clause, plus li_events
+	// contributed by the `li` subject.
+	wantTools := map[string]bool{
+		"search_spec": true, "get_spec": true, "get_changelog": true, "list_releases": true,
+		"resolve_term": true, "trace_evolution": true, "find_cross_references": true,
+		"list_specs": true, "search_api": true, "server_info": true, "trace_clause": true,
+		"li_events": true,
+	}
+	gotTools := map[string]bool{}
+	for _, tl := range tools.Tools {
+		gotTools[tl.Name] = true
+	}
+	for name := range wantTools {
+		if !gotTools[name] {
+			t.Errorf("tool %q is not exposed", name)
+		}
+	}
+	for name := range gotTools {
+		if !wantTools[name] {
+			t.Errorf("tool %q is exposed but undeclared here — the surface grew without this test noticing", name)
+		}
 	}
 	if got := call(t, c, ctx, "server_info", map[string]any{}); got["lexical"] != true {
 		t.Errorf("server_info lexical = %v, want true", got["lexical"])

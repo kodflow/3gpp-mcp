@@ -15,9 +15,48 @@ absence accepted to get there.
 
 ### Added
 
-- `cmd/goal` + `internal/goal`: a 19-step resumable state machine that owns the
+- **The corpus is stored content-addressed, at paragraph granularity**
+  (`docs/adr/0004`). Each distinct paragraph is stored once, each distinct
+  `(heading, paragraph sequence)` body once, and one occurrence row per real
+  `(spec, release, version, clause)`. **30.25 GB → 12.36 GB**, vectors
+  2 752 688 → 821 146, `smoke` 45 s → 4 s. Splitting on `\n\n` and re-joining
+  reproduces the original for **2 752 688 / 2 752 688** clauses, and the
+  migration asserts it rather than assuming it.
+- Lexical retrieval now ranks deduplicated text instead of versions. The 12-hit
+  window for `CHECK_IMEI` used to be one clause repeated across twelve releases,
+  with the real answer never in it; it is now 8 distinct clauses with TS 29.273
+  at rank 3. **nDCG@10 0.014 → 0.072.**
+- `trace_clause`: paragraph-level provenance. `get_changelog` says a CR touched a
+  clause; this says what the clause SAYS differently — which releases carry each
+  statement, when it was introduced, whether it is gone from the newest one. It
+  reports plainly when a corpus cannot answer that (ETSI is served alongside and
+  is not converted) instead of guessing.
+- `cmd/freeze-hnsw` (Go): the vector index is now built by the side that knows
+  where the vectors are. `rust/store`'s version names `clauses`, which on a
+  converted corpus is a view over 2 752 688 references to 897 556 vectors — and
+  DuckDB will not index a view at all. `internal/store.hnswTarget` already
+  resolved both shapes and was tested on both, so this is a thin front for it.
+- `migrate-paragraphs --restore`, the exact inverse of `--drop-clauses`, and
+  `merge` runs it before folding. `merge --base` compact-copies a corpus **table
+  by table**, so a converted corpus's `clauses` VIEW is left behind and
+  `schema.sql` recreates it empty — the fold would then write the delta into an
+  empty table while `clause_occ` still held every occurrence, with
+  `max_chunk_id()` reading 0 and handing the shard colliding ids. Restoring the
+  shape the write side has always known costs one grouped reconstruction (1 m 47
+  for 2.87 GB) and keeps ADR 0004's layout out of the write side entirely.
+  Proven on a real 46 440-occurrence slice: convert → restore → fold a bucket →
+  convert again loses and invents **0 rows**.
+- The two external overlays acquire themselves (`scripts/fetch-5g-apis.sh` now
+  resolves through the 3GPP archive endpoint; `scripts/fetch-li-asn.sh` is new),
+  so `enrich` no longer depends on files someone fetched by hand.
+- `scripts/local/build-image.sh` builds both images from a locally produced
+  corpus, ETSI included. The `full` image itself has never been built — no
+  container runtime here — but the script was dry-run end to end against a stub
+  `docker`, and CI's `image-smoke` builds the `light` target on every push.
+
+- `cmd/goal` + `internal/goal`: a 20-step resumable state machine that owns the
   whole build — toolchain, build, seed, discover, fetch, ingest, merge, embed,
-  enrich, index, validate, smoke, plus the four ETSI steps. Every step is
+  enrich, paragraphs, index, validate, smoke, plus the four ETSI steps. Every step is
   content-addressed, so `goal plan` shows the differential and
   `goal run --only <steps>` executes a subset **without** skipping its
   preconditions.
@@ -39,6 +78,68 @@ absence accepted to get there.
   well is a draw, and a draw is not a hallucination.
 - The `scripts/*_test.sh` suites now run inside the `test` step. They were
   written, green, and executed by no runner.
+
+### Fixed
+
+- **The in-image data guard was weaker than both.** `mcp-3gpp check-data`, the
+  `RUN` that fails a `full` image build when the inherited data layer is
+  incomplete, compared `hnsw_state` to `"frozen"` and stopped there — it did not
+  even check the index existed. A corpus carrying the word "frozen" over nothing
+  passed it. It now runs `LoadVSS` too and reports `hnsw_usable`, so the last
+  gate before a corpus starts answering queries asks the same question as the
+  thing that will answer them.
+- `scripts/local/build-image.sh` built the **wrong image**: `light` is the last
+  stage in the Dockerfile by design, so a build without `--target full` silently
+  produced the lexical-only image, ignored `DATA_IMAGE`, and tagged it as the
+  full one. It now passes `--target full` and feeds the guard the real contract
+  from `scripts/data-contract.sh` instead of the Dockerfile's two-flag default.
+- Two more in the same script, found by running it against a stub `docker` that
+  prints its argv — the only way a quoting bug shows itself short of a real
+  build. `${CONTRACT:+--build-arg "DATA_CONTRACT_FLAGS=$CONTRACT"}` looks quoted
+  and is not: the expansion is word-split afterwards, so docker received
+  `--build-arg DATA_CONTRACT_FLAGS=--require-fts` followed by two loose
+  positional arguments. And `io.kodflow.3gpp.duckdb.rows` was being filled from
+  `dbcount | head -1`, i.e. `spec_versions=20163` — a catalogue size labelled as
+  a row count, telling an operator the wrong thing about the image they pulled.
+- **`validate --require-hnsw` asked a weaker question than the server.** It
+  checked `hnsw_state` and `HNSWIndexPresent`, which resolves the index name
+  through `hnswTarget()`; the server asks `store.LoadVSS`, which additionally
+  compares `embedding_count` against the vectors actually present. Two checks of
+  the same property, and the gate read green on a corpus the server refused. It
+  now runs `LoadVSS` itself and reports `serve_usable`, so the contract gate
+  fails the build the same way the server would — verified against the exact
+  defect above: "the server would REFUSE this index: embedding count drift".
+- **The server exact-scanned every vector on the shipped corpus, and said
+  nothing.** `store.LoadVSS` — the serve-time gate that decides whether the
+  frozen index may be trusted — looked for `clauses_hnsw` by name, while the
+  index had been moved to `bodies_hnsw` along with the vectors. It reported
+  "hnsw index absent" over a corpus carrying a perfectly good index, fell back
+  to an O(N) exact scan, and returned correct answers slowly with no error
+  anywhere. Behind it sat the same miss again: `schema_meta.embedding_count`
+  still held the pre-conversion 2 207 218 against the 821 146 vectors actually
+  present, so even with the right name the gate failed on "embedding count
+  drift". The guard now follows `hnswTarget()`, and the conversion re-stamps
+  both markers — it is what changed the vector population, so it is what has to
+  say so. Found by running the real server over the real corpus rather than by a
+  test, which is why there are now two.
+- **Every write-side tool failed at bootstrap on a converted corpus.**
+  `schema.sql` carries three `CREATE INDEX ... ON clauses`, and DuckDB answers
+  those against a view with "can only create an index on a base table"; schema
+  application is all-or-nothing on both sides, so `merge`, `embed-io`, the three
+  `enrich` ingesters and `freeze-hnsw` all died before reading a row. Go's
+  `migrate()` had a second one (`ALTER TABLE clauses ADD COLUMN ...` →
+  "Can only modify view with ALTER VIEW statement"). The index statements are now
+  bracketed by markers in `schema.sql` and both readers strip them when the name
+  resolves to a view — markers in the shared file so the two languages cannot
+  drift. Nothing was silently wrong: the tools refused to open rather than
+  corrupting anything. The test that was supposed to catch this applied a
+  two-column stand-in for the schema instead of the schema, and passed
+  throughout; it now applies the real one and asserts the raw form still fails.
+
+### Removed
+
+- The eleven corpus/Kaggle workflows the local pipeline replaced. `ci.yml` and
+  `post-commit.yml` stay — they gate this repository's own commits.
 
 ### Changed
 
