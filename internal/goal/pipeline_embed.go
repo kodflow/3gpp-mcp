@@ -499,7 +499,14 @@ func stepSmoke() *Step {
 		Deps:    []string{"validate"},
 		Impl:    []string{"cmd/server", "internal/mcp", "internal/search"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			in := []string{c.dataPath("3gpp.duckdb")}
+			// The ETSI corpus is served ALONGSIDE, so a change to it changes what
+			// the smoke proves. A step that ignores an input it reads reports
+			// VALID over stale evidence.
+			if etsi := c.dataPath("etsi.duckdb"); fileNonEmpty(etsi) {
+				in = append(in, etsi)
+			}
+			return in, nil
 		},
 		Run: func(c *Ctx) error { return runSmoke(c) },
 	}
@@ -514,7 +521,17 @@ func stepSmoke() *Step {
 // to unit tests and to `cmd/validate` — only a real startup shows it.
 func runSmoke(c *Ctx) error {
 	db := c.dataPath("3gpp.duckdb")
-	cmd := exec.CommandContext(c.Context, c.bin("server"), "serve", "--db", db)
+	args := []string{"serve", "--db", db}
+	// --etsi-db is a shipped flag (cmd/server/main.go) that no end-to-end run had
+	// ever exercised: the ETSI corpus was built, validated, then never served.
+	// Launch the server the way the product is meant to be launched.
+	etsiAttached := false
+	if etsi := c.dataPath("etsi.duckdb"); fileNonEmpty(etsi) {
+		args = append(args, "--etsi-db", etsi)
+		etsiAttached = true
+		c.Log.Printf("attaching the ETSI corpus alongside (split federation)")
+	}
+	cmd := exec.CommandContext(c.Context, c.bin("server"), args...)
 	cmd.Dir = c.Root
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -554,7 +571,7 @@ func runSmoke(c *Ctx) error {
 		select {
 		case r := <-ch:
 			if r.err != nil {
-				return nil, fmt.Errorf("%w (server stderr: %s)", r.err, tailString(stderr.String(), 12))
+				return nil, fmt.Errorf("%w — %s", r.err, serverPostmortem(cmd, &stderr))
 			}
 			var m map[string]any
 			if err := json.Unmarshal([]byte(r.line), &m); err != nil {
@@ -626,6 +643,12 @@ func runSmoke(c *Ctx) error {
 	// THE assertion. The guard prints this exact prefix when it disables vector
 	// search, and a corpus with vectors that is served lexically is a failed goal.
 	errs := stderr.String()
+	// Federation degrades silently by design (a bad etsi.duckdb leaves a 3GPP-only
+	// server running), which is precisely how a corpus stops being served without
+	// anyone noticing. If we asked for it, it has to be there.
+	if etsiAttached && !strings.Contains(errs, "ETSI corpus attached") {
+		return fmt.Errorf("--etsi-db was passed and the server did NOT attach the ETSI corpus — it degraded to 3GPP-only:\n%s", tailString(errs, 20))
+	}
 	if strings.Contains(errs, "semantic disabled") {
 		return fmt.Errorf("the server DISABLED vector search at startup — the embed identity does not match the corpus stamp:\n%s", tailString(errs, 20))
 	}
@@ -655,6 +678,35 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// serverPostmortem turns an EOF on stdout into a statement about the server.
+//
+// The 2026-08-26 03:50 failure read "initialize failed: EOF (server stderr: )" —
+// an empty stderr, which says nothing at all. Two causes, both fixed here: the
+// step never waited for the process, so it could not report an exit code; and it
+// read the builder while os/exec's copier was still filling it, so whatever the
+// server did print could be missing. Waiting first makes stderr complete AND
+// removes the race.
+//
+// The doctrine this serves: never let a guard confound "I cannot measure" with
+// "the condition is violated".
+func serverPostmortem(cmd *exec.Cmd, stderr fmt.Stringer) string {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		how := "the server exited with status 0"
+		if err != nil {
+			how = "the server died: " + err.Error()
+		}
+		if e := strings.TrimSpace(stderr.String()); e != "" {
+			return how + "; stderr:\n" + tailString(e, 12)
+		}
+		return how + " and wrote nothing to stderr"
+	case <-time.After(10 * time.Second):
+		return "the server is still alive but closed its stdout"
+	}
 }
 
 func tailString(s string, lines int) string {
