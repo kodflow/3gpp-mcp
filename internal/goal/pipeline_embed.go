@@ -207,6 +207,18 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 		c.Log.Printf("every clause already carries a vector — nothing to do")
 		return nil
 	}
+
+	// THE WORKLIST READS THROUGH THE VIEW; THE WRITE-BACK CANNOT.
+	//
+	// On a content-addressed corpus (ADR 0004) `clauses` is a view, and DuckDB
+	// answers an UPDATE against it with a hard error. Reading is fine — the
+	// filters land on `clause_occ` and `bodies` before any text is rebuilt, which
+	// is why the export above costs seconds and not hours — so the restore is
+	// deferred to here, AFTER the count. A run with nothing to embed then pays
+	// nothing at all, which is the common case once the corpus is complete.
+	if err := ensureWriteShape(c, db); err != nil {
+		return err
+	}
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
@@ -266,9 +278,18 @@ func stepEnrich() *Step {
 		Version: 1,
 		Doc:     "overlay the DynaReport catalogue, the 5GC OpenAPI corpus and the LI registry",
 		Deps:    []string{"merge"},
-		Impl:    []string{"rust/ingest/src/bin"},
+		// The two fetch scripts are part of this step's implementation now that it
+		// runs them: changing how an overlay is acquired must replay the overlay.
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.statePath("status-report.htm"), c.dataPath("sources", "5g-apis")}, nil
+			// data/sources/asn joins the inputs for the same reason 5g-apis is
+			// already here: acquiring the LI registry must make the overlay dirty,
+			// or the corpus keeps whatever li_events it had.
+			return []string{
+				c.statePath("status-report.htm"),
+				c.dataPath("sources", "5g-apis"),
+				c.dataPath("sources", "asn"),
+			}, nil
 		},
 		Heavy: true,
 		Validate: func(c *Ctx) error {
@@ -300,25 +321,52 @@ func stepEnrich() *Step {
 				return err
 			}
 
-			if apis := c.dataPath("sources", "5g-apis"); dirExists(apis) {
+			// The two external overlays acquire themselves when absent.
+			//
+			// They used to be a log line telling the operator to run a script —
+			// "run scripts/fetch-5g-apis.sh to add it" — which meant a fresh clone
+			// completed all 19 steps, reported success, and served an empty
+			// `search_api` and an empty `li_events`. A pipeline that names the
+			// command instead of running it has not built the product.
+			//
+			// Only when ABSENT, and never fatal. Refreshing is a separate,
+			// deliberate act (OVERLAY_REFRESH=1, or run the scripts): re-fetching
+			// on every enrich would re-download the release archives to discover
+			// nothing changed, and an offline machine must still finish the run
+			// with whatever it already has.
+			apis := c.dataPath("sources", "5g-apis")
+			if !dirExists(apis) || refreshOverlays() {
+				c.Log.Printf("no 5GC OpenAPI corpus — acquiring it (scripts/fetch-5g-apis.sh auto)")
+				if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/fetch-5g-apis.sh", "auto"}, Echo: true}); err != nil {
+					c.Log.Printf("the OpenAPI fetch failed (%v) — continuing with what is on disk", err)
+				}
+			}
+			if dirExists(apis) {
 				c.Log.Printf("5GC OpenAPI overlay")
 				if err := c.Run(Cmd{Name: c.rbin("ingest-openapi"), Args: []string{"--src", apis, "--db", db}, Echo: true}); err != nil {
 					return err
 				}
 			} else {
-				c.Log.Printf("no data/sources/5g-apis — skipping the OpenAPI overlay (run scripts/fetch-5g-apis.sh to add it)")
+				c.Log.Printf("no data/sources/5g-apis and none could be fetched — search_api will answer from nothing")
 			}
 
-			// ingest-li is wired into no workflow and no make target today, while
-			// li_events/asn1_types are in the schema and the `li` subject declares
-			// a footprint. Wire it here rather than leave the tables empty.
+			// The TS 33.128 ASN.1 registry is not published on its own: it rides in
+			// a zip inside the zip of the spec, and this machine purges the origin
+			// archives after conversion, so it has to be refetched rather than
+			// found.
+			if findASN(c) == "" || refreshOverlays() {
+				c.Log.Printf("no TS 33.128 ASN.1 registry — acquiring it (scripts/fetch-li-asn.sh)")
+				if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/fetch-li-asn.sh"}, Echo: true}); err != nil {
+					c.Log.Printf("the LI registry fetch failed (%v) — continuing with what is on disk", err)
+				}
+			}
 			if asn := findASN(c); asn != "" {
 				c.Log.Printf("Lawful Interception registry from %s", filepath.Base(asn))
 				if err := c.Run(Cmd{Name: c.rbin("ingest-li"), Args: []string{"--db", db, "--asn", asn}, Echo: true}); err != nil {
 					return err
 				}
 			} else {
-				c.Log.Printf("no TS33128Payloads .asn found — li_events stays empty")
+				c.Log.Printf("no TS33128Payloads .asn and none could be fetched — li_events stays empty")
 			}
 			return nil
 		},
@@ -377,7 +425,7 @@ func stepIndex(t corpusTarget) *Step {
 		Version: 1,
 		Doc:     "build and freeze the HNSW cosine index over the vectors of " + t.DB,
 		Deps:    t.indexDeps(),
-		Impl:    []string{"rust/store/src/bin/freeze_hnsw.rs"},
+		Impl:    []string{"cmd/freeze-hnsw", "internal/store/hnsw.go"},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The vector index is a DERIVED CACHE of the vectors. Its identity is
 			// the embed identity plus the index parameters; anything else (the
@@ -432,7 +480,11 @@ func stepIndex(t corpusTarget) *Step {
 				"HNSW_BUILD_TEMP_LIMIT=" + envOr("HNSW_BUILD_TEMP_LIMIT", "16GB"),
 			}
 			c.Log.Printf("freezing the HNSW index over %d vectors in %s (%s)", rep.Embedded, t.DB, strings.Join(env, " "))
-			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
+			// The Go builder, not the Rust one: it puts the index on whichever table
+			// holds the vectors. rust/store names `clauses`, which on a converted
+			// corpus is a view over 2 752 688 occurrences of 897 556 vectors — and
+			// DuckDB will not index a view in any case. Both shapes work here.
+			return c.Run(Cmd{Name: c.bin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
 		},
 	}
 }
@@ -859,7 +911,80 @@ func (t corpusTarget) multiProducer() []string {
 // embed alone.
 func (t corpusTarget) indexDeps() []string {
 	if t.Suffix == "" {
-		return []string{"embed", "enrich"}
+		// The 3GPP index is built AFTER the corpus is content-addressed: the
+		// vectors move to `bodies` in that step, and an index built before it
+		// would index the table the step is about to drop.
+		// build-go because the index is now built by cmd/freeze-hnsw.
+		return []string{"embed", "enrich", "paragraphs", "build-go"}
 	}
-	return []string{"embed" + t.Suffix}
+	return []string{"embed" + t.Suffix, "build-go"}
+}
+
+// refreshOverlays reports whether the operator asked for the external overlays
+// to be re-acquired even though they are already on disk.
+//
+// The default is NOT to: the 5GC OpenAPI fetch pulls one archive per release to
+// discover that nothing moved, and an enrich that goes to the network every run
+// is an enrich that fails when the network does. Refreshing is what you do when
+// a new release lands, and saying so is cheap.
+func refreshOverlays() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OVERLAY_REFRESH"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// --------------------------------------------------------------- paragraphs
+
+// stepParagraphs converts the merged corpus to the content-addressed storage of
+// ADR 0004 and drops the table it replaces.
+//
+// It sits between enrich and index, and that position is the whole design. The
+// write side still produces `clauses` with its text and its vectors; running the
+// conversion AFTER embed and enrich means the vectors are simply carried across
+// to the bodies that own them, so neither embed nor the Rust write side has to
+// change. `index` then builds the HNSW where the vectors now live.
+//
+// Without this step a fresh clone would run all nineteen steps and rebuild the
+// OLD shape: the conversion existed only as a tool someone had to remember to
+// run, which is the same failure as the overlays printing the name of a script
+// instead of running it.
+func stepParagraphs() *Step {
+	return &Step{
+		Name:    "paragraphs",
+		Version: 1,
+		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
+		Deps:    []string{"embed", "enrich", "build-go"},
+		Impl:    []string{"cmd/migrate-paragraphs"},
+		Heavy:   true,
+		Inputs: func(c *Ctx) ([]string, error) {
+			return []string{c.dataPath("3gpp.duckdb")}, nil
+		},
+		Outputs: func(c *Ctx) []string { return []string{c.dataPath("3gpp.duckdb")} },
+		Validate: func(c *Ctx) error {
+			// Prove the corpus can still produce the text it used to store,
+			// rather than trusting that the conversion said so earlier.
+			out, err := c.Output(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+				"--db", c.dataPath("3gpp.duckdb"), "--verify",
+			}})
+			if err != nil {
+				return fmt.Errorf("the converted corpus does not verify: %w", err)
+			}
+			if !strings.Contains(out, "clause_occ=") {
+				return fmt.Errorf("verification produced no counters: %q", out)
+			}
+			return nil
+		},
+		Run: func(c *Ctx) error {
+			db := c.dataPath("3gpp.duckdb")
+			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
+			// --drop-clauses is safe to pass unconditionally: the tool refuses to
+			// drop anything unless its own verification passed first, and on an
+			// already-converted corpus the build is a no-op re-derivation.
+			return c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+				"--db", db, "--drop-clauses",
+			}, Echo: true})
+		},
+	}
 }

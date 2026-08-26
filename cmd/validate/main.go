@@ -202,7 +202,7 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		res.add("embed-identity", got == cfg.expectedIdentity, "schema_meta.embedding_model=%q want=%q", got, cfg.expectedIdentity)
 	}
 
-	// require-hnsw — the INDEX must be there, not just the claim that it is.
+	// require-hnsw — the index must be there, AND the server must agree that it is.
 	//
 	// hnsw_state is a schema_meta row, and rows travel. merge compacts the corpus with
 	// COPY FROM DATABASE, which copies the data and deliberately leaves custom indexes
@@ -210,11 +210,26 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	// it describes is gone. Checking only the flag passed a corpus that could answer
 	// lexically and nothing else, which is exactly the failure `smoke` was written to
 	// catch after it shipped for months.
+	//
+	// Checking the flag AND the index was still not enough, and the gap cost a shipped
+	// corpus. This asked HNSWIndexPresent, which resolves the index name through
+	// hnswTarget(); the SERVER asks store.LoadVSS, which did not, and which also
+	// compares embedding_count against the vectors actually present. So the gate read
+	// green while the server it gates refused the same index and exact-scanned every
+	// vector. Two checks of the same property, one converted and one not.
+	//
+	// So ask the question the server asks. LoadVSS never creates an index, and its
+	// error says which of the four conditions failed, which is more than "false".
 	if cfg.requireHNSW {
 		st := db.GetMeta(ctx, "hnsw_state")
 		present := db.HNSWIndexPresent(ctx)
-		res.add("require-hnsw", st == "frozen" && present,
-			"hnsw_state=%q index_present=%v", st, present)
+		if err := db.LoadVSS(ctx); err != nil {
+			res.add("require-hnsw", false,
+				"hnsw_state=%q index_present=%v but the server would REFUSE this index: %v", st, present, err)
+		} else {
+			res.add("require-hnsw", db.VSSAvailable(),
+				"hnsw_state=%q index_present=%v serve_usable=%v", st, present, db.VSSAvailable())
+		}
 	}
 
 	// require-fts — LOAD (never build) then probe availability

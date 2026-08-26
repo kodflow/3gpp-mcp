@@ -246,18 +246,19 @@ chemin autorisé pour étendre la surface. Aujourd'hui : 10 + `li_events` = **11
 ## 6. Pipeline d'ingestion
 
 Depuis le 2026-08-23, tout passe par **une machine** et une seule commande :
-`cmd/goal` + `internal/goal`, une machine à états de **19 étapes** reprenable.
+`cmd/goal` + `internal/goal`, une machine à états de **20 étapes** reprenable.
 Runbook complet : `docs/local-pipeline.md`. Décision : `docs/adr/0003`.
 
 ```
-toolchain ─┬─ build-go ── test
-           ├─ build-rust ─────────┐
-           └─ build-embedder ──┐  │
-                               │  │
+toolchain ─┬─ build-go ─┬─ test
+           │            └──────────────────────┐
+           ├─ build-rust ─────────┐            │
+           └─ build-embedder ──┐  │            │
+                               │  │            │
              seed ── discover ─┼──┴── fetch ── ingest ── merge ─┬─ embed ─┐
-                                                                └─ enrich ┴─ index
-                                                                             │
-                                                              validate ── smoke
+                                                                └─ enrich ┴─ paragraphs ─┬─ index
+                                                                                         │
+                                                                          validate ── smoke
 ```
 
 | Étape | Fait quoi | Coût mesuré |
@@ -268,6 +269,7 @@ toolchain ─┬─ build-go ── test
 | `merge` | plie les shards dans le corpus, réécrit l'ancre, construit le FTS | ~6 min |
 | `embed` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
+| `paragraphs` | stocke chaque paragraphe une fois et pointe dessus (ADR 0004) | ~9 min |
 | `index` | construit et **gèle** le HNSW cosine | 1m46 |
 | `validate` | contrat de complétude + `anchorcheck` | ~30 s |
 | `smoke` | démarre le vrai serveur et prouve que le vectoriel est resté actif | ~30 s |
@@ -277,6 +279,25 @@ Points qui ne se devinent pas en lisant le code :
 - **On parse le HTML de LibreOffice, pas le DOCX en natif.** Le chemin
   `zip.NewReader → word/document.xml` a existé (`internal/ooxml`) et a été retiré.
   Conséquence : LibreOffice est le goulot d'étranglement, pas le GPU.
+- **Un corpus converti sert `clauses` comme une VUE, et DuckDB refuse d'indexer
+  une vue.** Les trois `CREATE INDEX ... ON clauses` de `schema.sql` sont donc
+  encadrés par `-- @clauses-indexes-begin/end`, et les deux lecteurs du fichier
+  (`internal/store.migrate`, `Store::open_rw`) les retirent quand le nom est une
+  vue. Sans ça, l'application du schéma étant tout-ou-rien, **tous** les outils
+  d'écriture mouraient au bootstrap : « can only create an index on a base
+  table ». Ouvrir n'est pas écrire : `merge` et `embed` modifient réellement
+  `clauses` et appellent `--restore` d'abord ; `freeze-hnsw` est le seul qui doit
+  fonctionner *sur* la forme convertie, et c'est pour ça que c'est le binaire Go
+  (`cmd/freeze-hnsw`) — il pose l'index sur la table qui porte les vecteurs.
+- **`merge` rend d'abord au corpus la forme que le write side connaît.** Un corpus
+  converti sert `clauses` comme une VUE ; `merge --base` recopie la base *table par
+  table* (`duckdb_tables()`), donc la vue est laissée derrière et `schema.sql` la
+  recrée **vide** dans la destination. Le fold remplirait cette table vide pendant
+  que `clause_occ` garde ses 2 752 688 occurrences — et `max_chunk_id()` lirait 0,
+  donnant au shard des `chunk_id` qui entrent en collision avec l'existant. Donc
+  `merge` lance `migrate-paragraphs --restore` avant de plier, et `paragraphs`
+  reconvertit après. Le write side ne connaît jamais ADR 0004 : c'est ADR 0001 qui
+  l'exige, et ça coûte une reconstruction groupée (1m47 pour 2,87 Go, mesuré).
 - **`merge` avant `embed`**, l'inverse de l'ancienne CI — cf. §13.
 - **Le batch d'embedding est dynamique**, dimensionné sur `nvidia-smi` et
   `--vram-fraction`, avec repli réversible sur OOM. Pas de « batch de 32 ».
@@ -333,7 +354,7 @@ oublie de transmettre ce plancher recale un corpus complet.
 ```
 3gpp-mcp/
 ├── cmd/
-│   ├── goal/            # LE point d'entrée : la machine à états 19 étapes
+│   ├── goal/            # LE point d'entrée : la machine à états 20 étapes
 │   ├── server/          # MCP server (stdio + HTTP) + bootstrap subcommand
 │   ├── validate/        # contrat de complétude des données
 │   ├── anchorcheck/     # l'ancre ne doit pas revendiquer du texte absent

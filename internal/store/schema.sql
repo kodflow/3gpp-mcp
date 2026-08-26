@@ -48,9 +48,87 @@ CREATE TABLE IF NOT EXISTS clauses (
                                          -- Lets the decoupled embed step re-embed ONLY
                                          -- clauses whose text or model changed (micro-granular).
 );
+-- Bracketed because these three cannot be applied to a converted corpus: after
+-- ADR 0004's --drop-clauses, `clauses` is a VIEW, and DuckDB answers
+-- `CREATE INDEX ... ON <view>` with "can only create an index on a base table".
+-- Every tool that bootstraps this schema read-write would fail before doing
+-- anything. Both readers of this file (internal/store.migrate, Store::open_rw)
+-- drop everything between the markers when the name resolves to a view. They
+-- index columns the view computes anyway; the tables underneath carry their own.
+-- @clauses-indexes-begin
 CREATE INDEX IF NOT EXISTS clauses_spec   ON clauses (spec_id);
 CREATE INDEX IF NOT EXISTS clauses_rel    ON clauses (release);
 CREATE INDEX IF NOT EXISTS clauses_path   ON clauses (spec_id, clause_path);
+-- @clauses-indexes-end
+
+-- ---------------------------------------------------------------------------
+-- CONTENT-ADDRESSED STORAGE (ADR 0004)
+--
+-- 79.8 % of clause bodies are byte-identical between releases, so `clauses`
+-- above writes the same text down once per release. The four tables below store
+-- each distinct text ONCE and record where it occurs — and the occurrence table
+-- is also the presence matrix the release lineage is computed from, so the
+-- structure that shrinks the corpus is the one that makes traceability exact.
+--
+-- Measured, same columns, both databases compacted: 4.38 GB -> 2.03 GB.
+--
+-- The dedup unit is the PARAGRAPH (blank-line separated), which measurement
+-- picked over the line: lines halve the text again but need 71 M mapping rows
+-- to remember their order — more than they save.
+
+-- Each distinct paragraph, once. Empty parts are KEPT: a run of blank lines in
+-- the source produces them, and dropping them is the one thing that stops the
+-- split from being reversible byte-for-byte.
+CREATE TABLE IF NOT EXISTS paragraphs (
+    para_id INTEGER PRIMARY KEY,
+    part    VARCHAR
+);
+
+-- A body is one distinct (heading, paragraph sequence): the unit that is
+-- SERVED, EMBEDDED and INDEXED. The key includes the heading because the rest
+-- of the system already believes it does — embedding_hash is
+-- sha(heading+text+model) and BM25 indexes both — so deduplicating on the text
+-- alone would leave the vectors and the bodies disagreeing.
+CREATE TABLE IF NOT EXISTS bodies (
+    body_id        INTEGER PRIMARY KEY,
+    heading        VARCHAR,
+    embedding      FLOAT[1024],          -- the HNSW lives HERE, not on clauses
+    embedding_hash VARCHAR               -- sha(heading+text+model)
+);
+
+-- The ordered paragraphs of a body. The SEQUENCE is deduplicated too, not only
+-- the paragraphs: because most clauses repeat verbatim, factoring the ordering
+-- out drops paragraph occurrences from 13 375 116 to 8 290 716.
+CREATE TABLE IF NOT EXISTS body_seq (
+    body_id INTEGER,
+    ord     SMALLINT,
+    para_id INTEGER
+);
+
+-- One row per real occurrence in the corpus: what `clauses` was, minus the text
+-- it kept repeating.
+--
+-- chunk_id is carried, and it is not sentiment for the old schema.
+-- (spec_id, release, version, clause_path) is NOT unique — 2 752 688 rows share
+-- only 2 579 376 such keys, and TS 51.010-1 v7.12.0 alone has 16 509 rows with
+-- an empty clause_path. Joining on it multiplies instead of matching: the first
+-- verification written that way compared 550 568 438 pairs for 2.75 M clauses
+-- and reported a corpus-wide corruption that did not exist. chunk_id is the only
+-- per-occurrence identity there has ever been, so it stays.
+CREATE TABLE IF NOT EXISTS clause_occ (
+    chunk_id     UBIGINT PRIMARY KEY,
+    spec_id      VARCHAR,
+    release      VARCHAR,
+    version      VARCHAR,
+    clause_path  VARCHAR,
+    is_normative BOOLEAN,
+    body_id      INTEGER
+);
+CREATE INDEX IF NOT EXISTS occ_spec ON clause_occ (spec_id);
+CREATE INDEX IF NOT EXISTS occ_path ON clause_occ (spec_id, clause_path);
+CREATE INDEX IF NOT EXISTS occ_body ON clause_occ (body_id);
+CREATE INDEX IF NOT EXISTS seq_body ON body_seq (body_id);
+CREATE INDEX IF NOT EXISTS seq_para ON body_seq (para_id);
 
 -- BGE-M3 SPARSE (learned-lexical) weights: one row per (clause, vocab token id).
 -- The sparse arm scores a query's term weights against these as an inverted-index

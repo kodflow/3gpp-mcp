@@ -47,9 +47,10 @@ ALL_PHASES=(discover fetch ingest merge embed enrich freeze validate)
 PHASES=""; FROM=""; ONLY=""
 SCOPE="${SCOPE:-}"            # series explicites ; vide = delta auto
 FLOOR="${FLOOR:-Rel-99}"      # Rel-99 = toutes les vraies releases 3GPP
-JOBS="${JOBS:-4}"             # workers de conversion (LibreOffice est RAM-heavy)
+JOBS="${JOBS:-6}"             # workers de conversion ; 6 mesure 21 % plus rapide que 4
+                              # (A/B/B/A sur 28 documents : 225 s a 4, 178 s a 6)
 BASE_DB="${BASE_DB:-$DB_OUT}" # base de depart du merge incremental
-FULL=0; DRY=0; KEEP_ZIP="${KEEP_ZIP:-0}"
+FULL=0; DRY=0; PURGE_ZIP="${PURGE_ZIP:-0}"   # on garde les caches par defaut
 EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}"
 STATUS_URL="https://www.3gpp.org/DynaReport/status-report.htm"
 
@@ -63,7 +64,8 @@ while [ $# -gt 0 ]; do
     --base)        BASE_DB="$2"; shift 2;;
     --embed-floor) EMBED_FLOOR="$2"; shift 2;;
     --full)        FULL=1; shift;;
-    --keep-zip)    KEEP_ZIP=1; shift;;
+    --keep-zip)    PURGE_ZIP=0; shift;;   # retro-compat : c'est deja le defaut
+    --purge-zip)   PURGE_ZIP=1; shift;;
     --dry-run)     DRY=1; shift;;
     -h|--help)     sed -n '2,45p' "$0"; exit 0;;
     *) die "argument inconnu: $1";;
@@ -171,12 +173,21 @@ phase_fetch() {
   ok "fetch/convert termine"
 }
 
-# PURGE DES ZIP : le corpus complet pese ~37 Go de sources + ~37 Go de HTML. Le
-# HTML converti est le seul intrant de l'ingest ; le .zip d'origine ne sert plus
-# une fois le .html produit. On le supprime au fil de l'eau (KEEP_ZIP=1 pour
-# desactiver). C'est ce qui rend le corpus complet tenable sur ce disque.
+# PURGE DES ZIP -- DESACTIVEE PAR DEFAUT depuis le 2026-08-26.
+#
+# Le raisonnement d'origine tenait quand le disque etait plein a 98 % : le .zip
+# ne sert plus une fois le .html produit, donc on le jetait au fil de l'eau. Ce
+# qu'il ne disait pas, c'est le prix de le refaire. Le cache de HTML a fini par
+# etre purge lui aussi, et repartir de zero coute le retelechargement ET la
+# reconversion LibreOffice de ~20 000 specs -- des heures, a chaque fois qu'une
+# etape amont change.
+#
+# Le disque n'est plus la contrainte (168 Go libres). La regle s'inverse donc :
+# ON GARDE TOUT par defaut, et il faut demander explicitement la purge
+# (PURGE_ZIP=1, ou --purge-zip) pour la retrouver. Un cache qu'on jette est un
+# cache qu'on repaie.
 purge_zips() {
-  [ "$KEEP_ZIP" = "1" ] && { dim "KEEP_ZIP=1 : zips conserves"; return 0; }
+  [ "${PURGE_ZIP:-0}" = "1" ] || { dim "zips conserves (PURGE_ZIP=1 pour purger)"; return 0; }
   local freed=0 n=0 z rel base sz
   while IFS= read -r z; do
     rel="$(basename "$(dirname "$z")")"
