@@ -28,6 +28,19 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// SchemaSQL is the corpus schema, verbatim. It is exported for the one caller
+// that recreates a table this file declares WITHOUT going through Open:
+// cmd/migrate-paragraphs --restore, which drops the `clauses` compatibility view
+// and has to put back a table whose columns are in exactly the declared order —
+// rust/store copies databases with `INSERT INTO dst SELECT * FROM src`, and that
+// is correct only while both sides agree on that order.
+//
+// Handing out the schema is what keeps them agreeing. A second copy of the DDL
+// written into the tool would be one more place to forget, and this repository
+// has already been bitten three times by a duplicated definition drifting away
+// from its original.
+func SchemaSQL() string { return schemaSQL }
+
 // arraySep separates list elements packed into a single bound parameter before
 // DuckDB string_split() turns them back into a VARCHAR[] (avoids array binding).
 const arraySep = "\x1f"

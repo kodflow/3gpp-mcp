@@ -412,8 +412,11 @@ func stepMerge() *Step {
 		Name:    "merge",
 		Version: 1,
 		Doc:     "fold the shards into the corpus DB and rewrite the delta anchor",
-		Deps:    []string{"ingest"},
-		Impl:    []string{"rust/store/src/bin/merge.rs", "rust/store/src/lib.rs"},
+		// build-go is a dependency because the fold is preceded by a restore, and
+		// that restore is a Go binary. cmd/migrate-paragraphs is in Impl for the
+		// same reason: what this step does to the corpus now depends on it.
+		Deps: []string{"ingest", "build-go"},
+		Impl: []string{"rust/store/src/bin/merge.rs", "rust/store/src/lib.rs", "cmd/migrate-paragraphs"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			var in []string
 			shardDir := filepath.Join(c.Local, "shards")
@@ -461,6 +464,31 @@ func stepMerge() *Step {
 				return ensureCorpusIndex(c)
 			}
 
+			// GIVE THE WRITE SIDE BACK THE SHAPE IT KNOWS, BEFORE IT TOUCHES THE CORPUS.
+			//
+			// `merge --base` compact-copies the base table by table, from
+			// duckdb_tables(). A converted corpus serves `clauses` as a VIEW, which
+			// is not a table, so the copy leaves it behind and schema.sql recreates
+			// it EMPTY in the destination. merge then folds the changed buckets into
+			// that empty table, and the result is a corpus whose `clauses` holds the
+			// increment while `clause_occ` still holds every occurrence — with
+			// max_chunk_id() reading 0 and handing the shard chunk_ids that collide
+			// with the ones already there, and changed_buckets() seeing an empty
+			// table and calling every bucket changed.
+			//
+			// Restoring first costs one grouped reconstruction (1 m 47 for 2.87 GB,
+			// measured) and keeps ADR 0004's storage layout entirely on this side of
+			// the write/read split, which is where ADR 0001 put it. The `paragraphs`
+			// step converts again afterwards, from a `clauses` that is once more
+			// whole — so its own refusal to rebuild from a delta never has to fire.
+			if fileNonEmpty(db) {
+				c.Log.Printf("restoring the write-side corpus shape before folding")
+				if err := c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+					"--db", db, "--restore",
+				}, Echo: true}); err != nil {
+					return fmt.Errorf("restoring `clauses` before the merge: %w", err)
+				}
+			}
 			tmp := db + ".new"
 			args := []string{
 				"--out", tmp,

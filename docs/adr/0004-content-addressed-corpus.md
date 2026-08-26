@@ -212,14 +212,64 @@ write side needs no change at all: it keeps producing `clauses` with its text an
 its vectors, and converting afterwards carries those vectors onto the bodies that
 own them.
 
-**The conversion is not incremental.** It derives the tables from whatever
-`clauses` holds, which is right on a full corpus and destructive on a delta:
-`merge --base` folds only the changed buckets, so re-deriving would replace
-2 752 688 occurrences with the increment — and every gate would stay green,
-because the numbers would agree with each other. `migrate-paragraphs` therefore
-REFUSES to rebuild a corpus that already carries more occurrences than `clauses`
-has rows. Making it merge instead of replace is the next piece of work, and until
-it exists a delta run must be followed by a full re-derivation.
+## A delta run: restore the old shape, fold, convert again
+
+The conversion is not incremental, and does not need to be — but the reason a
+delta run breaks without help is worth writing down, because nothing about it is
+guessable from the code.
+
+`merge --base` starts by compact-copying the base **table by table**, from
+`duckdb_tables()`. A view is not a table. So the copy leaves `clauses` behind,
+`schema.sql` recreates it EMPTY in the destination, and the fold writes the
+changed buckets into that empty table. The result is a corpus whose `clauses`
+holds the increment while `clause_occ` still holds all 2 752 688 occurrences —
+exactly the input a re-derivation would collapse the corpus onto.
+
+Three more things break in that same state, all silently:
+
+| | |
+|---|---|
+| `max_chunk_id()` | reads `clauses`, so the shard's offset is 0 and its `chunk_id`s collide with occurrences already present |
+| `changed_buckets()` | compares the shard against an empty table, so every bucket looks changed and the delta stops being one |
+| `stash_bucket_vectors()` | carries embeddings across a bucket replacement by reading `clauses`, and finds none |
+
+Teaching the write side about paragraphs, bodies and occurrences fixes all four.
+It also puts ADR 0004's storage layout inside the one component ADR 0001
+arranged for it not to be in, and each of those four is a place where being
+subtly wrong yields a corpus that passes every gate.
+
+So the pipeline gives the write side back the shape it has always known, and
+converts again afterwards. `migrate-paragraphs --restore` is the exact inverse of
+`--drop-clauses`: one grouped reconstruction into a real table, then the
+content-addressed tables are dropped. `merge` runs it before folding.
+
+It is one grouped pass, not the view: the view rebuilds a body with a correlated
+scalar subquery, which is right for the bounded reads it exists for and quadratic
+here — 5.34 s for 1 191 clauses is over three hours for the corpus. Grouping
+`body_seq` once costs **1 m 47 for all 2.87 GB**.
+
+The check runs while the originals are still on disk, because afterwards there is
+nothing left to compare against: one row per occurrence, no fanout, no NULL text.
+It is not the byte-for-byte proof `verify` runs — it cannot be, since the only
+reference for the text is the tables being read — and the code says so.
+
+Measured on a real 46 440-occurrence slice (TS 23.501, 24.501, 29.273, 33.128 and
+51.010-1, the last of which carries 16 509 rows with an empty `clause_path`),
+running the whole loop — convert → restore → delete a bucket → fold it back with a
+`chunk_id` offset → convert again:
+
+| | |
+|---|---:|
+| Occurrences identical to an independent reconstruction | 46 440 / 46 440 |
+| Text bytes | 43 990 280, unchanged |
+| Vectors carried back | 36 538, matching the source exactly |
+| After the delta round trip: rows lost / invented | **0 / 0** |
+| Paragraphs, bodies, sequences after re-conversion | identical counts |
+
+`refuseToShrink` stays. It is no longer describing the expected path — it is the
+backstop for the day someone re-derives from a `clauses` that is not whole, and
+it refuses rather than letting every gate agree with a corpus reduced to its last
+increment.
 
 **One limit worth stating in answers, not just in code.** The dedup unit is the
 exact byte string, so a re-wrapped line reads as a change. TS 23.501 §5.4.4a
