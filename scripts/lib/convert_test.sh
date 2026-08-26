@@ -72,5 +72,43 @@ else
 	pass "clearing the cache restores measurement"
 fi
 
+# 7. Every helper convert_doc reaches for must survive the trip into a worker.
+#    xargs spawns fresh bash processes: they see only what `export -f` put in the
+#    environment. This list was hand-written and drifted three times, the last one
+#    costing 900 s per hanging spec, so the invariant is pinned here rather than
+#    left to whoever adds the next helper.
+convert_export_fns
+missing=""
+for fn in $(compgen -A function | grep -E '^(convert_|_conv_|_soffice_)'); do
+	bash -c "declare -F $fn >/dev/null" || missing="$missing $fn"
+done
+if [ -z "$missing" ]; then
+	pass "every convert.sh helper is exported to a worker"
+else
+	fail "not exported to workers:$missing"
+fi
+
+# 8. And the env they READ, not just the functions. Isolated in its own shell:
+#    this file exports SOFFICE_TIMEOUT_LIST for the tests above, so asking the
+#    question here would answer itself.
+cat > "$WORK/probe.sh" <<PROBE
+SOFFICE_TIMEOUT_LIST=/probe/timeouts.txt
+source "$HERE/convert.sh"
+convert_export_fns
+PROBE
+echo 'bash -c '"'"'printf "%s\n" "$SOFFICE_TIMEOUT_LIST"'"'" >> "$WORK/probe.sh"
+if [ "$(env -u SOFFICE_TIMEOUT_LIST bash "$WORK/probe.sh")" = "/probe/timeouts.txt" ]; then
+	pass "the hang-cache path reaches the worker"
+else
+	fail "SOFFICE_TIMEOUT_LIST does not survive into a worker"
+fi
+
+# There was a 9th check here — "a worker can call the hang guard" — driving the
+# guard from a grandchild shell and grepping for "command not found". It passed
+# against the BROKEN export list as readily as against the fixed one, so it
+# asserted nothing. Checks 7 and 8 already fail on that bug, precisely and by
+# name. A check that cannot fail is worse than no check: it buys confidence
+# without paying for it.
+
 [ "$fails" -eq 0 ] || { echo "$fails failure(s)"; exit 1; }
 echo "all good"

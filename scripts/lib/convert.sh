@@ -173,10 +173,24 @@ _soffice_html() {
 # because soffice's own complaint is sent to /dev/null.
 #
 # So the list lives HERE, beside the functions it names, and callers ask for it
-# by name. Adding a helper to this file is now the only place it must be
-# remembered.
+# by name.
+#
+# And it drifted a THIRD time, right here: 2751708 added _soffice_known_hang and
+# _soffice_note_hang to this file without adding them to the list below, so every
+# worker printed "_soffice_known_hang: command not found" once per document and
+# the hang cache never fired — each hanging spec re-bought its 900 s timeout,
+# which is the exact cost that commit existed to stop. A list that has to be
+# remembered will be forgotten, three times out of three. So it is DERIVED:
+# whatever this file defines in its own namespace travels to the workers.
 convert_export_fns() {
-  export -f convert_doc _soffice_html _soffice_profile _conv_native _conv_url
+  local f
+  while IFS= read -r f; do
+    export -f "$f"
+  done < <(compgen -A function | grep -E '^(convert_|_conv_|_soffice_)')
+  # The env those functions READ has to travel too. An unexported
+  # SOFFICE_TIMEOUT_LIST disables the cache exactly as silently as a missing
+  # helper: `[[ -s "" ]]` is false, so nothing is ever a known hang.
+  export CONV_TIMEOUT CONV_KILL DEGRADED_TSV SOFFICE_TIMEOUT_LIST ETSI_MIN_TEXT
 }
 
 # convert_pdf <pdf> <target_html> [label] — ETSI deliverables are PUBLISHED as
