@@ -98,7 +98,16 @@ CREATE TABLE IF NOT EXISTS body_seq (
 
 -- One row per real occurrence in the corpus: what `clauses` was, minus the text
 -- it kept repeating.
+--
+-- chunk_id is carried, and it is not sentiment for the old schema.
+-- (spec_id, release, version, clause_path) is NOT unique — 2 752 688 rows share
+-- only 2 579 376 such keys, and TS 51.010-1 v7.12.0 alone has 16 509 rows with
+-- an empty clause_path. Joining on it multiplies instead of matching: the first
+-- verification written that way compared 550 568 438 pairs for 2.75 M clauses
+-- and reported a corpus-wide corruption that did not exist. chunk_id is the only
+-- per-occurrence identity there has ever been, so it stays.
 CREATE TABLE IF NOT EXISTS clause_occ (
+    chunk_id     UBIGINT PRIMARY KEY,
     spec_id      VARCHAR,
     release      VARCHAR,
     version      VARCHAR,

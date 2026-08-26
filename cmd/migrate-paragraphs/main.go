@@ -92,7 +92,7 @@ func build(h *sql.DB) error {
 			FROM x JOIN paragraphs p ON p.part = x.e['p']`},
 
 		{"clause_occ", `CREATE OR REPLACE TABLE clause_occ AS
-			SELECT c.spec_id, c.release, c.version, c.clause_path, c.is_normative, b.body_id
+			SELECT c.chunk_id, c.spec_id, c.release, c.version, c.clause_path, c.is_normative, b.body_id
 			FROM clauses c JOIN _mig_bodies b
 			  ON b.heading IS NOT DISTINCT FROM c.heading AND b.body = c.text`},
 
@@ -124,6 +124,12 @@ func build(h *sql.DB) error {
 // exactly the text it had. Comparing the rebuild against `clauses` rather than
 // against a copy kept inside the new tables is the point: a check that reads its
 // own output would pass on a corpus that lost the original.
+//
+// The join is on chunk_id and nothing else. (spec_id, release, version,
+// clause_path) looks like a key and is not one: 2 752 688 rows share 2 579 376
+// of them, and TS 51.010-1 v7.12.0 alone carries 16 509 rows with an empty
+// clause_path. Joining on it compared 550 568 438 pairs and declared the corpus
+// corrupt when nothing was wrong with it.
 func verify(h *sql.DB) error {
 	var occ, exact int64
 	err := h.QueryRow(`
@@ -135,8 +141,7 @@ func verify(h *sql.DB) error {
 		       count(*) FILTER (WHERE c.text IS NOT DISTINCT FROM r.body
 		                          AND c.heading IS NOT DISTINCT FROM b.heading)
 		FROM clauses c
-		JOIN clause_occ o ON o.spec_id = c.spec_id AND o.release = c.release
-		                 AND o.version = c.version AND o.clause_path = c.clause_path
+		JOIN clause_occ o ON o.chunk_id = c.chunk_id
 		JOIN bodies b USING (body_id)
 		JOIN rebuilt r USING (body_id)`).Scan(&occ, &exact)
 	if err != nil {

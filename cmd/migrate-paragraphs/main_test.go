@@ -60,8 +60,7 @@ func TestEveryBodyRebuildsByteForByte(t *testing.T) {
 		)
 		SELECT c.spec_id, c.text, r.body
 		FROM clauses c
-		JOIN clause_occ o ON o.spec_id = c.spec_id AND o.release = c.release
-		                 AND o.version = c.version AND o.clause_path = c.clause_path
+		JOIN clause_occ o ON o.chunk_id = c.chunk_id
 		JOIN rebuilt r USING (body_id)`)
 	if err != nil {
 		t.Fatal(err)
@@ -166,5 +165,43 @@ func TestVerificationRejectsALossyCorpus(t *testing.T) {
 	}
 	if err := verify(h); err == nil {
 		t.Fatal("verify accepted a corpus with paragraphs removed from the sequences")
+	}
+}
+
+// (spec_id, release, version, clause_path) LOOKS like the natural key and is
+// not one: front matter carries an empty clause_path, and TS 51.010-1 v7.12.0
+// alone has 16 509 such rows in the real corpus. A verification joining on it
+// compared 550 568 438 pairs for 2.75 M clauses and reported a corruption that
+// did not exist. Only chunk_id identifies an occurrence.
+func TestOccurrencesAreIdentifiedByChunkIDNotByPath(t *testing.T) {
+	h := fixture(t)
+	// Three more rows sharing one (spec, release, version, clause_path) — the
+	// shape that made the naive join multiply.
+	for i, text := range []string{"front matter one", "front matter two", "front matter three"} {
+		if _, err := h.Exec(`INSERT INTO clauses VALUES (?,?,?,?,?,?,?,true,NULL,?)`,
+			100+i, "51.010-1", "Rel-7", "7.12.0", "", "Preamble", text, "hash-pre"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(h); err != nil {
+		t.Fatalf("a corpus with repeated clause paths must still verify: %v", err)
+	}
+	var occ int
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		t.Fatal(err)
+	}
+	if occ != 11 {
+		t.Fatalf("occurrences = %d, want 11 — one per clause, never a product", occ)
+	}
+	// And the key really is degenerate, so the test is testing something.
+	var distinctKeys int
+	if err := h.QueryRow(`SELECT count(DISTINCT (spec_id, release, version, clause_path)) FROM clauses`).Scan(&distinctKeys); err != nil {
+		t.Fatal(err)
+	}
+	if distinctKeys >= 11 {
+		t.Fatalf("the fixture no longer contains a repeated clause path (%d distinct keys for 11 rows)", distinctKeys)
 	}
 }
