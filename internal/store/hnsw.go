@@ -85,8 +85,9 @@ func (s *Store) GetMeta(ctx context.Context, key string) string {
 // is not a guard.
 func (s *Store) HNSWIndexPresent(ctx context.Context) bool {
 	var n int
+	idx, _ := s.hnswTarget()
 	err := s.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'clauses_hnsw'`).Scan(&n)
+		`SELECT count(*) FROM duckdb_indexes() WHERE index_name = ?`, idx).Scan(&n)
 	return err == nil && n > 0
 }
 
@@ -110,15 +111,20 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	if err := s.EnableVSS(ctx); err != nil { // (5) extension + persistence flag
 		return err
 	}
+	// The index follows the vectors. On a content-addressed corpus they live on
+	// `bodies`, one per distinct text: indexing the occurrences would index
+	// 2 752 688 copies of 897 556 vectors, paying the duplication again in RAM
+	// and in build time.
+	idx, table := s.hnswTarget()
 	if _, err := s.db.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine')`); err != nil {
-		return fmt.Errorf("create hnsw: %w", err) // (6)
+		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine')`); err != nil {
+		return fmt.Errorf("create hnsw on %s: %w", table, err) // (6)
 	}
 	if err := s.checkpoint(ctx); err != nil { // (7) serialise the index into the file
 		return err
 	}
-	if !s.indexExists(ctx, "clauses_hnsw") { // (8) verify
-		return fmt.Errorf("hnsw index missing after build")
+	if !s.indexExists(ctx, idx) { // (8) verify
+		return fmt.Errorf("hnsw index %s missing after build", idx)
 	}
 
 	// (9) freeze markers — self-describing state for serve to trust without guessing
@@ -139,7 +145,7 @@ func (s *Store) RebuildHNSW(ctx context.Context) error {
 	if err := s.EnableVSS(ctx); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS clauses_hnsw`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS clauses_hnsw; DROP INDEX IF EXISTS bodies_hnsw`); err != nil {
 		return err
 	}
 	if err := s.checkpoint(ctx); err != nil {
@@ -160,7 +166,7 @@ func (s *Store) PrepareForEmbedUpdate(ctx context.Context) error {
 	// VSS may be unavailable (extension not installed); that's fine for a DB with
 	// no HNSW index — the DROP becomes a no-op and UPDATEs work normally.
 	_ = s.EnableVSS(ctx)
-	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS clauses_hnsw`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS clauses_hnsw; DROP INDEX IF EXISTS bodies_hnsw`); err != nil {
 		return fmt.Errorf("drop hnsw before embed update: %w", err)
 	}
 	// Clear the frozen markers so a crash mid-embed doesn't leave serve trusting a
@@ -218,7 +224,13 @@ func (s *Store) indexExists(ctx context.Context, name string) bool {
 
 func (s *Store) embeddingCount(ctx context.Context) (int, error) {
 	var n int
+	// Count where the vectors actually are. On a content-addressed corpus that
+	// is `bodies`, and the number is the honest one: 897 556 vectors, not
+	// 2 752 688 references to them. embedding_count is written into schema_meta
+	// from here, so counting the wrong table would make the corpus advertise a
+	// vector population it does not hold.
+	_, table := s.hnswTarget()
 	err := s.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&n)
+		`SELECT count(*) FROM `+table+` WHERE embedding IS NOT NULL`).Scan(&n)
 	return n, err
 }

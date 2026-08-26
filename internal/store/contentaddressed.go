@@ -432,3 +432,94 @@ func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.Sea
 	}
 	return hits, nil
 }
+
+// hnswTarget names the table and index the vector index lives on.
+//
+// It moves with the storage: on a content-addressed corpus the vectors belong to
+// `bodies`, one per DISTINCT (heading, text), because that is what was embedded.
+// Indexing the occurrences instead would index 2 752 688 copies of 897 556
+// vectors — the same duplication that made a lexical top-K a top-K of versions,
+// paid again in RAM and in HNSW build time.
+//
+// ADR 0003 named this as the blocker it deferred: "DuckDB's VSS indexes a column
+// of a table while internal/store/hnsw.go asserts the index is clauses_hnsw".
+func (s *Store) hnswTarget() (index, table string) {
+	if s.contentAddressed {
+		return "bodies_hnsw", "bodies"
+	}
+	return "clauses_hnsw", "clauses"
+}
+
+// searchVectorsCA is dense search over the content-addressed corpus: nearest
+// bodies, then one occurrence per clause, then the text rebuilt for those.
+func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
+	if topK <= 0 {
+		topK = 10
+	}
+	filterSQL, filterArgs := filterClause(f)
+	// Over-fetch bodies: several of them can collapse onto the same clause, and
+	// the filter is applied after the nearest-neighbour scan. Asking for exactly
+	// topK bodies would return fewer than topK clauses.
+	const overFetch = 8
+
+	args := []any{vecLiteral(vec), topK * overFetch}
+	full := `
+		WITH near AS (
+			SELECT body_id, array_cosine_distance(embedding, CAST(? AS FLOAT[1024])) AS dist
+			FROM bodies WHERE embedding IS NOT NULL
+			ORDER BY dist LIMIT ?
+		),
+		pick AS (
+			SELECT n.dist, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
+			       o.is_normative, o.body_id, b.heading,
+			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
+			                          ORDER BY n.dist ASC, o.version DESC) AS rn
+			FROM near n
+			JOIN clause_occ o USING (body_id)
+			JOIN bodies b USING (body_id)
+			WHERE 1=1` + filterSQL + `
+		)
+		SELECT chunk_id, spec_id, release, version, clause_path, heading, is_normative, body_id, dist
+		FROM pick WHERE rn = 1 ORDER BY dist ASC LIMIT ?`
+	args = append(args, filterArgs...)
+	args = append(args, topK)
+
+	rows, err := s.db.QueryContext(ctx, full, args...)
+	if err != nil {
+		return nil, fmt.Errorf("vector search (content-addressed): %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var hits []model.SearchHit
+	var owner, want []int64
+	seen := map[int64]bool{}
+	for rows.Next() {
+		var h model.SearchHit
+		var bodyID int64
+		var dist float64
+		if err := rows.Scan(&h.Clause.ChunkID, &h.Clause.SpecID, &h.Clause.Release,
+			&h.Clause.Version, &h.Clause.ClausePath, &h.Clause.Heading,
+			&h.Clause.IsNormative, &bodyID, &dist); err != nil {
+			return nil, err
+		}
+		h.Score = 1 - dist // cosine similarity, as the old path reported it
+		hits = append(hits, h)
+		owner = append(owner, bodyID)
+		if !seen[bodyID] {
+			seen[bodyID] = true
+			want = append(want, bodyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	texts, err := s.bodyTexts(ctx, want)
+	if err != nil {
+		return nil, err
+	}
+	for i := range hits {
+		hits[i].Clause.Text = texts[owner[i]]
+		hits[i].Citation = hits[i].Clause.Cite()
+	}
+	return hits, nil
+}
