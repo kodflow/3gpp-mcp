@@ -79,6 +79,14 @@ absence accepted to get there.
 
 ### Fixed
 
+- **`validate --require-hnsw` asked a weaker question than the server.** It
+  checked `hnsw_state` and `HNSWIndexPresent`, which resolves the index name
+  through `hnswTarget()`; the server asks `store.LoadVSS`, which additionally
+  compares `embedding_count` against the vectors actually present. Two checks of
+  the same property, and the gate read green on a corpus the server refused. It
+  now runs `LoadVSS` itself and reports `serve_usable`, so the contract gate
+  fails the build the same way the server would — verified against the exact
+  defect above: "the server would REFUSE this index: embedding count drift".
 - **The server exact-scanned every vector on the shipped corpus, and said
   nothing.** `store.LoadVSS` — the serve-time gate that decides whether the
   frozen index may be trusted — looked for `clauses_hnsw` by name, while the
