@@ -215,3 +215,6 @@ docs/architecture-pipeline.md
 # Rust source bins live under src/bin/ — keep them tracked (the bin/ rule above is for compiled output)
 !rust/*/src/bin/
 !rust/*/src/bin/*.rs
+
+# Etat local du pipeline + toolchain portable (machine-specifique, jamais versionne)
+.local/

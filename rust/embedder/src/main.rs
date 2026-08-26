@@ -38,7 +38,22 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
+
+/// OOM_SPLITS counts how many times the adaptive batcher absorbed an allocation
+/// failure. It is a global because `run_adaptive` recurses and threading a counter
+/// through would obscure the recursion for no gain.
+///
+/// It exists to make the arena cap PROVABLE from the run itself. Watching
+/// `nvidia-smi` shows a human that memory stayed bounded; it cannot be asserted on,
+/// it samples, and it says nothing about whether the backoff was ever exercised.
+/// A run that reports `oom_splits=0 peak_batch=512` and one that reports
+/// `oom_splits=5 peak_batch=256` are both healthy — but only the second proves the
+/// recovery path works, and before the cap existed neither number could be produced
+/// at all.
+static OOM_SPLITS: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BATCH: AtomicUsize = AtomicUsize::new(0);
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -319,11 +334,29 @@ fn main() -> Result<()> {
     let total = chunk_ids.len();
     eprintln!("embedder: {total} clause(s) to embed");
 
+    // Cap the CUDA arena BEFORE the session is built (it is a session option, so it
+    // cannot be applied later). The base is TOTAL VRAM, not free: the arena holds the
+    // weights too, and the post-load `gpu::detect` below — which sizes batches from free
+    // VRAM — would double-count them. The remaining fraction is what the desktop, the
+    // CUDA context and any other process on the card get to keep.
+    let arena_cap = gpu::detect(args.device).map(|g| {
+        let cap = ((g.total_bytes as f64) * args.vram_fraction) as usize;
+        eprintln!(
+            "RESULT arena_cap bytes={} gib={:.2} of total_gib={:.2} (fraction={})",
+            cap,
+            cap as f64 / (1024.0 * 1024.0 * 1024.0),
+            g.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            args.vram_fraction
+        );
+        cap
+    });
+
     let bge = Bge::load(
         &args.model_dir.join(&args.onnx),
         &args.model_dir.join("tokenizer.json"),
         args.require_cuda,
         args.device,
+        arena_cap,
     )?;
 
     // Tokenise the whole work-list once (windowed to bound transient memory). The ids let
@@ -387,6 +420,9 @@ fn main() -> Result<()> {
                 // calibration before the OOM backoff (the hard ceiling) kicks in.
                 min_k: batch::K_ATTN_DEFAULT * 0.3,
                 max_batch: args.max_batch,
+                // Past this, the longest sequence is already down to one clause per
+                // batch; shrinking further only penalises the short ones.
+                max_k: avail / ((crate::model::MAX_TOKENS * crate::model::MAX_TOKENS) as f64),
             }
         }
         None => {
@@ -402,6 +438,7 @@ fn main() -> Result<()> {
                 k_attn: batch::K_ATTN_DEFAULT,
                 min_k: batch::K_ATTN_DEFAULT,
                 max_batch: args.batch.max(1),
+                max_k: f64::INFINITY, // CPU path: no CUDA arena to protect
             }
         }
     };
@@ -435,6 +472,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|g| prepared[g[0]].ids.as_slice())
             .collect();
+        PEAK_BATCH.fetch_max(batch_ids.len(), AtomicOrdering::Relaxed);
         let vecs = run_adaptive(&bge, &mut mem, &batch_ids)
             .with_context(|| format!("embed distinct batch [{i}, {end})"))?;
         if vecs.len() != end - i {
@@ -472,7 +510,17 @@ fn main() -> Result<()> {
                 let oomed = mem.k_attn > k_at_window_start + 1e-9;
                 let headroom = (g.free_bytes as f64) > (total_b as f64) * 0.25;
                 if !oomed && headroom && i < distinct {
-                    mem.grow(0.85);
+                    // 1/1.5 — the exact inverse of the OOM backoff, so ONE clean
+                    // window undoes ONE over-correction.
+                    //
+                    // It was 0.85 against a shrink of 1.5: geometric up, arithmetic
+                    // down. Thirteen OOMs multiplied k_attn by ~194x and nothing
+                    // brought it back, so the run finished computing long clauses ONE
+                    // AT A TIME where the calibration allowed 132. The backoff stays
+                    // the hard ceiling; a window with no OOM and free VRAM is evidence
+                    // the model over-corrected, and should cost one window to undo,
+                    // not thirty.
+                    mem.grow(1.0 / 1.5);
                     eprintln!(
                         "PROGRESS autotune grow — free {} MiB, k_attn now {:.0} (seq1024 batch {})",
                         g.free_bytes / (1024 * 1024),
@@ -498,6 +546,18 @@ fn main() -> Result<()> {
         }
     }
     eprintln!("PROGRESS {total}/{total} (100%) done");
+    // Machine-checkable evidence that the memory discipline held, emitted by the
+    // process that actually did the work. `nvidia-smi` samples from outside and
+    // cannot be asserted on; these three can. A campaign that reports oom_splits>0
+    // and still finishes is the backoff doing its job — the state that was
+    // unreachable while the arena was uncapped.
+    eprintln!(
+        "RESULT gpu_evidence arena_cap={} peak_batch={} oom_splits={} final_k_attn={:.0}",
+        arena_cap.unwrap_or(0),
+        PEAK_BATCH.load(AtomicOrdering::Relaxed),
+        OOM_SPLITS.load(AtomicOrdering::Relaxed),
+        mem.k_attn
+    );
     eprintln!("embedder: wrote {total} vector(s) to {:?}", args.out);
     Ok(())
 }
@@ -513,6 +573,7 @@ fn run_adaptive<R: AsRef<[i64]>>(
     match bge.embed_ids(rows) {
         Ok(v) => Ok(v),
         Err(e) if is_oom(&e) => {
+            OOM_SPLITS.fetch_add(1, AtomicOrdering::Relaxed);
             mem.shrink(1.5);
             if rows.len() <= 1 {
                 return Err(e.context("CUDA OOM on a single clause (LOWER --vram-fraction for more headroom, or lower MAX_TOKENS)"));
@@ -536,6 +597,18 @@ fn run_adaptive<R: AsRef<[i64]>>(
 
 /// is_oom recognises a CUDA/host out-of-memory in an ort error so the caller can back off
 /// instead of aborting the whole campaign.
+///
+/// The list is deliberately broad, because a missed pattern is not a missed
+/// optimisation: `run_adaptive` aborts the campaign on anything it does not
+/// recognise. The BFC-arena entries are the ones that matter once the arena is
+/// capped (see `Bge::load`) — exhausting a *capped* arena does NOT produce any of
+/// the CUDA driver wordings above. It reads:
+///
+///   BFCArena::AllocateRawInternal Available memory of 1177295872 is smaller
+///   than requested bytes of 1233125376
+///
+/// which matched nothing here, so capping the arena traded a silent hang for an
+/// immediate abort until these two patterns were added.
 fn is_oom(e: &anyhow::Error) -> bool {
     let s = format!("{e:?}").to_lowercase();
     s.contains("out of memory")
@@ -543,6 +616,8 @@ fn is_oom(e: &anyhow::Error) -> bool {
         || s.contains("cuda_error_out_of_memory")
         || s.contains("failed to allocate")
         || s.contains("bad_alloc")
+        || s.contains("is smaller than requested")
+        || (s.contains("bfcarena") && s.contains("allocate"))
 }
 
 /// log_distribution prints the REAL token-length distribution of this work-list (the data
@@ -634,7 +709,7 @@ fn scan_ledger(path: &Path, r: &mut Resume) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedup_by_ids, load_done, shard_of, DENSE_DIM};
+    use super::{dedup_by_ids, is_oom, load_done, shard_of, DENSE_DIM};
     use std::io::Write;
 
     #[test]
@@ -721,5 +796,41 @@ mod tests {
         let rows = [vec![1i64], vec![2], vec![3]];
         let groups = dedup_by_ids(rows.iter().map(|r| r.as_slice()));
         assert_eq!(groups, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    /// The message a CAPPED BFC arena produces when it is exhausted, copied verbatim
+    /// from the run that aborted at batch [2048, 2560). It carries none of the CUDA
+    /// driver wordings, so before this case existed the cap turned a silent hang into
+    /// an immediate abort — the backoff it was supposed to enable never ran.
+    #[test]
+    fn capped_arena_exhaustion_is_an_oom() {
+        let e = anyhow::anyhow!(concat!(
+            "Non-zero status code returned while running BiasGelu node. Name:'BiasGelu' ",
+            "Status Message: bfc_arena.cc:376 onnxruntime::BFCArena::AllocateRawInternal ",
+            "Available memory of 1177295872 is smaller than requested bytes of 1233125376",
+        ));
+        assert!(
+            is_oom(&e),
+            "capped-arena exhaustion must trigger the backoff"
+        );
+    }
+
+    #[test]
+    fn the_classic_cuda_wordings_still_match() {
+        for m in [
+            "CUDA error: out of memory",
+            "cudaErrorMemoryAllocation",
+            "Failed to allocate memory",
+            "std::bad_alloc",
+        ] {
+            assert!(is_oom(&anyhow::anyhow!("{m}")), "{m} must be an OOM");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_an_oom() {
+        // A shape mismatch must still abort loudly; splitting the batch cannot fix it.
+        let e = anyhow::anyhow!("Non-zero status code: invalid rank for input: input_ids");
+        assert!(!is_oom(&e));
     }
 }

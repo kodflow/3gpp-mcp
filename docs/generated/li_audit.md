@@ -2,40 +2,49 @@
 
 Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified in its cited spec, then relocated cross-spec when absent.
 
+Verdicts, strongest evidence first: **CONFIRMED** (the cited clause's own text supports the name) · **REAL_PARENT_REF** (the parent clause does) · **FOUND_IN_CITED_SPEC** (some other clause of the cited spec does) · **WRONG_SPEC_REF** (one other spec names it in a heading, unrivalled) · **AMBIGUOUS** (several specs name it equally well, or the name carries too few tokens to decide) · **NOT_FOUND** (no trace anywhere).
+
 ## Summary
 
+- **AMBIGUOUS**: 8
 - **CONFIRMED**: 96
-- **FOUND_IN_CITED_SPEC**: 59
-- **NOT_FOUND**: 5
-- **REAL_PARENT_REF**: 48
-- **WRONG_SPEC_REF**: 10
+- **FOUND_IN_CITED_SPEC**: 88
+- **NOT_FOUND**: 2
+- **REAL_PARENT_REF**: 18
+- **WRONG_SPEC_REF**: 6
 
 ## WRONG_SPEC_REF — relocated to their true normative home
 
-| NF | Event | Cited (wrong) | Real spec | Real clause | Heading |
-|---|---|---|---|---|---|
-| AMF | UE_POLICY_CONTAINER_TRANSFER | 33.128 §6.2.2.2.9 | **23.502** | **§4.11.0a.2a.10** | UE Policy Container delivery via EPS |
-| HLR | SEND_ROUTING_INFO_FOR_LCS | 33.108 §Annex | **29.002** | **§** | 13A.1 MAP-SEND-ROUTING-INFO-FOR-LCS Service |
-| HLR | RESTORE_DATA | 33.108 §Annex | **29.002** | **§8.10.3** | MAP_RESTORE_DATA service |
-| HSS | CHECK_IMEI | 33.108 §Annex | **29.273** | **§5.2.3.35** | IMEI-Check-In-VPLMN-Result |
-| HSS-IMS | REGISTRATION_REFRESH | 33.108 §Annex | **29.228** | **§6.1.2** | S-CSCF registration/deregistration notification (Cx Server-Assignment-Type RE_REGISTRATION) |
-| PGW | SERVING_EVOLVED_PS | 33.108 §10.5.1.5 | **33.107** | **§23.3.4.5.1** | Serving Evolved Packet System for IoT UE |
-| PTC | PTC_AMBIENT_LISTENING | 33.128 §7.5.2 | **23.379** | **§10.14.3.4** | Remotely initiated ambient listening call release – "listening" user initiated |
-| PTC | EMERGENCY_ALERT_CANCEL | 33.128 §7.5.2 | **29.379** | **§6.6.2.1.4.3** | Determining authorisation for initiating or cancelling an MCPTT emergency alert |
-| SGW | SERVING_EVOLVED_PS | 33.108 §10.5.1.4 | **33.107** | **§23.3.4.5.1** | Serving Evolved Packet System for IoT UE |
-| UDM | REGISTRATION_STATUS_QUERY | 33.128 §7.2.2.3.7 | **32.409** | **§4.1.1.5.2** | Successful user registration status query procedures |
+| NF | Event | Cited (wrong) | Real spec | Real clause | Heading | Heading match |
+|---|---|---|---|---|---|---|
+| AMF | UE_POLICY_CONTAINER_TRANSFER | 33.128 §6.2.2.2.9 | **23.502** | **§4.11.0a.2a.10** | UE Policy Container delivery via EPS | 0.67 |
+| HLR | SEND_ROUTING_INFO_FOR_LCS | 33.108 §Annex | **29.173** | **§6.2.3** | LCS-Routing-Info-Request (RIR) Command | 0.67 |
+| HLR | RESTORE_DATA | 33.108 §Annex | **29.002** | **§8.10.3** | MAP_RESTORE_DATA service | 1.00 |
+| HSS-IMS | REGISTRATION_REFRESH | 33.108 §Annex | **29.228** | **§6.1.2** | S-CSCF registration/deregistration notification (Cx Server-Assignment-Type RE_REGISTRATION) | 1.00 |
+| HSS-IMS | IMS_AUTH_REJECT | 33.108 §Annex | **33.234** | **§6.1.5.1.1** | Skipping authentication for IMS emergency call | 0.67 |
+| UDM | REGISTRATION_STATUS_QUERY | 33.128 §7.2.2.3.7 | **32.409** | **§4.1.1.5.2** | Successful user registration status query procedures | 1.00 |
+
+## AMBIGUOUS — the name does not identify one clause
+
+Not a statement about the corpus: the audit could not decide, and says why.
+
+- HLR / PURGE_MS (cited 33.108 §Annex) — one usable token in the name ("purge")
+- HLR / ANY_TIME_INTERROGATION (cited 33.108 §Annex) — 3 specs name it equally well (1.00): 23.078, 23.278, 29.002
+- HLR / INSERT_SUBSCRIBER_DATA (cited 33.108 §Annex) — 6 specs name it equally well (1.00): 23.012, 23.060, 23.082, 23.119, 23.401, 29.803
+- HSS / INSERT_SUBSCRIBER_DATA (cited 33.108 §Annex) — 6 specs name it equally well (1.00): 23.012, 23.060, 23.082, 23.119, 23.401, 29.803
+- MME / START_OF_INTCPT_IDLE (cited 33.108 §10.5.1.2) — one usable token in the name ("idle")
+- MME / DETACH_INITIATION (cited 33.108 §10.5.1.2.2) — 2 specs name it equally well (1.00): 24.008, 24.801
+- PTC / PTC_AMBIENT_LISTENING (cited 33.128 §7.5.2) — 3 specs name it equally well (0.67): 23.379, 23.783, 24.379
+- PTC / EMERGENCY_ALERT_CANCEL (cited 33.128 §7.5.2) — 6 specs name it equally well (1.00): 23.280, 23.283, 23.379, 23.783, 24.883, 29.379
 
 ## NOT_FOUND — no trace anywhere (candidate hallucination)
 
-- HSS-IMS / REG_TERMINATION (cited 33.108 §7.9)
-- MME / DETACH_INITIATION (cited 33.108 §10.5.1.2.2)
-- PGW / DELETE_BEARER (cited 33.108 §10.5.1.5.3)
-- PGW / PMIP_PDN_GW_INIT_DISCONN (cited 33.108 §10.5.1.5)
+- HSS-IMS / IMS_PURGE_UE (cited 33.108 §Annex)
 - PTC / PTC_E2E_KEYS (cited 33.128 §7.5.2)
 
 ## Full per-event table
 
-| NF | Event | Alias | Cited | Verdict | Real ref |
+| NF | Event | Alias | Cited | Verdict | Real ref / why |
 |---|---|---|---|---|---|
 | AMF | CONFIG_UPDATE_COMMAND | alias | 33.128 §6.2.2.2.9 | FOUND_IN_CITED_SPEC |  |
 | AMF | CONFIG_UPDATE_REJECT | alias | 33.128 §6.2.2.2.6 | FOUND_IN_CITED_SPEC |  |
@@ -52,50 +61,50 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | AMF | UNSUCCESSFUL_PROCEDURE |  | 33.128 §6.2.2.2.6 | CONFIRMED |  |
 | AUSF | AUTHENTICATION_REQUEST |  | 33.128 §6.1 | FOUND_IN_CITED_SPEC |  |
 | AUSF | AUTHENTICATION_RESPONSE |  | 33.128 §6.1 | FOUND_IN_CITED_SPEC |  |
-| HLR | ANY_TIME_INTERROGATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | CANCEL_LOCATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | DELETE_SUBSCRIBER_DATA |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | INSERT_SUBSCRIBER_DATA |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HLR | ANY_TIME_INTERROGATION |  | 33.108 §Annex | AMBIGUOUS | 3 specs name it equally well (1.00): 23.078, 23.278, 29.002 |
+| HLR | CANCEL_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | DELETE_SUBSCRIBER_DATA |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | INSERT_SUBSCRIBER_DATA |  | 33.108 §Annex | AMBIGUOUS | 6 specs name it equally well (1.00): 23.012, 23.060, 23.082, 23.119, 23.401, 29.803 |
 | HLR | LOCATION_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HLR | NOTE_SUBSCRIBER_DATA_MODIFIED |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | PROVIDE_SUBSCRIBER_INFO |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | PURGE_MS |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | NOTE_SUBSCRIBER_DATA_MODIFIED |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | PROVIDE_SUBSCRIBER_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | PURGE_MS |  | 33.108 §Annex | AMBIGUOUS | one usable token in the name ("purge") |
 | HLR | REGISTER_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HLR | REG_TERMINATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HLR | REG_TERMINATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HLR | RESTORE_DATA |  | 33.108 §Annex | WRONG_SPEC_REF | 29.002 §8.10.3 |
-| HLR | SEND_AUTHENTICATION_INFO |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | SEND_IDENTIFICATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | SEND_ROUTING_INFO |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | SEND_ROUTING_INFO_FOR_LCS |  | 33.108 §Annex | WRONG_SPEC_REF | 29.002 § |
-| HLR | SEND_ROUTING_INFO_FOR_SM |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | SERVING_SYSTEM |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HLR | SUBSCRIBER_CHANGE |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HLR | SEND_AUTHENTICATION_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | SEND_IDENTIFICATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | SEND_ROUTING_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | SEND_ROUTING_INFO_FOR_LCS |  | 33.108 §Annex | WRONG_SPEC_REF | 29.173 §6.2.3 |
+| HLR | SEND_ROUTING_INFO_FOR_SM |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | SERVING_SYSTEM |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HLR | SUBSCRIBER_CHANGE |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HLR | UPDATE_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HSS | AUTHENTICATION_INFORMATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS | CANCEL_LOCATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS | CHECK_IMEI |  | 33.108 §Annex | WRONG_SPEC_REF | 29.273 §5.2.3.35 |
-| HSS | DELETE_SUBSCRIBER_DATA |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS | HSS_SUBSCRIBER_RECORD_CHG |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS | INSERT_SUBSCRIBER_DATA |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HSS | AUTHENTICATION_INFORMATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | CANCEL_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | CHECK_IMEI |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | DELETE_SUBSCRIBER_DATA |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | HSS_SUBSCRIBER_RECORD_CHG |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | INSERT_SUBSCRIBER_DATA |  | 33.108 §Annex | AMBIGUOUS | 6 specs name it equally well (1.00): 23.012, 23.060, 23.082, 23.119, 23.401, 29.803 |
 | HSS | LOCATION_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HSS | NOTIFY_REQUEST | alias | 33.108 §Annex | REAL_PARENT_REF |  |
+| HSS | NOTIFY_REQUEST | alias | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HSS | PURGE_UE |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HSS | REGISTER_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HSS | SERVING_SYSTEM |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS | SUBSCRIBER_CHANGE |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HSS | SERVING_SYSTEM |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS | SUBSCRIBER_CHANGE |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HSS | UPDATE_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
-| HSS | UPDATE_SUBSCRIBER_DATA | alias | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_AUTHENTICATION_INFORMATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_AUTH_FAIL | alias | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_AUTH_REJECT | alias | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_CANCEL_LOCATION |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_DEREGISTRATION | alias | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | IMS_PURGE_UE |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HSS | UPDATE_SUBSCRIBER_DATA | alias | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | IMS_AUTHENTICATION_INFORMATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | IMS_AUTH_FAIL | alias | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | IMS_AUTH_REJECT | alias | 33.108 §Annex | WRONG_SPEC_REF | 33.234 §6.1.5.1.1 |
+| HSS-IMS | IMS_CANCEL_LOCATION |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | IMS_DEREGISTRATION | alias | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | IMS_PURGE_UE |  | 33.108 §Annex | NOT_FOUND |  |
 | HSS-IMS | LOCATION_INFO |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | HSS-IMS | REGISTRATION_REFRESH | alias | 33.108 §Annex | WRONG_SPEC_REF | 29.228 §6.1.2 |
-| HSS-IMS | REG_TERMINATION |  | 33.108 §7.9 | NOT_FOUND |  |
-| HSS-IMS | SERVING_SYSTEM |  | 33.108 §Annex | REAL_PARENT_REF |  |
-| HSS-IMS | SUBSCRIBER_CHANGE |  | 33.108 §Annex | REAL_PARENT_REF |  |
+| HSS-IMS | REG_TERMINATION |  | 33.108 §7.9 | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | SERVING_SYSTEM |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
+| HSS-IMS | SUBSCRIBER_CHANGE |  | 33.108 §Annex | FOUND_IN_CITED_SPEC |  |
 | LMF | LALS_REPORT |  | 33.128 §7.3.1.4 | CONFIRMED |  |
 | LMF | LOCATION_METHOD_FAILURE |  | 33.128 §7.3.1.4 | CONFIRMED |  |
 | MME | ATTACH_REJECT | alias | 33.108 §10.5.1.2.1 | REAL_PARENT_REF |  |
@@ -103,7 +112,7 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | MME | BEARER_DEACTIVATION |  | 33.108 §10.5.1.2.3 | REAL_PARENT_REF |  |
 | MME | BEARER_MODIFICATION |  | 33.108 §10.5.1.2.3 | REAL_PARENT_REF |  |
 | MME | CHECK_IMEI | alias | 33.108 §10.5.1.1 | CONFIRMED |  |
-| MME | DETACH_INITIATION | alias | 33.108 §10.5.1.2.2 | NOT_FOUND |  |
+| MME | DETACH_INITIATION | alias | 33.108 §10.5.1.2.2 | AMBIGUOUS | 2 specs name it equally well (1.00): 24.008, 24.801 |
 | MME | EUTRAN_ATTACH |  | 33.108 §10.5.1.2.1 | REAL_PARENT_REF |  |
 | MME | EUTRAN_DETACH |  | 33.108 §10.5.1.2.2 | REAL_PARENT_REF |  |
 | MME | LOCATION_UPDATE |  | 33.108 §10.5.1.2.4 | REAL_PARENT_REF |  |
@@ -121,7 +130,7 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | MME | START_INTCPT_EUTRAN_ATT_UE |  | 33.108 §10.5.1.2.1 | REAL_PARENT_REF |  |
 | MME | START_LI_PROSE_REMOTE |  | 33.108 §10.5.1.2 | FOUND_IN_CITED_SPEC |  |
 | MME | START_LI_PROSE_UE_NW_RELAY |  | 33.108 §10.5.1.2 | FOUND_IN_CITED_SPEC |  |
-| MME | START_OF_INTCPT_IDLE |  | 33.108 §10.5.1.2 | FOUND_IN_CITED_SPEC |  |
+| MME | START_OF_INTCPT_IDLE |  | 33.108 §10.5.1.2 | AMBIGUOUS | one usable token in the name ("idle") |
 | MME | START_OF_INTCPT_MS_ATTACHED |  | 33.108 §10.5.1.2 | CONFIRMED |  |
 | MME | TRACKING_AREA_UPDATE |  | 33.108 §10.5.1.2.4 | FOUND_IN_CITED_SPEC |  |
 | MME | UE_CONTEXT_RELEASE | alias | 33.108 §10.5.1.1 | CONFIRMED |  |
@@ -150,7 +159,7 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | MMS | MMS_SUBMIT_INDICATION | alias | 33.128 §7.4.3.1 | CONFIRMED |  |
 | PGW | CREATE_BEARER |  | 33.108 §10.5.1.5.3 | FOUND_IN_CITED_SPEC |  |
 | PGW | CREATE_SESSION |  | 33.108 §10.5.1.5.1 | FOUND_IN_CITED_SPEC |  |
-| PGW | DELETE_BEARER |  | 33.108 §10.5.1.5.3 | NOT_FOUND |  |
+| PGW | DELETE_BEARER |  | 33.108 §10.5.1.5.3 | FOUND_IN_CITED_SPEC |  |
 | PGW | DELETE_SESSION |  | 33.108 §10.5.1.5.2 | FOUND_IN_CITED_SPEC |  |
 | PGW | DSMIP_DEREG_TUNNEL |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | DSMIP_HA_SWITCH |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
@@ -166,12 +175,12 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | PGW | PACKET_DATA_SUMMARY_REPORT |  | 33.108 §10.5.1.1 | CONFIRMED |  |
 | PGW | PMIP_ATTACH_TUNNEL |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | PMIP_DETACH_TUNNEL |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
-| PGW | PMIP_PDN_GW_INIT_DISCONN |  | 33.108 §10.5.1.5 | NOT_FOUND |  |
+| PGW | PMIP_PDN_GW_INIT_DISCONN |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | PMIP_RES_ALLOC_DEACT |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | PMIP_SESSION_MODIFICATION |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | SCEF_REQ_NON_IP_PDN_DISCONNECTION |  | 33.108 §10.5.1.1.7A | REAL_PARENT_REF |  |
 | PGW | SCEF_REQ_NON_IP_PDN_ESTABLISHMENT |  | 33.108 §10.5.1.1.7B | REAL_PARENT_REF |  |
-| PGW | SERVING_EVOLVED_PS |  | 33.108 §10.5.1.5 | WRONG_SPEC_REF | 33.107 §23.3.4.5.1 |
+| PGW | SERVING_EVOLVED_PS |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | START_INTCPT_ACTIVE_BEARER |  | 33.108 §10.5.1.5.3 | FOUND_IN_CITED_SPEC |  |
 | PGW | START_INTCPT_ACTIVE_DSMIP |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | START_INTCPT_ACTIVE_MIP |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
@@ -180,11 +189,11 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | PGW | UE_REQ_BEARER_RES_MOD |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | UE_REQ_PDN_CONNECTIVITY |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
 | PGW | UE_REQ_PDN_DISCONNECTION |  | 33.108 §10.5.1.5 | FOUND_IN_CITED_SPEC |  |
-| PTC | EMERGENCY_ALERT_CANCEL | alias | 33.128 §7.5.2 | WRONG_SPEC_REF | 29.379 §6.6.2.1.4.3 |
+| PTC | EMERGENCY_ALERT_CANCEL | alias | 33.128 §7.5.2 | AMBIGUOUS | 6 specs name it equally well (1.00): 23.280, 23.283, 23.379, 23.783, 24.883, 29.379 |
 | PTC | FLOOR_REQUEST_DENIED | alias | 33.128 §7.5.2.14 | CONFIRMED |  |
 | PTC | PRE_ARRANGED_GROUP | alias | 33.128 §7.5.2.7 | CONFIRMED |  |
 | PTC | PTC_ACCESS_POLICY |  | 33.128 §7.5.2.18 | CONFIRMED |  |
-| PTC | PTC_AMBIENT_LISTENING |  | 33.128 §7.5.2 | WRONG_SPEC_REF | 23.379 §10.14.3.4 |
+| PTC | PTC_AMBIENT_LISTENING |  | 33.128 §7.5.2 | AMBIGUOUS | 3 specs name it equally well (0.67): 23.379, 23.783, 24.379 |
 | PTC | PTC_E2E_KEYS |  | 33.128 §7.5.2 | NOT_FOUND |  |
 | PTC | PTC_EMERGENCY |  | 33.128 §7.5.2 | REAL_PARENT_REF |  |
 | PTC | PTC_FLOOR_CONTROL |  | 33.128 §7.5.2.14 | CONFIRMED |  |
@@ -218,7 +227,7 @@ Oracle: `docs/inputs/sentinel_r17_events.json` (218 events). Each event verified
 | SGW | PMIP_RES_ALLOC_DEACT |  | 33.108 §10.5.1.4 | CONFIRMED |  |
 | SGW | PMIP_SESSION_MODIFICATION |  | 33.108 §10.5.1.4 | FOUND_IN_CITED_SPEC |  |
 | SGW | S1_HANDOVER |  | 33.108 §10.5.1.1 | CONFIRMED |  |
-| SGW | SERVING_EVOLVED_PS |  | 33.108 §10.5.1.4 | WRONG_SPEC_REF | 33.107 §23.3.4.5.1 |
+| SGW | SERVING_EVOLVED_PS |  | 33.108 §10.5.1.4 | FOUND_IN_CITED_SPEC |  |
 | SGW | START_INTCPT_ACTIVE_BEARER |  | 33.108 §10.5.1.4 | CONFIRMED |  |
 | SGW | START_INTCPT_ACTIVE_PMIP |  | 33.108 §10.5.1.4 | CONFIRMED |  |
 | SGW | TRACKING_AREA_UPDATE |  | 33.108 §10.5.1.4.4 | FOUND_IN_CITED_SPEC |  |

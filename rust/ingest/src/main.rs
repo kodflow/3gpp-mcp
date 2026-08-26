@@ -55,6 +55,10 @@ struct Args {
     /// separate pass (ingest-li). No-op here.
     #[arg(long, default_value = "")]
     origin: String,
+    /// The published corpus, so --resume can ask what is ALREADY HELD rather than only
+    /// what this scratch shard happens to remember. Optional; absent = shard-only resume.
+    #[arg(long, default_value = "")]
+    corpus: String,
 }
 
 /// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
@@ -72,10 +76,56 @@ fn run_count_only(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// read_html reads a converted document as text, accepting the encodings LibreOffice
+/// actually emits rather than the one we would prefer.
+///
+/// LibreOffice's HTML export keeps the SOURCE document's charset. A .doc written in
+/// Western Europe comes out as windows-1252, not UTF-8, and `read_to_string` refuses
+/// it outright: "stream did not contain valid UTF-8". ingest then logs a skip line to
+/// stderr and reports SUCCESS for the series, so the spec is fetched, converted, and
+/// silently never indexed. All six releases of TS 34.123-1 were lost that way on the
+/// 2026-08-25 repair — acquired three times over, dropped three times over, and
+/// counted as a corpus hole nobody could explain.
+///
+/// So: use UTF-8 when the bytes are UTF-8, and otherwise decode as windows-1252,
+/// which is what those files are. The mapping is Latin-1 for 0xA0-0xFF and the
+/// CP1252 punctuation block for 0x80-0x9F — the quotes and dashes Word litters
+/// through prose. Nothing is dropped and no byte can fail to decode, which is the
+/// point: a conformance spec must not be discarded over a typographic apostrophe.
+fn read_html(path: &str) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {path}"))?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            eprintln!("ingest: {path}: not UTF-8, decoding as windows-1252");
+            Ok(bytes.iter().map(|&b| cp1252_char(b)).collect())
+        }
+    }
+}
+
+/// cp1252_char maps one windows-1252 byte to its Unicode character. 0x00-0x7F and
+/// 0xA0-0xFF are Latin-1, i.e. identical to the code point; 0x80-0x9F is the CP1252
+/// punctuation block, which Latin-1 leaves undefined and Word uses constantly.
+fn cp1252_char(b: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    if (0x80..=0x9F).contains(&b) {
+        HIGH[(b - 0x80) as usize]
+    } else {
+        b as char
+    }
+}
+
 /// ingest_one parses one converted HTML by its 3GPP filename and writes it.
 fn ingest_one(store: &Store, html_path: &str, offset: u64) -> Result<(SpecMeta, usize)> {
     let meta = parse_filename_meta(html_path).map_err(|e| anyhow::anyhow!(e))?;
-    let html = std::fs::read_to_string(html_path).with_context(|| format!("read {html_path}"))?;
+    let html = read_html(html_path)?;
     let n = write_spec(store, &meta, &html, offset)?;
     Ok((meta, n))
 }
@@ -87,7 +137,9 @@ fn ingest_etsi_one(
     html_path: &str,
     offset: u64,
 ) -> Result<Option<(SpecMeta, usize)>> {
-    let html = std::fs::read_to_string(html_path).with_context(|| format!("read {html_path}"))?;
+    // Same reasoning as the 3GPP path: an ETSI PDF converted through a Western-encoded
+    // intermediate must not be discarded over its punctuation.
+    let html = read_html(html_path)?;
     let Some(meta) = parse3gpp::etsi::parse_etsi_meta(&html) else {
         return Ok(None);
     };
@@ -139,7 +191,26 @@ fn write_spec(store: &Store, meta: &SpecMeta, html: &str, offset: u64) -> Result
             )?;
         }
     }
-    store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
+    // A DOCUMENT THAT YIELDED NO CLAUSE DOES NOT GET TO CLAIM THE SPEC.
+    //
+    // One archive can hold several documents for the same (spec, version): TR 30.531
+    // v1.64.0 ships a 6 KB plenary cover note beside two 1.6 MB drafts. They are walked
+    // in name order, the cover sorts first, it parses to nothing — and marking it
+    // "done" made --resume skip the drafts that carry the actual text. The spec was
+    // then catalogued with no clauses behind it, which is a missing_content hole
+    // produced by the ingest itself.
+    //
+    // Marking "done" only when something was parsed lets the next candidate for the
+    // same (spec, version) have its turn, and leaves the slot open if none of them
+    // works — which is the honest outcome, and a visible one.
+    if rows.is_empty() {
+        eprintln!(
+            "ingest: {} {} produced no clause — leaving the slot open for another document",
+            meta.spec_id, meta.version
+        );
+    } else {
+        store.log_ingest(&meta.spec_id, &meta.version, "done", PIPELINE_VERSION)?;
+    }
     Ok(rows.len())
 }
 
@@ -243,6 +314,22 @@ fn main() -> Result<()> {
         store.set_meta("producer", "rust-writeside")?;
         store.set_meta("schema_version", "1")?;
         store.checkpoint()?;
+
+        // BUILD THE BM25 INDEX HERE — nothing downstream will.
+        //
+        // The corpus carries TWO indexes: dense HNSW and lexical BM25/FTS. On the
+        // 3GPP side `merge` builds the FTS because merge is what publishes the
+        // corpus; the per-series shards ingest writes are throwaway inputs.
+        //
+        // ETSI has no merge: `ingest --etsi` IS the publish. Leaving the FTS to a
+        // step that never runs shipped an ETSI corpus with only half its indexes —
+        // `validate --require-fts` on etsi.duckdb reported fts_available=false while
+        // the HNSW was frozen and green. Best-effort like merge: a missing extension
+        // degrades search to LIKE, it does not invalidate the corpus.
+        if let Err(e) = store.enable_fts() {
+            eprintln!("ingest: FTS build skipped ({e})");
+        }
+        store.checkpoint()?;
         return Ok(());
     }
 
@@ -260,12 +347,39 @@ fn main() -> Result<()> {
             anyhow::bail!("ingest: pass --html <file> or --series <NN> --convert <dir>");
         };
         let files = collect_series_html(convert, series, &args.release)?;
+
+        // RESUME AGAINST THE CORPUS, NOT ONLY AGAINST THE SHARD.
+        //
+        // ingest_log lives in the SHARD, and a shard is scratch. Delete it, or start a
+        // series that never had one, and the ledger is empty — so every converted file
+        // of the series is parsed and written again. The 2026-08-25 run re-ingested
+        // ~300 000 clauses that way to acquire five specs, and merge then had to decide
+        // bucket by bucket that almost none of it had moved.
+        //
+        // The corpus is the durable record of what is already held. When the caller
+        // names it, a document it already carries is skipped whatever the shard
+        // remembers. --corpus is optional: without it the old behaviour stands.
+        let already: std::collections::HashSet<(String, String)> = match Some(args.corpus.as_str())
+        {
+            Some(c) if !c.is_empty() && std::path::Path::new(c).exists() => {
+                let v = store.corpus_versions_with_text(c)?;
+                eprintln!(
+                    "ingest: corpus already holds {} (spec, version) pair(s)",
+                    v.len()
+                );
+                v.into_iter().collect()
+            }
+            _ => std::collections::HashSet::new(),
+        };
+
         let mut specs = 0usize;
         let mut clauses = 0usize;
         for f in &files {
             if args.resume {
                 if let Ok(m) = parse_filename_meta(f) {
-                    if store.ingest_done(&m.spec_id, &m.version, PIPELINE_VERSION)? {
+                    if store.ingest_done(&m.spec_id, &m.version, PIPELINE_VERSION)?
+                        || already.contains(&(m.spec_id.clone(), m.version.clone()))
+                    {
                         continue;
                     }
                 }
@@ -292,4 +406,131 @@ fn main() -> Result<()> {
     store.checkpoint()?;
     let _ = total;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A converted document must not be discarded over its punctuation.
+    //
+    // LibreOffice's HTML export keeps the SOURCE document's charset, so a .doc
+    // written in Western Europe comes out as windows-1252 and `read_to_string`
+    // refuses it: "stream did not contain valid UTF-8". ingest logged a skip line to
+    // stderr and reported SUCCESS for the series — so all six releases of
+    // TS 34.123-1 were fetched, converted, and silently never indexed, then counted
+    // as corpus holes nobody could explain.
+    #[test]
+    fn a_windows_1252_document_is_read_rather_than_discarded() {
+        let dir = std::env::temp_dir().join(format!("ingest-cp1252-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("doc.html");
+
+        // 0xE9 is 'é' in windows-1252 and an invalid lone byte in UTF-8; 0x92 is the
+        // right single quote Word inserts for every apostrophe it touches.
+        let mut bytes = b"<html><body><p>proc".to_vec();
+        bytes.push(0xE9); // é
+        bytes.extend_from_slice(b"dure d");
+        bytes.push(0x92); // ’
+        bytes.extend_from_slice(b"essai</p></body></html>");
+        std::fs::write(&p, &bytes).unwrap();
+
+        let got = read_html(p.to_str().unwrap()).expect("a non-UTF-8 document must still be read");
+        assert!(
+            got.contains("procédure"),
+            "Latin-1 accents must survive: {got}"
+        );
+        assert!(
+            got.contains('\u{2019}'),
+            "the CP1252 quote must decode, not vanish: {got}"
+        );
+        assert!(
+            !got.contains('\u{FFFD}'),
+            "nothing may be replaced by U+FFFD: {got}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Valid UTF-8 must go through untouched — the fallback exists for the files that
+    // need it, and must not become a lossy path for the files that do not.
+    #[test]
+    fn a_utf8_document_is_untouched() {
+        let dir = std::env::temp_dir().join(format!("ingest-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("doc.html");
+        let want = "<p>procédure d’essai — 日本語</p>";
+        std::fs::write(&p, want.as_bytes()).unwrap();
+
+        let got = read_html(p.to_str().unwrap()).unwrap();
+        assert_eq!(got, want, "valid UTF-8 must be returned byte for byte");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The CP1252 punctuation block is the whole reason a plain Latin-1 decode is not
+    // enough: Latin-1 leaves 0x80-0x9F undefined, and Word fills it constantly.
+    #[test]
+    fn the_cp1252_punctuation_block_decodes() {
+        for (byte, want) in [
+            (0x80u8, '\u{20AC}'), // €
+            (0x93, '\u{201C}'),   // “
+            (0x94, '\u{201D}'),   // ”
+            (0x96, '\u{2013}'),   // –
+            (0x97, '\u{2014}'),   // —
+        ] {
+            assert_eq!(cp1252_char(byte), want, "byte {byte:#04x}");
+        }
+        // Outside that block the byte IS the code point.
+        assert_eq!(cp1252_char(0x41), 'A');
+        assert_eq!(cp1252_char(0xE9), 'é');
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    // A document that yielded no clause must not claim the (spec, version) slot.
+    //
+    // One archive can hold several documents for the same version: TR 30.531 v1.64.0
+    // ships a 6 KB plenary cover note beside two 1.6 MB drafts. They are walked in name
+    // order, the cover sorts first, it parses to nothing — and marking it "done" made
+    // --resume skip the drafts carrying the actual text. The spec was catalogued with
+    // no clauses behind it: a missing_content hole produced by the ingest itself.
+    #[test]
+    fn an_empty_parse_leaves_the_slot_open() {
+        let store = Store::in_memory().unwrap();
+        let meta = SpecMeta {
+            spec_id: "30.531".into(),
+            series: "30".into(),
+            doc_type: "TR".into(),
+            working_group: "RAN3".into(),
+            release: "Rel-10".into(),
+            version: "1.64.0".into(),
+            docx_url: String::new(),
+        };
+
+        // The cover note: valid HTML, no clause structure at all.
+        let cover = "<html><body><p>Presentation of TR 30.531 for information</p></body></html>";
+        let n = write_spec(&store, &meta, cover, 0).unwrap();
+        assert_eq!(n, 0, "the cover carries no clause");
+        assert!(
+            !store
+                .ingest_done("30.531", "1.64.0", PIPELINE_VERSION)
+                .unwrap(),
+            "an empty parse must NOT mark the version done, or the real draft is skipped"
+        );
+
+        // The real draft, next in the walk, now gets its turn.
+        let draft = "<html><body><h1>4.1 Architecture</h1><p>the actual text</p></body></html>";
+        let n = write_spec(&store, &meta, draft, 100).unwrap();
+        assert!(n > 0, "the draft carries clauses");
+        assert!(
+            store
+                .ingest_done("30.531", "1.64.0", PIPELINE_VERSION)
+                .unwrap(),
+            "a parse that produced clauses DOES claim the version"
+        );
+    }
 }

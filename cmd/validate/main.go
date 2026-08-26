@@ -202,10 +202,19 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		res.add("embed-identity", got == cfg.expectedIdentity, "schema_meta.embedding_model=%q want=%q", got, cfg.expectedIdentity)
 	}
 
-	// require-hnsw (frozen) — only meaningful when vectorized
+	// require-hnsw — the INDEX must be there, not just the claim that it is.
+	//
+	// hnsw_state is a schema_meta row, and rows travel. merge compacts the corpus with
+	// COPY FROM DATABASE, which copies the data and deliberately leaves custom indexes
+	// behind — so the flag lands in the new file still reading "frozen" while the index
+	// it describes is gone. Checking only the flag passed a corpus that could answer
+	// lexically and nothing else, which is exactly the failure `smoke` was written to
+	// catch after it shipped for months.
 	if cfg.requireHNSW {
 		st := db.GetMeta(ctx, "hnsw_state")
-		res.add("require-hnsw", st == "frozen", "hnsw_state=%q", st)
+		present := db.HNSWIndexPresent(ctx)
+		res.add("require-hnsw", st == "frozen" && present,
+			"hnsw_state=%q index_present=%v", st, present)
 	}
 
 	// require-fts — LOAD (never build) then probe availability

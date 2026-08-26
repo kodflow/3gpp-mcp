@@ -17,7 +17,7 @@ JOBS="${JOBS:-2}"
 # shellcheck source=lib/convert.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/convert.sh"
 export CONV_TIMEOUT CONV_KILL DEGRADED_TSV CONVERT
-export -f convert_doc _soffice_html
+convert_export_fns
 
 mapfile -t ZIPS < <(grep FAILCV "$LOG" 2>/dev/null | grep -v '\._' \
   | grep -oE "$ORIGIN/Rel-[0-9]+/[0-9]+-[0-9a-z]+\.zip" | sort -u)

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      "command": ".local/bin/server.exe",
+      "args": [
+        "serve",
+        "--db", "data/3gpp.duckdb",
+        "--etsi-db", "data/etsi.duckdb"
+      ]
+    }
+  }
+}
