@@ -44,6 +44,13 @@ type Reader interface {
 	ClauseAvailability(ctx context.Context, specID, prefix string) ([]ClauseRel, []string, error)
 	ClauseLineage(ctx context.Context, specID, prefix string) (map[string]model.Lineage, error)
 
+	// Paragraph-level provenance (ADR 0004). ContentAddressed reports whether a
+	// given corpus can answer these at all: etsi.duckdb is served ALONGSIDE and
+	// has not been converted, so a caller must ask rather than assume.
+	ContentAddressed() bool
+	ParagraphLineage(ctx context.Context, specID, clausePath string) ([]ParagraphTrace, error)
+	ClauseDelta(ctx context.Context, specID, clausePath, from, to string) (added, removed []string, kept int, err error)
+
 	// Retrieval arms.
 	SearchClauses(ctx context.Context, q SearchQuery) ([]model.SearchHit, error)
 	SearchSparse(ctx context.Context, query model.SparseVec, f SpecFilter, topK int) ([]model.SearchHit, error)
