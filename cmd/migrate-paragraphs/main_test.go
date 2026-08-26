@@ -205,3 +205,67 @@ func TestOccurrencesAreIdentifiedByChunkIDNotByPath(t *testing.T) {
 		t.Fatalf("the fixture no longer contains a repeated clause path (%d distinct keys for 11 rows)", distinctKeys)
 	}
 }
+
+// Dropping the table must leave a VIEW behind, or every caller that reads
+// metadata off `clauses` — validate, anchorcheck, split, the sparse join —
+// breaks at once. DuckDB prunes the text column when it is not selected, so
+// those callers pay nothing for it.
+func TestDroppingTheTableLeavesAWorkingView(t *testing.T) {
+	h := fixture(t)
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := drop(h); err != nil {
+		t.Fatal(err)
+	}
+
+	var isView int
+	if err := h.QueryRow(`SELECT count(*) FROM duckdb_views() WHERE view_name = 'clauses'`).Scan(&isView); err != nil {
+		t.Fatal(err)
+	}
+	if isView != 1 {
+		t.Fatal("`clauses` is gone and nothing replaced it")
+	}
+	var n int
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&n); err != nil {
+		t.Fatalf("counting through the view: %v", err)
+	}
+	if n != 8 {
+		t.Fatalf("the view sees %d rows, want 8", n)
+	}
+	// And the text still comes back when it IS asked for.
+	var text string
+	if err := h.QueryRow(`SELECT text FROM clauses WHERE spec_id = '23.503'`).Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "a\n\n\n\nb" {
+		t.Errorf("view rebuilt %q, want the original blank-run text", text)
+	}
+}
+
+// Applying the schema to a migrated corpus must not resurrect the table.
+func TestTheSchemaDoesNotResurrectTheTable(t *testing.T) {
+	h := fixture(t)
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := drop(h); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`CREATE TABLE IF NOT EXISTS clauses (chunk_id UBIGINT, spec_id VARCHAR)`); err != nil {
+		t.Fatalf("re-applying the schema over the view failed: %v", err)
+	}
+	var isView int
+	if err := h.QueryRow(`SELECT count(*) FROM duckdb_views() WHERE view_name = 'clauses'`).Scan(&isView); err != nil {
+		t.Fatal(err)
+	}
+	if isView != 1 {
+		t.Fatal("the schema replaced the view with an empty table — the corpus would read as empty")
+	}
+}
