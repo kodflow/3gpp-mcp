@@ -266,9 +266,18 @@ func stepEnrich() *Step {
 		Version: 1,
 		Doc:     "overlay the DynaReport catalogue, the 5GC OpenAPI corpus and the LI registry",
 		Deps:    []string{"merge"},
-		Impl:    []string{"rust/ingest/src/bin"},
+		// The two fetch scripts are part of this step's implementation now that it
+		// runs them: changing how an overlay is acquired must replay the overlay.
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.statePath("status-report.htm"), c.dataPath("sources", "5g-apis")}, nil
+			// data/sources/asn joins the inputs for the same reason 5g-apis is
+			// already here: acquiring the LI registry must make the overlay dirty,
+			// or the corpus keeps whatever li_events it had.
+			return []string{
+				c.statePath("status-report.htm"),
+				c.dataPath("sources", "5g-apis"),
+				c.dataPath("sources", "asn"),
+			}, nil
 		},
 		Heavy: true,
 		Validate: func(c *Ctx) error {
@@ -300,25 +309,52 @@ func stepEnrich() *Step {
 				return err
 			}
 
-			if apis := c.dataPath("sources", "5g-apis"); dirExists(apis) {
+			// The two external overlays acquire themselves when absent.
+			//
+			// They used to be a log line telling the operator to run a script —
+			// "run scripts/fetch-5g-apis.sh to add it" — which meant a fresh clone
+			// completed all 19 steps, reported success, and served an empty
+			// `search_api` and an empty `li_events`. A pipeline that names the
+			// command instead of running it has not built the product.
+			//
+			// Only when ABSENT, and never fatal. Refreshing is a separate,
+			// deliberate act (OVERLAY_REFRESH=1, or run the scripts): re-fetching
+			// on every enrich would re-download the release archives to discover
+			// nothing changed, and an offline machine must still finish the run
+			// with whatever it already has.
+			apis := c.dataPath("sources", "5g-apis")
+			if !dirExists(apis) || refreshOverlays() {
+				c.Log.Printf("no 5GC OpenAPI corpus — acquiring it (scripts/fetch-5g-apis.sh auto)")
+				if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/fetch-5g-apis.sh", "auto"}, Echo: true}); err != nil {
+					c.Log.Printf("the OpenAPI fetch failed (%v) — continuing with what is on disk", err)
+				}
+			}
+			if dirExists(apis) {
 				c.Log.Printf("5GC OpenAPI overlay")
 				if err := c.Run(Cmd{Name: c.rbin("ingest-openapi"), Args: []string{"--src", apis, "--db", db}, Echo: true}); err != nil {
 					return err
 				}
 			} else {
-				c.Log.Printf("no data/sources/5g-apis — skipping the OpenAPI overlay (run scripts/fetch-5g-apis.sh to add it)")
+				c.Log.Printf("no data/sources/5g-apis and none could be fetched — search_api will answer from nothing")
 			}
 
-			// ingest-li is wired into no workflow and no make target today, while
-			// li_events/asn1_types are in the schema and the `li` subject declares
-			// a footprint. Wire it here rather than leave the tables empty.
+			// The TS 33.128 ASN.1 registry is not published on its own: it rides in
+			// a zip inside the zip of the spec, and this machine purges the origin
+			// archives after conversion, so it has to be refetched rather than
+			// found.
+			if findASN(c) == "" || refreshOverlays() {
+				c.Log.Printf("no TS 33.128 ASN.1 registry — acquiring it (scripts/fetch-li-asn.sh)")
+				if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/fetch-li-asn.sh"}, Echo: true}); err != nil {
+					c.Log.Printf("the LI registry fetch failed (%v) — continuing with what is on disk", err)
+				}
+			}
 			if asn := findASN(c); asn != "" {
 				c.Log.Printf("Lawful Interception registry from %s", filepath.Base(asn))
 				if err := c.Run(Cmd{Name: c.rbin("ingest-li"), Args: []string{"--db", db, "--asn", asn}, Echo: true}); err != nil {
 					return err
 				}
 			} else {
-				c.Log.Printf("no TS33128Payloads .asn found — li_events stays empty")
+				c.Log.Printf("no TS33128Payloads .asn and none could be fetched — li_events stays empty")
 			}
 			return nil
 		},
@@ -862,4 +898,19 @@ func (t corpusTarget) indexDeps() []string {
 		return []string{"embed", "enrich"}
 	}
 	return []string{"embed" + t.Suffix}
+}
+
+// refreshOverlays reports whether the operator asked for the external overlays
+// to be re-acquired even though they are already on disk.
+//
+// The default is NOT to: the 5GC OpenAPI fetch pulls one archive per release to
+// discover that nothing moved, and an enrich that goes to the network every run
+// is an enrich that fails when the network does. Refreshing is what you do when
+// a new release lands, and saying so is cheap.
+func refreshOverlays() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OVERLAY_REFRESH"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }

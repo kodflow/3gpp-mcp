@@ -1137,3 +1137,60 @@ func TestTheAcquiredSetIsPartOfWhatFetchProduces(t *testing.T) {
 		c.Config[k] = save
 	}
 }
+
+// --- the external overlays acquire themselves -------------------------------
+
+// They used to be a log line naming a script. A fresh clone therefore completed
+// all 19 steps, reported success, and served an empty search_api and an empty
+// li_events — the pipeline had named the command instead of running it.
+func TestTheOverlayFetchScriptsArePartOfEnrich(t *testing.T) {
+	step := stepEnrich()
+	var got string
+	for _, i := range step.Impl {
+		got += i + " "
+	}
+	for _, want := range []string{"scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("enrich runs %s but does not list it as implementation: changing how an overlay is acquired would not replay the overlay", want)
+		}
+	}
+}
+
+// Acquiring the LI registry has to make the step dirty, or the corpus keeps
+// whatever li_events it already had.
+func TestTheAcquiredOverlaysAreInputsOfEnrich(t *testing.T) {
+	c, _ := newTestCtx(t)
+	in, err := stepEnrich().Inputs(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var joined string
+	for _, i := range in {
+		joined += filepath.ToSlash(i) + " "
+	}
+	for _, want := range []string{"sources/5g-apis", "sources/asn"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("enrich does not take %s as an input: filling it would not re-run the overlay", want)
+		}
+	}
+}
+
+// Refreshing is deliberate. Going to the network on every enrich re-downloads a
+// release archive to discover nothing moved, and makes the step fail whenever
+// the network does.
+func TestOverlaysAreNotRefetchedUnlessAsked(t *testing.T) {
+	t.Setenv("OVERLAY_REFRESH", "")
+	if refreshOverlays() {
+		t.Error("the default must not re-fetch overlays that are already on disk")
+	}
+	for _, v := range []string{"1", "true", "YES", " yes "} {
+		t.Setenv("OVERLAY_REFRESH", v)
+		if !refreshOverlays() {
+			t.Errorf("OVERLAY_REFRESH=%q must force a refresh", v)
+		}
+	}
+	t.Setenv("OVERLAY_REFRESH", "0")
+	if refreshOverlays() {
+		t.Error("OVERLAY_REFRESH=0 must not force a refresh")
+	}
+}
