@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1083,5 +1084,56 @@ func TestAReleaseNumberIsReadFromThePathNotTheName(t *testing.T) {
 		if got := releaseNumber(filepath.FromSlash(path)); got != want {
 			t.Fatalf("releaseNumber(%q) = %d, want %d", path, got, want)
 		}
+	}
+}
+
+// --- what belongs in a fingerprint -----------------------------------------
+
+// A fingerprint must capture what changes the OUTPUT, not the rate at which it
+// is produced. `jobs` was in fetch's Extra, so raising the conversion
+// parallelism replayed fetch and cascaded through ingest, merge, embed and
+// index — half an hour of rework to answer a scheduling question.
+func TestParallelismIsNotPartOfWhatFetchProduces(t *testing.T) {
+	c, _ := newTestCtx(t)
+	step := stepFetch()
+
+	c.Config["floor"] = "Rel-99"
+	c.Config["repair"] = "0"
+	c.Config["jobs"] = "4"
+	four, err := step.Extra(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Config["jobs"] = "6"
+	six, err := step.Extra(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(four, six) {
+		t.Fatalf("jobs must not change the fetch fingerprint: %v vs %v", four, six)
+	}
+}
+
+// The two knobs that DO change which specs are acquired must still replay it.
+func TestTheAcquiredSetIsPartOfWhatFetchProduces(t *testing.T) {
+	c, _ := newTestCtx(t)
+	step := stepFetch()
+	c.Config["floor"] = "Rel-99"
+	c.Config["repair"] = "0"
+	base, err := step.Extra(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"floor", "repair"} {
+		save := c.Config[k]
+		c.Config[k] = "changed"
+		got, err := step.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reflect.DeepEqual(base, got) {
+			t.Fatalf("%q changes which specs are fetched and must replay the step", k)
+		}
+		c.Config[k] = save
 	}
 }

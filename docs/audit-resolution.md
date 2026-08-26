@@ -437,7 +437,16 @@ bundled ONNX Runtime, which is the first half of F14's remedy.
 ## Accepted
 
 ### F33 — More parallelism made the corpus build twice as slow
-`CONFIRMED` · `ACCEPT` (jobs=4 stays the default)
+`SUPERSEDED 2026-08-26` · the default is now **jobs=6**
+
+> **Reversed by a controlled measurement.** The numbers below were sampled from
+> windows of a live run, with downloads, other steps and an unknown machine load
+> mixed in. An A/B/B/A over the same 28 documents on an idle machine, driving the
+> real `convert.sh`, measured **225 s at `--jobs 4` against 178 s at `--jobs 6`** —
+> 6 is 21 % *faster*, and the two 6-runs agreed to the second. `scripts/corpus.sh`
+> now defaults to 6; see `docs/local-pipeline.md`. What survives F33 is not its
+> conclusion but its lesson about method: **a throughput figure taken mid-run is
+> not a measurement.**
 
 CPU sat at 73 % with 17 GB RAM free during conversion, so `--jobs` went from 4 to
 6 to use the headroom. Measured over 10–15 minute windows:

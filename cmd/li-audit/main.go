@@ -58,11 +58,15 @@ func main() {
 
 	// Actionable sections: relocated + not-found.
 	md.WriteString("\n## WRONG_SPEC_REF — relocated to their true normative home\n\n")
-	md.WriteString("| NF | Event | Cited (wrong) | Real spec | Real clause | Heading |\n|---|---|---|---|---|---|\n")
+	// The score is the fraction of the event's tokens the target HEADING carries.
+	// A relocation at 1.00 names the operation; one at 0.67 matched two tokens of
+	// three and deserves a human glance before it is believed. Printing it is the
+	// difference between a verdict and a verdict you can audit.
+	md.WriteString("| NF | Event | Cited (wrong) | Real spec | Real clause | Heading | Heading match |\n|---|---|---|---|---|---|---|\n")
 	for _, f := range fs {
 		if f.Verdict == li.VWrongSpec {
-			fmt.Fprintf(&md, "| %s | %s | %s §%s | **%s** | **§%s** | %s |\n",
-				f.NF, f.Event, f.CitedSpec, f.CitedClause, f.RealSpec, f.RealClause, f.RealHeading)
+			fmt.Fprintf(&md, "| %s | %s | %s §%s | **%s** | **§%s** | %s | %.2f |\n",
+				f.NF, f.Event, f.CitedSpec, f.CitedClause, f.RealSpec, f.RealClause, f.RealHeading, f.Score)
 		}
 	}
 	md.WriteString("\n## AMBIGUOUS — the name does not identify one clause\n\n")

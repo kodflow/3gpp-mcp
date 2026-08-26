@@ -171,7 +171,7 @@ the new ones.
 | GPU | An RTX A4500 (20 GB) exceeds the T4 (16 GB) the code was written for. `rust/embedder` sizes its batches from `nvidia-smi`; no tuning needed. |
 | RAM | The HNSW build needs the vectors in memory (2.85 M × 1024 × f32 ≈ 11.7 GB). What matters is RAM **+ swap**: CI managed it on a 7 GB runner with a 28 GB swapfile. |
 | Disk | The full corpus is ~37 GB of archives **plus** ~37 GB of converted HTML. `fetch` deletes each archive once its HTML exists (`KEEP_ZIP=1` to disable) — that is a feasibility condition, not an optimisation. It is what filled the CI runner and turned every scheduled build red. |
-| CPU | LibreOffice conversion is the wall-clock bottleneck, not the GPU. `--jobs` defaults to 4. **Do not raise it on visible CPU headroom.** Measured here: 4 workers at 73 % CPU convert 4.9/min; 6 workers peg the CPU at 99 % and convert **2.4/min** — 8 logical threads on ~4 physical cores, so the instances contend rather than parallelise (F33). RAM is not the limit (17 GB free at 6 workers); execution units are. |
+| CPU | LibreOffice conversion is the wall-clock bottleneck, not the GPU. `--jobs` defaults to **6**. Measured 2026-08-26 by an A/B/B/A over the same 28 documents on an idle machine: **225 s at `--jobs 4`, 178 s at `--jobs 6`** — 6 is 21 % faster, and the two 6-runs agreed to the second. This **reverses** F33 in `docs/audit-resolution.md`, whose numbers (4.9 vs 2.4 conversions/min) came from windows sampled mid-run rather than from a controlled comparison. RAM is not the limit at either setting. Caveat: the benchmark times conversion only, on an already-downloaded sample. |
 
 ---
 

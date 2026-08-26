@@ -129,11 +129,13 @@ fi
 
 # ----------------------------------------------------------------------- Rust
 if want rust; then
+  # Exported for BOTH branches: the "already present" path must still be able to
+  # add a component that a previous minimal install left out.
+  export RUSTUP_HOME="$TC/rustup" CARGO_HOME="$TC/cargo"
   if [ -x "$TC/cargo/bin/cargo.exe" ] || [ -x "$TC/cargo/bin/cargo" ]; then
     ok "Rust already present"
   else
     log "Rust (portable: RUSTUP_HOME/CARGO_HOME stay inside .local)"
-    export RUSTUP_HOME="$TC/rustup" CARGO_HOME="$TC/cargo"
     case "$(uname -s)" in
       MINGW*|MSYS*|CYGWIN*)
         fetch "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe" "$TC/rustup-init.exe" \
@@ -148,6 +150,20 @@ if want rust; then
           && ok "Rust installed" || warn "rustup failed"
         ;;
     esac
+  fi
+
+  # `--profile minimal` omits rustfmt, so `cargo fmt --check` — which CI runs and
+  # which blocks the merge — could not be reproduced here at all: the first time
+  # anyone found out was a red PR. A formatter the CI enforces has to exist on
+  # the machine that writes the code.
+  if [ -x "$TC/cargo/bin/cargo.exe" ] || [ -x "$TC/cargo/bin/cargo" ]; then
+    if PATH="$TC/cargo/bin:$PATH" cargo fmt --version >/dev/null 2>&1; then
+      ok "rustfmt already present"
+    else
+      log "rustfmt (component; the minimal profile leaves it out)"
+      PATH="$TC/cargo/bin:$PATH" rustup component add rustfmt >/dev/null 2>&1 \
+        && ok "rustfmt installed" || warn "rustup component add rustfmt failed"
+    fi
   fi
 fi
 
