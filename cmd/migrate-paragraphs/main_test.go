@@ -269,3 +269,32 @@ func TestTheSchemaDoesNotResurrectTheTable(t *testing.T) {
 		t.Fatal("the schema replaced the view with an empty table — the corpus would read as empty")
 	}
 }
+
+// The one way this tool can destroy a corpus: re-deriving from a `clauses` that
+// holds only a delta would replace every occurrence with that increment, and
+// every count would still agree with itself afterwards.
+func TestItRefusesToRebuildFromADelta(t *testing.T) {
+	h := fixture(t)
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	// A delta merge: `clauses` now carries one bucket instead of the corpus.
+	if _, err := h.Exec(`DELETE FROM clauses WHERE spec_id <> '23.501'`); err != nil {
+		t.Fatal(err)
+	}
+	err := build(h)
+	if err == nil {
+		t.Fatal("the tool rebuilt from a delta — the corpus would silently shrink to it")
+	}
+	if !strings.Contains(err.Error(), "REFUSING") {
+		t.Errorf("the refusal must be unmistakable, got %q", err)
+	}
+	// And it must not have touched anything on the way out.
+	var occ int
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		t.Fatal(err)
+	}
+	if occ != 8 {
+		t.Fatalf("occurrences = %d after a refused rebuild, want the original 8", occ)
+	}
+}

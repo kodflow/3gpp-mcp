@@ -1194,3 +1194,55 @@ func TestOverlaysAreNotRefetchedUnlessAsked(t *testing.T) {
 		t.Error("OVERLAY_REFRESH=0 must not force a refresh")
 	}
 }
+
+// --- the corpus shape is produced by the pipeline, not by remembering --------
+
+// migrate-paragraphs existed as a tool someone had to run. A fresh clone would
+// therefore complete all its steps and rebuild the OLD shape — the same failure
+// as enrich printing the name of a script instead of running it.
+func TestTheParagraphConversionIsAStepNotATool(t *testing.T) {
+	var found *Step
+	for _, s := range Pipeline() {
+		if s.Name == "paragraphs" {
+			found = s
+		}
+	}
+	if found == nil {
+		t.Fatal("the pipeline has no `paragraphs` step: a fresh clone rebuilds the pre-ADR-0004 corpus")
+	}
+	// After the vectors exist, or it would carry none across to the bodies.
+	var deps string
+	for _, d := range found.Deps {
+		deps += d + " "
+	}
+	for _, want := range []string{"embed", "enrich"} {
+		if !strings.Contains(deps, want) {
+			t.Errorf("paragraphs must run after %s — it carries that step's output onto the bodies", want)
+		}
+	}
+	var inGoBins bool
+	for _, b := range goBins {
+		if b == "migrate-paragraphs" {
+			inGoBins = true
+		}
+	}
+	if !inGoBins {
+		t.Error("build-go does not build migrate-paragraphs: the step would run a binary that is never produced")
+	}
+}
+
+// The index must be built AFTER the conversion, or it indexes the table the
+// conversion is about to drop.
+func TestTheIndexIsBuiltAfterTheConversion(t *testing.T) {
+	var deps string
+	for _, s := range Pipeline() {
+		if s.Name == "index" {
+			for _, d := range s.Deps {
+				deps += d + " "
+			}
+		}
+	}
+	if !strings.Contains(deps, "paragraphs") {
+		t.Fatalf("index deps = %q — it would index `clauses` and lose the index when that table goes", deps)
+	}
+}

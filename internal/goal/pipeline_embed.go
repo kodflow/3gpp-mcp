@@ -895,7 +895,10 @@ func (t corpusTarget) multiProducer() []string {
 // embed alone.
 func (t corpusTarget) indexDeps() []string {
 	if t.Suffix == "" {
-		return []string{"embed", "enrich"}
+		// The 3GPP index is built AFTER the corpus is content-addressed: the
+		// vectors move to `bodies` in that step, and an index built before it
+		// would index the table the step is about to drop.
+		return []string{"embed", "enrich", "paragraphs"}
 	}
 	return []string{"embed" + t.Suffix}
 }
@@ -913,4 +916,58 @@ func refreshOverlays() bool {
 		return true
 	}
 	return false
+}
+
+// --------------------------------------------------------------- paragraphs
+
+// stepParagraphs converts the merged corpus to the content-addressed storage of
+// ADR 0004 and drops the table it replaces.
+//
+// It sits between enrich and index, and that position is the whole design. The
+// write side still produces `clauses` with its text and its vectors; running the
+// conversion AFTER embed and enrich means the vectors are simply carried across
+// to the bodies that own them, so neither embed nor the Rust write side has to
+// change. `index` then builds the HNSW where the vectors now live.
+//
+// Without this step a fresh clone would run all nineteen steps and rebuild the
+// OLD shape: the conversion existed only as a tool someone had to remember to
+// run, which is the same failure as the overlays printing the name of a script
+// instead of running it.
+func stepParagraphs() *Step {
+	return &Step{
+		Name:    "paragraphs",
+		Version: 1,
+		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
+		Deps:    []string{"embed", "enrich"},
+		Impl:    []string{"cmd/migrate-paragraphs"},
+		Heavy:   true,
+		Inputs: func(c *Ctx) ([]string, error) {
+			return []string{c.dataPath("3gpp.duckdb")}, nil
+		},
+		Outputs: func(c *Ctx) []string { return []string{c.dataPath("3gpp.duckdb")} },
+		Validate: func(c *Ctx) error {
+			// Prove the corpus can still produce the text it used to store,
+			// rather than trusting that the conversion said so earlier.
+			out, err := c.Output(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+				"--db", c.dataPath("3gpp.duckdb"), "--verify",
+			}})
+			if err != nil {
+				return fmt.Errorf("the converted corpus does not verify: %w", err)
+			}
+			if !strings.Contains(out, "clause_occ=") {
+				return fmt.Errorf("verification produced no counters: %q", out)
+			}
+			return nil
+		},
+		Run: func(c *Ctx) error {
+			db := c.dataPath("3gpp.duckdb")
+			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
+			// --drop-clauses is safe to pass unconditionally: the tool refuses to
+			// drop anything unless its own verification passed first, and on an
+			// already-converted corpus the build is a no-op re-derivation.
+			return c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+				"--db", db, "--drop-clauses",
+			}, Echo: true})
+		},
+	}
 }
