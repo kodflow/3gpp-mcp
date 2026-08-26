@@ -300,6 +300,16 @@ jobs:
           # 4) gate on the baked DB BEFORE fusing vectors into it.
           CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
             --require-fts --min-clauses 1 --max-empty-meta 100000
+          # The embed identity is a property of the MODEL REGISTRY baked into the
+          # image, not of where the vectors came from, so it is read before the
+          # branch below. Left inside the fusion path it went unset whenever the
+          # corpus supplied its own vectors, and the layer shipped with an empty
+          # io.kodflow.3gpp.embedding.identity label — the one an operator reads to
+          # tell which model the vectors in the image they pulled were made with.
+          EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
+          echo "embed identity (baked registry): $EMBED_ID"
+          test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
+
           # 5) VECTORS — TWO ARCHITECTURES MEET HERE.
           #
           # Before ADR 0004 the corpus published to GHCR was LEXICAL and the
@@ -340,9 +350,6 @@ jobs:
             command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
             PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin overlay
             cp rust/target/release/overlay /tmp/overlay
-            EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
-            echo "embed identity (baked registry): $EMBED_ID"
-            test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
             VREF="ghcr.io/${{ github.repository_owner }}/3gpp-vec:latest-fp16"
             retry oras manifest fetch "$VREF" > /tmp/vec-manifest.json
             jq -r '.layers[] | select((.annotations["org.opencontainers.image.title"] // "") | test("^(s|shard-)[0-9]{2}.*\\.duckdb\\.zst$")) | .digest + " " + .annotations["org.opencontainers.image.title"]' \
@@ -402,65 +409,93 @@ jobs:
           test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
           test -s image-data/models/bge-reranker-v2-m3/model.onnx || { echo "::error::reranker model missing (drop --no-reranker?)"; exit 1; }
+          # COMPACTION AND THE HNSW BUILD ARE BOTH FUSION CLEANUP.
+          #
+          # The overlay rewrites the DB sub-base by sub-base — delete-then-insert,
+          # whose dead blocks DuckDB only reclaims at a checkpoint — and it
+          # invalidates the vector index it writes under. So the fused DB has to be
+          # compacted and re-frozen before it ships.
+          #
+          # A corpus that supplied its own vectors went through neither. It arrives
+          # compacted (30.25 GB -> 12.36 GB, done locally) and already carrying a
+          # frozen bodies_hnsw, and cmd/validate --require-hnsw asserted above that
+          # the SERVER can use that index. Redoing both is not merely wasted work:
+          #
+          #   - the compaction runs `COPY FROM DATABASE` through the DuckDB CLI, and
+          #     on this corpus that produced a database whose catalogue referenced
+          #     an index with no storage behind it, so the very next read-write open
+          #     died with "ExtractIndexStorageInfo: index storage info with name
+          #     'api_ops_opid' not found". rust/store's own compact copy avoids
+          #     COPY FROM DATABASE and goes table by table, for related reasons
+          #     already written down there;
+          #   - rust/store's freeze-hnsw indexes `clauses` BY NAME, which on a
+          #     content-addressed corpus is a view over the occurrences. The Go
+          #     cmd/freeze-hnsw resolves the table holding the vectors instead, and
+          #     that is what the local pipeline uses.
+          if [ "$SELF_VECTORISED" = 0 ]; then
           # DISK FIRST, then COMPACT on the emptiest disk (see #136/#137 history).
           rm -rf bge-cache /tmp/mcp /tmp/overlay /tmp/vec-manifest.json /tmp/subs.txt
-          scratch="image-data"
-          mnt_free="$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)"
-          if [ "${mnt_free:-0}" -ge 30 ]; then
-            sudo install -d -m 0777 /mnt/compact-scratch
-            scratch="/mnt/compact-scratch"
-          fi
-          compact="$scratch/3gpp.compact.duckdb"
-          echo "compaction scratch: $compact (mnt_free=${mnt_free:-0}G)"
-          if retry bash -c "curl -fsSL -o /tmp/duckdb.zip 'https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip'"; then
-            mkdir -p /tmp/dk && unzip -o -q /tmp/duckdb.zip -d /tmp/dk
-            cvec=0; cmeta=""
-            if /tmp/dk/duckdb -c "ATTACH 'image-data/3gpp.duckdb' AS src (READ_ONLY); ATTACH '$compact' AS dst; COPY FROM DATABASE src TO dst;" \
-               && cvec="$(/tmp/dk/duckdb -noheader -list "$compact" 'SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;')" \
-               && cmeta="$(/tmp/dk/duckdb -noheader -list "$compact" "SELECT value FROM schema_meta WHERE key = 'embedding_model';")" \
-               && [ "${cvec:-0}" -ge 2000000 ] && [ -n "$cmeta" ] \
-               && CGO_ENABLED=1 go run ./cmd/validate --db "$compact" \
-                    --require-fts --min-clauses 1 --max-empty-meta 100000; then
-              echo "compacted copy keeps vectors=$cvec embedding_model=$cmeta"
-              before=$(stat -c%s image-data/3gpp.duckdb); after=$(stat -c%s "$compact")
-              rm -f image-data/3gpp.duckdb
-              mv -f "$compact" image-data/3gpp.duckdb
-              echo "DB compacted: $((before/1024/1024)) MB -> $((after/1024/1024)) MB"
-            else
-              echo "::warning::compaction failed or lost FTS — keeping the (bloated) fused DB"
-              rm -f "$compact"
+            scratch="image-data"
+            mnt_free="$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)"
+            if [ "${mnt_free:-0}" -ge 30 ]; then
+              sudo install -d -m 0777 /mnt/compact-scratch
+              scratch="/mnt/compact-scratch"
             fi
+            compact="$scratch/3gpp.compact.duckdb"
+            echo "compaction scratch: $compact (mnt_free=${mnt_free:-0}G)"
+            if retry bash -c "curl -fsSL -o /tmp/duckdb.zip 'https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip'"; then
+              mkdir -p /tmp/dk && unzip -o -q /tmp/duckdb.zip -d /tmp/dk
+              cvec=0; cmeta=""
+              if /tmp/dk/duckdb -c "ATTACH 'image-data/3gpp.duckdb' AS src (READ_ONLY); ATTACH '$compact' AS dst; COPY FROM DATABASE src TO dst;" \
+                 && cvec="$(/tmp/dk/duckdb -noheader -list "$compact" 'SELECT count(*) FROM clauses WHERE embedding IS NOT NULL;')" \
+                 && cmeta="$(/tmp/dk/duckdb -noheader -list "$compact" "SELECT value FROM schema_meta WHERE key = 'embedding_model';")" \
+                 && [ "${cvec:-0}" -ge 2000000 ] && [ -n "$cmeta" ] \
+                 && CGO_ENABLED=1 go run ./cmd/validate --db "$compact" \
+                      --require-fts --min-clauses 1 --max-empty-meta 100000; then
+                echo "compacted copy keeps vectors=$cvec embedding_model=$cmeta"
+                before=$(stat -c%s image-data/3gpp.duckdb); after=$(stat -c%s "$compact")
+                rm -f image-data/3gpp.duckdb
+                mv -f "$compact" image-data/3gpp.duckdb
+                echo "DB compacted: $((before/1024/1024)) MB -> $((after/1024/1024)) MB"
+              else
+                echo "::warning::compaction failed or lost FTS — keeping the (bloated) fused DB"
+                rm -f "$compact"
+              fi
+            else
+              echo "::warning::duckdb CLI unavailable — skipping compaction"
+            fi
+            # 6) FREEZE the HNSW index on the (compacted) fused DB — the LAST DB step.
+            #    It MUST come after compaction: COPY FROM DATABASE does not copy custom
+            #    indexes, so freezing earlier would be undone. Without this the shipped
+            #    DB has hnsw_state="" → serve's LoadVSS refuses it → exact-scan →
+            #    server_info hnsw:false/semantic:false despite the vectors being baked.
+            #    freeze-hnsw indexes the EXISTING embedding column (no embedder/ONNX)
+            #    and fail-louds if the post-state is not "frozen".
+            #    NOTE (resources): HNSW on ~2.85M×1024 loads vectors into RAM + builds
+            #    the graph (several minutes). If this OOMs, move to a larger runner or
+            #    tune ef_construction/M.
+            # Memory cushion: the HNSW build loads ~12 GB of vectors (2.85M×1024) +
+            # the graph into RAM; a bare 16 GB runner OOMs (the agent dies → "operation
+            # was canceled"). A big swapfile on /mnt lets it complete (slower, never
+            # killed). The early cleanup swapoff'd to reclaim disk — re-arm it here.
+            echo "arming swap for the HNSW build…"
+            sudo swapoff -a 2>/dev/null || true
+            sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
+            if sudo fallocate -l 28G /mnt/hnsw-swap 2>/dev/null || sudo dd if=/dev/zero of=/mnt/hnsw-swap bs=1M count=28672 status=none; then
+              sudo chmod 600 /mnt/hnsw-swap && sudo mkswap /mnt/hnsw-swap >/dev/null && sudo swapon /mnt/hnsw-swap && echo "swap armed:" && free -h | grep -i swap
+            else
+              echo "::warning::could not create swapfile — HNSW build may OOM"
+            fi
+            echo "freezing HNSW index on the fused DB… (Rust store-rs freeze-hnsw)"; df -h / /mnt | tail -2; free -h | head -2
+            command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin freeze-hnsw
+            ./rust/target/release/freeze-hnsw --db image-data/3gpp.duckdb
+            sudo swapoff /mnt/hnsw-swap 2>/dev/null || true; sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
+            echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
           else
-            echo "::warning::duckdb CLI unavailable — skipping compaction"
+            echo "corpus arrived compacted and already carrying a usable frozen index — skipping compaction and the HNSW rebuild"
+            du -sh image-data/3gpp.duckdb
           fi
-          # 6) FREEZE the HNSW index on the (compacted) fused DB — the LAST DB step.
-          #    It MUST come after compaction: COPY FROM DATABASE does not copy custom
-          #    indexes, so freezing earlier would be undone. Without this the shipped
-          #    DB has hnsw_state="" → serve's LoadVSS refuses it → exact-scan →
-          #    server_info hnsw:false/semantic:false despite the vectors being baked.
-          #    freeze-hnsw indexes the EXISTING embedding column (no embedder/ONNX)
-          #    and fail-louds if the post-state is not "frozen".
-          #    NOTE (resources): HNSW on ~2.85M×1024 loads vectors into RAM + builds
-          #    the graph (several minutes). If this OOMs, move to a larger runner or
-          #    tune ef_construction/M.
-          # Memory cushion: the HNSW build loads ~12 GB of vectors (2.85M×1024) +
-          # the graph into RAM; a bare 16 GB runner OOMs (the agent dies → "operation
-          # was canceled"). A big swapfile on /mnt lets it complete (slower, never
-          # killed). The early cleanup swapoff'd to reclaim disk — re-arm it here.
-          echo "arming swap for the HNSW build…"
-          sudo swapoff -a 2>/dev/null || true
-          sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
-          if sudo fallocate -l 28G /mnt/hnsw-swap 2>/dev/null || sudo dd if=/dev/zero of=/mnt/hnsw-swap bs=1M count=28672 status=none; then
-            sudo chmod 600 /mnt/hnsw-swap && sudo mkswap /mnt/hnsw-swap >/dev/null && sudo swapon /mnt/hnsw-swap && echo "swap armed:" && free -h | grep -i swap
-          else
-            echo "::warning::could not create swapfile — HNSW build may OOM"
-          fi
-          echo "freezing HNSW index on the fused DB… (Rust store-rs freeze-hnsw)"; df -h / /mnt | tail -2; free -h | head -2
-          command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path rust/store/Cargo.toml --bin freeze-hnsw
-          ./rust/target/release/freeze-hnsw --db image-data/3gpp.duckdb
-          sudo swapoff /mnt/hnsw-swap 2>/dev/null || true; sudo rm -f /mnt/hnsw-swap 2>/dev/null || true
-          echo "HNSW frozen ✓"; du -sh image-data/3gpp.duckdb
           # AUTHORITATIVE COMPLETENESS GATE — the data layer is now final (fused +
           # compacted + frozen). Assert the FULL contract BEFORE anything is pushed, so
           # 3gpp-data:latest can NEVER move onto an incomplete layer (dense not
