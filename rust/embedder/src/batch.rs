@@ -39,6 +39,15 @@ pub struct MemModel {
     pub min_k: f64,
     /// Hard cap so tiny-sequence batches don't explode the linear-activation term.
     pub max_batch: usize,
+    /// Ceiling for `k_attn`. Past the point where the LONGEST sequence already
+    /// yields a batch of one, raising k_attn cannot make that batch any smaller —
+    /// it only keeps shrinking the SHORT-sequence batches, which were never the
+    /// thing that ran out of memory.
+    ///
+    /// Measured on the first full campaign: 13 OOMs took k_attn from 94 to 15 550,
+    /// far past the 12 447 at which seq=1024 is already down to one clause. The
+    /// excess bought nothing and cost throughput on every short batch after it.
+    pub max_k: f64,
 }
 
 impl MemModel {
@@ -58,7 +67,7 @@ impl MemModel {
     /// called after a CUDA out-of-memory so the campaign self-corrects to the real card.
     pub fn shrink(&mut self, factor: f64) {
         if factor > 1.0 {
-            self.k_attn *= factor;
+            self.k_attn = (self.k_attn * factor).min(self.max_k);
         }
     }
 
@@ -119,6 +128,7 @@ mod tests {
             k_attn: K_ATTN_DEFAULT,
             min_k: K_ATTN_DEFAULT * 0.3,
             max_batch,
+            max_k: f64::INFINITY,
         }
     }
 
@@ -210,5 +220,83 @@ mod tests {
             m.grow(0.85);
         }
         assert!(m.k_attn >= m.min_k - 1e-9, "k_attn fell below min_k");
+    }
+}
+
+#[cfg(test)]
+mod controller_tests {
+    use super::*;
+
+    /// The OOM backoff must stop where it stops helping. Once the LONGEST sequence
+    /// is down to one clause per batch, a bigger k_attn cannot shrink that batch
+    /// further — it only shrinks the short-sequence batches, which never ran out of
+    /// memory. The first real campaign ran past that point: 13 OOMs took k_attn to
+    /// 15 550 when 12 447 already meant "one at a time" at 1024 tokens.
+    #[test]
+    fn shrink_stops_once_the_longest_sequence_is_a_batch_of_one() {
+        let avail = 13.05e9_f64;
+        let cap = avail / (1024.0 * 1024.0); // ≈ 12 447
+        let mut m = MemModel {
+            avail_bytes: avail,
+            k_attn: K_ATTN_DEFAULT,
+            min_k: K_ATTN_DEFAULT * 0.3,
+            max_batch: 512,
+            max_k: cap,
+        };
+        for _ in 0..40 {
+            m.shrink(1.5);
+        }
+        assert!(
+            m.k_attn <= cap + 1e-6,
+            "k_attn ran away to {} past the {cap} ceiling",
+            m.k_attn
+        );
+        assert_eq!(
+            m.batch_for_len(1024),
+            1,
+            "at the ceiling the longest sequence is exactly one clause per batch"
+        );
+        assert!(
+            m.batch_for_len(128) > 1,
+            "short sequences must NOT be dragged down to one — that is the whole point"
+        );
+    }
+
+    /// Recovery must be the inverse of the backoff. Geometric up and arithmetic
+    /// down leaves the model permanently over-conservative after a burst of OOMs.
+    #[test]
+    fn one_clean_window_undoes_one_oom() {
+        let mut m = MemModel {
+            avail_bytes: 13.05e9,
+            k_attn: K_ATTN_DEFAULT,
+            min_k: K_ATTN_DEFAULT * 0.3,
+            max_batch: 512,
+            max_k: f64::INFINITY,
+        };
+        let start = m.k_attn;
+        m.shrink(1.5);
+        m.grow(1.0 / 1.5);
+        assert!(
+            (m.k_attn - start).abs() < 1e-6,
+            "shrink then grow left k_attn at {} instead of {start}",
+            m.k_attn
+        );
+    }
+
+    /// Growth is still floored: the controller may not talk itself into batches the
+    /// calibration never supported.
+    #[test]
+    fn growth_is_still_bounded_by_min_k() {
+        let mut m = MemModel {
+            avail_bytes: 13.05e9,
+            k_attn: K_ATTN_DEFAULT,
+            min_k: K_ATTN_DEFAULT * 0.3,
+            max_batch: 512,
+            max_k: f64::INFINITY,
+        };
+        for _ in 0..50 {
+            m.grow(1.0 / 1.5);
+        }
+        assert!((m.k_attn - K_ATTN_DEFAULT * 0.3).abs() < 1e-6);
     }
 }

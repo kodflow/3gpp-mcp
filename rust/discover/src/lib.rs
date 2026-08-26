@@ -731,3 +731,353 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// emit_repair_worklist is the primitive the operator should reach for instead of
+/// crossing two lists by hand.
+///
+/// The fetch set is NOT "what upstream changed". It is:
+///
+///   repair = upstream_drift  ∪  corpus_holes
+///
+/// Those two terms answer different questions and neither implies the other.
+/// `upstream_drift` (site version > anchor version) misses a spec the anchor
+/// claims at the version the site still serves — 24 of the 56 known holes are
+/// exactly that shape, and no amount of re-running discover will ever surface
+/// them. `corpus_holes` comes from the DB, via `anchorcheck --emit-repair`, and is
+/// passed in as `holes`.
+///
+/// Returns (lines, counts) where lines are "<release> <url> <name>", the same
+/// format `--emit-worklist` produces, so scripts/corpus.sh consumes it unchanged.
+pub fn emit_repair_worklist(
+    site: &BTreeMap<String, String>,
+    idx: &BTreeMap<String, String>,
+    holes: &BTreeSet<String>,
+    floor_major: i64,
+    series_filter: &str,
+) -> (String, RepairCounts) {
+    let allow = series_set(series_filter);
+    let mut counts = RepairCounts::default();
+    let mut lines = String::new();
+
+    for (key, ver) in site {
+        let (spec, rel) = split_key(key);
+        let pfx = match in_scope(spec, rel, floor_major, &allow) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let have = idx.get(key).map(String::as_str).unwrap_or("");
+        let drifted = cmp_ver(ver, have) == Ordering::Greater;
+        let holed = holes.contains(key);
+        if !drifted && !holed {
+            continue;
+        }
+        // Count each population in FULL, plus the overlap, so the identity
+        //     emitted = (missing + stale) + holes - overlap
+        // holds and is checkable by eye. Reporting only the disjoint parts would
+        // hide the term that matters: an overlap collapsing towards zero means the
+        // hole detector and the drift computation have stopped agreeing about what
+        // the corpus contains, and that is a defect, not an improvement.
+        if drifted {
+            if have.is_empty() {
+                counts.upstream_missing += 1;
+            } else {
+                counts.upstream_stale += 1;
+            }
+        }
+        if holed {
+            counts.corpus_holes += 1;
+        }
+        if drifted && holed {
+            counts.overlap += 1;
+        }
+
+        // A hole must be re-acquired at the version the ANCHOR claims when the site
+        // has nothing newer: fetching the site version would re-download something
+        // the corpus already believes it has and leave the hole open.
+        let want = if drifted { ver.as_str() } else { have };
+        match archive_line(spec, rel, &pfx, want) {
+            Some(line) => {
+                lines.push_str(&line);
+                counts.emitted += 1;
+            }
+            None => counts.unencodable += 1,
+        }
+    }
+
+    // A HOLE THE STATUS REPORT DOES NOT LIST IS STILL FETCHABLE.
+    //
+    // The report carries ONE row per spec — its current version — and the release is
+    // read off that version's major. So a hole at an OLDER version has no row to
+    // match: 29.558 reports 19.7.0, giving the key `29.558|Rel-19`, while the hole is
+    // `29.558|Rel-20` anchored at 19.5.0. The loop above can never see it.
+    //
+    // Counting it and moving on was the bug — the comment here used to say silence is
+    // how the 56 became invisible, then dropped the key anyway. The anchor already
+    // names the exact version and the archive keeps every version it ever published,
+    // so the URL needs no report: 29.558|Rel-20 -> 29.558/29558-j50.zip, which serves.
+    // All twelve such holes on the local corpus were verified to resolve to a real
+    // file, and re-acquiring the anchored version is precisely what flips a key from
+    // missing_content to non_content in cmd/anchorcheck.
+    //
+    // The count stays: it is the population the report cannot describe, and watching
+    // it grow says something the emitted total does not.
+    for key in holes {
+        if site.contains_key(key) {
+            continue;
+        }
+        counts.holes_not_in_report += 1;
+        let (spec, rel) = split_key(key);
+        let pfx = match in_scope(spec, rel, floor_major, &allow) {
+            Some(p) => p,
+            None => continue,
+        };
+        // With no anchor version there is nothing to ask for: the report has no row
+        // and the corpus makes no claim, so the key names no document at all.
+        let want = idx.get(key).map(String::as_str).unwrap_or("");
+        if want.is_empty() {
+            counts.unencodable += 1;
+            continue;
+        }
+        counts.corpus_holes += 1;
+        match archive_line(spec, rel, &pfx, want) {
+            Some(line) => {
+                lines.push_str(&line);
+                counts.emitted += 1;
+            }
+            None => counts.unencodable += 1,
+        }
+    }
+    (lines, counts)
+}
+
+/// in_scope resolves the series prefix for `spec`, or None when the key falls below
+/// the release floor or outside the series filter. Shared so the two passes of
+/// emit_repair_worklist cannot drift apart on what they consider in range.
+fn in_scope(
+    spec: &str,
+    rel: &str,
+    floor_major: i64,
+    allow: &Option<BTreeSet<String>>,
+) -> Option<String> {
+    if rel.is_empty() || spec.len() < 2 || major(rel) < floor_major {
+        return None;
+    }
+    let pfx = series_prefix(spec)?;
+    if let Some(set) = allow {
+        if !set.contains(&pfx) {
+            return None;
+        }
+    }
+    Some(pfx)
+}
+
+/// archive_line renders one "<release> <url> <name>" entry, or None when the version
+/// cannot be encoded into an archive file name.
+fn archive_line(spec: &str, rel: &str, pfx: &str, version: &str) -> Option<String> {
+    let code = encode_ver_code(version)?;
+    let num = spec.replacen('.', "", 1);
+    let name = format!("{num}-{code}.zip");
+    Some(format!(
+        "{rel} {STATUS_BASE}/{pfx}_series/{spec}/{name} {name}\n"
+    ))
+}
+
+/// RepairCounts breaks the repair set into its populations so the operator can see
+/// where the work came from, and so a sudden collapse in one term is visible
+/// instead of looking like progress.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepairCounts {
+    pub upstream_missing: usize,
+    pub upstream_stale: usize,
+    pub corpus_holes: usize,
+    pub overlap: usize,
+    pub emitted: usize,
+    pub unencodable: usize,
+    pub holes_not_in_report: usize,
+}
+
+/// load_holes reads `anchorcheck --emit-repair` output: one "spec|Rel" per line.
+/// A missing file is an EMPTY set, never an error — but the caller must say so
+/// out loud, because "no holes" and "never looked" produce the same repair set
+/// and only one of them is good news.
+pub fn load_holes(path: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if path.is_empty() {
+        return out;
+    }
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let l = line.trim();
+            if !l.is_empty() && !l.starts_with('#') {
+                out.insert(l.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    fn m(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The repair set is a UNION, and the identity
+    ///     emitted = (missing + stale) + holes - overlap
+    /// is what makes it auditable. This pins all four terms at once against a
+    /// fixture holding one of each population.
+    #[test]
+    fn repair_set_is_the_union_and_the_counts_reconcile() {
+        let site = m(&[
+            ("23.501|Rel-19", "19.6.0"), // stale: index behind
+            ("23.502|Rel-19", "19.1.0"), // missing: not in index at all
+            ("29.502|Rel-20", "19.5.0"), // hole only: index == site
+            ("24.501|Rel-19", "19.3.0"), // both: index behind AND no clause text
+            ("38.331|Rel-19", "19.2.0"), // clean: nothing to do
+        ]);
+        let idx = m(&[
+            ("23.501|Rel-19", "19.5.0"),
+            ("29.502|Rel-20", "19.5.0"),
+            ("24.501|Rel-19", "19.1.0"),
+            ("38.331|Rel-19", "19.2.0"),
+        ]);
+        let holes: BTreeSet<String> = ["29.502|Rel-20", "24.501|Rel-19"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+
+        assert_eq!(c.upstream_stale, 2, "23.501 and 24.501 are stale");
+        assert_eq!(c.upstream_missing, 1, "23.502 is absent from the index");
+        assert_eq!(c.corpus_holes, 2, "29.502 and 24.501 have no text");
+        assert_eq!(c.overlap, 1, "24.501 is both stale and a hole");
+        assert_eq!(
+            c.emitted,
+            c.upstream_missing + c.upstream_stale + c.corpus_holes - c.overlap,
+            "the union identity must hold, or the plan is silently over- or under-counting"
+        );
+        assert_eq!(c.emitted, 4);
+        assert!(
+            !lines.contains("38331"),
+            "a clean spec must not be re-fetched"
+        );
+        assert!(lines.contains("29502"), "a hole-only spec must be fetched");
+    }
+
+    /// A hole whose index version the site still serves must be fetched at the
+    /// ANCHOR's version. Fetching the site version would re-download what the
+    /// corpus already believes it holds and leave the hole open — which is exactly
+    /// how 24 of the 56 stayed invisible.
+    #[test]
+    fn a_hole_with_no_drift_is_fetched_at_the_anchored_version() {
+        let site = m(&[("29.520|Rel-20", "19.6.0")]);
+        let idx = m(&[("29.520|Rel-20", "19.6.0")]);
+        let holes: BTreeSet<String> = ["29.520|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.corpus_holes, 1);
+        assert_eq!(c.upstream_stale + c.upstream_missing, 0, "nothing drifted");
+        assert_eq!(c.emitted, 1, "the hole must still be in the plan");
+        // 19.6.0 -> base36 per component: j=19, 6, 0
+        assert!(
+            lines.contains("29520-j60.zip"),
+            "expected the anchored version code, got: {lines}"
+        );
+    }
+
+    /// Without a holes file the plan degrades to drift-only. That is a legitimate
+    /// mode, but it must not silently look like a full repair — the caller is
+    /// warned, and this test pins that the two are genuinely different sets.
+    #[test]
+    fn drift_only_plan_omits_the_holes() {
+        let site = m(&[("29.502|Rel-20", "19.5.0")]);
+        let idx = m(&[("29.502|Rel-20", "19.5.0")]);
+        let (_, c) = emit_repair_worklist(&site, &idx, &BTreeSet::new(), 0, "");
+        assert_eq!(c.emitted, 0, "drift-only sees nothing here");
+
+        let holes: BTreeSet<String> = ["29.502|Rel-20".to_string()].into_iter().collect();
+        let (_, c2) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c2.emitted, 1, "with holes it is one spec");
+    }
+
+    /// A hole the status report does not list is STILL fetchable, because the anchor
+    /// names the version and the archive keeps every version it published.
+    ///
+    /// This is the real shape, taken from the corpus: the report carries one row per
+    /// spec — 29.558 at 19.7.0, which reads as Rel-19 — while the hole is Rel-20
+    /// anchored at 19.5.0. No report row can ever match it, and counting it and
+    /// moving on left the corpus permanently short.
+    #[test]
+    fn a_hole_absent_from_the_report_is_fetched_at_the_anchored_version() {
+        let site = m(&[("29.558|Rel-19", "19.7.0")]);
+        let idx = m(&[("29.558|Rel-19", "19.7.0"), ("29.558|Rel-20", "19.5.0")]);
+        let holes: BTreeSet<String> = ["29.558|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.holes_not_in_report, 1, "the population must stay visible");
+        assert_eq!(c.emitted, 1, "and it must actually be fetched");
+        assert!(
+            lines.contains("29558-j50.zip"),
+            "expected the ANCHOR's version (19.5.0 -> j50), not the report's 19.7.0; got: {lines}"
+        );
+        assert!(
+            lines.starts_with("Rel-20 "),
+            "the line must carry the hole's release, got: {lines}"
+        );
+    }
+
+    /// A hole in neither the report nor the anchor names no document at all: there is
+    /// no version to ask the archive for. Count it, do not invent a URL.
+    #[test]
+    fn a_hole_with_no_anchor_names_no_document() {
+        let site = m(&[("23.501|Rel-19", "19.5.0")]);
+        let idx = m(&[("23.501|Rel-19", "19.5.0")]);
+        let holes: BTreeSet<String> = ["99.999|Rel-20".to_string()].into_iter().collect();
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.holes_not_in_report, 1);
+        assert_eq!(c.emitted, 0, "nothing to fetch without a version");
+        assert_eq!(
+            c.unencodable, 1,
+            "and it must be reported, not silently gone"
+        );
+        assert!(lines.is_empty());
+    }
+
+    /// The series filter and the release floor apply to anchor-recovered holes too.
+    /// The second pass must not become a hole in the scoping the first pass enforces.
+    #[test]
+    fn an_anchor_recovered_hole_still_obeys_scope() {
+        // 23.501 is anchored at what the site serves, so it neither drifts nor holes
+        // and contributes nothing — leaving 29.558 as the only candidate.
+        let site = m(&[("23.501|Rel-19", "19.5.0")]);
+        let idx = m(&[("23.501|Rel-19", "19.5.0"), ("29.558|Rel-20", "19.5.0")]);
+        let holes: BTreeSet<String> = ["29.558|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "23");
+        assert!(
+            !lines.contains("29558"),
+            "series 29 is outside the '23' filter, got: {lines}"
+        );
+        assert_eq!(c.emitted, 0);
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 99, "");
+        assert!(
+            !lines.contains("29558"),
+            "Rel-20 is below a Rel-99-major floor, got: {lines}"
+        );
+        assert_eq!(c.emitted, 0);
+
+        // And with neither restriction it IS emitted — otherwise the two assertions
+        // above would pass on a function that never emits anything.
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(c.emitted, 1);
+        assert!(lines.contains("29558-j50.zip"), "got: {lines}");
+    }
+}

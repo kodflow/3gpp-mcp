@@ -141,7 +141,19 @@ pub fn archive_url(spec_id: &str, version: &str) -> String {
 /// AUTHORITATIVE convert-dir release when present, falling back to the version-major decode
 /// (a draft v1.x of a Rel-20 spec lives under Rel-20, not Rel-1).
 pub fn parse_filename_meta(path: &str) -> Result<SpecMeta, String> {
-    let re_file = Regex::new(r"^([0-9]{4,5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:_.*)?$").unwrap();
+    // The trailing suffix may be introduced by '-' as well as '_'.
+    //
+    // 3GPP archives ship editorial variants beside the spec: "-clean", "-rm",
+    // "-diff-100", "-cl". Accepting only "_…" rejected them outright, so the ONLY file
+    // that parsed out of TR 26.917's archive was its 8 KB cover page — which yields no
+    // clause. The spec was catalogued with no text behind it, i.e. a missing_content
+    // hole, while 324 KB of the actual document sat unread beside it.
+    //
+    // The version code is exactly three chars from [0-9a-z] (or six digits), and '-' is
+    // in neither class, so a suffix cannot be mistaken for a code: "26917-130-clean"
+    // can only split as 26917 / 130 / -clean, and "34123-1-a70" only as 34123-1 / a70.
+    let re_file =
+        Regex::new(r"^([0-9]{4,5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:[-_].*)?$").unwrap();
     let re_release_dir = Regex::new(r"^(Rel-[0-9]+|GSM|Phase[0-9]+)$").unwrap();
 
     let p = std::path::Path::new(path);
@@ -318,6 +330,25 @@ impl Walker {
                     return;
                 }
                 "p" | "li" | "pre" | "dd" | "dt" => {
+                    // A HEADING NESTED IN A TEXT BLOCK IS STILL A HEADING.
+                    //
+                    // LibreOffice renders Word's auto-numbered headings as an ordered
+                    // list — <ol><li><h1>Scope</h1></li></ol> — because that is what
+                    // Word's numbering IS. Treating <li> as a leaf swallowed the <h1>
+                    // into the running text, so the walker never opened a clause and
+                    // the document parsed to ZERO clauses.
+                    //
+                    // upsert_version still wrote the catalogue row, which is exactly a
+                    // missing_content hole: the corpus promises a spec it holds no text
+                    // for. TR 25.890, TR 25.933, TS 34.123-1 and a dozen more sat in
+                    // that state through four repair runs, re-fetched and re-converted
+                    // every time, because the file was always fine and the walk was not.
+                    if contains_heading(n) {
+                        for c in n.children() {
+                            self.walk(c);
+                        }
+                        return;
+                    }
                     let txt = node_text(n);
                     if !txt.is_empty() {
                         self.buf.push_str(&txt);
@@ -384,6 +415,72 @@ impl Walker {
     }
 }
 
+/// salvage_numbered_text segments plain text on 3GPP clause numbering, for documents
+/// whose HTML carries no heading markup at all.
+///
+/// Used only as a last resort by `parse_html_clauses` when the structured walk found
+/// nothing — a document converted by the doc-text-salvage path, which dumps the text
+/// into one <pre>. The numbering is still there; only the markup is gone.
+///
+/// A table-of-contents line is NOT a heading: it ends with the page number the entry
+/// points at ("1<tab>Scope<tab>5"). Taking those would produce a duplicate, empty
+/// clause for every real one.
+fn salvage_numbered_text(text: &str) -> Vec<ParsedClause> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| Regex::new(r"^(\d+(?:\.\d+)*)[ \t]+(\S.*)$").unwrap());
+    static TOC: OnceLock<Regex> = OnceLock::new();
+    let toc = TOC.get_or_init(|| Regex::new(r"[ \t]+\d+$").unwrap());
+
+    let mut out: Vec<ParsedClause> = Vec::new();
+    let mut buf = String::new();
+    let mut id = 0u64;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if let Some(c) = re.captures(line) {
+            let heading = c[2].trim();
+            if !toc.is_match(heading) {
+                if let Some(cur) = out.last_mut() {
+                    cur.text = buf.trim().to_string();
+                }
+                buf.clear();
+                id += 1;
+                out.push(ParsedClause {
+                    chunk_id: id,
+                    clause_path: c[1].to_string(),
+                    heading: heading.to_string(),
+                    text: String::new(),
+                    is_normative: true,
+                });
+                continue;
+            }
+        }
+        if !line.trim().is_empty() {
+            buf.push_str(line.trim());
+            buf.push('\n');
+        }
+    }
+    if let Some(cur) = out.last_mut() {
+        cur.text = buf.trim().to_string();
+    }
+    out
+}
+
+/// contains_heading reports whether `n`'s subtree holds an h1-h6.
+///
+/// Used to tell a text block that merely LOOKS like a leaf from one that wraps a
+/// heading. LibreOffice emits Word's auto-numbered headings as <ol><li><h1>…</h1></li>,
+/// so a walker that stops at <li> never sees them.
+fn contains_heading(n: ego_tree::NodeRef<scraper::Node>) -> bool {
+    for c in n.descendants() {
+        if let scraper::Node::Element(e) = c.value() {
+            if matches!(e.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// parse_html_clauses walks a converted spec's HTML into clause-leaf chunks, in the same
 /// document order and with the same per-spec chunk_id sequence as Go's htmlparse walker.
 /// spec_id/release/version come from parse_filename_meta. Returns (clauses, saw_change_history,
@@ -412,6 +509,25 @@ pub fn parse_html_clauses(
     w.flush();
     // silence unused-field warnings on the metadata the ingest will read off each clause.
     let _ = (&w.spec_id, &w.release, &w.version);
+
+    // A DOCUMENT THAT SEGMENTS INTO NOTHING IS A SALVAGE CASE, NOT AN EMPTY ONE.
+    //
+    // When soffice cannot render a legacy .doc at all, the conversion falls back to
+    // dumping the text into a single <pre>. There is no heading markup left, so the
+    // walk above yields zero clauses — while ingest still writes the catalogue row,
+    // which is exactly a missing_content hole. Six releases of TS 34.123-1 sat in that
+    // state.
+    //
+    // The 3GPP numbering survives in the TEXT ("4.1<tab>Test Methodology"), so segment
+    // on that instead of discarding the document. This runs ONLY when the structured
+    // walk found nothing, so it cannot change how a well-formed spec is parsed.
+    if w.clauses.is_empty() {
+        let salvaged = salvage_numbered_text(&node_text(doc.tree.root()));
+        if !salvaged.is_empty() {
+            return (salvaged, w.saw_change_history, true);
+        }
+    }
+
     (w.clauses, w.saw_change_history, w.degraded)
 }
 
@@ -540,5 +656,191 @@ mod tests {
         );
         assert_eq!(clauses[0].text, "This document specifies the system.");
         assert_eq!(clauses[3].text, "Sub annex text.");
+    }
+}
+
+#[cfg(test)]
+mod nested_heading_tests {
+    use super::*;
+
+    // A heading wrapped in a list item is still a heading.
+    //
+    // LibreOffice renders Word's auto-numbered headings as an ordered list —
+    // <ol><li><h1>Scope</h1></li></ol> — because that is what Word's numbering IS.
+    // The walker treated <li> as a leaf and returned without descending, so the <h1>
+    // was swallowed into the running text, no clause was ever opened, and the whole
+    // document parsed to ZERO clauses. upsert_version still wrote the catalogue row,
+    // which is exactly a missing_content hole: the corpus promising text it does not
+    // hold. TR 25.890, TR 25.933 and TS 33.900 sat in that state through four repair
+    // runs — re-fetched and re-converted every time, because the file was always fine
+    // and the walk was not.
+    #[test]
+    fn a_heading_inside_a_list_item_still_opens_a_clause() {
+        let html = r#"<html><body>
+            <ol>
+              <li><h1><a name="x"></a>Scope</h1></li>
+              <li><h2>General</h2></li>
+            </ol>
+            <p>The purpose of this document is to capture the discussions.</p>
+        </body></html>"#;
+        let (clauses, _, _) = parse_html_clauses(html, "25.890", "Rel-5", "1.0.0");
+        assert!(
+            clauses.len() >= 2,
+            "both nested headings must open clauses, got {}: {:?}",
+            clauses.len(),
+            clauses.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            clauses.iter().any(|c| c.heading.contains("Scope")),
+            "the first heading must survive: {:?}",
+            clauses.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            clauses
+                .iter()
+                .any(|c| c.text.contains("capture the discussions")),
+            "the prose after the headings must land in a clause"
+        );
+    }
+
+    // A list item that is only text must still behave as one: descending into every
+    // <li> would turn ordinary bullet lists into clause boundaries.
+    #[test]
+    fn a_plain_list_item_is_still_body_text() {
+        let html = r#"<html><body>
+            <h1>6.1 Requirements</h1>
+            <ul><li>the first requirement</li><li>the second requirement</li></ul>
+        </body></html>"#;
+        let (clauses, _, _) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert_eq!(clauses.len(), 1, "a bullet list must not split the clause");
+        assert!(clauses[0].text.contains("the first requirement"));
+        assert!(clauses[0].text.contains("the second requirement"));
+    }
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+
+    // A document with no heading markup at all must still segment.
+    //
+    // When soffice cannot render a legacy .doc, the conversion dumps the text into a
+    // single <pre>. The structured walk finds no heading and yields zero clauses, while
+    // ingest still writes the catalogue row — which is exactly a missing_content hole.
+    // Six releases of TS 34.123-1 sat in that state through four repair runs.
+    #[test]
+    fn a_headingless_salvage_still_segments_on_the_numbering() {
+        let html = "<html><body><pre>\n\
+            3GPP TS 34.123-1 V10.7.0 (2013-12)\n\
+            \n\
+            1\tScope\t5\n\
+            4\tOverview\t6\n\
+            \n\
+            3\tDefinitions and abbreviations\n\
+            Void\n\
+            \n\
+            4\tOverview\n\
+            \n\
+            4.1\tTest Methodology\n\
+            The requirements are provided in Release 11.\n\
+            </pre></body></html>";
+        let (clauses, _, degraded) = parse_html_clauses(html, "34.123-1", "Rel-10", "10.7.0");
+
+        assert!(degraded, "a salvaged parse must be flagged degraded");
+        let paths: Vec<&str> = clauses.iter().map(|c| c.clause_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["3", "4", "4.1"],
+            "the table of contents must not become clauses: {paths:?}"
+        );
+        assert_eq!(clauses[0].heading, "Definitions and abbreviations");
+        assert!(
+            clauses[2].text.contains("provided in Release 11"),
+            "prose must land under the clause that precedes it: {:?}",
+            clauses[2].text
+        );
+    }
+
+    // The salvage must NEVER pre-empt a document the structured walk can read: it runs
+    // only when that walk produced nothing.
+    #[test]
+    fn a_well_formed_document_is_not_salvaged() {
+        let html =
+            "<html><body><h1>6.1 Requirements</h1><p>1 is not a heading here.</p></body></html>";
+        let (clauses, _, degraded) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert_eq!(clauses.len(), 1, "the structured walk owns this document");
+        assert!(!degraded, "a clean parse must not be flagged degraded");
+        assert!(clauses[0].text.contains("1 is not a heading here"));
+    }
+
+    // Text with no numbering at all yields nothing rather than one giant clause: a
+    // document we genuinely cannot segment must stay visible as a hole.
+    #[test]
+    fn unnumbered_text_is_not_forced_into_a_clause() {
+        let html = "<html><body><pre>just some prose\nand more prose\n</pre></body></html>";
+        let (clauses, _, _) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
+        assert!(clauses.is_empty(), "got {clauses:?}");
+    }
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::*;
+
+    // 3GPP ships editorial variants beside the spec, introduced by '-' as well as '_':
+    // "-clean", "-rm", "-diff-100", "-cl". Accepting only "_…" rejected them, so the
+    // only file that parsed out of TR 26.917's archive was its 8 KB cover page — which
+    // yields no clause. The spec was catalogued with no text behind it while 324 KB of
+    // the actual document sat unread beside it.
+    #[test]
+    fn a_hyphenated_editorial_suffix_is_still_the_same_spec() {
+        for name in [
+            "26917-130-clean",
+            "26917-130-diff-100",
+            "30531-016400-rm",
+            "26917-130_S4-AHI729-TR26-917-v130-cover-page",
+        ] {
+            let m = parse_filename_meta(&format!("convert/Rel-14/{name}.html"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                m.spec_id,
+                if name.starts_with("30531") {
+                    "30.531"
+                } else {
+                    "26.917"
+                }
+            );
+        }
+    }
+
+    // A sub-part spec must still split on the PART, not on the suffix rule: the version
+    // code is three chars from [0-9a-z] and '-' is in neither class, so there is only
+    // one way to read these.
+    #[test]
+    fn a_sub_part_spec_is_unaffected_by_the_suffix_rule() {
+        let m = parse_filename_meta("convert/Rel-10/34123-1-a70.html").unwrap();
+        assert_eq!(m.spec_id, "34.123-1");
+        assert_eq!(m.version, "10.7.0");
+
+        let m = parse_filename_meta("convert/Rel-20/38760-1-030.html").unwrap();
+        assert_eq!(m.spec_id, "38.760-1");
+        assert_eq!(m.version, "0.3.0");
+
+        // And a sub-part spec WITH an editorial suffix reads correctly too.
+        let m = parse_filename_meta("convert/Rel-10/34123-1-a70-clean.html").unwrap();
+        assert_eq!(m.spec_id, "34.123-1");
+        assert_eq!(m.version, "10.7.0");
+    }
+
+    // Genuinely malformed names must still be rejected: the suffix rule must not turn
+    // the pattern into "anything goes".
+    #[test]
+    fn a_malformed_name_is_still_rejected() {
+        for bad in ["notaspec", "123-abc", "26917", "26917-1234"] {
+            assert!(
+                parse_filename_meta(&format!("convert/Rel-14/{bad}.html")).is_err(),
+                "{bad} must not parse"
+            );
+        }
     }
 }

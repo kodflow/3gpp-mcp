@@ -3,11 +3,13 @@ package li
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
@@ -21,16 +23,32 @@ type SentinelEvent struct {
 }
 
 // Verdicts for an audited event.
+//
+// AMBIGUOUS exists so the report stops calling a draw a hallucination. NOT_FOUND
+// is a claim about the corpus — "this text is nowhere" — and it must not be used
+// for "the name does not carry enough signal to decide". Separating "I cannot
+// measure" from "the condition is violated" is the same rule the pipeline's
+// guards follow.
 const (
 	VConfirmed = "CONFIRMED"           // cited clause exists AND name supported by its text
 	VParentRef = "REAL_PARENT_REF"     // cited clause number synthetic, parent clause supports it
 	VInCited   = "FOUND_IN_CITED_SPEC" // name present in cited spec, clause ref imprecise
 	VWrongSpec = "WRONG_SPEC_REF"      // absent from cited spec, located in ANOTHER indexed spec
+	VAmbiguous = "AMBIGUOUS"           // the name does not identify one clause (see Why)
 	VNotFound  = "NOT_FOUND"           // no trace anywhere (candidate hallucination)
+)
+
+// Score floors. A verdict is only as good as the evidence that clears its floor,
+// so each one is named rather than inlined.
+const (
+	clauseFloor   = 0.5  // tokens co-located in the cited (or parent) clause
+	inCitedFloor  = 0.75 // tokens co-located in some clause of the cited spec
+	relocateFloor = 0.66 // tokens co-located in ANOTHER spec's heading
 )
 
 // Finding is the per-event audit result. When Verdict==WRONG_SPEC_REF, the
 // Real* fields give the event's true normative home (e.g. TS 29.002 §8.10.3).
+// When Verdict==AMBIGUOUS, Why says what stopped the decision.
 type Finding struct {
 	NF          string  `json:"nf"`
 	Event       string  `json:"event"`
@@ -41,6 +59,7 @@ type Finding struct {
 	RealSpec    string  `json:"real_spec,omitempty"`
 	RealClause  string  `json:"real_clause,omitempty"`
 	RealHeading string  `json:"real_heading,omitempty"`
+	Why         string  `json:"why,omitempty"`
 	Score       float64 `json:"score"`
 }
 
@@ -99,6 +118,12 @@ func parentClause(p string) string {
 // then the best-matching clause WITHIN the cited spec; when no clause co-locates
 // the tokens it searches the WHOLE index to relocate the event to its true spec
 // — turning a bare "suspect" into "WRONG_SPEC_REF, real home = X §Y".
+//
+// Every lexical lookup goes through searchDistinct, because the corpus holds one
+// row per RELEASE: a raw top-K is a top-K of versions, not of clauses, and it
+// hides the answer behind copies of a single near-miss. And a search that cannot
+// separate two candidate homes returns AMBIGUOUS with its reason, never
+// NOT_FOUND — the latter is a claim that the text does not exist.
 func AuditCatalog(ctx context.Context, st store.Reader, events []SentinelEvent) ([]Finding, error) {
 	type idx struct{ byPath map[string]string }
 	cache := map[string]idx{}
@@ -110,6 +135,18 @@ func AuditCatalog(ctx context.Context, st store.Reader, events []SentinelEvent) 
 		if _, v, ok, _ := st.LatestVersion(ctx, spec); ok {
 			if cs, err := st.GetClauses(ctx, spec, v, ""); err == nil {
 				for _, c := range cs {
+					// Front matter — Contents, Foreword, Introduction — carries no
+					// clause path, so every one of those rows collapses into
+					// byPath[""]: last write wins, and which row that is depends on
+					// storage order. TS 33.108's table of contents is 19 KB listing
+					// every annex title, so it "contains" the tokens of almost any
+					// operation name. 43 events cite "33.108 §Annex", whose parent
+					// path is "" — 30 of them were once confirmed against that table
+					// of contents, non-deterministically. An unpathed clause is not
+					// addressable by a citation, so it is not indexed.
+					if c.ClausePath == "" {
+						continue
+					}
 					si.byPath[c.ClausePath] = auditNorm(c.Heading + " " + c.Text)
 				}
 			}
@@ -132,19 +169,31 @@ func AuditCatalog(ctx context.Context, st store.Reader, events []SentinelEvent) 
 			continue
 		}
 		si := loadSpec(e.Spec)
+		// An empty parent means the citation has no parent to fall back to
+		// ("Annex" holds no dot), not that the parent is the unpathed front
+		// matter. Checking one against the other is how a table of contents
+		// became evidence.
+		parent := parentClause(e.Clause)
 		switch {
-		case fracIn(tk, si.byPath[e.Clause]) >= 0.5:
+		case e.Clause != "" && fracIn(tk, si.byPath[e.Clause]) >= clauseFloor:
 			f.Verdict, f.Score = VConfirmed, 1
-		case e.Clause != "" && fracIn(tk, si.byPath[parentClause(e.Clause)]) >= 0.5:
+		case parent != "" && fracIn(tk, si.byPath[parent]) >= clauseFloor:
 			f.Verdict, f.Score = VParentRef, 0.9
 		default:
 			// Co-located match somewhere in the cited spec? (BM25-ranked clause.)
-			if _, _, sc := bestHit(ctx, st, e.Event, tk, e.Spec); sc >= 0.75 {
+			if _, _, sc := bestHit(ctx, st, e.Event, tk, e.Spec); sc >= inCitedFloor {
 				f.Verdict, f.Score = VInCited, sc
-			} else if rs, rc, rh, sc := relocate(ctx, st, tk, e.Event, e.Spec); sc >= 0.66 {
-				f.Verdict, f.RealSpec, f.RealClause, f.RealHeading, f.Score = VWrongSpec, rs, rc, rh, sc
-			} else {
-				f.Verdict, f.Score = VNotFound, sc
+				break
+			}
+			r := relocate(ctx, st, tk, e.Event, e.Spec)
+			switch {
+			case r.score >= relocateFloor && r.rivals == 0:
+				f.Verdict, f.Score = VWrongSpec, r.score
+				f.RealSpec, f.RealClause, f.RealHeading = r.spec, r.clause, r.heading
+			case r.why != "":
+				f.Verdict, f.Score, f.Why = VAmbiguous, r.score, r.why
+			default:
+				f.Verdict, f.Score = VNotFound, r.score
 			}
 		}
 		out = append(out, f)
@@ -152,17 +201,49 @@ func AuditCatalog(ctx context.Context, st store.Reader, events []SentinelEvent) 
 	return out, nil
 }
 
+// releaseFanOut is how many rows one clause occupies in `clauses`: the table
+// holds every RELEASE of every spec, so a clause appears once per version — up
+// to 17 times in this corpus, 5.6 on average. A raw TopK is therefore NOT a
+// count of candidates. Measured on CHECK_IMEI, the whole 12-hit window was ONE
+// clause (TS 29.002 §25.6.6) repeated twelve times, while the event's true home
+// — TS 29.273 §5.2.3.35 "IMEI-Check-In-VPLMN-Result", heading coverage 1.0 —
+// never entered it. Over-fetch, then fold the versions away.
+const releaseFanOut = 20
+
+// searchDistinct ranks clauses lexically and returns at most want hits with
+// DISTINCT (spec, clause), keeping the best-ranked row of each.
+func searchDistinct(ctx context.Context, st store.Reader, text, onlySpec string, want int) []model.SearchHit {
+	hits, err := st.SearchClauses(ctx, store.SearchQuery{
+		Text:   text,
+		Filter: store.SpecFilter{SpecID: onlySpec},
+		TopK:   want * releaseFanOut,
+	})
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool, want)
+	out := make([]model.SearchHit, 0, want)
+	for _, h := range hits {
+		key := h.Clause.SpecID + "\x00" + h.Clause.ClausePath
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, h)
+		if len(out) == want {
+			break
+		}
+	}
+	return out
+}
+
 // bestHit returns the best token-coverage clause for name, optionally scoped to
 // onlySpec (empty = whole index). It ranks via the store's lexical search then
 // re-scores each hit by event-token co-location.
 func bestHit(ctx context.Context, st store.Reader, name string, tk []string, onlySpec string) (string, string, float64) {
-	hits, err := st.SearchClauses(ctx, store.SearchQuery{Text: name, Filter: store.SpecFilter{SpecID: onlySpec}, TopK: 8})
-	if err != nil {
-		return "", "", 0
-	}
 	best := 0.0
 	var bc, bh string
-	for _, h := range hits {
+	for _, h := range searchDistinct(ctx, st, name, onlySpec, 8) {
 		if score := fracIn(tk, auditNorm(h.Clause.Heading+" "+h.Clause.Text)); score > best {
 			best, bc, bh = score, h.Clause.ClausePath, h.Clause.Heading
 		}
@@ -170,15 +251,33 @@ func bestHit(ctx context.Context, st store.Reader, name string, tk []string, onl
 	return bc, bh, best
 }
 
+// relocation is a cross-spec placement attempt: where the event's name is best
+// supported, how well, and how many other specs support it just as well.
+type relocation struct {
+	spec, clause, heading string
+	score                 float64
+	rivals                int    // OTHER specs tying with the winner
+	why                   string // set when the attempt cannot decide
+}
+
 // relocate finds the event's true home in a spec OTHER than the cited one.
-func relocate(ctx context.Context, st store.Reader, tk []string, name, citedSpec string) (string, string, string, float64) {
-	hits, err := st.SearchClauses(ctx, store.SearchQuery{Text: name, TopK: 12})
-	if err != nil {
-		return "", "", "", 0
+func relocate(ctx context.Context, st store.Reader, tk []string, name, citedSpec string) relocation {
+	// One token is not evidence. auditTokens drops fragments under three
+	// characters, so IP_RELEASE reduces to ["release"] and every heading
+	// carrying that word scores a perfect 1.0 — the "winner" is then whichever
+	// row the ranker happened to return first, a coin toss reported as a
+	// finding. That is how PGW/IP_RELEASE landed in TS 38.331, NR radio
+	// resource control.
+	if len(tk) < 2 {
+		if len(tk) == 1 {
+			return relocation{why: fmt.Sprintf("one usable token in the name (%q)", tk[0])}
+		}
+		return relocation{why: "no usable token in the name"}
 	}
 	best := 0.0
 	var bs, bc, bh string
-	for _, h := range hits {
+	ties := map[string]bool{}
+	for _, h := range searchDistinct(ctx, st, name, "", 12) {
 		if h.Clause.SpecID == citedSpec {
 			continue
 		}
@@ -186,11 +285,31 @@ func relocate(ctx context.Context, st store.Reader, tk []string, name, citedSpec
 		// NAMES it in its title (e.g. "MAP_RESTORE_DATA service"). Body-text
 		// token coincidences (e.g. a charging spec mentioning "bearer deletion")
 		// would otherwise produce false relocations.
-		if score := fracIn(tk, auditNorm(h.Clause.Heading)); score > best {
+		score := fracIn(tk, auditNorm(h.Clause.Heading))
+		switch {
+		case score > best:
 			best, bs, bc, bh = score, h.Clause.SpecID, h.Clause.ClausePath, h.Clause.Heading
+			ties = map[string]bool{h.Clause.SpecID: true}
+		case score == best && best > 0:
+			ties[h.Clause.SpecID] = true
 		}
 	}
-	return bs, bc, bh, best
+	r := relocation{spec: bs, clause: bc, heading: bh, score: best, rivals: len(ties) - 1}
+	// Two specs that name the operation equally well are two candidate homes,
+	// and picking the first is not a measurement.
+	if best >= relocateFloor && r.rivals > 0 {
+		r.why = fmt.Sprintf("%d specs name it equally well (%.2f): %s", len(ties), best, strings.Join(sortedKeys(ties), ", "))
+	}
+	return r
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // LoadSentinel reads the oracle JSON.

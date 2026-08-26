@@ -1,0 +1,63 @@
+# .gitattributes — normalisation des fins de ligne.
+#
+# POURQUOI CE FICHIER EXISTE
+#
+# Sans lui, un checkout Windows (core.autocrlf=true, le defaut de Git for Windows)
+# convertit les fichiers texte en CRLF dans l'arbre de travail. Trois consequences
+# concretes, toutes rencontrees :
+#
+#  1. REPRODUCTIBILITE DES BINAIRES. `cmd/server/landing.go` fait
+#     `//go:embed skill_3gpp.md`. go:embed embarque les octets TELS QU'ILS SONT SUR
+#     LE DISQUE : le meme commit produit donc un binaire different selon la
+#     plateforme de build. TestSkillIsARealSkill (qui verifie le prefixe
+#     "---\nname: 3gpp\n") echoue sur tout checkout Windows. Idem pour
+#     `internal/store/schema.sql`, embarque et execute comme DDL.
+#
+#  2. SCRIPTS SHELL INEXECUTABLES. Un `#!/usr/bin/env bash\r` fait echouer le
+#     shebang sous Linux avec un message incomprehensible ("bad interpreter").
+#     Le pipeline corpus est integralement en bash.
+#
+#  3. FINGERPRINTS INSTABLES. La machine a etats hash le contenu des fichiers
+#     d'implementation pour decider quoi rejouer. Un CRLF/LF fait diverger le
+#     fingerprint entre deux machines pour un contenu identique, et casse le
+#     "SKIP si inchange".
+#
+# `eol=lf` force LF dans l'arbre de travail sur TOUTES les plateformes. Le projet
+# cible Linux (CI, images, WSL2) ; LF partout est la seule valeur coherente.
+#
+# Apres modification de ce fichier : `git add --renormalize .`
+
+* text=auto eol=lf
+
+# Binaires : jamais de conversion, jamais de diff textuel.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.zst    binary
+*.gz     binary
+*.7z     binary
+*.duckdb binary
+*.onnx   binary
+*.so     binary
+*.dll    binary
+*.dylib  binary
+*.a      binary
+*.exe    binary
+*.doc    binary
+*.docx   binary
+
+# Assets embarques par go:embed — LF explicite : leur contenu octet-pour-octet
+# fait partie du binaire livre.
+cmd/server/skill_3gpp.md   text eol=lf
+internal/store/schema.sql  text eol=lf
+internal/embed/models.yaml text eol=lf
+
+# Le corpus 3GPP n'entre jamais dans git, mais si un .htm/.asn y atterrit par
+# accident il doit rester intact (le parser compte sur les octets d'origine).
+*.asn  -text
+*.htm  -text
+*.html -text
