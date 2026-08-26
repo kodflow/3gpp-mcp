@@ -224,6 +224,70 @@ from "condition failed", and so should anything added here.
 
 ---
 
+## The two overlays `enrich` cannot invent
+
+`enrich` folds three sources into the corpus. The DynaReport catalogue is
+derived from what `discover` already fetched; the other two are external and
+have their own scripts, because the corpus is useless as a *retrieval* target
+for them if they are missing and nothing says so:
+
+```bash
+./scripts/fetch-5g-apis.sh auto   # 5GC OpenAPI YAMLs -> data/sources/5g-apis
+./scripts/fetch-li-asn.sh         # TS 33.128 ASN.1   -> data/sources/asn
+```
+
+- Without the first, `enrich` logs *"no data/sources/5g-apis — skipping the
+  OpenAPI overlay"* and `search_api` answers from whatever a previous merge left
+  behind. A from-scratch corpus would answer from nothing.
+- Without the second, it logs *"no TS33128Payloads .asn found — li_events stays
+  empty"* and the `li_events` tool returns nothing at all. The modules are not
+  published on their own: they ride in a zip inside the zip of TS 33.128, and
+  `fetch-li-asn.sh` reads the version code from the HTML the corpus already
+  holds so the registry describes the same version as the text.
+- `fetch-5g-apis.sh` needs a Python 3 for JSON. The Windows toolchain provisions
+  none and `python3` on PATH is the Store stub — it prints an advert and exits
+  non-zero — so the script accepts `PYTHON=…`, otherwise falls back to the
+  interpreter bundled with LibreOffice, and **refuses to run** rather than fetch
+  into empty JSON.
+- **A Windows Python ends every `print()` with CRLF.** `$( )` strips the LF and
+  keeps the CR, so that byte rides into every filename and every URL: the
+  file-exists test misses files that are on disk, and `curl` reports `http=000`
+  for blobs that answer 200 by hand. One `tr -d '\r'` where the interpreter is
+  read is the fix — same shape as the soffice pitfall above.
+- It takes a release as **one archive**, not as 484 raw blobs: ~40 requests for
+  a full six-release fetch instead of ~3000. Per-file download stays as the
+  fallback, retries with backoff, and never retries a 403/404 — on 3GPP hosts a
+  403 *is* a 404.
+- Measured: 1774 YAML files over REL-15..REL-20 and 405 LI events (Rel-19), both
+  `missing=0`, in minutes.
+
+---
+
+## Serving the finished corpus
+
+`smoke` proves the server starts, so the same command line is what a client
+should use. `.mcp.json` at the repo root wires it into any `mcpServers` client:
+
+```json
+{ "mcpServers": { "3gpp": { "type": "stdio",
+    "command": ".local/bin/server.exe",
+    "args": ["serve", "--db", "data/3gpp.duckdb", "--etsi-db", "data/etsi.duckdb"] } } }
+```
+
+- **On Linux, drop the `.exe`** — `goal` names its binaries with the host's
+  extension, so the file is `.local/bin/server`.
+- `--etsi-db` attaches the ETSI Lawful-Interception corpus **alongside**, never
+  merged: `get_spec`/`list_releases` route `ETSI …` ids there and `list_specs`
+  unions both. It degrades to 3GPP-only on a missing or unreadable file, which
+  is why `smoke` now asserts the "ETSI corpus attached" line rather than trusting
+  the flag.
+- The server needs no toolchain environment: `duckdb.dll` sits beside the binary
+  and the embedder is off by default (`embedder=false`).
+- For a hosted deployment, `.claude/skills/3gpp/SKILL.md` documents the
+  Streamable-HTTP path (`claude mcp add --transport http 3gpp <origin>/mcp`).
+
+---
+
 ## What is deliberately not here
 
 - **The sparse arm.** It is produced but no consumer folds it into the served
