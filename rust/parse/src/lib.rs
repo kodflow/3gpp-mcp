@@ -141,7 +141,19 @@ pub fn archive_url(spec_id: &str, version: &str) -> String {
 /// AUTHORITATIVE convert-dir release when present, falling back to the version-major decode
 /// (a draft v1.x of a Rel-20 spec lives under Rel-20, not Rel-1).
 pub fn parse_filename_meta(path: &str) -> Result<SpecMeta, String> {
-    let re_file = Regex::new(r"^([0-9]{4,5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:_.*)?$").unwrap();
+    // The trailing suffix may be introduced by '-' as well as '_'.
+    //
+    // 3GPP archives ship editorial variants beside the spec: "-clean", "-rm",
+    // "-diff-100", "-cl". Accepting only "_…" rejected them outright, so the ONLY file
+    // that parsed out of TR 26.917's archive was its 8 KB cover page — which yields no
+    // clause. The spec was catalogued with no text behind it, i.e. a missing_content
+    // hole, while 324 KB of the actual document sat unread beside it.
+    //
+    // The version code is exactly three chars from [0-9a-z] (or six digits), and '-' is
+    // in neither class, so a suffix cannot be mistaken for a code: "26917-130-clean"
+    // can only split as 26917 / 130 / -clean, and "34123-1-a70" only as 34123-1 / a70.
+    let re_file =
+        Regex::new(r"^([0-9]{4,5}(?:-[0-9]+)?)-([0-9a-z]{3}|[0-9]{6})(?:[-_].*)?$").unwrap();
     let re_release_dir = Regex::new(r"^(Rel-[0-9]+|GSM|Phase[0-9]+)$").unwrap();
 
     let p = std::path::Path::new(path);
@@ -765,5 +777,60 @@ mod salvage_tests {
         let html = "<html><body><pre>just some prose\nand more prose\n</pre></body></html>";
         let (clauses, _, _) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
         assert!(clauses.is_empty(), "got {clauses:?}");
+    }
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::*;
+
+    // 3GPP ships editorial variants beside the spec, introduced by '-' as well as '_':
+    // "-clean", "-rm", "-diff-100", "-cl". Accepting only "_…" rejected them, so the
+    // only file that parsed out of TR 26.917's archive was its 8 KB cover page — which
+    // yields no clause. The spec was catalogued with no text behind it while 324 KB of
+    // the actual document sat unread beside it.
+    #[test]
+    fn a_hyphenated_editorial_suffix_is_still_the_same_spec() {
+        for name in [
+            "26917-130-clean",
+            "26917-130-diff-100",
+            "30531-016400-rm",
+            "26917-130_S4-AHI729-TR26-917-v130-cover-page",
+        ] {
+            let m = parse_filename_meta(&format!("convert/Rel-14/{name}.html"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(m.spec_id, if name.starts_with("30531") { "30.531" } else { "26.917" });
+        }
+    }
+
+    // A sub-part spec must still split on the PART, not on the suffix rule: the version
+    // code is three chars from [0-9a-z] and '-' is in neither class, so there is only
+    // one way to read these.
+    #[test]
+    fn a_sub_part_spec_is_unaffected_by_the_suffix_rule() {
+        let m = parse_filename_meta("convert/Rel-10/34123-1-a70.html").unwrap();
+        assert_eq!(m.spec_id, "34.123-1");
+        assert_eq!(m.version, "10.7.0");
+
+        let m = parse_filename_meta("convert/Rel-20/38760-1-030.html").unwrap();
+        assert_eq!(m.spec_id, "38.760-1");
+        assert_eq!(m.version, "0.3.0");
+
+        // And a sub-part spec WITH an editorial suffix reads correctly too.
+        let m = parse_filename_meta("convert/Rel-10/34123-1-a70-clean.html").unwrap();
+        assert_eq!(m.spec_id, "34.123-1");
+        assert_eq!(m.version, "10.7.0");
+    }
+
+    // Genuinely malformed names must still be rejected: the suffix rule must not turn
+    // the pattern into "anything goes".
+    #[test]
+    fn a_malformed_name_is_still_rejected() {
+        for bad in ["notaspec", "123-abc", "26917", "26917-1234"] {
+            assert!(
+                parse_filename_meta(&format!("convert/Rel-14/{bad}.html")).is_err(),
+                "{bad} must not parse"
+            );
+        }
     }
 }
