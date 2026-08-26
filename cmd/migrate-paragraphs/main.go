@@ -64,7 +64,12 @@ func main() {
 
 func build(h *sql.DB) error {
 	steps := []struct{ label, sql string }{
-		{"bodies", `CREATE OR REPLACE TABLE bodies AS
+		// Staging carries the body text: it is the join key for the occurrences
+		// and the reference the verification compares against. It does NOT
+		// survive — reconstructing a body from its paragraphs costs 0.035 ms
+		// once seq_body exists, so materialising 1.53 GB of it would be paying
+		// storage to avoid a cost that is not there.
+		{"staging", `CREATE OR REPLACE TABLE _mig_bodies AS
 			SELECT row_number() OVER ()::INTEGER AS body_id, heading, body,
 			       arg_max(emb, has_emb) AS embedding, any_value(ehash) AS embedding_hash
 			FROM (
@@ -73,69 +78,84 @@ func build(h *sql.DB) error {
 				FROM clauses
 			) GROUP BY heading, body`},
 
-		// The distinct parts of every distinct body — including the empty ones.
 		{"paragraphs", `CREATE OR REPLACE TABLE paragraphs AS
 			SELECT row_number() OVER ()::INTEGER AS para_id, part
-			FROM (SELECT DISTINCT unnest(string_split(body, ` + sep + `)) AS part FROM bodies)`},
+			FROM (SELECT DISTINCT unnest(string_split(body, ` + sep + `)) AS part FROM _mig_bodies)`},
 
 		{"body_seq", `CREATE OR REPLACE TABLE body_seq AS
 			WITH x AS (
 				SELECT body_id,
 				       unnest(list_transform(string_split(body, ` + sep + `), (s, i) -> {'o': i, 'p': s})) AS e
-				FROM bodies
+				FROM _mig_bodies
 			)
 			SELECT x.body_id, x.e['o']::SMALLINT AS ord, p.para_id
 			FROM x JOIN paragraphs p ON p.part = x.e['p']`},
 
 		{"clause_occ", `CREATE OR REPLACE TABLE clause_occ AS
 			SELECT c.spec_id, c.release, c.version, c.clause_path, c.is_normative, b.body_id
-			FROM clauses c JOIN bodies b ON b.heading IS NOT DISTINCT FROM c.heading AND b.body = c.text`},
+			FROM clauses c JOIN _mig_bodies b
+			  ON b.heading IS NOT DISTINCT FROM c.heading AND b.body = c.text`},
+
+		{"bodies", `CREATE OR REPLACE TABLE bodies AS
+			SELECT body_id, heading, embedding, embedding_hash FROM _mig_bodies`},
+
+		{"drop staging", `DROP TABLE _mig_bodies`},
+
+		// Declared in schema.sql, and not optional: without seq_body the
+		// reconstruction join is a full scan of 8.4 M rows and a thousand
+		// bodies take 5.8 s instead of 35 ms.
+		{"indexes", `CREATE INDEX IF NOT EXISTS seq_body ON body_seq (body_id);
+			CREATE INDEX IF NOT EXISTS seq_para ON body_seq (para_id);
+			CREATE INDEX IF NOT EXISTS occ_body ON clause_occ (body_id);
+			CREATE INDEX IF NOT EXISTS occ_spec ON clause_occ (spec_id);
+			CREATE INDEX IF NOT EXISTS occ_path ON clause_occ (spec_id, clause_path)`},
 	}
 	for _, s := range steps {
 		start := time.Now()
 		if _, err := h.Exec(s.sql); err != nil {
 			return fmt.Errorf("%s: %w", s.label, err)
 		}
-		fmt.Fprintf(os.Stderr, "  %-12s built in %s\n", s.label, time.Since(start).Round(time.Second))
+		fmt.Fprintf(os.Stderr, "  %-12s in %s\n", s.label, time.Since(start).Round(time.Second))
 	}
 	return nil
 }
 
-// verify asserts the two properties that make the new shape lossless, over the
-// WHOLE corpus. A sampled check here would be worse than none: the failure mode
-// it guards against — a separator that does not round-trip — is rare by nature.
+// verify asserts, over the WHOLE corpus, that every occurrence still resolves to
+// exactly the text it had. Comparing the rebuild against `clauses` rather than
+// against a copy kept inside the new tables is the point: a check that reads its
+// own output would pass on a corpus that lost the original.
 func verify(h *sql.DB) error {
-	var bodies, exact int64
+	var occ, exact int64
 	err := h.QueryRow(`
 		WITH rebuilt AS (
 			SELECT s.body_id, string_agg(p.part, `+sep+` ORDER BY s.ord) AS body
 			FROM body_seq s JOIN paragraphs p USING (para_id) GROUP BY s.body_id
 		)
-		SELECT count(*), count(*) FILTER (WHERE b.body IS NOT DISTINCT FROM r.body)
-		FROM bodies b JOIN rebuilt r USING (body_id)`).Scan(&bodies, &exact)
+		SELECT count(*),
+		       count(*) FILTER (WHERE c.text IS NOT DISTINCT FROM r.body
+		                          AND c.heading IS NOT DISTINCT FROM b.heading)
+		FROM clauses c
+		JOIN clause_occ o ON o.spec_id = c.spec_id AND o.release = c.release
+		                 AND o.version = c.version AND o.clause_path = c.clause_path
+		JOIN bodies b USING (body_id)
+		JOIN rebuilt r USING (body_id)`).Scan(&occ, &exact)
 	if err != nil {
 		return fmt.Errorf("reconstruction query: %w", err)
 	}
-	if bodies == 0 {
-		return fmt.Errorf("no bodies — nothing was migrated")
+	if occ == 0 {
+		return fmt.Errorf("no occurrences matched `clauses` — nothing was verified")
 	}
-	if exact != bodies {
-		return fmt.Errorf("%d of %d bodies do not rebuild byte-for-byte", bodies-exact, bodies)
+	if exact != occ {
+		return fmt.Errorf("%d of %d occurrences do not rebuild byte-for-byte", occ-exact, occ)
 	}
-	fmt.Fprintf(os.Stderr, "  reconstruction  %d/%d bodies exact\n", exact, bodies)
-
-	// Every clause must have found its body: a JOIN that silently dropped rows
-	// would shrink the corpus by losing it.
-	var clauses, occ int64
-	if err := h.QueryRow(`SELECT (SELECT count(*) FROM clauses), (SELECT count(*) FROM clause_occ)`).Scan(&clauses, &occ); err != nil {
-		// `clauses` is gone on an already-dropped corpus; that is not a failure.
-		fmt.Fprintf(os.Stderr, "  occurrences     clauses table absent (already dropped)\n")
-		return nil
+	var clauses int64
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&clauses); err != nil {
+		return fmt.Errorf("counting clauses: %w", err)
 	}
 	if occ != clauses {
-		return fmt.Errorf("%d clauses but %d occurrences — the join lost %d rows", clauses, occ, clauses-occ)
+		return fmt.Errorf("%d clauses but only %d verified occurrences — %d were lost", clauses, occ, clauses-occ)
 	}
-	fmt.Fprintf(os.Stderr, "  occurrences     %d/%d preserved\n", occ, clauses)
+	fmt.Fprintf(os.Stderr, "  verified        %d/%d occurrences rebuild byte-for-byte\n", exact, clauses)
 	return nil
 }
 
