@@ -213,6 +213,13 @@ reason: `internal/store.hnswTarget` puts the index on whichever table holds the
 vectors, so it builds `bodies_hnsw` over 897 556 vectors instead of failing to
 build `clauses_hnsw` over 2 752 688 references to them.
 
+## What the conversion broke afterwards, and what the four misses share
+
+The design above held. What did not hold was everything downstream that had been
+written against the old shape and was never asked whether it still applied. Four
+separate places, all found by running things rather than by the test suite, and
+all the same mistake in different clothes.
+
 ### The markers have to move with the vectors
 
 Two things describe the vector population to the server, and both were left
@@ -259,6 +266,13 @@ and its error names which condition failed, which is more than a boolean.
 The general form is worth keeping: **a gate that re-implements the check instead
 of running it will eventually ask a different question than the code it gates,**
 and the day it does, it passes.
+
+### The schema itself could not be applied
+
+The first of the four, and the one that made the pipeline unable to complete a
+run on the shape it produces — see the CREATE INDEX section above. It is listed
+here because it is the same mistake: `schema.sql` was written for a corpus whose
+`clauses` is a table, and nobody asked it whether that was still true.
 
 ### The image path had the same shape of bug, three more times
 
@@ -316,10 +330,16 @@ Executed and measured on the real corpus:
 | `smoke` | 45 s → **4 s** |
 
 `paragraphs` is a pipeline step between `enrich` and `index`, so a fresh clone
-produces this shape rather than the old one. That position is also why the Rust
-write side needs no change at all: it keeps producing `clauses` with its text and
-its vectors, and converting afterwards carries those vectors onto the bodies that
-own them.
+produces this shape rather than the old one. That position is why the Rust write
+side keeps working: it goes on producing `clauses` with its text and its vectors,
+and converting afterwards carries those vectors onto the bodies that own them.
+
+An earlier draft of this ADR said the write side "needs no change at all". That
+turned out to be one line short of true: `Store::open_rw` had to learn not to
+apply `CREATE INDEX ... ON clauses` when that name is a view, or every write-side
+tool died at bootstrap. It is not a change that teaches it ADR 0004 — it is the
+narrower rule that you cannot index a view — but the stronger claim was wrong and
+saying so here is cheaper than letting the next reader trust it.
 
 ## A delta run: restore the old shape, fold, convert again
 

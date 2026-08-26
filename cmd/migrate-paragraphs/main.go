@@ -344,7 +344,9 @@ func refuseToShrink(h *sql.DB) error {
 // getting it subtly wrong produces a corpus that passes every gate. Restoring
 // the shape the write side has always seen, and converting again afterwards,
 // costs one grouped reconstruction — 1 m 47 for 2.87 GB on this corpus, measured
-// — and needs no write-side change at all.
+// — and needs no write-side change beyond one: Store::open_rw had to learn not
+// to apply `CREATE INDEX ... ON clauses` when that name is a view. That is the
+// narrow rule "you cannot index a view", not knowledge of this storage layout.
 func restore(h *sql.DB) error {
 	var occ int64
 	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil || occ == 0 {
