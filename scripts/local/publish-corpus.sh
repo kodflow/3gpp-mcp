@@ -172,17 +172,26 @@ publish_one() {
   log "$pkg: published $repo:$date_tag (+ :latest)"
 
   # ANTI-LEAK. Verbatim standards text must not become a public package.
+  #
+  # NO LEADING SLASH, and MSYS_NO_PATHCONV. Git Bash rewrites an argument that
+  # looks like an absolute POSIX path into a Windows one, so `gh api
+  # "/users/..."` became `C:/Program Files/Git/users/...` and the call failed
+  # with "invalid API endpoint". The first version read that failure as "no
+  # read:packages" and printed a warning saying it could not check — on a token
+  # that could check perfectly well. A guard that cannot tell "forbidden" from
+  # "malformed" reports the wrong thing in the one case it exists for.
   local vis
-  vis="$(GH_TOKEN=$TOKEN gh api "/users/$OWNER/packages/container/$pkg" --jq '.visibility' 2>/dev/null || echo unknown)"
+  vis="$(MSYS_NO_PATHCONV=1 GH_TOKEN=$TOKEN gh api "user/packages?package_type=container&per_page=100" \
+         --jq ".[] | select(.name==\"$pkg\") | .visibility" 2>/dev/null || echo unknown)"
   case "$vis" in
     private) log "$pkg: visibility private ✓";;
     public)
       log "$pkg: PUBLIC — flipping to private"
-      GH_TOKEN=$TOKEN gh api -X PATCH "/user/packages/container/$pkg/visibility" -f visibility=private >/dev/null 2>&1 \
+      MSYS_NO_PATHCONV=1 GH_TOKEN=$TOKEN gh api -X PATCH "user/packages/container/$pkg/visibility" -f visibility=private >/dev/null 2>&1 \
         || die "$pkg is PUBLIC and could not be made private. It carries verbatim standards text.
    Fix it by hand NOW: https://github.com/users/$OWNER/packages/container/$pkg/settings";;
     *)
-      printf '[publish][WARNING] %s\n' "cannot read $pkg visibility (needs read:packages).
+      printf '[publish][WARNING] %s\n' "cannot read $pkg visibility (got: ${vis:-empty}).
    It carries verbatim standards text. CHECK IT:
    https://github.com/users/$OWNER/packages/container/$pkg/settings" >&2;;
   esac
