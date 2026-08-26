@@ -213,6 +213,33 @@ reason: `internal/store.hnswTarget` puts the index on whichever table holds the
 vectors, so it builds `bodies_hnsw` over 897 556 vectors instead of failing to
 build `clauses_hnsw` over 2 752 688 references to them.
 
+### The markers have to move with the vectors
+
+Two things describe the vector population to the server, and both were left
+pointing at the old shape:
+
+- `store.LoadVSS` — the gate that decides whether the frozen index may be trusted
+  — looked for `clauses_hnsw` **by name**, while `BuildAndFreezeHNSW` had already
+  been taught to build `bodies_hnsw`;
+- `schema_meta.embedding_count` still held 2 207 218, the pre-conversion count,
+  against the 821 146 vectors the corpus actually holds.
+
+Either one alone turns vector search off. Neither reports an error: the server
+logs *"HNSW unavailable, vector search uses exact scan"*, answers every query
+correctly by scanning all 821 146 vectors, and nothing downstream notices. That
+is precisely the failure the freeze markers exist to catch, arriving through the
+check meant to catch it.
+
+Both were found by running the real server over the real corpus — `hnsw=false` in
+its own startup line — and not by any test. So the guard now resolves its name
+through `hnswTarget()`, the conversion re-stamps `embedding_count` and clears
+`hnsw_state` when no index yet exists on `bodies`, and there are two tests: one
+that fails with the old hardcoded name, one that fails without the re-stamp.
+
+The rule the misses share: **whatever describes the vectors has to move with
+them.** The conversion changes the vector population, so the conversion is what
+must say so.
+
 ## Consequences
 
 - The read side is converted, not wrapped: two steps at each call site that
