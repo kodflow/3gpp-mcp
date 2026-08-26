@@ -60,7 +60,8 @@ func TestEveryBodyRebuildsByteForByte(t *testing.T) {
 		)
 		SELECT c.spec_id, c.text, r.body
 		FROM clauses c
-		JOIN bodies b ON b.heading IS NOT DISTINCT FROM c.heading AND b.body = c.text
+		JOIN clause_occ o ON o.spec_id = c.spec_id AND o.release = c.release
+		                 AND o.version = c.version AND o.clause_path = c.clause_path
 		JOIN rebuilt r USING (body_id)`)
 	if err != nil {
 		t.Fatal(err)
