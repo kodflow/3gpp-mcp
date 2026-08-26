@@ -3,6 +3,7 @@ package goal
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -976,5 +977,69 @@ func TestShellTestsAreFoundInSubdirectoriesToo(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("ran %d shell test(s), want 2 — the nested one must not be missed", n)
+	}
+}
+
+// --- the smoke postmortem -------------------------------------------------
+//
+// The 2026-08-26 03:50 run reported `initialize failed: EOF (server stderr: )`.
+// An empty stderr and no exit code is a report that says nothing, and it sent
+// the next reader looking for a bug in the server that may never have existed.
+
+func TestThePostmortemNamesTheExitStatusAndKeepsTheStderr(t *testing.T) {
+	cmd := helperProcess(t, "die")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	got := serverPostmortem(cmd, &stderr)
+	if !strings.Contains(got, "the server died") {
+		t.Fatalf("the postmortem must say the process died, got %q", got)
+	}
+	if !strings.Contains(got, "a word before dying") {
+		t.Fatalf("the postmortem must carry the stderr the process wrote, got %q", got)
+	}
+}
+
+// A process that says nothing must be REPORTED as saying nothing, rather than
+// leaving an empty parenthesis for the reader to interpret.
+func TestThePostmortemSaysWhenTheServerWroteNothing(t *testing.T) {
+	cmd := helperProcess(t, "silent")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	got := serverPostmortem(cmd, &stderr)
+	if !strings.Contains(got, "wrote nothing to stderr") {
+		t.Fatalf("silence must be stated, not implied, got %q", got)
+	}
+	if !strings.Contains(got, "status 0") {
+		t.Fatalf("a clean exit must still be named, got %q", got)
+	}
+}
+
+// helperProcess re-executes this test binary as a child, the portable way to get
+// a real process to autopsy without assuming any shell or coreutils exists —
+// this toolchain has burnt us on `mktemp`, `sed` and `make` already.
+func helperProcess(t *testing.T, mode string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=TestGoalHelperProcess")
+	cmd.Env = append(os.Environ(), "GOAL_HELPER_MODE="+mode)
+	return cmd
+}
+
+func TestGoalHelperProcess(t *testing.T) {
+	mode := os.Getenv("GOAL_HELPER_MODE")
+	if mode == "" {
+		t.Skip("not the helper process")
+	}
+	switch mode {
+	case "die":
+		os.Stderr.WriteString("a word before dying\n")
+		os.Exit(3)
+	default:
+		os.Exit(0)
 	}
 }
