@@ -298,3 +298,201 @@ func TestItRefusesToRebuildFromADelta(t *testing.T) {
 		t.Fatalf("occurrences = %d after a refused rebuild, want the original 8", occ)
 	}
 }
+
+// snapshot copies `clauses` so a later restore can be compared against the table
+// it is supposed to give back, rather than against itself.
+func snapshot(t *testing.T, h *sql.DB) {
+	t.Helper()
+	if _, err := h.Exec(`CREATE OR REPLACE TABLE _orig AS SELECT * FROM clauses`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// divergence counts rows that differ between the restored table and the
+// snapshot, in either direction. EXCEPT is set difference, so running it both
+// ways catches a row that changed, a row that vanished and a row invented.
+func divergence(t *testing.T, h *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := h.QueryRow(`SELECT
+		(SELECT count(*) FROM (SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative FROM _orig
+		                       EXCEPT SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative FROM clauses))
+	  + (SELECT count(*) FROM (SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative FROM clauses
+	                           EXCEPT SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative FROM _orig))`).
+		Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func convert(t *testing.T, h *sql.DB) {
+	t.Helper()
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := drop(h); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoreGivesBackTheTableItReplaced(t *testing.T) {
+	h := fixture(t)
+	snapshot(t, h)
+	convert(t, h)
+	if err := restore(h); err != nil {
+		t.Fatal(err)
+	}
+	if d := divergence(t, h); d != 0 {
+		t.Fatalf("%d rows differ from the table that was dropped", d)
+	}
+	// The content-addressed tables must be GONE, not merely ignored: leaving
+	// them behind means the next compact copy carries a stale copy of the corpus
+	// alongside the real one, and a later conversion would build on top of it.
+	for _, tbl := range []string{"paragraphs", "bodies", "body_seq", "clause_occ"} {
+		var n int
+		if err := h.QueryRow(`SELECT count(*) FROM duckdb_tables() WHERE table_name = ?`, tbl).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("%s survived the restore", tbl)
+		}
+	}
+	var isView int
+	if err := h.QueryRow(`SELECT count(*) FROM duckdb_views() WHERE view_name = 'clauses'`).Scan(&isView); err != nil {
+		t.Fatal(err)
+	}
+	if isView != 0 {
+		t.Error("`clauses` is still a view — the write side cannot INSERT into it")
+	}
+}
+
+// rust/store copies a database with `INSERT INTO dst SELECT * FROM src`, which
+// is correct only while both sides declare the same columns in the same order.
+// The restored table is built by this tool, so that order has to come from
+// schema.sql and not from whatever the reconstruction query happened to select.
+func TestRestoreDeclaresColumnsInSchemaOrder(t *testing.T) {
+	h := fixture(t)
+	convert(t, h)
+	if err := restore(h); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.Query(`SELECT column_name FROM information_schema.columns
+		WHERE table_name = 'clauses' ORDER BY ordinal_position`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, c)
+	}
+	want := []string{"chunk_id", "spec_id", "release", "version", "clause_path",
+		"heading", "text", "is_normative", "embedding", "embedding_hash"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("restored column order is %v, schema.sql declares %v — a compact copy would fill the wrong columns", got, want)
+	}
+}
+
+// The whole point of restore: a delta run, in the shape the write side actually
+// performs it. merge copies the base table by table (so the view is left behind
+// and schema.sql recreates it empty), deletes the changed buckets and folds the
+// shard back in. Reproduced here on the restored table, then converted again.
+func TestADeltaRunSurvivesTheRoundTrip(t *testing.T) {
+	h := fixture(t)
+	snapshot(t, h)
+	convert(t, h)
+
+	// What the pipeline now does BEFORE handing the corpus to the write side.
+	if err := restore(h); err != nil {
+		t.Fatal(err)
+	}
+
+	// The bucket replacement: (spec_id, release) out, then folded back with a
+	// chunk_id offset past everything the corpus already holds — which is what
+	// max_chunk_id() computes, and which only works because `clauses` is once
+	// again the table that holds every occurrence.
+	if _, err := h.Exec(`CREATE OR REPLACE TABLE _shard AS
+		SELECT * FROM clauses WHERE spec_id = '23.501' AND release = 'Rel-19'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`DELETE FROM clauses WHERE spec_id = '23.501' AND release = 'Rel-19'`); err != nil {
+		t.Fatal(err)
+	}
+	var offset int64
+	if err := h.QueryRow(`SELECT coalesce(max(chunk_id), 0) FROM clauses`).Scan(&offset); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`INSERT INTO clauses SELECT chunk_id + ?, spec_id, release, version,
+		clause_path, heading, text, is_normative, embedding, embedding_hash FROM _shard`, offset); err != nil {
+		t.Fatalf("folding the shard back in: %v", err)
+	}
+	if _, err := h.Exec(`DROP TABLE _shard`); err != nil {
+		t.Fatal(err)
+	}
+
+	// And converting again must not refuse, because `clauses` is whole.
+	convert(t, h)
+
+	var occ int
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		t.Fatal(err)
+	}
+	if occ != 8 {
+		t.Fatalf("occurrences = %d after a delta round trip, want the original 8", occ)
+	}
+	// The text has to survive the whole loop. chunk_ids moved — that is what a
+	// fold does — so compare everything else.
+	var d int
+	if err := h.QueryRow(`SELECT
+		(SELECT count(*) FROM (SELECT spec_id, release, clause_path, heading, text FROM _orig
+		                       EXCEPT SELECT spec_id, release, clause_path, heading, text FROM clauses))
+	  + (SELECT count(*) FROM (SELECT spec_id, release, clause_path, heading, text FROM clauses
+	                           EXCEPT SELECT spec_id, release, clause_path, heading, text FROM _orig))`).Scan(&d); err != nil {
+		t.Fatal(err)
+	}
+	if d != 0 {
+		t.Fatalf("%d clauses differ after convert → restore → fold → convert", d)
+	}
+}
+
+// The check has to run while the originals are still there. Sabotage the
+// reconstruction and the tool must refuse rather than drop the only copy.
+func TestRestoreRefusesAShortReconstruction(t *testing.T) {
+	h := fixture(t)
+	convert(t, h)
+	if _, err := h.Exec(`DELETE FROM body_seq WHERE body_id = (SELECT min(body_id) FROM body_seq)`); err != nil {
+		t.Fatal(err)
+	}
+	err := restore(h)
+	if err == nil {
+		t.Fatal("restore accepted a reconstruction that lost a body")
+	}
+	if !strings.Contains(err.Error(), "refusing to drop") {
+		t.Errorf("the refusal must say what it protects, got %q", err)
+	}
+	var n int
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("the occurrences were dropped despite the refusal")
+	}
+}
+
+func TestRestoreLeavesAnUnconvertedCorpusAlone(t *testing.T) {
+	h := fixture(t)
+	snapshot(t, h)
+	if err := restore(h); err != nil {
+		t.Fatalf("restore must be a no-op on a corpus that was never converted: %v", err)
+	}
+	if d := divergence(t, h); d != 0 {
+		t.Fatalf("%d rows changed on a corpus with nothing to restore", d)
+	}
+}

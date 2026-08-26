@@ -6,6 +6,7 @@
 //	migrate-paragraphs --db data/3gpp.duckdb            # build + verify, additive
 //	migrate-paragraphs --db data/3gpp.duckdb --verify    # verify only, no writes
 //	migrate-paragraphs --db data/3gpp.duckdb --drop-clauses
+//	migrate-paragraphs --db data/3gpp.duckdb --restore     # the inverse of --drop-clauses
 //
 // It is ADDITIVE: the new tables are built alongside `clauses`, which is what
 // makes the read side migratable one call at a time instead of in one jump.
@@ -30,6 +31,8 @@ import (
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
+
+	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
 const sep = "chr(10)||chr(10)"
@@ -38,6 +41,7 @@ func main() {
 	db := flag.String("db", "data/3gpp.duckdb", "corpus to migrate (in place, additive)")
 	verifyOnly := flag.Bool("verify", false, "check an already-migrated corpus and exit")
 	dropClauses := flag.Bool("drop-clauses", false, "after a passing verification, drop the now-redundant `clauses` table")
+	restoreFlag := flag.Bool("restore", false, "put `clauses` back as a real table and remove the content-addressed tables (the inverse of --drop-clauses)")
 	flag.Parse()
 
 	h, err := sql.Open("duckdb", *db)
@@ -62,6 +66,15 @@ func main() {
 	_, _ = h.Exec(`LOAD vss`)
 	_, _ = h.Exec(`SET hnsw_enable_experimental_persistence = true`)
 
+	if *restoreFlag {
+		// Restore replaces the tables the other paths read, so it is the whole
+		// run: verifying afterwards would have nothing left to verify against,
+		// and report would count tables that no longer exist.
+		if err := restore(h); err != nil {
+			die("restore: %v", err)
+		}
+		return
+	}
 	if !*verifyOnly {
 		if err := build(h); err != nil {
 			die("build: %v", err)
@@ -230,15 +243,18 @@ func die(f string, a ...any) {
 //
 // The build derives the tables from whatever `clauses` currently holds, with
 // CREATE OR REPLACE. That is right the first time and on a full rebuild. It is
-// catastrophic on a DELTA: `merge --base` folds only the changed buckets into a
-// fresh `clauses`, so re-deriving from it would replace 2 752 688 occurrences
-// with the handful the delta carried — a corpus silently reduced to its last
-// increment, with every gate still green because the numbers are internally
-// consistent.
+// catastrophic against a PARTIAL one. `merge --base` compact-copies the base
+// table by table, so a converted corpus's `clauses` VIEW is left behind and
+// schema.sql recreates it empty; the fold then fills it with the changed buckets
+// alone. Re-deriving from that would replace 2 752 688 occurrences with the
+// handful the delta carried — a corpus silently reduced to its last increment,
+// with every gate still green because the numbers agree with each other.
 //
-// The conversion is not incremental yet. Until it is, this refuses rather than
-// discovers the problem later: a corpus that already carries occurrences may
-// only be rebuilt from a `clauses` that holds at least as many rows.
+// The pipeline no longer produces that input: `merge` restores `clauses` as a
+// real table before folding (see restore), so a re-derivation always runs
+// against a whole corpus. This stays anyway. It costs one count, it is the only
+// thing standing between a mis-sequenced run and a corpus that agrees with
+// itself about being empty, and the day it fires is the day nobody expects it.
 func refuseToShrink(h *sql.DB) error {
 	var occ int64
 	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
@@ -259,4 +275,129 @@ func refuseToShrink(h *sql.DB) error {
 			clauses, occ)
 	}
 	return nil
+}
+
+// restore is the exact inverse of drop: it materialises `clauses` back into a
+// real table and removes the content-addressed tables it came from.
+//
+// It exists because of a constraint the conversion cannot argue with. The Rust
+// write side folds a delta with `merge --base`, which starts by COMPACT-COPYING
+// the base — table by table, from `duckdb_tables()`. A view is not a table, so
+// the copy silently leaves `clauses` behind, and schema.sql then recreates it
+// EMPTY in the destination. `merge` folds the changed buckets into that empty
+// table and the result is a corpus whose `clauses` holds the increment while
+// `clause_occ` still holds all 2 752 688 occurrences — the precise input
+// refuseToShrink refuses, arrived at by a route nobody would predict.
+//
+// Three further things break in the same state, all quietly:
+//
+//   - max_chunk_id() reads `clauses`, so the offset applied to a folded shard is
+//     0 and its chunk_ids collide with the occurrences already in the corpus;
+//   - changed_buckets() compares the shard against an empty `clauses`, so every
+//     bucket looks changed and the delta stops being a delta;
+//   - stash_bucket_vectors() carries embeddings across a bucket replacement by
+//     reading them from `clauses`, and finds none.
+//
+// Teaching the write side about paragraphs, bodies and occurrences would fix all
+// four. It would also put the storage layout of ADR 0004 into the one component
+// ADR 0001 arranged for it not to be in, and each of those four is a place where
+// getting it subtly wrong produces a corpus that passes every gate. Restoring
+// the shape the write side has always seen, and converting again afterwards,
+// costs one grouped reconstruction — 1 m 47 for 2.87 GB on this corpus, measured
+// — and needs no write-side change at all.
+func restore(h *sql.DB) error {
+	var occ int64
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil || occ == 0 {
+		fmt.Fprintln(os.Stderr, "  nothing to restore — this corpus is not content-addressed")
+		return nil
+	}
+	var isView bool
+	if err := h.QueryRow(`SELECT count(*) > 0 FROM duckdb_views()
+		WHERE database_name = current_database() AND schema_name = 'main' AND view_name = 'clauses'`).
+		Scan(&isView); err != nil {
+		return fmt.Errorf("looking for the clauses view: %w", err)
+	}
+	if !isView {
+		// `clauses` is a real table and the occurrences are also there. Both
+		// shapes present means the last conversion was additive and never
+		// dropped anything, so there is nothing to give back.
+		fmt.Fprintln(os.Stderr, "  `clauses` is already a table — leaving it alone")
+		return nil
+	}
+
+	steps := []struct{ label, sql string }{
+		// ONE grouped reconstruction, not the view. The view rebuilds a body with
+		// a correlated scalar subquery, which is right for the bounded reads it
+		// was written for (a search window, one clause) and quadratic here: 5.34 s
+		// for 1 191 clauses is 3+ hours for the corpus. Grouping body_seq once and
+		// joining costs 1 m 47 for all of it.
+		{"reconstruct", `CREATE OR REPLACE TABLE _mig_restore AS
+			WITH r AS (
+				SELECT s.body_id, string_agg(p.part, ` + sep + ` ORDER BY s.ord) AS body
+				FROM body_seq s JOIN paragraphs p USING (para_id) GROUP BY s.body_id
+			)
+			SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
+			       b.heading, r.body AS text, o.is_normative, b.embedding, b.embedding_hash
+			FROM clause_occ o JOIN bodies b USING (body_id) JOIN r USING (body_id)`},
+	}
+	for _, s := range steps {
+		start := time.Now()
+		if _, err := h.Exec(s.sql); err != nil {
+			return fmt.Errorf("%s: %w", s.label, err)
+		}
+		fmt.Fprintf(os.Stderr, "  %-12s in %s\n", s.label, time.Since(start).Round(time.Second))
+	}
+
+	// Assert BEFORE anything is dropped, because after the drop there is nothing
+	// left to compare against and a wrong answer becomes the corpus.
+	//
+	// This is not the byte-for-byte proof `verify` runs — it cannot be, since the
+	// only reference for the text is the tables being read. It is the check that
+	// the join behaved: one row per occurrence, no fanout, no row lost to a NULL
+	// on the way through, every chunk_id still distinct.
+	var rows, distinct, nulls int64
+	if err := h.QueryRow(`SELECT count(*), count(DISTINCT chunk_id),
+	                             count(*) FILTER (WHERE text IS NULL) FROM _mig_restore`).
+		Scan(&rows, &distinct, &nulls); err != nil {
+		return fmt.Errorf("checking the reconstruction: %w", err)
+	}
+	switch {
+	case rows != occ:
+		return fmt.Errorf("reconstructed %d rows from %d occurrences — refusing to drop the originals", rows, occ)
+	case distinct != rows:
+		return fmt.Errorf("%d rows carry only %d distinct chunk_ids — the join fanned out", rows, distinct)
+	case nulls != 0:
+		return fmt.Errorf("%d reconstructed clauses have no text", nulls)
+	}
+	fmt.Fprintf(os.Stderr, "  reconstructed   %d clauses, %d distinct chunk_ids, no empties\n", rows, distinct)
+
+	// The view has to go before schema.sql runs, or `CREATE TABLE IF NOT EXISTS
+	// clauses` sees a relation of that name and does nothing — the same no-op
+	// that lets the schema be applied to a converted corpus safely, working
+	// against us here.
+	if _, err := h.Exec(`DROP VIEW IF EXISTS clauses; DROP VIEW IF EXISTS clauses_probe`); err != nil {
+		return fmt.Errorf("dropping the compatibility view: %w", err)
+	}
+	if _, err := h.Exec(store.SchemaSQL()); err != nil {
+		return fmt.Errorf("recreating the declared schema: %w", err)
+	}
+	// Column ORDER, not just column names: rust/store's compact copy is
+	// `INSERT INTO dst SELECT * FROM src`, so a table whose columns are in a
+	// different order than schema.sql declares would be copied into the wrong
+	// ones. Naming them here and letting DuckDB match by name is what makes the
+	// order come from schema.sql rather than from the SELECT above.
+	if _, err := h.Exec(`INSERT INTO clauses
+		(chunk_id, spec_id, release, version, clause_path, heading, text, is_normative, embedding, embedding_hash)
+		SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative, embedding, embedding_hash
+		FROM _mig_restore`); err != nil {
+		return fmt.Errorf("filling the restored table: %w", err)
+	}
+	for _, t := range []string{"_mig_restore", "clause_occ", "body_seq", "bodies", "paragraphs"} {
+		if _, err := h.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
+			return fmt.Errorf("dropping %s: %w", t, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  `clauses` is a table again (%d rows); the corpus is in write-side shape\n", rows)
+	_, err := h.Exec(`CHECKPOINT`)
+	return err
 }

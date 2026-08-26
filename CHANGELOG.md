@@ -15,9 +15,41 @@ absence accepted to get there.
 
 ### Added
 
-- `cmd/goal` + `internal/goal`: a 19-step resumable state machine that owns the
+- **The corpus is stored content-addressed, at paragraph granularity**
+  (`docs/adr/0004`). Each distinct paragraph is stored once, each distinct
+  `(heading, paragraph sequence)` body once, and one occurrence row per real
+  `(spec, release, version, clause)`. **30.25 GB → 12.36 GB**, vectors
+  2 752 688 → 821 146, `smoke` 45 s → 4 s. Splitting on `\n\n` and re-joining
+  reproduces the original for **2 752 688 / 2 752 688** clauses, and the
+  migration asserts it rather than assuming it.
+- Lexical retrieval now ranks deduplicated text instead of versions. The 12-hit
+  window for `CHECK_IMEI` used to be one clause repeated across twelve releases,
+  with the real answer never in it; it is now 8 distinct clauses with TS 29.273
+  at rank 3. **nDCG@10 0.014 → 0.072.**
+- `trace_clause`: paragraph-level provenance. `get_changelog` says a CR touched a
+  clause; this says what the clause SAYS differently — which releases carry each
+  statement, when it was introduced, whether it is gone from the newest one. It
+  reports plainly when a corpus cannot answer that (ETSI is served alongside and
+  is not converted) instead of guessing.
+- `migrate-paragraphs --restore`, the exact inverse of `--drop-clauses`, and
+  `merge` runs it before folding. `merge --base` compact-copies a corpus **table
+  by table**, so a converted corpus's `clauses` VIEW is left behind and
+  `schema.sql` recreates it empty — the fold would then write the delta into an
+  empty table while `clause_occ` still held every occurrence, with
+  `max_chunk_id()` reading 0 and handing the shard colliding ids. Restoring the
+  shape the write side has always known costs one grouped reconstruction (1 m 47
+  for 2.87 GB) and keeps ADR 0004's layout out of the write side entirely.
+  Proven on a real 46 440-occurrence slice: convert → restore → fold a bucket →
+  convert again loses and invents **0 rows**.
+- The two external overlays acquire themselves (`scripts/fetch-5g-apis.sh` now
+  resolves through the 3GPP archive endpoint; `scripts/fetch-li-asn.sh` is new),
+  so `enrich` no longer depends on files someone fetched by hand.
+- `scripts/local/build-image.sh` builds both images from a locally produced
+  corpus, ETSI included. Written but **not exercised**: no Docker runtime here.
+
+- `cmd/goal` + `internal/goal`: a 20-step resumable state machine that owns the
   whole build — toolchain, build, seed, discover, fetch, ingest, merge, embed,
-  enrich, index, validate, smoke, plus the four ETSI steps. Every step is
+  enrich, paragraphs, index, validate, smoke, plus the four ETSI steps. Every step is
   content-addressed, so `goal plan` shows the differential and
   `goal run --only <steps>` executes a subset **without** skipping its
   preconditions.
@@ -39,6 +71,11 @@ absence accepted to get there.
   well is a draw, and a draw is not a hallucination.
 - The `scripts/*_test.sh` suites now run inside the `test` step. They were
   written, green, and executed by no runner.
+
+### Removed
+
+- The eleven corpus/Kaggle workflows the local pipeline replaced. `ci.yml` and
+  `post-commit.yml` stay — they gate this repository's own commits.
 
 ### Changed
 
