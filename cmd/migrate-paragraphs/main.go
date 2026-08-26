@@ -46,6 +46,22 @@ func main() {
 	}
 	defer func() { _ = h.Close() }()
 
+	// A corpus carrying a frozen HNSW cannot be MODIFIED — nor even
+	// CHECKPOINTed — unless the extension providing that index type is loaded:
+	//
+	//   FATAL Error: Failed to create checkpoint because of error: Cannot bind
+	//   index 'bodies', unknown index type 'HNSW'. You need to load the
+	//   extension that provides this index type before table 'bodies' can be
+	//   modified.
+	//
+	// Invisible on a first pass, when no index exists yet, and fatal on every
+	// one after — which is to say, precisely in the incremental case. This is
+	// the same load Store::open_rw does, and for the same reason. Best-effort:
+	// a build without VSS has no such index to bind.
+	_, _ = h.Exec(`INSTALL vss`)
+	_, _ = h.Exec(`LOAD vss`)
+	_, _ = h.Exec(`SET hnsw_enable_experimental_persistence = true`)
+
 	if !*verifyOnly {
 		if err := build(h); err != nil {
 			die("build: %v", err)
@@ -169,6 +185,27 @@ func drop(h *sql.DB) error {
 	if _, err := h.Exec(`DROP TABLE IF EXISTS clauses`); err != nil {
 		return err
 	}
+	// A VIEW takes its place, with the same columns. Every caller that reads
+	// metadata off `clauses` — validate's counts, anchorcheck's (spec, release,
+	// version) sweep, split, the sparse join — keeps working untouched, because
+	// DuckDB PRUNES the text column when it is not selected: measured on this
+	// corpus, count(*) through the view is 0.62 s and count(DISTINCT release)
+	// 0.44 s. The rebuild is only paid by a query that actually asks for text,
+	// and those paths were converted in Go to the bounded two-step read.
+	//
+	// The view is also why schema.sql stays as it is: `CREATE TABLE IF NOT
+	// EXISTS clauses` is a no-op against an existing view of that name, so
+	// applying the schema to a migrated corpus does not resurrect the table.
+	if _, err := h.Exec(`CREATE OR REPLACE VIEW clauses AS
+		SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path, b.heading,
+		       (SELECT string_agg(p.part, ` + sep + ` ORDER BY s.ord)
+		          FROM body_seq s JOIN paragraphs p USING (para_id)
+		         WHERE s.body_id = o.body_id) AS text,
+		       o.is_normative, b.embedding, b.embedding_hash
+		FROM clause_occ o JOIN bodies b USING (body_id)`); err != nil {
+		return fmt.Errorf("compatibility view: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "  `clauses` is now a view over the occurrences")
 	_, err := h.Exec(`CHECKPOINT`)
 	return err
 }
