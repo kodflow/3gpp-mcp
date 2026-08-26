@@ -279,6 +279,16 @@ Points qui ne se devinent pas en lisant le code :
 - **On parse le HTML de LibreOffice, pas le DOCX en natif.** Le chemin
   `zip.NewReader → word/document.xml` a existé (`internal/ooxml`) et a été retiré.
   Conséquence : LibreOffice est le goulot d'étranglement, pas le GPU.
+- **Un corpus converti sert `clauses` comme une VUE, et DuckDB refuse d'indexer
+  une vue.** Les trois `CREATE INDEX ... ON clauses` de `schema.sql` sont donc
+  encadrés par `-- @clauses-indexes-begin/end`, et les deux lecteurs du fichier
+  (`internal/store.migrate`, `Store::open_rw`) les retirent quand le nom est une
+  vue. Sans ça, l'application du schéma étant tout-ou-rien, **tous** les outils
+  d'écriture mouraient au bootstrap : « can only create an index on a base
+  table ». Ouvrir n'est pas écrire : `merge` et `embed` modifient réellement
+  `clauses` et appellent `--restore` d'abord ; `freeze-hnsw` est le seul qui doit
+  fonctionner *sur* la forme convertie, et c'est pour ça que c'est le binaire Go
+  (`cmd/freeze-hnsw`) — il pose l'index sur la table qui porte les vecteurs.
 - **`merge` rend d'abord au corpus la forme que le write side connaît.** Un corpus
   converti sert `clauses` comme une VUE ; `merge --base` recopie la base *table par
   table* (`duckdb_tables()`), donc la vue est laissée derrière et `schema.sql` la

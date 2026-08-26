@@ -209,9 +209,12 @@ func drop(h *sql.DB) error {
 	// 0.44 s. The rebuild is only paid by a query that actually asks for text,
 	// and those paths were converted in Go to the bounded two-step read.
 	//
-	// The view is also why schema.sql stays as it is: `CREATE TABLE IF NOT
-	// EXISTS clauses` is a no-op against an existing view of that name, so
-	// applying the schema to a migrated corpus does not resurrect the table.
+	// `CREATE TABLE IF NOT EXISTS clauses` is a no-op against an existing view of
+	// that name, so applying the schema to a migrated corpus does not resurrect
+	// the table. The three `CREATE INDEX ... ON clauses` in the same file are NOT
+	// a no-op — DuckDB refuses to index a view, and schema application is
+	// all-or-nothing — so they are bracketed by markers and both readers of
+	// schema.sql strip them here. See store.SchemaForView.
 	if _, err := h.Exec(`CREATE OR REPLACE VIEW clauses AS
 		SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path, b.heading,
 		       (SELECT string_agg(p.part, ` + sep + ` ORDER BY s.ord)

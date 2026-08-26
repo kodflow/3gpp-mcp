@@ -42,7 +42,7 @@ func exe(name string) string {
 
 // goBins are the Go commands the pipeline needs on disk. cmd/server is the
 // product; the others are the offline tools the steps call.
-var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs"}
+var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs", "freeze-hnsw"}
 
 // rustBins maps a cargo manifest to the binaries built from it. The embedder is
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own

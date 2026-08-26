@@ -481,13 +481,11 @@ func stepMerge() *Step {
 			// the write/read split, which is where ADR 0001 put it. The `paragraphs`
 			// step converts again afterwards, from a `clauses` that is once more
 			// whole — so its own refusal to rebuild from a delta never has to fire.
-			if fileNonEmpty(db) {
-				c.Log.Printf("restoring the write-side corpus shape before folding")
-				if err := c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
-					"--db", db, "--restore",
-				}, Echo: true}); err != nil {
-					return fmt.Errorf("restoring `clauses` before the merge: %w", err)
-				}
+			//
+			// After the shard check on purpose: a run with nothing to fold must not
+			// restore, or every no-op run would undo the conversion and re-do it.
+			if err := ensureWriteShape(c, db); err != nil {
+				return err
 			}
 			tmp := db + ".new"
 			args := []string{
@@ -606,4 +604,31 @@ func repairKeys(c *Ctx) (string, error) {
 	}
 	c.Log.Printf("repair mode: %d corpus hole(s) folded into the work list", countLines(out))
 	return out, nil
+}
+
+// ensureWriteShape gives the corpus back the shape the write side knows, if it
+// is not already in it.
+//
+// A converted corpus (ADR 0004) serves `clauses` as a VIEW over the occurrences.
+// The Rust write tools can now OPEN such a corpus — schema.sql's three
+// `CREATE INDEX ... ON clauses` statements are skipped when that name resolves
+// to a view, because DuckDB answers them with "can only create an index on a
+// base table" and execute_batch is all-or-nothing. Opening is not writing,
+// though: `merge` deletes and re-inserts rows of `clauses`, and `embed` UPDATEs
+// them, and neither works against a view.
+//
+// So the steps that write clauses call this first. It is a no-op — one count —
+// on a corpus that was never converted or is already restored, so it can be
+// called unconditionally at the point where the precondition actually applies,
+// rather than being a step somebody has to remember to schedule.
+func ensureWriteShape(c *Ctx, db string) error {
+	if !fileNonEmpty(db) {
+		return nil
+	}
+	if err := c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
+		"--db", db, "--restore",
+	}, Echo: true}); err != nil {
+		return fmt.Errorf("restoring the write-side shape of %s: %w", db, err)
+	}
+	return nil
 }

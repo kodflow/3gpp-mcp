@@ -207,6 +207,18 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 		c.Log.Printf("every clause already carries a vector — nothing to do")
 		return nil
 	}
+
+	// THE WORKLIST READS THROUGH THE VIEW; THE WRITE-BACK CANNOT.
+	//
+	// On a content-addressed corpus (ADR 0004) `clauses` is a view, and DuckDB
+	// answers an UPDATE against it with a hard error. Reading is fine — the
+	// filters land on `clause_occ` and `bodies` before any text is rebuilt, which
+	// is why the export above costs seconds and not hours — so the restore is
+	// deferred to here, AFTER the count. A run with nothing to embed then pays
+	// nothing at all, which is the common case once the corpus is complete.
+	if err := ensureWriteShape(c, db); err != nil {
+		return err
+	}
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
@@ -413,7 +425,7 @@ func stepIndex(t corpusTarget) *Step {
 		Version: 1,
 		Doc:     "build and freeze the HNSW cosine index over the vectors of " + t.DB,
 		Deps:    t.indexDeps(),
-		Impl:    []string{"rust/store/src/bin/freeze_hnsw.rs"},
+		Impl:    []string{"cmd/freeze-hnsw", "internal/store/hnsw.go"},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The vector index is a DERIVED CACHE of the vectors. Its identity is
 			// the embed identity plus the index parameters; anything else (the
@@ -468,7 +480,11 @@ func stepIndex(t corpusTarget) *Step {
 				"HNSW_BUILD_TEMP_LIMIT=" + envOr("HNSW_BUILD_TEMP_LIMIT", "16GB"),
 			}
 			c.Log.Printf("freezing the HNSW index over %d vectors in %s (%s)", rep.Embedded, t.DB, strings.Join(env, " "))
-			return c.Run(Cmd{Name: c.rbin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
+			// The Go builder, not the Rust one: it puts the index on whichever table
+			// holds the vectors. rust/store names `clauses`, which on a converted
+			// corpus is a view over 2 752 688 occurrences of 897 556 vectors — and
+			// DuckDB will not index a view in any case. Both shapes work here.
+			return c.Run(Cmd{Name: c.bin("freeze-hnsw"), Args: []string{"--db", t.dbPath(c)}, Env: env, Echo: true})
 		},
 	}
 }
@@ -898,9 +914,10 @@ func (t corpusTarget) indexDeps() []string {
 		// The 3GPP index is built AFTER the corpus is content-addressed: the
 		// vectors move to `bodies` in that step, and an index built before it
 		// would index the table the step is about to drop.
-		return []string{"embed", "enrich", "paragraphs"}
+		// build-go because the index is now built by cmd/freeze-hnsw.
+		return []string{"embed", "enrich", "paragraphs", "build-go"}
 	}
-	return []string{"embed" + t.Suffix}
+	return []string{"embed" + t.Suffix, "build-go"}
 }
 
 // refreshOverlays reports whether the operator asked for the external overlays
@@ -938,7 +955,7 @@ func stepParagraphs() *Step {
 		Name:    "paragraphs",
 		Version: 1,
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
-		Deps:    []string{"embed", "enrich"},
+		Deps:    []string{"embed", "enrich", "build-go"},
 		Impl:    []string{"cmd/migrate-paragraphs"},
 		Heavy:   true,
 		Inputs: func(c *Ctx) ([]string, error) {

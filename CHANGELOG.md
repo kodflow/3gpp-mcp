@@ -31,6 +31,11 @@ absence accepted to get there.
   statement, when it was introduced, whether it is gone from the newest one. It
   reports plainly when a corpus cannot answer that (ETSI is served alongside and
   is not converted) instead of guessing.
+- `cmd/freeze-hnsw` (Go): the vector index is now built by the side that knows
+  where the vectors are. `rust/store`'s version names `clauses`, which on a
+  converted corpus is a view over 2 752 688 references to 897 556 vectors — and
+  DuckDB will not index a view at all. `internal/store.hnswTarget` already
+  resolved both shapes and was tested on both, so this is a thin front for it.
 - `migrate-paragraphs --restore`, the exact inverse of `--drop-clauses`, and
   `merge` runs it before folding. `merge --base` compact-copies a corpus **table
   by table**, so a converted corpus's `clauses` VIEW is left behind and
@@ -71,6 +76,22 @@ absence accepted to get there.
   well is a draw, and a draw is not a hallucination.
 - The `scripts/*_test.sh` suites now run inside the `test` step. They were
   written, green, and executed by no runner.
+
+### Fixed
+
+- **Every write-side tool failed at bootstrap on a converted corpus.**
+  `schema.sql` carries three `CREATE INDEX ... ON clauses`, and DuckDB answers
+  those against a view with "can only create an index on a base table"; schema
+  application is all-or-nothing on both sides, so `merge`, `embed-io`, the three
+  `enrich` ingesters and `freeze-hnsw` all died before reading a row. Go's
+  `migrate()` had a second one (`ALTER TABLE clauses ADD COLUMN ...` →
+  "Can only modify view with ALTER VIEW statement"). The index statements are now
+  bracketed by markers in `schema.sql` and both readers strip them when the name
+  resolves to a view — markers in the shared file so the two languages cannot
+  drift. Nothing was silently wrong: the tools refused to open rather than
+  corrupting anything. The test that was supposed to catch this applied a
+  two-column stand-in for the schema instead of the schema, and passed
+  throughout; it now applies the real one and asserts the raw form still fails.
 
 ### Removed
 
