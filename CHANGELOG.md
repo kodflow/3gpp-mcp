@@ -2,7 +2,96 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased] — Skills Architecture v1.5 (2026-05-20)
+## [Unreleased] — the corpus is built on one machine (2026-08-26)
+
+Indexing moved off Kaggle GPU + five GitHub workflows and onto a single
+machine, and ran to the end for the first time. Runbook:
+`docs/local-pipeline.md`; rationale: `docs/adr/0003-local-goal-pipeline.md`.
+
+Measured on the finished corpus: **2 752 688 clauses**, 20 163 spec versions,
+8 562 API operations, 405 LI events; data contract 5/5 (FTS present, HNSW
+frozen, `null_at_floor=0`); `anchorcheck` **`missing_content=0`**, with no
+absence accepted to get there.
+
+### Added
+
+- `cmd/goal` + `internal/goal`: a 19-step resumable state machine that owns the
+  whole build — toolchain, build, seed, discover, fetch, ingest, merge, embed,
+  enrich, index, validate, smoke, plus the four ETSI steps. Every step is
+  content-addressed, so `goal plan` shows the differential and
+  `goal run --only <steps>` executes a subset **without** skipping its
+  preconditions.
+- The ETSI corpus, built alongside 3GPP and deliberately kept **split**: 14
+  Lawful-Interception deliverables in their own `etsi.duckdb`, same embedder,
+  same index. `server --etsi-db` federates the two at serve time; `get_spec`
+  and `list_releases` route `ETSI …` ids there and `list_specs` unions both.
+- `smoke`: starts the shipped binary over stdio, calls real tools, and asserts
+  vector search was not silently disabled at startup — the failure that shipped
+  for months and that no unit test can see.
+- `cmd/anchorcheck` and `contracts/accepted-absences.txt`: the delta anchor may
+  not claim text the corpus does not hold. Keys that genuinely cannot be
+  acquired are recorded **with a reason**, never to silence a red check.
+- `scripts/fetch-li-asn.sh`, which acquires the TS 33.128 ASN.1 payload
+  registry — it ships in a zip inside the zip of the spec — so `li_events` and
+  `asn1_types` stop being empty.
+- `.mcp.json`, because the finished corpus was being served to nobody.
+- `AMBIGUOUS` verdict in `li-audit`: several specs naming an operation equally
+  well is a draw, and a draw is not a hallucination.
+- The `scripts/*_test.sh` suites now run inside the `test` step. They were
+  written, green, and executed by no runner.
+
+### Changed
+
+- **Merge before embed** (the CI did the opposite). `ingest` rebases `chunk_id`
+  per shard, so a ledger shared across shards drops clauses by collision. After
+  the merge the ids are unique, which makes one ledger both safe and a
+  corpus-wide content-dedup — a measured 2.74× reduction in GPU work.
+- The corpus cron workflows are disabled (`workflow_dispatch` kept): they were
+  failing ~28 times a day against infrastructure that no longer indexes.
+- The server refuses to start when the embed identity disagrees with the corpus
+  stamp instead of degrading to lexical in silence
+  (`--allow-lexical-fallback` to assume it explicitly).
+
+### Fixed
+
+Most of these reported SUCCESS while doing nothing. The recurring shape is a
+step that writes `skip` on stderr and returns 0.
+
+- A corpus discarded over its **encoding**: LibreOffice keeps the Word source's
+  windows-1252, `read_to_string` refused it, and six specs were downloaded,
+  converted and thrown away on three consecutive runs while the series reported
+  SUCCESS.
+- A **series list that did not cover what the work list reached** — 400 KB of
+  converted HTML per release, never read, every step green.
+- A **stale binary behind a green build**: `skipDirs["bin"]` pruned
+  `rust/store/src/bin/`, hiding the sources of `merge`, `embed-io`, `overlay`
+  and `freeze-hnsw` from the fingerprint.
+- A **merge that cloned dead space** instead of reclaiming it, so the corpus
+  grew 38 → 135 GB across runs and each run started from the previous file.
+- **`403` treated as transient** on www.3gpp.org, where 403 *is* "not found".
+- A **`.wal` left behind** by the publishing rename, leaving a sound corpus
+  that could not be opened (`Conflict on tuple deletion!`).
+- The HNSW build's ceiling reported as **RAM when it is temp disk**
+  (`max_temp_directory_size` defaults to 90 % of free space).
+- A **Windows Python's CRLF** riding into every filename and URL of the OpenAPI
+  fetch: `http=000` for 478 blobs that answered 200 by hand.
+- `li-audit` taking a **top-K over a table that holds every release**, so its
+  window was versions rather than candidates, and letting a 19 KB table of
+  contents stand as evidence for the 43 events citing `33.108 §Annex`.
+
+### Performance
+
+| Lever | Before | After |
+|---|---|---|
+| `fetch` (403 is not-found) | 54m35 | **4m10** |
+| Merge's compact copy (skip the FTS it rebuilds) | 77 min | **~6 min** |
+| `index` with its own ceilings | 19m05 | **1m46** |
+| Vector import (let DuckDB read the ledger) | — | **23×** |
+| Corpus on disk | 135 GB | **30 GB** |
+
+---
+
+## Skills Architecture v1.5 (2026-05-20)
 
 ### Changed — v1.5 patch on top of v1.4
 
@@ -23,7 +112,7 @@ All notable changes to this project are documented here.
 - `--lenses light|full` replaces `--light` / `--full` for FULL mode
   lens-depth override.
 
-## [Unreleased] — Skills Architecture v1.4 (2026-05-20) — superseded by v1.5
+## Skills Architecture v1.4 (2026-05-20) — superseded by v1.5
 
 ### Changed — v1.4 patch on top of v1.3
 
@@ -35,7 +124,7 @@ All notable changes to this project are documented here.
 - The "standalone /goal" use case ships without bringing back the
   deprecated `/prompt` skill — the migration doc remains valid.
 
-## [Unreleased] — Skills Architecture v1.3 (2026-05-20)
+## Skills Architecture v1.3 (2026-05-20)
 
 ### Added
 
