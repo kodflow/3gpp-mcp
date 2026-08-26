@@ -56,7 +56,7 @@ func TestKnownHomeOverride(t *testing.T) {
 // different code path would prove nothing.
 type fakeStore struct {
 	store.Reader
-	latest  map[string]string        // spec -> latest version
+	latest  map[string]string         // spec -> latest version
 	clauses map[string][]model.Clause // spec -> clauses of that version
 	hits    []model.SearchHit         // what the lexical ranker returns, in order
 }
