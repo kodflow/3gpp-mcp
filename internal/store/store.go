@@ -38,6 +38,11 @@ type Store struct {
 	ftsAvailable    bool
 	vssAvailable    bool
 	sparseAvailable bool
+	// contentAddressed: this corpus stores paragraphs once and points at them
+	// (ADR 0004). A capability, not an assumption — etsi.duckdb and any
+	// published lexical snapshot still carry the old `clauses` table, and the
+	// same Store serves both.
+	contentAddressed bool
 }
 
 // Open opens (or creates) the DuckDB file at path and applies the schema.
@@ -53,6 +58,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	s.probeContentAddressed(context.Background())
 	return s, nil
 }
 
@@ -816,6 +822,14 @@ func (s *Store) ClauseAvailability(ctx context.Context, specID, prefix string) (
 	ordered, err := s.releasesOrdered(ctx, specID)
 	if err != nil {
 		return nil, nil, err
+	}
+	// On a content-addressed corpus this question never touches the text: which
+	// releases carry a clause IS clause_occ. Strictly less work than the scan
+	// below, and the reason the migration makes lineage exact rather than
+	// derived.
+	if s.contentAddressed {
+		out, aErr := s.availabilityCA(ctx, specID, prefix)
+		return out, ordered, aErr
 	}
 	q := `SELECT clause_path, max(heading), list(DISTINCT release)
 	      FROM clauses WHERE spec_id = ?`
