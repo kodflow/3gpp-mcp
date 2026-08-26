@@ -79,6 +79,19 @@ absence accepted to get there.
 
 ### Fixed
 
+- **The server exact-scanned every vector on the shipped corpus, and said
+  nothing.** `store.LoadVSS` — the serve-time gate that decides whether the
+  frozen index may be trusted — looked for `clauses_hnsw` by name, while the
+  index had been moved to `bodies_hnsw` along with the vectors. It reported
+  "hnsw index absent" over a corpus carrying a perfectly good index, fell back
+  to an O(N) exact scan, and returned correct answers slowly with no error
+  anywhere. Behind it sat the same miss again: `schema_meta.embedding_count`
+  still held the pre-conversion 2 207 218 against the 821 146 vectors actually
+  present, so even with the right name the gate failed on "embedding count
+  drift". The guard now follows `hnswTarget()`, and the conversion re-stamps
+  both markers — it is what changed the vector population, so it is what has to
+  say so. Found by running the real server over the real corpus rather than by a
+  test, which is why there are now two.
 - **Every write-side tool failed at bootstrap on a converted corpus.**
   `schema.sql` carries three `CREATE INDEX ... ON clauses`, and DuckDB answers
   those against a view with "can only create an index on a base table"; schema

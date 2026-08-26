@@ -224,6 +224,43 @@ func drop(h *sql.DB) error {
 		FROM clause_occ o JOIN bodies b USING (body_id)`); err != nil {
 		return fmt.Errorf("compatibility view: %w", err)
 	}
+
+	// RE-STAMP WHAT THE CONVERSION JUST CHANGED.
+	//
+	// schema_meta.embedding_count is the corpus telling the server how many
+	// vectors it holds, and the server refuses to use the index if the number
+	// disagrees with reality — the corruption gate in store.LoadVSS. The
+	// conversion collapses 2 752 688 references onto the 821 146 distinct vectors
+	// they point at, so the old number stops being true the moment `clauses` goes.
+	//
+	// Left stale, the gate fires on a perfectly good corpus: "embedding count
+	// drift (meta=2207218 have=821146)", vector search silently degrades to an
+	// exact scan over every vector, and nothing anywhere reports an error. Correct
+	// answers, O(N), no signal. Exactly what these markers exist to prevent.
+	//
+	// hnsw_state goes with it. Whatever index existed was on a table that no
+	// longer exists; unless one is already on `bodies`, the corpus must not claim
+	// to be frozen. The `index` step runs after this one and re-stamps both.
+	var vecs int
+	if err := h.QueryRow(`SELECT count(*) FROM bodies WHERE embedding IS NOT NULL`).Scan(&vecs); err != nil {
+		return fmt.Errorf("counting the vectors the corpus now holds: %w", err)
+	}
+	if _, err := h.Exec(`INSERT INTO schema_meta (key, value) VALUES ('embedding_count', ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, fmt.Sprintf("%d", vecs)); err != nil {
+		return fmt.Errorf("stamping embedding_count: %w", err)
+	}
+	var indexed int
+	_ = h.QueryRow(`SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'bodies_hnsw'`).Scan(&indexed)
+	if indexed == 0 {
+		if _, err := h.Exec(`INSERT INTO schema_meta (key, value) VALUES ('hnsw_state', 'building')
+			ON CONFLICT (key) DO UPDATE SET value = excluded.value`); err != nil {
+			return fmt.Errorf("clearing hnsw_state: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "  %d vector(s) on `bodies`, no index yet — hnsw_state=building until `index` runs\n", vecs)
+	} else {
+		fmt.Fprintf(os.Stderr, "  %d vector(s) on `bodies`, bodies_hnsw present\n", vecs)
+	}
+
 	fmt.Fprintln(os.Stderr, "  `clauses` is now a view over the occurrences")
 	_, err := h.Exec(`CHECKPOINT`)
 	return err

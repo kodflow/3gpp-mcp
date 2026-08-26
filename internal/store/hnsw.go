@@ -191,8 +191,15 @@ func (s *Store) LoadVSS(ctx context.Context) error {
 	if s.GetMeta(ctx, "hnsw_metric") != "cosine" || s.GetMeta(ctx, "embedding_dim") != "1024" {
 		return fmt.Errorf("hnsw guard mismatch (metric/dim)")
 	}
-	if !s.indexExists(ctx, "clauses_hnsw") {
-		return fmt.Errorf("hnsw index absent")
+	// The index follows the vectors, and so must the name this looks for. Left
+	// hardcoded, this guard reported "hnsw index absent" on a corpus carrying a
+	// perfectly good bodies_hnsw, and the server fell back to an exact scan over
+	// every vector — correct answers, O(N), and no error anywhere. That is the
+	// exact failure the freeze markers exist to prevent, arriving through the
+	// check meant to prevent it.
+	idx, _ := s.hnswTarget()
+	if !s.indexExists(ctx, idx) {
+		return fmt.Errorf("hnsw index %s absent", idx)
 	}
 	want := s.GetMeta(ctx, "embedding_count")
 	have, err := s.embeddingCount(ctx)

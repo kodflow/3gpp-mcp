@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,6 +26,12 @@ func fixture(t *testing.T) *sql.DB {
 		chunk_id UBIGINT, spec_id VARCHAR, release VARCHAR, version VARCHAR,
 		clause_path VARCHAR, heading VARCHAR, text VARCHAR, is_normative BOOLEAN,
 		embedding FLOAT[1024], embedding_hash VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	// schema_meta is not decoration: --drop-clauses re-stamps the vector markers
+	// through it, and a fixture without it would exercise a corpus that cannot
+	// exist.
+	if _, err := h.Exec(`CREATE TABLE schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR)`); err != nil {
 		t.Fatal(err)
 	}
 	rows := []struct{ spec, rel, head, text string }{
@@ -508,5 +515,48 @@ func TestRestoreLeavesAnUnconvertedCorpusAlone(t *testing.T) {
 	}
 	if d := divergence(t, h); d != 0 {
 		t.Fatalf("%d rows changed on a corpus with nothing to restore", d)
+	}
+}
+
+// The conversion changes how many vectors the corpus holds, so it has to say so.
+//
+// schema_meta.embedding_count is what the server checks the index against
+// (store.LoadVSS). Collapsing 2 752 688 references onto the distinct vectors they
+// point at makes the old number false, and a false one there does not fail
+// loudly: the server reports "embedding count drift", turns vector search off,
+// exact-scans every vector and returns correct answers slowly, with no error
+// anywhere. It happened on the real corpus.
+func TestDroppingTheTableRestampsTheVectorMarkers(t *testing.T) {
+	h := fixture(t)
+	// Two occurrences share a body; give the bodies vectors so the counts differ
+	// in the way the real corpus's do.
+	if _, err := h.Exec(`UPDATE clauses SET embedding =
+		CAST([1.0] || [0.0 FOR i IN range(1023)] AS FLOAT[1024])`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`INSERT INTO schema_meta VALUES ('embedding_count', '8'), ('hnsw_state', 'frozen')`); err != nil {
+		t.Fatal(err)
+	}
+	convert(t, h)
+
+	var bodies int
+	if err := h.QueryRow(`SELECT count(*) FROM bodies WHERE embedding IS NOT NULL`).Scan(&bodies); err != nil {
+		t.Fatal(err)
+	}
+	if bodies == 8 {
+		t.Fatal("the fixture no longer collapses anything — this test would pass for the wrong reason")
+	}
+	var stamped, state string
+	if err := h.QueryRow(`SELECT
+		(SELECT value FROM schema_meta WHERE key = 'embedding_count'),
+		(SELECT value FROM schema_meta WHERE key = 'hnsw_state')`).Scan(&stamped, &state); err != nil {
+		t.Fatal(err)
+	}
+	if stamped != fmt.Sprintf("%d", bodies) {
+		t.Errorf("embedding_count = %q but the corpus holds %d vectors — the server would refuse its own index", stamped, bodies)
+	}
+	// No index was built on `bodies`, so the corpus must not still claim frozen.
+	if state != "building" {
+		t.Errorf("hnsw_state = %q after the vectors moved to a table with no index, want building", state)
 	}
 }
