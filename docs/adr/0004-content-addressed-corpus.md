@@ -130,10 +130,38 @@ reconstructed to answer a question about presence.
 Both are re-runnable; the migration asserts them and refuses to publish a corpus
 that fails either.
 
+## The compatibility view does not work — measured, then abandoned
+
+The obvious migration path was a `clauses` VIEW rebuilding the old columns,
+leaving all 26 read-side call sites untouched. Both shapes were tried on the
+real corpus, reading one spec-version (1 191 clauses). All of them return
+identical rows and identical byte counts, so this is purely about cost:
+
+| shape | time |
+|---|---:|
+| the real `clauses` table | **0.146 s** |
+| view, correlated scalar subquery | 5.34 s |
+| view, join against a grouped reconstruction | **97 s** |
+| **two-step read** (filter, then rebuild only the retained bodies) | **0.885 s** |
+
+Neither view survives contact. The correlated form is not decorrelated into an
+indexed lookup; the join form rebuilds all 897 556 bodies before the filter is
+applied. A view cannot guarantee the filter reaches `body_seq`, and that
+guarantee is the entire performance story: rebuilding a *bounded* set of bodies
+costs 0.035 ms each, rebuilding all of them costs a minute and a half.
+
+So the read side is converted rather than wrapped, in two steps: filter
+`clause_occ` joined to `bodies` and collect the `body_id`s, then rebuild exactly
+those with `WHERE body_id IN (…)`. Six times slower than the table it replaces
+for a whole spec-version — the honest cost — and not measurable for a search
+returning ten hits. The alternative, keeping the text materialised to avoid it,
+is the 1.53 GB this change exists to remove.
+
 ## Consequences
 
-- The read side must reconstruct on read. `internal/store` gains that join;
-  everything above it keeps receiving whole clauses.
+- The read side is converted, not wrapped: two steps at each call site that
+  needs text. Several get *simpler* instead — availability and lineage never
+  touch the text and read `clause_occ` directly.
 - `internal/store/hnsw.go` asserts the index is `clauses_hnsw`. It moves to
   `bodies`. This is the read-side surgery ADR 0003 named and deferred.
 - `chunk_id` stops being the natural key of a served fragment; `body_id` is what

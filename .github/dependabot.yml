@@ -18,7 +18,7 @@ updates:
       # An auto-bump breaks the embedder at runtime ("requested API version [N]
       # is not available"). Bump them together by hand.
       - dependency-name: "github.com/yalue/onnxruntime_go"
-  # GitHub Actions used by ci.yml / release.yml / corpus-sync.yml.
+  # GitHub Actions used by ci.yml / release.yml / the image workflows.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
