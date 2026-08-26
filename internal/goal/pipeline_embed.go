@@ -330,23 +330,43 @@ func dirExists(p string) bool {
 	return err == nil && st.IsDir()
 }
 
+// findASN returns the TS 33.128 payload registry of the NEWEST release on disk.
+//
+// filepath.Walk visits lexically, so "first hit wins" hands back Rel-17 while
+// Rel-19 sits in the next directory: li_events would then describe the events of
+// a spec three releases behind the text the corpus actually serves. Rank by
+// release number instead, and fall back to the lexically last path for a file
+// whose path carries no Rel-NN at all.
 func findASN(c *Ctx) string {
-	var found string
+	best, bestRel := "", -1
 	for _, base := range []string{c.dataPath("sources"), c.dataPath("asn")} {
 		_ = filepath.Walk(base, func(p string, info os.FileInfo, err error) error {
-			if err != nil || found != "" || info.IsDir() {
+			if err != nil || info == nil || info.IsDir() {
 				return nil
 			}
-			if strings.HasPrefix(info.Name(), "TS33128Payloads") && strings.HasSuffix(info.Name(), ".asn") {
-				found = p
+			if !strings.HasPrefix(info.Name(), "TS33128Payloads") || !strings.HasSuffix(info.Name(), ".asn") {
+				return nil
+			}
+			if r := releaseNumber(p); r > bestRel || (r == bestRel && p > best) {
+				best, bestRel = p, r
 			}
 			return nil
 		})
-		if found != "" {
-			return found
+	}
+	return best
+}
+
+// releaseNumber pulls NN out of a "Rel-NN" path element, or -1 when there is none.
+func releaseNumber(p string) int {
+	for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+		if !strings.HasPrefix(part, "Rel-") {
+			continue
+		}
+		if n, err := strconv.Atoi(part[len("Rel-"):]); err == nil {
+			return n
 		}
 	}
-	return ""
+	return -1
 }
 
 // -------------------------------------------------------------------- index
