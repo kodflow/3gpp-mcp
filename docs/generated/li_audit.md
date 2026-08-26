@@ -15,14 +15,14 @@ Verdicts, strongest evidence first: **CONFIRMED** (the cited clause's own text s
 
 ## WRONG_SPEC_REF — relocated to their true normative home
 
-| NF | Event | Cited (wrong) | Real spec | Real clause | Heading |
-|---|---|---|---|---|---|
-| AMF | UE_POLICY_CONTAINER_TRANSFER | 33.128 §6.2.2.2.9 | **23.502** | **§4.11.0a.2a.10** | UE Policy Container delivery via EPS |
-| HLR | SEND_ROUTING_INFO_FOR_LCS | 33.108 §Annex | **29.173** | **§6.2.3** | LCS-Routing-Info-Request (RIR) Command |
-| HLR | RESTORE_DATA | 33.108 §Annex | **29.002** | **§8.10.3** | MAP_RESTORE_DATA service |
-| HSS-IMS | REGISTRATION_REFRESH | 33.108 §Annex | **29.228** | **§6.1.2** | S-CSCF registration/deregistration notification (Cx Server-Assignment-Type RE_REGISTRATION) |
-| HSS-IMS | IMS_AUTH_REJECT | 33.108 §Annex | **33.234** | **§6.1.5.1.1** | Skipping authentication for IMS emergency call |
-| UDM | REGISTRATION_STATUS_QUERY | 33.128 §7.2.2.3.7 | **32.409** | **§4.1.1.5.2** | Successful user registration status query procedures |
+| NF | Event | Cited (wrong) | Real spec | Real clause | Heading | Heading match |
+|---|---|---|---|---|---|---|
+| AMF | UE_POLICY_CONTAINER_TRANSFER | 33.128 §6.2.2.2.9 | **23.502** | **§4.11.0a.2a.10** | UE Policy Container delivery via EPS | 0.67 |
+| HLR | SEND_ROUTING_INFO_FOR_LCS | 33.108 §Annex | **29.173** | **§6.2.3** | LCS-Routing-Info-Request (RIR) Command | 0.67 |
+| HLR | RESTORE_DATA | 33.108 §Annex | **29.002** | **§8.10.3** | MAP_RESTORE_DATA service | 1.00 |
+| HSS-IMS | REGISTRATION_REFRESH | 33.108 §Annex | **29.228** | **§6.1.2** | S-CSCF registration/deregistration notification (Cx Server-Assignment-Type RE_REGISTRATION) | 1.00 |
+| HSS-IMS | IMS_AUTH_REJECT | 33.108 §Annex | **33.234** | **§6.1.5.1.1** | Skipping authentication for IMS emergency call | 0.67 |
+| UDM | REGISTRATION_STATUS_QUERY | 33.128 §7.2.2.3.7 | **32.409** | **§4.1.1.5.2** | Successful user registration status query procedures | 1.00 |
 
 ## AMBIGUOUS — the name does not identify one clause
 

@@ -60,7 +60,12 @@ SET="${SET:-Rel-99}"          # release floor (env-overridable). Rel-99 = every 
                               # RELEASE (per the status report), NOT the version-major,
                               # so a draft v1.x of an in-scope release is kept. Future
                               # releases auto.
-JOBS=4                        # per-spec workers (soffice is RAM-heavy)
+# 6, not 4. The old default came from an uncontrolled observation taken mid-run
+# ("4 workers convert 4.9/min, 6 workers 2.4/min"); a controlled A/B/B/A over the
+# same 28 documents, on an otherwise idle machine, measured the opposite:
+# 225 s at --jobs 4 against 178 s at --jobs 6, the two 6-runs agreeing to the
+# second. See docs/local-pipeline.md.
+JOBS=6                        # per-spec workers (soffice is RAM-heavy)
 ENUM_JOBS=8                   # enumeration workers (network-bound)
 SERIES_FILTER=""
 WORKLIST_IN=""                # exact fetch worklist to use instead of enumerating

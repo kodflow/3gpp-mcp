@@ -212,12 +212,18 @@ func stepFetch() *Step {
 			return []string{c.statePath("series.json"), c.statePath("worklist.txt")}, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
-			// `repair` belongs in the fingerprint: the two modes acquire genuinely
-			// different sets, so switching between them must replay the step rather
-			// than reuse whichever one happened to run first.
+			// `floor` and `repair` belong in the fingerprint: both change WHICH
+			// specs are acquired, so switching between them must replay the step
+			// rather than reuse whichever one happened to run first.
+			//
+			// `jobs` does NOT. It changes how fast the same set is fetched, never
+			// the set itself — and having it here meant that tuning a parallelism
+			// knob invalidated `fetch` and cascaded through ingest, merge, embed
+			// and index: half an hour of rework to answer a scheduling question.
+			// A fingerprint must capture what changes the OUTPUT, not the rate at
+			// which it is produced.
 			return map[string]string{
 				"floor":  c.Cfg("floor"),
-				"jobs":   c.Cfg("jobs"),
 				"repair": c.Cfg("repair"),
 			}, nil
 		},
