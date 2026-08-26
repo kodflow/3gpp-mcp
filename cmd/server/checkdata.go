@@ -57,8 +57,28 @@ func checkData(args []string) error {
 
 	hasVectors := st.GetMeta(ctx, "embedding_model") != ""
 	hnswState := st.GetMeta(ctx, "hnsw_state")
-	hnswFrozen := hnswState == "frozen"
 
+	// ASK WHAT THE SERVER ASKS, NOT WHETHER THE CORPUS SAYS IT IS FINE.
+	//
+	// This used to compare hnsw_state to "frozen" and stop there. hnsw_state is a
+	// row, and rows travel: a corpus can carry the word "frozen" with no index
+	// under it at all. The server decides with store.LoadVSS, which wants the flag
+	// AND the index present under the name the vectors actually live at AND
+	// embedding_count agreeing with what is there.
+	//
+	// Every one of those has been wrong at least once, and the mode is always the
+	// same: no error, vector search off, an exact scan across every vector, correct
+	// answers arriving slowly. An image built on that guard ships a server that
+	// degrades in production while its own build log said the data was complete.
+	// LoadVSS never creates an index, and its error names which condition failed.
+	hnswUsable, hnswWhy := true, ""
+	if hasVectors {
+		if err := st.LoadVSS(ctx); err != nil {
+			hnswUsable, hnswWhy = false, err.Error()
+		} else {
+			hnswUsable = st.VSSAvailable()
+		}
+	}
 	// Dense convergence (floor-aware, like cmd/embed --count-null-at-floor): no clause
 	// at/above the floor still NULL. Below-floor/legacy clauses are intentionally NULL.
 	nullAtFloor := -1
@@ -90,16 +110,17 @@ func checkData(args []string) error {
 
 	// Report the full picture first (so a failing build log shows every signal at
 	// once, not just the first tripwire).
-	fmt.Printf("check-data: db=%s fts_index=%v vectors=%v hnsw_state=%q null_at_floor=%d sparse_model=%q\n",
-		*dbPath, ftsOK, hasVectors, hnswState, nullAtFloor, sparseModel)
+	fmt.Printf("check-data: db=%s fts_index=%v vectors=%v hnsw_state=%q hnsw_usable=%v null_at_floor=%d sparse_model=%q\n",
+		*dbPath, ftsOK, hasVectors, hnswState, hnswUsable, nullAtFloor, sparseModel)
 
 	if *requireFTS && !ftsOK {
 		return fmt.Errorf("FTS index absent (LoadFTS: %v) — server would fall back to LIKE full-scan; "+
 			"re-bake the corpus DB (ingest builds the FTS index)", ftsErr)
 	}
-	if *requireHNSW && hasVectors && !hnswFrozen {
-		return fmt.Errorf("vectors present but hnsw_state=%q (want \"frozen\") — vector arm would degrade to "+
-			"bounded exact-scan; run cmd/freeze-hnsw as the final bake step", hnswState)
+	if *requireHNSW && hasVectors && !hnswUsable {
+		return fmt.Errorf("vectors present but the server would REFUSE this index (hnsw_state=%q): %s — "+
+			"the vector arm would degrade to bounded exact-scan; run freeze-hnsw as the final bake step",
+			hnswState, hnswWhy)
 	}
 	if *requireEmbed && nullAtFloor != 0 {
 		return fmt.Errorf("dense incomplete: %d clause(s) at/above floor %q still lack a vector — "+

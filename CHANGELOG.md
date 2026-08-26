@@ -79,6 +79,26 @@ absence accepted to get there.
 
 ### Fixed
 
+- **The in-image data guard was weaker than both.** `mcp-3gpp check-data`, the
+  `RUN` that fails a `full` image build when the inherited data layer is
+  incomplete, compared `hnsw_state` to `"frozen"` and stopped there — it did not
+  even check the index existed. A corpus carrying the word "frozen" over nothing
+  passed it. It now runs `LoadVSS` too and reports `hnsw_usable`, so the last
+  gate before a corpus starts answering queries asks the same question as the
+  thing that will answer them.
+- `scripts/local/build-image.sh` built the **wrong image**: `light` is the last
+  stage in the Dockerfile by design, so a build without `--target full` silently
+  produced the lexical-only image, ignored `DATA_IMAGE`, and tagged it as the
+  full one. It now passes `--target full` and feeds the guard the real contract
+  from `scripts/data-contract.sh` instead of the Dockerfile's two-flag default.
+- Two more in the same script, found by running it against a stub `docker` that
+  prints its argv — the only way a quoting bug shows itself short of a real
+  build. `${CONTRACT:+--build-arg "DATA_CONTRACT_FLAGS=$CONTRACT"}` looks quoted
+  and is not: the expansion is word-split afterwards, so docker received
+  `--build-arg DATA_CONTRACT_FLAGS=--require-fts` followed by two loose
+  positional arguments. And `io.kodflow.3gpp.duckdb.rows` was being filled from
+  `dbcount | head -1`, i.e. `spec_versions=20163` — a catalogue size labelled as
+  a row count, telling an operator the wrong thing about the image they pulled.
 - **`validate --require-hnsw` asked a weaker question than the server.** It
   checked `hnsw_state` and `HNSWIndexPresent`, which resolves the index name
   through `hnswTarget()`; the server asks `store.LoadVSS`, which additionally

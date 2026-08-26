@@ -240,6 +240,53 @@ The rule the misses share: **whatever describes the vectors has to move with
 them.** The conversion changes the vector population, so the conversion is what
 must say so.
 
+### Three gates asked three different questions
+
+Once the serve guard was wrong, the interesting part was that nothing caught it.
+There are three checks of "is the vector index usable", and they had drifted into
+three different questions:
+
+| | asked | caught the defect |
+|---|---|---|
+| `validate --require-hnsw` | `hnsw_state` + `HNSWIndexPresent` (name via `hnswTarget`) | no |
+| `check-data` (fails a `full` image build) | `hnsw_state == "frozen"` | no |
+| `store.LoadVSS` (what the server does) | flag + index present under the right name + `embedding_count` agrees | — it *is* the thing that failed |
+
+The weakest one was the image gate, which is the last thing standing between a
+corpus and production. All three now call `LoadVSS` — it never creates an index,
+and its error names which condition failed, which is more than a boolean.
+
+The general form is worth keeping: **a gate that re-implements the check instead
+of running it will eventually ask a different question than the code it gates,**
+and the day it does, it passes.
+
+### The image path had the same shape of bug, three more times
+
+`scripts/local/build-image.sh` bakes a locally produced corpus into the two
+images. It could not be run here — no Docker, no Podman, and WSL carries no
+distro — so it was run against a stub `docker` that prints its argv. That found
+three things a reading had not:
+
+- **It built the wrong image.** `light` is the last stage in the Dockerfile by
+  design, so that a bare `docker build .` produces the one target needing no data
+  image. Without `--target full`, the script silently built the lexical-only
+  image, ignored `DATA_IMAGE`, and tagged the result as the full one.
+- **`${CONTRACT:+--build-arg "DATA_CONTRACT_FLAGS=$CONTRACT"}` looks quoted and
+  is not** — the expansion is word-split afterwards, so docker got
+  `--build-arg DATA_CONTRACT_FLAGS=--require-fts` and two loose positional
+  arguments. An array fixes it. Note that a stub echoing `"$*"` cannot show this:
+  the collapsed line is identical either way. It has to print argv one per line.
+- **`io.kodflow.3gpp.duckdb.rows` carried `spec_versions=20163`**, the first line
+  of a multi-line `dbcount` report — a catalogue size labelled as a row count, on
+  the label an operator reads to find out what they pulled.
+
+And the in-image guard, `check-data`, was the weakest of the three checks in the
+table above: `hnsw_state == "frozen"` and nothing else, not even that the index
+existed. It is the last gate before a corpus starts answering queries.
+
+The full image itself has not been built. That needs a container runtime this
+machine does not have, and installing one is not a thing to do unasked.
+
 ## Consequences
 
 - The read side is converted, not wrapped: two steps at each call site that
