@@ -31,11 +31,12 @@ esac
 target="${goos}_${goarch}"
 archive="mcp-3gpp_${target}.tar.gz"
 
-if [ "$VERSION" = "latest" ]; then
-  base="https://github.com/$REPO/releases/latest/download"
-else
-  base="https://github.com/$REPO/releases/download/$VERSION"
-fi
+# `latest` here is a TAG, not GitHub's "/releases/latest/" alias. The alias
+# resolves to the newest non-prerelease — the `models` tag in this repository,
+# which carries only the ORT/BGE-M3 bundles — so it redirects to a release with
+# no binaries in it. Both branches therefore use the same /releases/download/<tag>
+# form. Same bug, same fix, as cmd/server/bootstrap.go.
+base="https://github.com/$REPO/releases/download/$VERSION"
 
 echo "→ mcp-3gpp ($target) from $base/$archive"
 mkdir -p "$BINDIR"

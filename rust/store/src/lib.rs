@@ -60,7 +60,144 @@ impl Store {
     pub fn open_rw(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open duckdb rw {path}"))?;
         conn.execute_batch(SCHEMA_SQL).context("bootstrap schema")?;
+
+        // A WRITER MUST BE ABLE TO BIND AN HNSW INDEX THAT IS ALREADY THERE.
+        //
+        // Once `clauses` carries a frozen HNSW, DuckDB refuses to modify the table
+        // — or even to CHECKPOINT — unless the extension providing that index type
+        // is loaded: "Cannot bind index 'clauses', unknown index type 'HNSW'. You
+        // need to load the extension ... before table 'clauses' can be modified."
+        //
+        // A first run never sees this: the index does not exist yet. It appears on
+        // the SECOND pass, which is exactly the incremental path this pipeline is
+        // built for — ETSI re-ingesting into an already-indexed etsi.duckdb hit it.
+        //
+        // Best-effort on purpose: a build without vss must still open a corpus that
+        // has no HNSW. If the index IS there and vss is missing, the later write
+        // fails with DuckDB's own message, which says precisely what is wrong.
+        let _ = conn.execute_batch(
+            "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
+        );
         Ok(Self { conn })
+    }
+
+    /// copy_database_compact builds `dst` as a COMPACT copy of `src`.
+    ///
+    /// merge used to clone the base with std::fs::copy — a byte-for-byte copy, so it
+    /// carried the previous run's dead space AND the stale HNSW index that the merge is
+    /// about to rebuild anyway. A bucket replacement is delete-then-insert and DuckDB
+    /// does not reclaim in place, so the file grew on every incremental run and, because
+    /// each run started from the last run's file, the growth COMPOUNDED: 38.5 GB in,
+    /// 133 GB out on the 2026-08-25 repair, and the next run would have started at 133.
+    ///
+    /// COPY FROM DATABASE rebuilds the storage rather than cloning it: no dead space
+    /// carried, and custom indexes are not copied (internal/store/CLAUDE.md) — which is
+    /// exactly right here, since merge rebuilds FTS and freeze-hnsw rebuilds the index.
+    ///
+    /// Both databases are attached under explicit aliases from a scratch in-memory
+    /// connection, so neither catalog name has to be guessed from a file stem — "3gpp.
+    /// duckdb.new" does not yield an identifier anyone should have to predict.
+    pub fn copy_database_compact(src: &str, dst: &str) -> Result<()> {
+        let conn = Connection::open_in_memory().context("scratch connection")?;
+        // The source carries an HNSW index; without vss its catalog cannot even be bound.
+        // Best-effort, exactly as open_rw does it.
+        let _ = conn.execute_batch(
+            "INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;",
+        );
+
+        // A MEMORY LIMIT WITHOUT A TEMP DIRECTORY IS A GUARANTEED OOM, NOT A GUARD.
+        //
+        // This connection is in-memory, and an in-memory DuckDB has NOWHERE to spill:
+        // capping the buffer manager without giving it a temp directory does not make
+        // the copy careful, it makes the copy die. That is exactly what happened —
+        // 70 minutes of CPU, nothing written, then
+        //
+        //   Failed to create checkpoint: Out of Memory Error: could not allocate block
+        //   of size 256.0 KiB (3.7 GiB/3.7 GiB used)
+        //
+        // against a 4 GB cap. So point temp_directory at the DESTINATION's own folder
+        // (the volume that must have room for the result anyway) before capping
+        // anything, and give the cap enough headroom that spilling is the exception.
+        let tmp = std::path::Path::new(dst)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("compact-copy.tmp"))
+            .unwrap_or_else(|| std::path::PathBuf::from("compact-copy.tmp"));
+        let buf = std::env::var("MERGE_COPY_MEMORY_LIMIT").unwrap_or_else(|_| "12GB".into());
+
+        let esc = |p: &str| p.replace('\'', "''");
+
+        // COPY FROM DATABASE WOULD BRING THE FTS INDEX ACROSS, AND MERGE REBUILDS IT.
+        //
+        // It copies every schema, including the six internal tables DuckDB's fts
+        // extension keeps under fts_main_clauses — a BM25 index over 2.75 M clauses.
+        // merge then calls enable_fts(), whose PRAGMA is overwrite=1, so all of that is
+        // dropped and built again. The corpus pays for the same index twice and the
+        // copy carries gigabytes it will throw away.
+        //
+        // So copy the MAIN schema table by table instead. The table list is read from
+        // the source's own catalogue rather than hard-coded, so a new table cannot be
+        // silently left behind the way a stale list would leave it.
+        //
+        // The secondary indexes come off for the duration: maintaining three ART
+        // indexes across 2.75 M row-by-row inserts costs far more than building them
+        // once at the end over settled data.
+        {
+            let d = Self::open_rw(dst).context("bootstrap destination schema")?;
+            d.conn.execute_batch(
+                "DROP INDEX IF EXISTS clauses_spec;
+                 DROP INDEX IF EXISTS clauses_rel;
+                 DROP INDEX IF EXISTS clauses_path;",
+            )?;
+            d.checkpoint()?;
+        }
+
+        let res = (|| -> Result<()> {
+            conn.execute_batch(&format!(
+                "SET temp_directory = '{}';
+                 SET memory_limit = '{buf}';
+                 SET preserve_insertion_order = false;
+                 ATTACH '{}' AS copy_src (READ_ONLY);
+                 ATTACH '{}' AS copy_dst;",
+                esc(&tmp.to_string_lossy()),
+                esc(src),
+                esc(dst)
+            ))
+            .context("attach for compact copy")?;
+
+            let tables: Vec<String> = {
+                let mut st = conn.prepare(
+                    "SELECT table_name FROM duckdb_tables()
+                      WHERE database_name = 'copy_src' AND schema_name = 'main'
+                      ORDER BY table_name",
+                )?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.filter_map(std::result::Result::ok).collect()
+            };
+            for t in &tables {
+                // Column order is identical — both sides were bootstrapped from the same
+                // schema.sql — so SELECT * is the right shape, not a shortcut.
+                conn.execute_batch(&format!(
+                    "INSERT INTO copy_dst.main.\"{t}\" SELECT * FROM copy_src.main.\"{t}\";"
+                ))
+                .with_context(|| format!("copy table {t}"))?;
+            }
+            conn.execute_batch("DETACH copy_dst; DETACH copy_src;")?;
+            Ok(())
+        })();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        res.with_context(|| format!("compact copy {src} -> {dst}"))?;
+
+        // Rebuild the secondary indexes once, over data that is now settled.
+        let d = Self::open_rw(dst).context("reopen destination")?;
+        d.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS clauses_spec ON clauses (spec_id);
+             CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release);
+             CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path);",
+        )?;
+        d.checkpoint()?;
+        Ok(())
     }
 
     /// in_memory opens a transient DB (tests).
@@ -160,6 +297,77 @@ impl Store {
 
     /// delete_spec_release purges one (spec_id, release) bucket from the merged DB so a
     /// fresher shard can replace it (== Go merge --base bucket replacement).
+    /// stash_bucket_vectors snapshots the vectors of the given (spec, release) buckets,
+    /// keyed by the TEXT they describe, so a bucket replacement can hand them back to
+    /// every clause whose wording did not change. Returns the number of distinct texts
+    /// kept. Call it BEFORE delete_spec_release, and restore_stashed_vectors after the
+    /// fold.
+    ///
+    /// Without it, re-ingesting a spec whose text is identical still throws its vectors
+    /// away: the shard carries no embeddings, the delete takes the base's with it, and
+    /// the next embed pass pays the GPU again for work already done. The 2026-08-25
+    /// repair re-embedded 211 511 clauses that way, on a corpus where almost nothing had
+    /// actually changed — the ledger normally hides this by matching content hashes from
+    /// a 31 GB sidecar, which is a lot of disk to solve a problem merge can avoid making.
+    ///
+    /// embedding_hash is sha(heading+text+model), so a row keyed by identical heading+text
+    /// keeps a hash that is still true — the model identity cannot change mid-merge.
+    pub fn stash_bucket_vectors(&self, buckets: &[(String, String)]) -> Result<usize> {
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS carry_vecs;")
+            .context("drop carry_vecs")?;
+        if buckets.is_empty() {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE carry_vecs (heading VARCHAR, text VARCHAR,
+                                               embedding FLOAT[1024], embedding_hash VARCHAR);",
+            )?;
+            return Ok(0);
+        }
+        // GROUP BY the key: one bucket can hold the same heading+text twice, and a
+        // duplicated join key would multiply rows on the way back.
+        let pairs = buckets
+            .iter()
+            .map(|(s, r)| format!("({}, {})", q(s), q(r)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE carry_vecs AS
+                 SELECT heading, text,
+                        any_value(embedding)      AS embedding,
+                        any_value(embedding_hash) AS embedding_hash
+                 FROM clauses
+                 WHERE embedding IS NOT NULL AND (spec_id, release) IN ({pairs})
+                 GROUP BY heading, text;"
+            ))
+            .context("stash_bucket_vectors")?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM carry_vecs", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// restore_stashed_vectors gives the stashed vectors back to every clause that still
+    /// lacks one and whose heading+text matches. Returns how many rows were revived.
+    pub fn restore_stashed_vectors(&self) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE clauses
+                    SET embedding      = c.embedding,
+                        embedding_hash = c.embedding_hash
+                   FROM carry_vecs c
+                  WHERE clauses.embedding IS NULL
+                    AND clauses.heading = c.heading
+                    AND clauses.text    = c.text",
+                [],
+            )
+            .context("restore_stashed_vectors")?;
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS carry_vecs;")?;
+        Ok(n)
+    }
+
     pub fn delete_spec_release(&self, spec_id: &str, release: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM clauses WHERE spec_id = ? AND release = ?",
@@ -448,6 +656,69 @@ impl Store {
         Ok(())
     }
 
+    /// import_ledger loads a whole JSONL vector ledger in ONE statement, letting
+    /// DuckDB read the file itself.
+    ///
+    /// The row-by-row path above makes the same numbers cross the text boundary three
+    /// times: serde parses the JSON into `Vec<f32>`, `set_embeddings_batch` turns each
+    /// f32 back into decimal with `to_string()` and glues 1024 of them into an
+    /// `UPDATE … SET embedding = [0.0076,…]`, and DuckDB then parses those decimals
+    /// back into f32. Over a full corpus that is ~2.3 billion float↔text conversions
+    /// and tens of gigabytes of generated SQL; measured, it took ~70 minutes to import
+    /// 2.2 M vectors — longer than fetch's ingest and merge combined.
+    ///
+    /// `read_json` parses once, in DuckDB's own reader, straight into a FLOAT[] column,
+    /// and the write becomes a single set-based join instead of one statement per row.
+    ///
+    /// Returns (staged, embedded_total). Malformed rows are counted out, not fatal: a
+    /// killed embedder leaves a half-written final line, and one truncated line must
+    /// never cost the whole ledger — `ignore_errors` skips them exactly as the
+    /// hand-rolled loop did, and the width filter drops any vector that is not
+    /// DENSE_DIM wide rather than letting one bad cast abort the import.
+    pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
+        let p = path.replace('\\', "/").replace('\'', "''");
+        self.conn
+            .execute_batch(&format!(
+                "BEGIN;
+                 CREATE OR REPLACE TEMP TABLE _ledger AS
+                   SELECT chunk_id, hash AS embedding_hash, vec
+                   FROM read_json('{p}',
+                                  format='newline_delimited',
+                                  ignore_errors=true,
+                                  columns={{chunk_id:'UBIGINT', hash:'VARCHAR', vec:'FLOAT[]'}})
+                   WHERE vec IS NOT NULL AND len(vec) = {DENSE_DIM};"
+            ))
+            .with_context(|| format!("read ledger {path}"))?;
+
+        let staged: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM _ledger", [], |r| r.get(0))
+            .context("count staged ledger rows")?;
+
+        // The cast to the FIXED width happens only here: staging is FLOAT[] (variable),
+        // the column is FLOAT[1024], and the filter above has already guaranteed every
+        // surviving row is exactly that wide.
+        self.conn
+            .execute_batch(&format!(
+                "UPDATE clauses SET embedding = l.vec::FLOAT[{DENSE_DIM}],
+                                    embedding_hash = l.embedding_hash
+                 FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;
+                 DROP TABLE _ledger;
+                 COMMIT;"
+            ))
+            .context("apply ledger to clauses")?;
+
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .context("count embedded clauses")?;
+        Ok((staged, embedded))
+    }
+
     /// set_sparse replaces the sparse posting for one clause (idempotent: stale terms
     /// deleted first). `terms` are (term_id, weight) pairs. == Go SetSparse.
     pub fn set_sparse(&self, chunk_id: u64, terms: &[(u32, f32)]) -> Result<()> {
@@ -490,14 +761,70 @@ impl Store {
             anyhow::bail!("no embeddings to index");
         }
         self.set_meta("hnsw_state", "building")?;
-        self.conn
-            .execute_batch(
-                "CHECKPOINT;
-                 INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
-                 CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
-                 CHECKPOINT;",
-            )
-            .context("build hnsw")?;
+
+        // CAP THE BUFFER MANAGER FOR THE DURATION OF THE BUILD.
+        //
+        // A vss HNSW index lives OUTSIDE DuckDB's buffer manager: it is held whole
+        // in RAM for the entire build and never spills. At DENSE_DIM float32 that
+        // is 4 KB per row for the vectors alone — 2 443 844 rows is ~10 GB before
+        // the graph. Meanwhile memory_limit defaults to ~80% of physical RAM, so
+        // the buffer manager and the index each believe they may take most of the
+        // machine, and nothing arbitrates between them.
+        //
+        // On a 28 GB host that ended at 46.7 GB of committed virtual memory with
+        // 1.0 GB left, the pagefile eating the last 5 GB of free disk, and the
+        // build still unfinished after 1 h 54 of CPU — thrashing, not progressing.
+        //
+        // So give the buffer manager a fixed, modest budget and leave the rest of
+        // the machine to the structure that has nowhere else to go. What the buffer
+        // manager does NOT fit, it spills to temp_directory — the build materialises
+        // the whole embedding column, so the spill is measured in GB, not MB. That
+        // spill is the second ceiling, and it is a DISK one: see below.
+        let buf = std::env::var("HNSW_BUILD_MEMORY_LIMIT").unwrap_or_else(|_| "4GB".into());
+
+        // Operator overrides, unset by default so DuckDB keeps its own defaults
+        // wherever they are sane. HNSW_BUILD_TEMP_LIMIT is the escape hatch for the
+        // disk ceiling documented in the error path below; HNSW_BUILD_THREADS trades
+        // build speed for a smaller concurrent materialisation.
+        let mut knobs = String::new();
+        if let Ok(t) = std::env::var("HNSW_BUILD_TEMP_LIMIT") {
+            knobs.push_str(&format!("SET max_temp_directory_size = '{t}';"));
+        }
+        if let Ok(n) = std::env::var("HNSW_BUILD_THREADS") {
+            knobs.push_str(&format!("SET threads = {n};"));
+        }
+
+        // preserve_insertion_order is pure cost here: HNSW is an unordered structure
+        // and the scan feeding it has no ORDER BY, so holding the row order only
+        // widens the materialisation that has to spill.
+        let sql = format!(
+            "CHECKPOINT;
+             SET memory_limit = '{buf}';
+             SET preserve_insertion_order = false;
+             {knobs}
+             INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
+             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
+             CHECKPOINT;"
+        );
+        self.conn.execute_batch(&sql).map_err(|e| {
+            let cause = e.to_string();
+            // DuckDB reports the spill ceiling as "Out of Memory Error", which sends
+            // every reader after the RAM. It is not RAM. max_temp_directory_size
+            // defaults to 90% of the FREE SPACE on the temp drive, so a nearly-full
+            // disk silently caps the spill at a few GiB and the build dies against
+            // that cap twenty minutes in. Raising memory_limit only changes how fast
+            // it gets there. Say so, in the error, where it costs nothing to read.
+            if cause.contains("max_temp_directory_size") {
+                anyhow::anyhow!(
+                    "build hnsw ({count} vectors, buffer budget {buf}): out of TEMP DISK, not RAM. \
+                     'max_temp_directory_size' defaults to 90% of the free space on the drive \
+                     holding DuckDB's temp_directory, so a full disk caps the spill. Free space on \
+                     that drive, or set HNSW_BUILD_TEMP_LIMIT to pick the cap yourself.\n\ncaused by: {cause}"
+                )
+            } else {
+                anyhow::anyhow!("build hnsw (buffer budget {buf}, {count} vectors)\n\ncaused by: {cause}")
+            }
+        })?;
         for (k, v) in [
             ("hnsw_metric", "cosine"),
             ("embedding_dim", "1024"),
@@ -537,6 +864,118 @@ impl Store {
     /// Vectors are copied as-is; the caller rebuilds FTS + HNSW once on the merged DB
     /// (per-shard HNSW indexes are not concatenable — internal/store/CLAUDE.md).
     pub fn fold_shard(&self, shard_path: &str, offset: u64) -> Result<()> {
+        self.fold_shard_buckets(shard_path, offset, None)
+    }
+
+    /// changed_buckets returns the shard's (spec, release) pairs this database does not
+    /// already hold in full: a different version, a spec it has never seen, OR a bucket
+    /// whose catalogue row is present while its TEXT is missing.
+    ///
+    /// A shard is rebuilt from every converted HTML of its series, so after one full
+    /// pass it carries the whole series whether or not anything moved. Replaying all of
+    /// it through delete-then-insert is not merely wasted time: DuckDB does not reclaim
+    /// the deleted blocks, so re-folding 745 unchanged specs to bring in 5 changed ones
+    /// grew a 26 GB corpus past 43 GB on a single shard, and the run died on disk.
+    ///
+    /// The version alone is NOT enough, and assuming it was skipped every shard on the
+    /// 2026-08-25 repair — including the one carrying the 6 209 clauses the repair
+    /// existed to acquire. A corpus hole is exactly the case where `spec_versions` holds
+    /// the right version and `clauses` holds nothing: that is what `anchorcheck` calls
+    /// missing_content, and skipping it makes the hole permanent. So the clause side is
+    /// checked too, which is also what makes this safe to use as the repair path.
+    ///
+    /// And the clause COUNT is compared, not merely its existence, because the version
+    /// describes the DOCUMENT and not the parse. Fixing the walker so that a heading
+    /// wrapped in a list item opens a clause took TR 25.890 from 0 to 41 clauses at the
+    /// very same version — content a version check would have refused to let in.
+    pub fn changed_buckets(&self, shard_path: &str) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS s (READ_ONLY)",
+            shard_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self.conn.prepare(
+                "SELECT sv.spec_id, sv.release
+                   FROM s.spec_versions sv
+                   LEFT JOIN spec_versions b
+                     ON b.spec_id = sv.spec_id AND b.release = sv.release
+                   LEFT JOIN (SELECT spec_id, release, count(*) AS n FROM clauses GROUP BY 1,2) c
+                     ON c.spec_id = sv.spec_id AND c.release = sv.release
+                   LEFT JOIN (SELECT spec_id, release, count(*) AS n FROM s.clauses GROUP BY 1,2) sc
+                     ON sc.spec_id = sv.spec_id AND sc.release = sv.release
+                  WHERE b.version IS NULL          -- never seen
+                     OR b.version <> sv.version    -- the document moved
+                     OR c.spec_id IS NULL          -- catalogued but textless: a HOLE
+                     -- The PARSE moved at the same version. Guarded by sc.n IS NOT NULL:
+                     -- a shard holding NO clauses for a bucket the corpus does hold text
+                     -- for must never trigger a fold, because the fold would delete that
+                     -- text and insert nothing in its place.
+                     OR (sc.n IS NOT NULL AND c.n IS DISTINCT FROM sc.n)",
+            )?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH s")?;
+        Ok(out)
+    }
+
+    /// corpus_versions_with_text returns the (spec_id, version) pairs the corpus at
+    /// `corpus_path` already holds actual CLAUSES for.
+    ///
+    /// `ingest --resume` consults the SHARD's own ingest_log, and a shard is scratch:
+    /// delete it, or start a series that never had one, and the ledger is empty, so
+    /// every converted file of that series is parsed and written again. The 2026-08-25
+    /// run re-ingested ~300 000 clauses that way to acquire five specs, and merge then
+    /// had to decide, bucket by bucket, that almost none of it had changed.
+    ///
+    /// The corpus is the durable record of what is already held, so let resume ask it.
+    /// The version is the key rather than the release: a spec is re-ingested when its
+    /// DOCUMENT changed, and that is what the version names.
+    pub fn corpus_versions_with_text(&self, corpus_path: &str) -> Result<Vec<(String, String)>> {
+        self.conn.execute_batch(&format!(
+            "ATTACH '{}' AS corp (READ_ONLY)",
+            corpus_path.replace('\'', "''")
+        ))?;
+        let out = {
+            let mut st = self
+                .conn
+                .prepare("SELECT DISTINCT spec_id, version FROM corp.clauses")?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect::<Vec<_>>()
+        };
+        self.conn.execute_batch("DETACH corp")?;
+        Ok(out)
+    }
+
+    /// fold_shard_buckets folds a shard, optionally restricted to the given (spec,
+    /// release) buckets. `None` folds everything (== the old behaviour).
+    pub fn fold_shard_buckets(
+        &self,
+        shard_path: &str,
+        offset: u64,
+        only: Option<&[(String, String)]>,
+    ) -> Result<()> {
+        // The row filter is applied to the clause-bearing tables only. The catalogue
+        // inserts are ON CONFLICT DO NOTHING, so replaying them costs nothing and keeps
+        // a spec's catalogue row present even when its text did not move.
+        let (clause_where, sparse_where) = match only {
+            None => (String::new(), String::new()),
+            Some(bs) => {
+                let pairs = bs
+                    .iter()
+                    .map(|(s, r)| format!("({}, {})", q(s), q(r)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(" WHERE (spec_id, release) IN ({pairs})"),
+                    format!(
+                        " WHERE chunk_id IN (SELECT chunk_id FROM s.clauses WHERE (spec_id, release) IN ({pairs}))"
+                    ),
+                )
+            }
+        };
         let sql = format!(
             "ATTACH '{shard_path}' AS s (READ_ONLY);
              INSERT INTO specs SELECT * FROM s.specs ON CONFLICT DO NOTHING;
@@ -546,8 +985,9 @@ impl Store {
              INSERT INTO clauses
                SELECT chunk_id + {offset}, spec_id, release, version, clause_path, heading, text,
                       is_normative, embedding, embedding_hash
-               FROM s.clauses;
-             INSERT INTO clause_sparse SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse;
+               FROM s.clauses{clause_where};
+             INSERT INTO clause_sparse
+               SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse{sparse_where};
              INSERT INTO changes SELECT * FROM s.changes;
              INSERT INTO evolutions SELECT * FROM s.evolutions;
              DETACH s;"
@@ -1322,5 +1762,715 @@ mod tests {
             "fresh clauses need vectors"
         );
         assert_eq!(done, "done");
+    }
+
+    // A writer must be able to touch a corpus that ALREADY carries a frozen HNSW.
+    //
+    // DuckDB refuses to modify — or even CHECKPOINT — a table whose index type it
+    // cannot bind, so a Store that opens without vss works on the FIRST pass and
+    // fails on every incremental one. ETSI re-ingesting into an already-indexed
+    // etsi.duckdb is precisely that second pass, and it failed with
+    // "Cannot bind index 'clauses', unknown index type 'HNSW'".
+    #[test]
+    fn a_writer_can_modify_a_corpus_that_already_carries_a_frozen_hnsw() {
+        let dir = std::env::temp_dir().join(format!("storers-hnswrw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("corpus.duckdb");
+        let _ = std::fs::remove_file(&p);
+        let path = p.to_str().unwrap().to_string();
+
+        // First pass: build the corpus and freeze the index, then CLOSE it, so the
+        // second open sees the index on disk exactly as a later step would.
+        {
+            let s = Store::open_rw(&path).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES
+                       (1,'23.501','h1','t1'),(2,'23.501','h2','t2');",
+                )
+                .unwrap();
+            s.raw()
+                .execute_batch(&format!(
+                    "UPDATE clauses SET embedding =
+                       (SELECT list(CAST(i AS FLOAT)) FROM range({DENSE_DIM}) t(i))::FLOAT[{DENSE_DIM}];"
+                ))
+                .unwrap();
+            s.build_and_freeze_hnsw("test-model").unwrap();
+        }
+
+        // Second pass: the index exists. Both the write and the checkpoint must work.
+        let s = Store::open_rw(&path).unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES (3,'23.501','h3','t3');",
+            )
+            .expect("a writer must bind the existing HNSW before modifying clauses");
+        s.checkpoint()
+            .expect("checkpoint must not fail on a corpus that carries an HNSW");
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A bucket replacement must not throw away the vectors of text that did not change.
+    //
+    // merge deletes a (spec, release) bucket and folds the shard's rows in its place, and
+    // the shard carries no embeddings. So a re-ingested spec whose wording is untouched
+    // came out unvectorised, and the next embed pass paid the GPU all over again — 211 511
+    // clauses on the 2026-08-25 repair, for a corpus where almost nothing had changed.
+    #[test]
+    fn replacing_a_bucket_keeps_the_vectors_of_unchanged_text() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h1','unchanged'),
+                   (2,'23.501','Rel-19','h2','will be rewritten');",
+            )
+            .unwrap();
+        s.raw()
+            .execute_batch(&format!(
+                "UPDATE clauses SET
+                   embedding = (SELECT list(CAST(i AS FLOAT)) FROM range({DENSE_DIM}) t(i))::FLOAT[{DENSE_DIM}],
+                   embedding_hash = 'sha-' || heading;"
+            ))
+            .unwrap();
+
+        let buckets = vec![("23.501".to_string(), "Rel-19".to_string())];
+        let stashed = s.stash_bucket_vectors(&buckets).unwrap();
+        assert_eq!(stashed, 2, "both texts must be kept");
+
+        // Replay what merge does: drop the bucket, then insert the shard's rows — same
+        // wording for h1, new wording for h2, and no embeddings on either.
+        s.delete_spec_release("23.501", "Rel-19").unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (10,'23.501','Rel-19','h1','unchanged'),
+                   (11,'23.501','Rel-19','h2','rewritten in the new revision');",
+            )
+            .unwrap();
+
+        let revived = s.restore_stashed_vectors().unwrap();
+        assert_eq!(revived, 1, "only the unchanged text may be revived");
+
+        let (id, hash): (u64, String) = s
+            .raw()
+            .query_row(
+                "SELECT chunk_id, embedding_hash FROM clauses WHERE embedding IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            id, 10,
+            "the vector must land on the NEW row, not the deleted one"
+        );
+        assert_eq!(
+            hash, "sha-h1",
+            "the hash travels with the vector it describes"
+        );
+
+        // The rewritten clause must stay unvectorised: handing it a stale vector would be
+        // worse than the GPU cost this whole mechanism exists to avoid.
+        let nulls: i64 = s
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM clauses WHERE embedding IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+    }
+
+    /// Stashing nothing must still leave a usable table: merge calls restore
+    /// unconditionally, and a missing carry_vecs would abort a legitimate empty run.
+    #[test]
+    fn stashing_an_empty_bucket_set_is_not_an_error() {
+        let s = Store::in_memory().unwrap();
+        assert_eq!(s.stash_bucket_vectors(&[]).unwrap(), 0);
+        assert_eq!(s.restore_stashed_vectors().unwrap(), 0);
+    }
+
+    // A merge must replace only what MOVED.
+    //
+    // A shard is rebuilt from every converted HTML of its series, so after one full pass
+    // it carries the whole series whether or not anything changed. Replacing every
+    // bucket is delete-then-insert, DuckDB does not reclaim the deleted blocks, and
+    // re-folding 745 unchanged specs to bring in 5 changed ones took a 26 GB corpus past
+    // 43 GB on ONE shard. Three merges died on disk before the cause turned out to be
+    // the work itself rather than the machine.
+    #[test]
+    fn only_the_buckets_whose_version_moved_are_replaced() {
+        let dir = std::env::temp_dir().join(format!("storers-changed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = dir.join("shard.duckdb");
+        let _ = std::fs::remove_file(&sp);
+        let shard = sp.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                       ('23.501','Rel-19','19.7.0'),   -- same as base  -> untouched
+                       ('24.501','Rel-19','19.9.0'),   -- newer than base -> changed
+                       ('34.123-1','Rel-10','10.7.0'); -- absent from base -> new",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        let base = Store::in_memory().unwrap();
+        base.raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.2.0');
+                 -- 23.501 is genuinely complete: catalogued AND textual.
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   VALUES (1,'23.501','Rel-19','h','t');",
+            )
+            .unwrap();
+
+        let mut got = base.changed_buckets(&shard).unwrap();
+        got.sort();
+        let want = vec![
+            ("24.501".to_string(), "Rel-19".to_string()),
+            ("34.123-1".to_string(), "Rel-10".to_string()),
+        ];
+        assert_eq!(
+            got, want,
+            "a bucket at the SAME version must not be replaced"
+        );
+
+        // A CATALOGUED BUT TEXTLESS BUCKET IS A HOLE, AND MUST STILL BE FOLDED.
+        //
+        // This is the case a version check alone gets wrong, and getting it wrong
+        // skipped every shard of the 2026-08-25 repair — including the one carrying
+        // the 6 209 clauses the repair existed to acquire. spec_versions held the right
+        // version, clauses held nothing, and "same version" read as "nothing to do".
+        let holed = Store::in_memory().unwrap();
+        holed
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');
+                 -- every version matches the shard, but 34.123-1 has NO clauses
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t');",
+            )
+            .unwrap();
+        assert_eq!(
+            holed.changed_buckets(&shard).unwrap(),
+            vec![("34.123-1".to_string(), "Rel-10".to_string())],
+            "a catalogued bucket with no text is a hole and must be re-folded"
+        );
+
+        // And a shard that moved nothing AND is fully textual yields nothing, so merge
+        // can skip it whole — that is the optimisation this all exists for.
+        let same = Store::in_memory().unwrap();
+        same.raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t'),
+                   (3,'34.123-1','Rel-10','h','t');",
+            )
+            .unwrap();
+        assert!(
+            same.changed_buckets(&shard).unwrap().is_empty(),
+            "an unchanged, fully textual shard must be skippable entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A REPARSE AT THE SAME VERSION MUST STILL BE FOLDED.
+        //
+        // The version describes the DOCUMENT, not the parse. Fixing the walker so a
+        // heading wrapped in a list item opens a clause took TR 25.890 from 0 to 41
+        // clauses at the very same version — content a version check would have
+        // refused to let in, leaving the hole open after the bug that caused it was
+        // fixed.
+        //
+        // Its own directory: the assertions above end by removing theirs.
+        let dir2 = std::env::temp_dir().join(format!("storers-reparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let sp2 = dir2.join("shard.duckdb");
+        let _ = std::fs::remove_file(&sp2);
+        let shard = sp2.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                       ('23.501','Rel-19','19.7.0'),
+                       ('24.501','Rel-19','19.9.0'),
+                       ('34.123-1','Rel-10','10.7.0');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let reparsed = Store::in_memory().unwrap();
+        reparsed
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version) VALUES
+                   ('23.501','Rel-19','19.7.0'),
+                   ('24.501','Rel-19','19.9.0'),
+                   ('34.123-1','Rel-10','10.7.0');
+                 -- 23.501 is at the same version but the corpus holds FEWER clauses
+                 -- than the shard now produces: the parse moved.
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                   (1,'23.501','Rel-19','h','t'),
+                   (2,'24.501','Rel-19','h','t'),
+                   (3,'34.123-1','Rel-10','h','t');",
+            )
+            .unwrap();
+        // The shard holds TWO clauses for 23.501 where the corpus holds one.
+        {
+            let s = Store::open_rw(&shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO clauses(chunk_id,spec_id,release,heading,text) VALUES
+                       (10,'23.501','Rel-19','h1','t1'),
+                       (11,'23.501','Rel-19','h2','t2'),
+                       (12,'24.501','Rel-19','h','t'),
+                       (13,'34.123-1','Rel-10','h','t');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        assert_eq!(
+            reparsed.changed_buckets(&shard).unwrap(),
+            vec![("23.501".to_string(), "Rel-19".to_string())],
+            "a bucket whose PARSE produced more clauses must be re-folded"
+        );
+
+        // AND THE COUNT RULE MUST NEVER DESTROY TEXT.
+        //
+        // A shard that holds no clauses for a bucket the corpus DOES hold text for must
+        // not trigger a fold: the fold deletes the bucket and inserts the shard's rows,
+        // so folding an empty one would replace a good spec with nothing. The very
+        // first assertion in this test is that case — a shard carrying only catalogue
+        // rows — and it stays skipped.
+        let empty_shard_dir = dir2.join("empty");
+        std::fs::create_dir_all(&empty_shard_dir).unwrap();
+        let esp = empty_shard_dir.join("shard.duckdb");
+        let empty_shard = esp.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&empty_shard).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO spec_versions(spec_id,release,version)
+                       VALUES ('23.501','Rel-19','19.7.0');",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let holder = Store::in_memory().unwrap();
+        holder
+            .raw()
+            .execute_batch(
+                "INSERT INTO spec_versions(spec_id,release,version)
+                   VALUES ('23.501','Rel-19','19.7.0');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   VALUES (1,'23.501','Rel-19','h','t');",
+            )
+            .unwrap();
+        assert!(
+            holder.changed_buckets(&empty_shard).unwrap().is_empty(),
+            "an empty shard must never replace a bucket the corpus holds text for"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // `--resume` must be able to ask the CORPUS what is already held, not only the
+    // scratch shard it happens to be writing.
+    //
+    // ingest_log lives in the shard. Delete the shard — or start a series that never
+    // had one — and the ledger is empty, so every converted file of that series is
+    // parsed and written again. That re-ingested ~300 000 clauses on 2026-08-25 to
+    // acquire five specs, and merge then had to decide bucket by bucket that almost
+    // none of it had moved.
+    #[test]
+    fn the_corpus_can_be_asked_what_it_already_holds() {
+        let dir = std::env::temp_dir().join(format!("storers-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cp = dir.join("corpus.duckdb");
+        let _ = std::fs::remove_file(&cp);
+        let corpus = cp.to_str().unwrap().to_string();
+        {
+            let c = Store::open_rw(&corpus).unwrap();
+            c.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,release,version,heading,text) VALUES
+                       (1,'23.501','Rel-19','19.7.0','h','t'),
+                       (2,'23.501','Rel-18','18.9.0','h','t');
+                     -- catalogued but textless: the corpus does NOT hold this one
+                     INSERT INTO spec_versions(spec_id,release,version)
+                       VALUES ('34.123-1','Rel-10','10.7.0');",
+                )
+                .unwrap();
+            c.checkpoint().unwrap();
+        }
+
+        let shard = Store::in_memory().unwrap();
+        let mut got = shard.corpus_versions_with_text(&corpus).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("23.501".to_string(), "18.9.0".to_string()),
+                ("23.501".to_string(), "19.7.0".to_string()),
+            ],
+            "only versions the corpus has TEXT for may be skipped"
+        );
+        assert!(
+            !got.contains(&("34.123-1".to_string(), "10.7.0".to_string())),
+            "a catalogued-but-textless version must still be re-ingested — it is a hole"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The base copy must RECLAIM, not clone.
+    //
+    // std::fs::copy carried the previous run's dead space forward, so an incremental
+    // merge grew the corpus every time and the growth compounded across runs — 38.5 GB
+    // in, 133 GB out, and the next run would have started from 133. COPY FROM DATABASE
+    // rebuilds the storage, so the copy is sized by the DATA, not by the file it came
+    // from.
+    #[test]
+    fn the_base_copy_reclaims_dead_space_instead_of_cloning_it() {
+        let dir = std::env::temp_dir().join(format!("storers-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bloated.duckdb");
+        let dst = dir.join("compact.duckdb");
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+        let srcs = src.to_str().unwrap().to_string();
+        let dsts = dst.to_str().unwrap().to_string();
+
+        // Bloat the source the way a bucket replacement does: write a lot, delete most
+        // of it, and let DuckDB keep the file it already grew to.
+        {
+            let s = Store::open_rw(&srcs).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                       SELECT i, '23.501', 'Rel-19', 'h' || i, repeat('x', 4000)
+                       FROM range(60000) t(i);",
+                )
+                .unwrap();
+            s.checkpoint().unwrap();
+            s.raw()
+                .execute_batch("DELETE FROM clauses WHERE chunk_id >= 200;")
+                .unwrap();
+            s.checkpoint().unwrap();
+        }
+        let bloated = std::fs::metadata(&src).unwrap().len();
+
+        Store::copy_database_compact(&srcs, &dsts).unwrap();
+        let compact = std::fs::metadata(&dst).unwrap().len();
+
+        // Same rows on the other side — compaction must not be lossy.
+        let s = Store::open_rw(&dsts).unwrap();
+        let n: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 200, "every surviving row must make the trip");
+        let specs: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(specs, 1, "the catalogue travels too");
+
+        assert!(
+            compact < bloated,
+            "the copy must be sized by the DATA, not by the file: {compact} vs {bloated}"
+        );
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The copy must NOT carry the FTS index, because merge rebuilds it.
+    //
+    // COPY FROM DATABASE copies every schema, including the six internal tables the fts
+    // extension keeps under fts_main_clauses. merge then calls enable_fts(), whose
+    // PRAGMA is overwrite=1 — so a BM25 index over 2.75 M clauses was copied at length
+    // and immediately thrown away. Measured on the real corpus: the copy is the whole
+    // cost of a merge (77 of 79 minutes).
+    #[test]
+    fn the_compact_copy_leaves_the_rebuildable_fts_behind() {
+        let dir = std::env::temp_dir().join(format!("storers-fts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.duckdb");
+        let dst = dir.join("dst.duckdb");
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+        let (s1, d1) = (
+            src.to_str().unwrap().to_string(),
+            dst.to_str().unwrap().to_string(),
+        );
+        {
+            let s = Store::open_rw(&s1).unwrap();
+            s.raw().execute_batch(
+                "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                 INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                   SELECT i,'23.501','Rel-19','h'||i, 'the quick brown fox jumps over the lazy dog number '||i
+                   FROM range(2000) t(i);").unwrap();
+            s.enable_fts().unwrap();
+            s.checkpoint().unwrap();
+            let n: i64 = s
+                .raw()
+                .query_row(
+                    "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            eprintln!("SOURCE: {n} table(s) internes FTS");
+            assert!(n > 0, "la source doit bien avoir un index FTS");
+        }
+        Store::copy_database_compact(&s1, &d1).unwrap();
+        let d = Store::open_rw(&d1).unwrap();
+
+        let n: i64 = d
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "the FTS index must not be copied — merge rebuilds it");
+
+        // Everything that is NOT rebuildable must still make the trip.
+        let rows: i64 = d
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2000, "every clause must survive the copy");
+        let specs: i64 = d
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(specs, 1, "the catalogue travels too");
+
+        // And the secondary indexes, dropped for the bulk insert, must be back.
+        let idx: i64 = d
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE index_name IN
+               ('clauses_spec','clauses_rel','clauses_path')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 3,
+            "the secondary indexes must be rebuilt after the bulk insert"
+        );
+
+        // The rebuild itself must still work on the copy.
+        d.enable_fts()
+            .expect("FTS must be buildable on the copied corpus");
+
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod import_via_read_json {
+    use super::*;
+
+    /// Can DuckDB ingest the ledger DIRECTLY, without Rust parsing it and without
+    /// generating SQL text? If so the import collapses from
+    ///   serde parse -> 1024 f32::to_string -> 28 GB of SQL -> DuckDB re-parses
+    /// to a single statement over the file. This test decides it on real syntax
+    /// rather than on hope.
+    #[test]
+    fn duckdb_reads_a_jsonl_ledger_into_a_float_array() {
+        let store = Store::in_memory().expect("open");
+        store
+            .raw()
+            .execute_batch(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text,is_normative)
+                 VALUES (1,'23.501','Rel-19','19.5.0','5.1','A','alpha',true),
+                        (2,'23.501','Rel-19','19.5.0','5.2','B','beta',true);",
+            )
+            .expect("seed");
+
+        // A ledger with a SHORT vector so the fixture stays readable; the cast target
+        // is what matters, not the width.
+        let dir = std::env::temp_dir().join(format!("rj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let led = dir.join("ledger.jsonl");
+        std::fs::write(
+            &led,
+            "{\"chunk_id\":1,\"hash\":\"aaaa\",\"vec\":[0.5,0.25,0.125,0.0625]}\n\
+             {\"chunk_id\":2,\"hash\":\"bbbb\",\"vec\":[1.0,2.0,3.0,4.0]}\n",
+        )
+        .unwrap();
+
+        let p = led.to_str().unwrap().replace('\\', "/");
+        let sql = format!(
+            "CREATE OR REPLACE TEMP TABLE _l AS
+               SELECT chunk_id::UBIGINT AS chunk_id,
+                      hash::VARCHAR      AS embedding_hash,
+                      vec                AS vec
+               FROM read_json('{p}', format='newline_delimited',
+                              columns={{chunk_id:'UBIGINT', hash:'VARCHAR', vec:'FLOAT[]'}});"
+        );
+        store.raw().execute_batch(&sql).expect("read_json");
+
+        let n: i64 = store
+            .raw()
+            .query_row("SELECT count(*) FROM _l", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "read_json must see both ledger lines");
+
+        let v: f32 = store
+            .raw()
+            .query_row("SELECT vec[2] FROM _l WHERE chunk_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!((v - 0.25).abs() < 1e-6, "vec[2] came back {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod import_bench {
+    use super::*;
+
+    fn seed(store: &Store, n: u64) {
+        let mut sql = String::from("BEGIN;");
+        for i in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text,is_normative) \
+                 VALUES ({i},'23.501','Rel-19','19.5.0','5.{i}','H','body {i}',true);"
+            ));
+        }
+        sql.push_str("COMMIT;");
+        store.raw().execute_batch(&sql).unwrap();
+    }
+
+    fn ledger(path: &std::path::Path, n: u64) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        let v: Vec<String> = (0..DENSE_DIM)
+            .map(|i| format!("{:.6}", i as f32 * 1e-4))
+            .collect();
+        let joined = v.join(",");
+        for i in 1..=n {
+            writeln!(
+                w,
+                "{{\"chunk_id\":{i},\"hash\":\"h{i}\",\"vec\":[{joined}]}}"
+            )
+            .unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    /// A/B on the SAME ledger and the same row count. The point is not a precise
+    /// speed-up figure -- an in-memory DB is not the 8 GB corpus -- but whether the
+    /// set-based path is faster at all, and by roughly how much, before it replaces a
+    /// working import on a multi-hour pipeline.
+    #[test]
+    fn set_based_import_beats_the_row_loop() {
+        const N: u64 = 3000;
+        let dir = std::env::temp_dir().join(format!("imp-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let led = dir.join("l.jsonl");
+        ledger(&led, N);
+
+        // OLD: parse in Rust, format back to decimal, generate SQL.
+        let a = Store::in_memory().unwrap();
+        seed(&a, N);
+        let t0 = std::time::Instant::now();
+        {
+            let txt = std::fs::read_to_string(&led).unwrap();
+            let (mut ids, mut vecs, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+            for line in txt.lines() {
+                let j: serde_json::Value = serde_json::from_str(line).unwrap();
+                ids.push(j["chunk_id"].as_u64().unwrap());
+                vecs.push(
+                    j["vec"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_f64().unwrap() as f32)
+                        .collect::<Vec<f32>>(),
+                );
+                hs.push(j["hash"].as_str().unwrap().to_string());
+                if ids.len() >= 512 {
+                    a.set_embeddings_batch(&ids, &vecs, &hs).unwrap();
+                    ids.clear();
+                    vecs.clear();
+                    hs.clear();
+                }
+            }
+            if !ids.is_empty() {
+                a.set_embeddings_batch(&ids, &vecs, &hs).unwrap();
+            }
+        }
+        let old = t0.elapsed();
+
+        // NEW: DuckDB reads the file.
+        let b = Store::in_memory().unwrap();
+        seed(&b, N);
+        let t1 = std::time::Instant::now();
+        let (staged, embedded) = b.import_ledger(led.to_str().unwrap()).unwrap();
+        let new = t1.elapsed();
+
+        assert_eq!(staged, N as i64, "every ledger row must be staged");
+        assert_eq!(embedded, N as i64, "every clause must end up embedded");
+
+        // Same result, not just same count: spot-check a value survived.
+        let av: f32 = a
+            .raw()
+            .query_row(
+                "SELECT embedding[3] FROM clauses WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let bv: f32 = b
+            .raw()
+            .query_row(
+                "SELECT embedding[3] FROM clauses WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((av - bv).abs() < 1e-6, "paths disagree: {av} vs {bv}");
+
+        eprintln!(
+            "IMPORT BENCH n={N}: row-loop {:?}, set-based {:?}  ({:.1}x)",
+            old,
+            new,
+            old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

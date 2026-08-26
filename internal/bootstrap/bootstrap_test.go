@@ -102,8 +102,11 @@ func TestCacheDirOverride(t *testing.T) {
 	if err != nil || d != "/tmp/custom-cache" {
 		t.Fatalf("CacheDir override: %q err=%v", d, err)
 	}
+	// DBPath composes with filepath.Join, donc le separateur est celui de l'OS.
+	// Comparer a une chaine POSIX en dur ferait echouer ce test sur tout checkout
+	// Windows alors que le code est correct — on compare au join attendu.
 	db, _ := DBPath()
-	if db != "/tmp/custom-cache/3gpp.duckdb" {
-		t.Errorf("DBPath = %q", db)
+	if want := filepath.Join("/tmp/custom-cache", "3gpp.duckdb"); db != want {
+		t.Errorf("DBPath = %q, want %q", db, want)
 	}
 }

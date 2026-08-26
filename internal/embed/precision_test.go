@@ -66,8 +66,12 @@ models:
 		t.Fatalf("file active not honoured: %+v", m)
 	}
 	// the embedded default models are still present (merge, not replace).
+	// models.yaml declare le repertoire en slashes POSIX ("data/models/bge-m3") et
+	// le registre le conserve tel quel — c'est valide, les API fichier de Go
+	// acceptent les slashes sur toutes les plateformes. Comparer via
+	// filepath.ToSlash plutot qu'a un filepath.Join dependant de l'OS.
 	t.Setenv("EMBED_MODEL", "bge-m3")
-	if m := ActiveModel(); m.Name != "bge-m3" || m.Dir != filepath.Join("data", "models", "bge-m3") {
+	if m := ActiveModel(); m.Name != "bge-m3" || filepath.ToSlash(m.Dir) != "data/models/bge-m3" {
 		t.Errorf("embedded bge-m3 lost after override: %+v", m)
 	}
 }

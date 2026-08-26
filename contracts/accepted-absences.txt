@@ -1,0 +1,26 @@
+# Corpus keys accepted as permanently absent.
+#
+# `anchorcheck` fails when the delta anchor claims a (spec|release) the corpus
+# holds no text for. Most such keys are repairable: `goal run --repair` folds them
+# into the fetch plan and the next ingest fills them. A few are not — the 3GPP
+# status report does not list them at all, so there is no URL to fetch, and no
+# amount of re-running will ever close them.
+#
+# Those belong HERE, one key per line, each with the reason on the line above.
+# Nothing else does.
+#
+# The rule this file exists to enforce: expected absence is a decision somebody
+# made and can be asked about, not a number that quietly stopped mattering. An
+# entry added to silence a red check, without a reason that survives being read
+# back in six months, is the failure this whole mechanism is meant to prevent —
+# it is how 56 holes hid behind 61 legitimate ones.
+#
+# Format:
+#   # <why this can never be acquired>
+#   <spec>|<Rel-N>
+#
+# Verify a candidate before adding it: `discover --repair-plan` reports
+# `holes absent from the status report`, and only those are eligible.
+
+# (no accepted absences yet — the 10 keys the status report omits still need
+#  their individual reasons established before they are written down here)

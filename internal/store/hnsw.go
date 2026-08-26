@@ -66,6 +66,25 @@ func (s *Store) GetMeta(ctx context.Context, key string) string {
 	return v
 }
 
+// HNSWIndexPresent reports whether the corpus actually CARRIES the vector index,
+// rather than merely claiming it in schema_meta.
+//
+// hnsw_state is a row in schema_meta, and rows travel. `COPY FROM DATABASE` — which
+// merge uses to compact the corpus — copies the data and deliberately does NOT copy
+// custom indexes, so the flag arrives at the new file saying "frozen" while the
+// index it describes was left behind. Anything that trusts the flag then reports a
+// vector-searchable corpus that can only answer lexically.
+//
+// This is the same failure `smoke` exists to catch, and smoke runs at the very end
+// of the pipeline, after validate. A guard that reads the claim instead of the fact
+// is not a guard.
+func (s *Store) HNSWIndexPresent(ctx context.Context) bool {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'clauses_hnsw'`).Scan(&n)
+	return err == nil && n > 0
+}
+
 // BuildAndFreezeHNSW runs the non-negotiable build sequence (axis #6 §2):
 // CHECKPOINT → enable VSS → CREATE INDEX → CHECKPOINT → verify → freeze markers.
 // It is called by ingest after embeddings are populated. A failed verification

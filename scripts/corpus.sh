@@ -31,7 +31,12 @@
 #   17 3 * * *  /workspace/scripts/corpus.sh >> /workspace/data/sources/.cron.log 2>&1
 #
 # Flags: --set Rel-N  --jobs N  --enum-jobs N  --series "23 33"
-#        --no-download  --no-convert  --quick  --help
+#        --worklist FILE  --no-download  --no-convert  --quick  --help
+#
+# --worklist FILE fetches exactly those "<release> <url> <name>" lines instead of
+# enumerating. Produce it with `discover --repair-plan --holes ...`, which is
+# drift ∪ corpus-holes; a worklist built from drift alone leaves every spec the
+# anchor over-claims permanently missing.
 #
 set -uo pipefail
 
@@ -55,9 +60,15 @@ SET="${SET:-Rel-99}"          # release floor (env-overridable). Rel-99 = every 
                               # RELEASE (per the status report), NOT the version-major,
                               # so a draft v1.x of an in-scope release is kept. Future
                               # releases auto.
-JOBS=4                        # per-spec workers (soffice is RAM-heavy)
+# 6, not 4. The old default came from an uncontrolled observation taken mid-run
+# ("4 workers convert 4.9/min, 6 workers 2.4/min"); a controlled A/B/B/A over the
+# same 28 documents, on an otherwise idle machine, measured the opposite:
+# 225 s at --jobs 4 against 178 s at --jobs 6, the two 6-runs agreeing to the
+# second. See docs/local-pipeline.md.
+JOBS=6                        # per-spec workers (soffice is RAM-heavy)
 ENUM_JOBS=8                   # enumeration workers (network-bound)
 SERIES_FILTER=""
+WORKLIST_IN=""                # exact fetch worklist to use instead of enumerating
 DO_DOWNLOAD=1
 DO_CONVERT=1
 QUICK=0
@@ -69,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --jobs)        JOBS="$2"; shift 2;;
     --enum-jobs)   ENUM_JOBS="$2"; shift 2;;
     --series)      SERIES_FILTER="$2"; shift 2;;
+    --worklist)    WORKLIST_IN="$2"; shift 2;;
     --no-download) DO_DOWNLOAD=0; shift;;
     --no-convert)  DO_CONVERT=0; shift;;
     --quick)       QUICK=1; shift;;
@@ -94,15 +106,49 @@ LEGACY_GSM="${INCLUDE_LEGACY_GSM:-0}"
 
 mkdir -p "$ORIGIN" "$CONVERT"
 
-LOCK="$ROOT/data/sources/.corpus.lock"
-exec 9>"$LOCK"
-if ! flock -n 9; then echo "$(date -Is) [corpus] another run in progress — exiting" >&2; exit 0; fi
+# Single-writer lock, portable.
+#
+# This used to be `flock -n 9` with the failure branch saying "another run in
+# progress". Git Bash on Windows ships no flock, so the command failed with 127
+# and the script announced contention that did not exist — then exited 0, which
+# made "I did nothing" indistinguishable from "I succeeded" to everything except
+# the caller's own output validation. Two separate causes collapsed into one
+# reassuring message.
+#
+# mkdir is atomic on every filesystem this runs on and needs no external tool, so
+# the lock now works the same way everywhere. A lock whose owning PID is gone is
+# stale and is reclaimed; a lock held by a LIVE process is never stolen, because
+# the thing it protects is a multi-hour download.
+LOCKDIR="$ROOT/data/sources/.corpus.lock.d"
+acquire_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    echo $$ > "$LOCKDIR/pid"
+    return 0
+  fi
+  local owner
+  owner="$(cat "$LOCKDIR/pid" 2>/dev/null || echo '')"
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  echo "$(date -Is) [corpus] reclaiming a stale lock (owner pid ${owner:-unknown} is gone)" >&2
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  echo $$ > "$LOCKDIR/pid"
+  return 0
+}
+if ! acquire_lock; then
+  echo "$(date -Is) [corpus] another run holds the lock (pid $(cat "$LOCKDIR/pid" 2>/dev/null)) — exiting" >&2
+  exit 0
+fi
 
 log() { echo "$(date -Is) [corpus] $*" >&2; }
 rm -f "$DONE"
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+# One EXIT trap for both: a second `trap ... EXIT` REPLACES the first, so the
+# lock and the scratch directory have to be released by the same handler or one
+# of them leaks — and a leaked lock is a corpus build that refuses to start.
+trap 'rm -rf "$WORKDIR" "$LOCKDIR"' EXIT
 
 fetch() { curl -fsSL -A "$UA" --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 900 "$@"; }
 export -f fetch; export UA
@@ -158,8 +204,9 @@ export -f emit_spec; export BASE WORKDIR SET_MAJOR LEGACY_GSM
 # download_zip <rel> <url> <name> — robustly fetch one spec zip. Prints the local
 # path on success (rc 0); rc 1 + a FAILDL log on genuine absence. Strategy:
 #   1. the worklist URL, with AGGRESSIVE retry: transient (000/429/5xx) up to 6×
-#      with backoff; 403/404 twice (a momentary edge miss) — measured ~0.8% of
-#      URLs are genuinely absent, so we don't burn long backoff on them.
+#      with backoff; 403/404 twice (a momentary edge miss). On a REPAIR worklist
+#      absence is the common case, not the ~0.8% a drift worklist sees: it aims at
+#      old anchors and withdrawn drafts, and 177 of 251 URLs came back absent.
 #   2. FALLBACK (the auto-fix): if the exact version is absent, list the spec's
 #      archive dir and take the HIGHEST version actually present at/above the floor
 #      — recovers "status report ahead of the archive" cases. The release stays the
@@ -178,8 +225,23 @@ download_zip() {
     j=$(( RANDOM % 3 ))
     case "$code" in
       000|429|5*) [[ $t -ge 6 ]] && break; sleep $(( (t*3 < 30 ? t*3 : 30) + j ));;  # transient: long backoff
-      403)        [[ $t -ge 5 ]] && break; sleep $(( (t*t < 20 ? t*t : 20) + j ));;  # 403 is often transient WAF/rate here: quadratic backoff + jitter, MORE tries before giving up
-      404)        [[ $t -ge 2 ]] && break; sleep 1;;                                 # 404 = genuine absent: don't hammer
+      # 403 IS THIS HOST'S "NOT FOUND". www.3gpp.org answers 403 — never 404 — for
+      # a missing file in an existing directory, for a nonsense name (zzz.zip), and
+      # for a directory that does not exist at all; all three verified, while a file
+      # that IS present answers 200 with or without a browser UA. There is no WAF to
+      # wait out.
+      #
+      # It was classed as transient and given five tries with quadratic backoff:
+      # measured 35 s per absent spec, against 2 s for the same verdict. A repair
+      # worklist targets old anchors and drafts, so absence is the COMMON case, not
+      # the ~0.8% assumed above — 177 of 251 URLs in one repair run. That is over an
+      # hour of pure sleeping per campaign, for nothing.
+      #
+      # A genuinely transient 403 is still recovered: the FALLBACK below lists the
+      # archive directory (which answers 200) and re-fetches through a different
+      # path, including the requested file itself when it is the highest of its
+      # release. Cheap here, recoverable there.
+      403|404)    [[ $t -ge 2 ]] && break; sleep 1;;                                 # absent: don't hammer
       *) break;;
     esac
   done
@@ -252,6 +314,30 @@ process_spec() {
   local recode='s/^([0-9]{4,5}(-[0-9]+)?)_([0-9a-z]{3}|[0-9]{6})/\1-\3/'
   zipbase="$(printf '%s' "$zipbase" | sed -E "$recode")"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
+    # A ZIP INSIDE THE ZIP IS WHERE THE SPEC ACTUALLY IS.
+    #
+    # When a spec is submitted to plenary for information, 3GPP wraps it: the outer
+    # archive holds a presentation cover ("SP-260553_Presentation_of_TS23366...docx")
+    # NEXT TO a nested zip carrying the real document. Stopping at the first level
+    # therefore found a .docx, converted it happily, and indexed an 8 KB cover note
+    # under the spec id — while 182 KB of specification sat unopened beside it.
+    #
+    # Five keys were in that state (23.366, 23.370, 23.545, 26.892, 28.893) and every
+    # one of them looked like a permanent upstream absence: the archive existed, it
+    # was fetched, it contained a document, and the document had no clauses. They came
+    # within one commit of being recorded in contracts/accepted-absences.txt as specs
+    # 3GPP never published.
+    #
+    # Bounded to two levels on purpose: that is the shape 3GPP actually ships, and an
+    # unbounded descent would follow a zip bomb.
+    local nested
+    while IFS= read -r nested; do
+      [ -n "$nested" ] || continue
+      echo "$(date -Is) NESTEDZIP $(basename "$zip") :: $(basename "$nested")" >&2
+      unzip -qo "$nested" -d "$tmp" 2>/dev/null || true
+      rm -f "$nested"
+    done < <(find "$tmp" -type f -iname '*.zip')
+
     # Candidate spec documents, minus: Word owner-lock stubs (._*, ~$* — e.g. the
     # 28552 sample media), and pure readme / release-note placeholders. Some zips
     # (e.g. 55.226) ship ONLY a readme and no spec doc — converting it would index
@@ -284,12 +370,40 @@ process_spec() {
   fi
   rm -rf "$tmp"
 }
-export -f process_spec convert_doc _soffice_html
+# The conversion helpers run INSIDE _soffice_html, in the xargs worker subshell —
+# exporting the caller without them gives "command not found" per conversion and
+# no HTML at all. The list is no longer restated here: convert.sh owns it, so it
+# cannot drift again. It already did, twice — see convert_export_fns.
+convert_export_fns
+export -f process_spec
 export ORIGIN CONVERT DO_DOWNLOAD DO_CONVERT CONV_TIMEOUT CONV_KILL DEGRADED_TSV
 
 # ----- disk guard -----
-free_gb=$(df -BG --output=avail "$ROOT/data/sources" | tail -1 | tr -dc '0-9')
-if (( free_gb < MIN_FREE_GB )); then log "ERROR: only ${free_gb}G free (< ${MIN_FREE_GB}G), abort"; exit 1; fi
+# Free space, measured portably — and "could not measure" kept DISTINCT from
+# "not enough".
+#
+# This was one GNU-only invocation whose output was scraped with `tr -dc '0-9'`.
+# When it produced nothing the arithmetic saw an empty string, and the script
+# announced `ERROR: only G free (< 5G), abort` — a threshold violation that had
+# not been observed, with the number conspicuously missing from its own message.
+# An unmeasurable disk and a full disk demand opposite reactions, and reporting
+# both as the second is how a portability problem gets diagnosed as a capacity
+# problem.
+free_gb=""
+if v=$(df -BG --output=avail "$ROOT/data/sources" 2>/dev/null | tail -1 | tr -dc '0-9') && [[ -n "$v" ]]; then
+  free_gb="$v"                                    # GNU coreutils
+elif v=$(df -P -k "$ROOT/data/sources" 2>/dev/null | awk 'NR==2{print int($4/1048576)}') && [[ -n "$v" ]]; then
+  free_gb="$v"                                    # POSIX df, kB -> GiB
+fi
+if [[ -z "$free_gb" ]]; then
+  log "WARNING: cannot measure free space here — proceeding UNGUARDED."
+  log "         The archive purge still runs, but nothing will stop a full disk."
+elif (( free_gb < MIN_FREE_GB )); then
+  log "ERROR: ${free_gb}G free, below the ${MIN_FREE_GB}G floor — abort"
+  exit 1
+else
+  log "disk: ${free_gb}G free (floor ${MIN_FREE_GB}G)"
+fi
 
 # ----- soffice presence (needed only if converting) -----
 # Normally provided at build by the libreoffice devcontainer feature; this is a
@@ -315,7 +429,21 @@ fi
 # mis-filed under Rel-99); driving from the report closes that. Legacy GSM 4-digit
 # specs are omitted by the report, so they keep the archive enumeration (opt-in).
 MANIFEST="$ORIGIN/.manifest.tsv"
-if [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
+# An explicit worklist wins over enumeration. This is how a REPAIR pass stays
+# proportionate: `discover --repair-plan` emits drift ∪ corpus-holes (1 000 specs
+# on the measured corpus) in exactly this format, against the 20 225 that
+# enumerating every spec of every affected series produces. The two are not
+# interchangeable — see the warning below.
+if [[ -n "$WORKLIST_IN" ]]; then
+  [[ -s "$WORKLIST_IN" ]] || { log "ERROR: --worklist $WORKLIST_IN is missing or empty"; exit 1; }
+  mkdir -p "$ORIGIN"
+  cp "$WORKLIST_IN" "$MANIFEST"
+  log "worklist: $(wc -l < "$MANIFEST") entries supplied via --worklist (enumeration skipped)"
+  log "NOTE: a supplied worklist is fetched VERBATIM. Anything it omits is not"
+  log "      acquired and nothing downstream will notice — build it with"
+  log "      'discover --repair-plan --holes <anchorcheck --emit-repair>', never"
+  log "      from drift alone, or specs the anchor already over-claims stay missing."
+elif [[ $QUICK -eq 0 || ! -s "$MANIFEST" ]]; then
   log "building fetch worklist from the 3GPP status report (release floor $SET) ..."
   : > "$MANIFEST"
   wl_args=(--emit-worklist --floor "$SET")

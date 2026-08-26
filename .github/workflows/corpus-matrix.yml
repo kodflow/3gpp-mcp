@@ -93,31 +93,32 @@ on:
   # no-op merge produces an empty matrix and costs ~1 min. Publishes to `latest` and
   # includes Phase 1/2 (legacy GSM). Embedding is NOT done here — it is the separate
   # Kaggle GPU job (corpus-rust-embed-kaggle.yml), dispatched per changed series below.
-  push:
-    branches: [main]
-    # Only auto-run when something that actually affects the corpus changes — so an
-    # unrelated merge (docs, the embed/serve code, the Kaggle scripts) does NOT kick
-    # off the heavy build. discover still makes a triggered run a near-no-op when the
-    # 3GPP site hasn't moved either.
-    paths:
-      - 'rust/parse/**'
-      - 'cmd/merge/**'
-      - 'rust/discover/**'
-      - 'rust/ingest/**'
-      - 'internal/ingest/**'
-      - 'internal/htmlparse/**'
-      - 'internal/ooxml/**'
-      - 'internal/model/**'
-      - 'internal/catalog/**'
-      - 'internal/openapi/**'
-      - 'internal/subject/**'
-      - 'internal/subjectmeta/**'
-      - 'internal/registry/**'
-      - 'internal/store/schema.sql'
-      - 'scripts/corpus.sh'
-      - 'scripts/lib/convert.sh'
-      - 'scripts/convert-origin.sh'
-      - '.github/workflows/corpus-matrix.yml'
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  push:
+#    branches: [main]
+#    # Only auto-run when something that actually affects the corpus changes — so an
+#    # unrelated merge (docs, the embed/serve code, the Kaggle scripts) does NOT kick
+#    # off the heavy build. discover still makes a triggered run a near-no-op when the
+#    # 3GPP site hasn't moved either.
+#    paths:
+#      - 'rust/parse/**'
+#      - 'cmd/merge/**'
+#      - 'rust/discover/**'
+#      - 'rust/ingest/**'
+#      - 'internal/ingest/**'
+#      - 'internal/htmlparse/**'
+#      - 'internal/ooxml/**'
+#      - 'internal/model/**'
+#      - 'internal/catalog/**'
+#      - 'internal/openapi/**'
+#      - 'internal/subject/**'
+#      - 'internal/subjectmeta/**'
+#      - 'internal/registry/**'
+#      - 'internal/store/schema.sql'
+#      - 'scripts/corpus.sh'
+#      - 'scripts/lib/convert.sh'
+#      - 'scripts/convert-origin.sh'
+#      - '.github/workflows/corpus-matrix.yml'
   # HANDS-OFF daily refresh: a delta build that picks up new 3GPP spec versions
   # (discover diffs the live status report) AND new 5GC OpenAPI releases (fetch auto).
   # Near-no-op when nothing moved (~1-2 min discover, empty matrix). Publishes `latest`,
@@ -127,9 +128,10 @@ on:
   # embed (Corpus · Embed (Kaggle GPU)) so vectors track the corpus automatically. With
   # the variable unset (default) the embed stays a separate, independently-dispatchable
   # job — no surprise Kaggle spend. Either way the two halves are one coherent system.
-  schedule:
-    - cron: "17 4 * * *"   # every day ~04:17 UTC (off-peak, not midnight)
-
+# [local-pipeline] trigger desactive — indexation deplacee en local (make)
+#  schedule:
+#    - cron: "17 4 * * *"   # every day ~04:17 UTC (off-peak, not midnight)
+#
 # One corpus build at a time. On back-to-back merges, CANCEL the in-flight build and
 # let the newest one supersede it: a delta build diffs against the published `latest`,
 # so the superseding run is a SUPERSET (it re-does anything the cancelled run dropped)

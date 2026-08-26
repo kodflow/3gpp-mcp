@@ -1,4 +1,5 @@
 SHELL    := /bin/bash
+
 BIN      := mcp-3gpp
 PKG      := github.com/kodflow/3gpp-mcp
 GO       := go
@@ -100,7 +101,7 @@ image-light: ## Build the lexical (no-embed) runtime image 3gpp-mcp:light with L
 	@echo "built 3gpp-mcp:light (lexical DB baked) — run: docker run -i --rm 3gpp-mcp:light serve"
 
 help: ## List targets
-	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 inspect-layers: ## Per-platform layers of the published :latest + the 3gpp-data blob (dedupe eyeball; needs crane + GHCR login)
 	@DATA_PM=$$(crane manifest ghcr.io/kodflow/3gpp-data:latest | jq -r '.manifests[0].digest // empty'); \
@@ -111,3 +112,8 @@ inspect-layers: ## Per-platform layers of the published :latest + the 3gpp-data 
 	  echo "== 3gpp-mcp@$$d =="; \
 	  crane manifest ghcr.io/kodflow/3gpp-mcp@$$d | jq -r --arg l "$$DATA_LAYER" '.layers[] | (if .digest == $$l then "DATA→ " else "      " end) + (.size|tostring) + "  " + .digest'; \
 	done
+
+# ---------------------------------------------------------------------------
+# Indexation locale (GPU du poste) — remplace Kaggle + les 5 workflows corpus.
+# Inclus EN FIN de fichier pour que `all` reste la cible par defaut.
+-include mk/local.mk

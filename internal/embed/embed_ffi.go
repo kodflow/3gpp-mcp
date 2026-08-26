@@ -42,13 +42,14 @@ func (ffiEmbedder) Dim() int { return int(C.embed_core_dim()) }
 
 // ModelID mirrors the cdylib's backend so the serve coherence guard compares the query
 // embedder against the corpus embedding_model (a mismatch disables vector search).
+//
+// The mapping itself lives in ffi_identity.go (untagged, CGO-free) so the contract
+// "what this returns == what cmd/embedid stamps" is covered by a plain `go test`.
+// It previously returned the bare family name "bge-m3" while the corpus stamps a
+// 12-hex EmbedIdentity digest — every valid vectorised DB was therefore served as
+// pure lexical, silently. See ffi_identity.go for the full contract.
 func (ffiEmbedder) ModelID() string {
-	switch C.GoString(C.embed_core_backend()) {
-	case "hash":
-		return "hash-local" // matches a Local-embedded corpus (seam validation)
-	default:
-		return "bge-m3" // real ONNX path (ort feature); family id the corpus uses
-	}
+	return ffiModelID(C.GoString(C.embed_core_backend()))
 }
 
 // Embed returns one Dim-length vector per text via the cdylib. cgo copies each query in/out
@@ -76,11 +77,12 @@ func (ffiEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error)
 
 // SparseModelID identifies the FFI sparse arm; "" when the loaded model has no sparse head
 // (dense-only / hash baseline) so the engine simply does not offer the sparse arm.
+//
+// Same contract as ModelID: the corpus stamps schema_meta.sparse_model with
+// `cmd/embedid --sparse` (a digest), so returning the bare "bge-m3-sparse" made
+// every sparse-layer comparison fail. Mapping in ffi_identity.go.
 func (ffiEmbedder) SparseModelID() string {
-	if C.embed_core_has_sparse() == 1 {
-		return "bge-m3-sparse"
-	}
-	return ""
+	return ffiSparseModelID(C.GoString(C.embed_core_backend()), C.embed_core_has_sparse() == 1)
 }
 
 // EmbedSparse returns one post-processed sparse vector per text via the cdylib's sparse head

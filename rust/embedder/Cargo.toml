@@ -13,10 +13,32 @@ path = "src/main.rs"
 # ort = ONNX Runtime bindings. fastembed 4.9.1 has no BGE-M3 (only BGE v1.5) and its
 # user-defined loader can't handle BGE-M3's >2GB external-data ONNX, so we drive ORT
 # directly: load model.onnx from a FILE path (ORT reads the model.onnx_data sibling
-# automatically), run the forward pass, CLS-pool, L2-normalise. The `cuda` feature +
-# download-binaries fetch the GPU-enabled runtime, so the SAME binary uses the GPU on
-# Kaggle (T4) and falls back to CPU elsewhere — letting Rust replace the Go GPU embed.
-ort = { version = "=2.0.0-rc.9", features = ["cuda", "ndarray", "download-binaries"] }
+# automatically), run the forward pass, CLS-pool, L2-normalise.
+#
+# LINKAGE: `load-dynamic`, NOT `download-binaries`.
+#
+# Two reasons, and the first is decisive:
+#
+#  1. ort-sys ships prebuilt binaries only for a subset of targets. On
+#     x86_64-pc-windows-gnu it panics at build time — "downloaded binaries not
+#     available for target x86_64-pc-windows-gnu" — so the embedder simply could
+#     not be built on a Windows host whose C toolchain is mingw (the toolchain the
+#     rest of this project needs, because the DuckDB static libs are MSVC-built and
+#     only the C API can bridge the two).
+#  2. rust/embed-core ALREADY uses load-dynamic, deliberately: when cmd/server is
+#     built with -tags onnx,embed_ffi, the Go reranker and this cdylib must share
+#     ONE onnxruntime in the process. Having the bulk embedder bundle a SECOND copy
+#     was the concrete shape of the "two ORT integrations" drift.
+#
+# The runtime library is located by ORT_DYLIB_PATH. The CUDA execution provider is
+# still selected by the `cuda` feature; it is registered best-effort at session
+# creation, and `--require-cuda` turns a silent CPU fallback into a hard failure.
+#
+# `default-features = false` is REQUIRED, not tidiness: ort's default feature set
+# is ["ndarray", "half", "download-binaries", "copy-dylibs"], and cargo features
+# are additive — asking for load-dynamic while leaving the defaults on still
+# enables download-binaries, and ort-sys still panics on an unsupported target.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["cuda", "ndarray", "load-dynamic"] }
 ndarray = "0.16"
 # ort logs EP-registration failures (e.g. why CUDA fell back to CPU) via `tracing`;
 # without a subscriber those warnings are invisible — which hid a silent CPU fallback.
