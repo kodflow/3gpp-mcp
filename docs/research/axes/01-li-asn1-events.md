@@ -26,10 +26,12 @@
   record clauses, with an explicit domain→NE mapping. Low confidence by design.
 
 We have **proven this is unreliable**: `docs/generated/li_audit.md` shows that of
-218 oracle events, 10 were attributed to the wrong spec, 48 only matched a parent
-ref, and 5 were not found at all — because heading text and prose are lossy,
-release-drifting, and never an exhaustive enumeration. The headings say *where the
-spec talks about* an event; they are not the event registry.
+218 oracle events only **96 are confirmed at the clause they cite**. 18 rest on a
+parent clause, 88 sit merely *somewhere* in the cited spec, 6 belong to another
+spec entirely, 8 cannot be placed at all — several specs name them equally well —
+and 2 have no trace anywhere. Heading text and prose are lossy, release-drifting,
+and never an exhaustive enumeration. The headings say *where the spec talks about*
+an event; they are not the event registry.
 
 TS 33.128, by contrast, **ships a formal registry**: an ASN.1 module that is the
 normative on-the-wire definition of X1/X2/X3/HI2/HI3/HI4 payloads. The event list
