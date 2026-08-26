@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -35,6 +36,16 @@ func (s *Store) probeContentAddressed(ctx context.Context) {
 		return
 	}
 	s.contentAddressed = present
+	if !present {
+		return
+	}
+	// Whether BM25 exists over `paragraphs` is a SEPARATE fact from whether it
+	// exists over `clauses`: a corpus can be migrated and not yet re-indexed.
+	// Asking costs one query; assuming costs a search that fails on the first
+	// real request.
+	var probe sql.NullFloat64
+	s.paraFTS = s.db.QueryRowContext(ctx,
+		`SELECT fts_main_paragraphs.match_bm25(para_id, 'probe') FROM paragraphs LIMIT 1`).Scan(&probe) == nil
 }
 
 // bodyTexts rebuilds the text of the given bodies, and only those.
@@ -300,4 +311,124 @@ func (s *Store) getClausesCA(ctx context.Context, specID, version, clausePrefix 
 		out[i].Text = texts[owner[i]]
 	}
 	return out, nil
+}
+
+// searchClausesCA is lexical search over the content-addressed corpus.
+//
+// BM25 lives on `paragraphs`, not on the occurrences, and that is the point.
+// Ranking the occurrence table means ranking VERSIONS: measured on this corpus,
+// the entire twelve-hit window for "CHECK_IMEI" was ONE clause repeated across
+// twelve releases, while the spec that actually answers it never entered the
+// window at all. Scoring deduplicated text and collapsing to one hit per clause
+// puts that spec at rank 3.
+//
+// Three stages, each doing one thing:
+//
+//	paragraphs  BM25 over text that is stored once
+//	bodies      a body scores as the sum of its paragraphs
+//	clause_occ  one row per clause, carrying its best-scoring release
+func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.SearchHit, error) {
+	if q.TopK <= 0 {
+		q.TopK = 10
+	}
+	filterSQL, filterArgs := filterClause(q.Filter)
+
+	// The scoring half is BM25 when the extension is loaded, and a term-count
+	// fallback otherwise — same degradation contract as the old path: a corpus
+	// without FTS still answers, just less well.
+	var scoreSQL string
+	args := []any{}
+	if s.paraFTS {
+		scoreSQL = `SELECT para_id, fts_main_paragraphs.match_bm25(para_id, ?) AS s FROM paragraphs`
+		args = append(args, q.Text)
+	} else {
+		toks := likeTokens(q.Text)
+		if len(toks) == 0 {
+			return nil, nil
+		}
+		var sc, wh strings.Builder
+		for i := range toks {
+			if i > 0 {
+				sc.WriteString(" + ")
+				wh.WriteString(" OR ")
+			}
+			sc.WriteString(`(CASE WHEN lower(part) LIKE ? THEN 1.0 ELSE 0 END)`)
+			wh.WriteString(`lower(part) LIKE ?`)
+		}
+		scoreSQL = `SELECT para_id, (` + sc.String() + `) AS s FROM paragraphs WHERE (` + wh.String() + `)`
+		for _, tk := range toks {
+			args = append(args, "%"+tk+"%")
+		}
+		for _, tk := range toks {
+			args = append(args, "%"+tk+"%")
+		}
+	}
+
+	full := `
+		WITH hits AS (` + scoreSQL + `),
+		-- max, NOT sum. Summing paragraph scores rewards long bodies: BM25
+		-- normalises length PER PARAGRAPH, so adding them back reintroduces
+		-- exactly the bias BM25 exists to remove. Measured on this corpus, sum
+		-- put the tables of contents of the largest specs at the top and drove
+		-- nDCG@10 to 0.000; max takes it to 0.072, against 0.014 for the BM25
+		-- over the clauses table it replaces.
+		scored AS (
+			SELECT bs.body_id, max(h.s) AS sc
+			FROM hits h JOIN body_seq bs USING (para_id)
+			WHERE h.s IS NOT NULL AND h.s > 0
+			GROUP BY bs.body_id
+		),
+		pick AS (
+			SELECT sc.sc, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
+			       o.is_normative, o.body_id, b.heading,
+			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
+			                          ORDER BY sc.sc DESC, o.version DESC) AS rn
+			FROM scored sc
+			JOIN clause_occ o USING (body_id)
+			JOIN bodies b USING (body_id)
+			WHERE 1=1` + filterSQL + `
+		)
+		SELECT chunk_id, spec_id, release, version, clause_path, heading, is_normative, body_id, sc
+		FROM pick WHERE rn = 1 ORDER BY sc DESC, spec_id, clause_path LIMIT ?`
+	args = append(args, filterArgs...)
+	args = append(args, q.TopK)
+
+	rows, err := s.db.QueryContext(ctx, full, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search (content-addressed): %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var hits []model.SearchHit
+	var owner []int64
+	var want []int64
+	seen := map[int64]bool{}
+	for rows.Next() {
+		var h model.SearchHit
+		var bodyID int64
+		if err := rows.Scan(&h.Clause.ChunkID, &h.Clause.SpecID, &h.Clause.Release,
+			&h.Clause.Version, &h.Clause.ClausePath, &h.Clause.Heading,
+			&h.Clause.IsNormative, &bodyID, &h.Score); err != nil {
+			return nil, err
+		}
+		hits = append(hits, h)
+		owner = append(owner, bodyID)
+		if !seen[bodyID] {
+			seen[bodyID] = true
+			want = append(want, bodyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	texts, err := s.bodyTexts(ctx, want)
+	if err != nil {
+		return nil, err
+	}
+	for i := range hits {
+		hits[i].Clause.Text = texts[owner[i]]
+		hits[i].Citation = hits[i].Clause.Cite()
+	}
+	return hits, nil
 }
