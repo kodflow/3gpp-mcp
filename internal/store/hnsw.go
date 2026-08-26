@@ -36,6 +36,11 @@ func OpenReadOnly(path string) (*Store, error) {
 	ctx := context.Background()
 	// Read-only: schema already exists; just detect FTS presence like Open does.
 	_ = s.LoadFTS(ctx)
+	// Same idea one shape up: whether this corpus stores its text
+	// content-addressed decides which query the availability and lineage paths
+	// run. etsi.duckdb is served alongside and has NOT been migrated, so this is
+	// asked of each database rather than assumed of the build.
+	s.probeContentAddressed(ctx)
 	// Producer marker (migration Phase 11a A14): a DB built by the Rust write-side stamps
 	// schema_meta.producer + .schema_version. Warn (never fail) on a schema_version the
 	// read side wasn't built for — a self-describing guard that the served corpus matches.
