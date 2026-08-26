@@ -153,8 +153,8 @@ cat <<EOF
 
 Next, on GitHub (both are workflow_dispatch):
 
-  gh workflow run corpus-data-image.yml -f release_tag=latest
-  gh workflow run corpus-image.yml
+  gh workflow run corpus-data-image.yml -f corpus_tag=latest
+  gh workflow run corpus-image.yml   -f release_tag=latest
 
 The first bakes 3gpp-data from the images just pushed (it copies /3gpp.duckdb and
 /etsi.duckdb out of them); the second builds 3gpp-mcp on top, inheriting that data
