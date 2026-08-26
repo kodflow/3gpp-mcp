@@ -89,17 +89,27 @@ fi
 
 # --- Platform modules must not straddle two lines --------------------------------
 #
-# The prebuilt platform modules (duckdb-go-bindings/<plat>) carry the static
-# libraries used when building WITHOUT -tags duckdb_use_lib. If they sit on a
-# different line than the bindings root — which supplies the headers — the static
-# build links one engine's objects against another engine's declarations.
-plat_versions="$(grep -oE 'github\.com/duckdb/duckdb-go-bindings/(lib/)?[a-z0-9-]+ v[0-9.]+' go.mod | grep -oE 'v[0-9.]+$' | sort -u || true)"
+# duckdb-go-bindings/lib/<plat> carries the static libraries linked when building
+# WITHOUT -tags duckdb_use_lib. If one sits on a different line than the bindings
+# root — which supplies the headers — the static build links one engine's objects
+# against another engine's declarations.
+#
+# ONLY lib/. The legacy duckdb-go-bindings/<plat> modules are a SEPARATE family
+# with its own version scheme: its newest release is v0.1.24 while the root and
+# lib/ moved to v0.105xx, and no v0.10503.0 of it exists to "align" to. Matching
+# both families here read v0.1.24 as "DuckDB 1.4 straddling a 1.5 root" and
+# failed CI on a module go-duckdb v2 no longer links for its engine — while
+# advising a `go get` that cannot resolve. The authority on whether the engines
+# actually agree is the round-trip test (TestPhase0RustGoRoundTrip), which passes
+# with this exact go.mod; this script is the cheap drift guard in front of it,
+# and a cheap guard that cries wolf gets switched off.
+plat_versions="$(grep -oE 'github\.com/duckdb/duckdb-go-bindings/lib/[a-z0-9-]+ v[0-9.]+' go.mod | grep -oE 'v[0-9.]+$' | sort -u || true)"
 if [ -n "$plat_versions" ]; then
 	while read -r pv; do
 		[ -n "$pv" ] || continue
 		pl="$(duckdb_line "$pv")"
 		if [ "$pl" != "$go_line" ]; then
-			fail "platform bindings $pv target DuckDB $pl while the bindings root ($go_bindings) targets $go_line. A static build (no -tags duckdb_use_lib) would link $pl objects against $go_line headers. Run 'go get github.com/duckdb/duckdb-go-bindings@$go_bindings && go mod tidy' to drop the orphaned family."
+			fail "prebuilt libs duckdb-go-bindings/lib/* are at $pv (DuckDB $pl) while the bindings root ($go_bindings) targets $go_line. A static build (no -tags duckdb_use_lib) would link $pl objects against $go_line headers. Align them: 'go get github.com/duckdb/duckdb-go-bindings/lib/...@$go_bindings && go mod tidy'."
 		fi
 	done <<<"$plat_versions"
 fi
