@@ -61,8 +61,32 @@ CRANE="$ROOT/.local/bin/crane.exe"; [ -x "$CRANE" ] || CRANE="$ROOT/.local/bin/c
 # upload is a wasted hour, so the scope is asserted first. `gh auth token` yields
 # whatever the CLI holds; GHCR_PAT overrides it for the case where a separate PAT
 # is used (which is what CI does, to keep the package born-private).
-TOKEN="${GHCR_PAT:-$(gh auth token 2>/dev/null)}"
-[ -n "$TOKEN" ] || die "no token: set GHCR_PAT, or run 'gh auth login'"
+# THREE SOURCES, IN THIS ORDER, AND THE FILE EXISTS FOR A REASON.
+#
+#   1. $GHCR_PAT              — what CI uses
+#   2. .local/ghcr.pat        — a file, so the token never has to be typed into a
+#                               shell (history) or pasted into a chat transcript.
+#                               .local/ is gitignored, so it cannot be committed.
+#   3. `gh auth token`        — convenient, but the CLI's own token is an OAuth
+#                               token whose scopes are granted by a DEVICE FLOW:
+#                               `gh auth refresh` prints a code and waits for a
+#                               browser. Run non-interactively it just dies with
+#                               "context deadline exceeded" and grants nothing.
+#
+# A classic PAT is also the posture CI deliberately chose: pushing with a PAT
+# rather than the workflow token is what makes the package born-PRIVATE, which
+# matters because this is verbatim standards text.
+TOKEN="${GHCR_PAT:-}"
+if [ -z "$TOKEN" ] && [ -f "$ROOT/.local/ghcr.pat" ]; then
+  TOKEN="$(tr -d ' \t\r\n' < "$ROOT/.local/ghcr.pat")"
+  log "token read from .local/ghcr.pat"
+fi
+[ -n "$TOKEN" ] || TOKEN="$(gh auth token 2>/dev/null)"
+[ -n "$TOKEN" ] || die "no token. Either:
+   - write a classic PAT with write:packages into .local/ghcr.pat, or
+   - export GHCR_PAT=<that PAT>, or
+   - run 'gh auth refresh -h github.com -s write:packages,read:packages' in a REAL
+     terminal (it needs a browser and will not work backgrounded)"
 # grep+cut, not awk: `awk -F': '` with tolower() returns EMPTY for this header on
 # the awk that ships with Git Bash here, which would report "no scopes" for a
 # perfectly good token and refuse to publish. Verified both ways against the live
@@ -72,11 +96,15 @@ SCOPES="$(curl -sS -I -H "Authorization: token $TOKEN" https://api.github.com/us
 log "token scopes: ${SCOPES:-<none reported>}"
 case ",$(echo "$SCOPES" | tr -d ' '),"  in
   *,write:packages,*) ;;
-  *) die "the token cannot write packages. Grant the scope and re-run:
+  *) die "this token cannot write packages (it has: ${SCOPES:-none}).
 
-     gh auth refresh -h github.com -s write:packages,read:packages
+   Easiest, and what CI does — a classic PAT, no browser dance:
+     1. https://github.com/settings/tokens/new  -> tick write:packages + read:packages
+     2. write it to .local/ghcr.pat   (gitignored; keeps it out of shell history)
+     3. re-run this script
 
-   or export GHCR_PAT=<a classic PAT with write:packages>.";;
+   Or, in a REAL terminal (it opens a browser and will NOT work backgrounded):
+     gh auth refresh -h github.com -s write:packages,read:packages";;
 esac
 
 # publish_one <package> <local file> <name inside the image>
