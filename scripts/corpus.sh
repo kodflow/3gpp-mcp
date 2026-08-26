@@ -309,6 +309,30 @@ process_spec() {
   local recode='s/^([0-9]{4,5}(-[0-9]+)?)_([0-9a-z]{3}|[0-9]{6})/\1-\3/'
   zipbase="$(printf '%s' "$zipbase" | sed -E "$recode")"
   if unzip -qo "$zip" -d "$tmp" 2>/dev/null; then
+    # A ZIP INSIDE THE ZIP IS WHERE THE SPEC ACTUALLY IS.
+    #
+    # When a spec is submitted to plenary for information, 3GPP wraps it: the outer
+    # archive holds a presentation cover ("SP-260553_Presentation_of_TS23366...docx")
+    # NEXT TO a nested zip carrying the real document. Stopping at the first level
+    # therefore found a .docx, converted it happily, and indexed an 8 KB cover note
+    # under the spec id — while 182 KB of specification sat unopened beside it.
+    #
+    # Five keys were in that state (23.366, 23.370, 23.545, 26.892, 28.893) and every
+    # one of them looked like a permanent upstream absence: the archive existed, it
+    # was fetched, it contained a document, and the document had no clauses. They came
+    # within one commit of being recorded in contracts/accepted-absences.txt as specs
+    # 3GPP never published.
+    #
+    # Bounded to two levels on purpose: that is the shape 3GPP actually ships, and an
+    # unbounded descent would follow a zip bomb.
+    local nested
+    while IFS= read -r nested; do
+      [ -n "$nested" ] || continue
+      echo "$(date -Is) NESTEDZIP $(basename "$zip") :: $(basename "$nested")" >&2
+      unzip -qo "$nested" -d "$tmp" 2>/dev/null || true
+      rm -f "$nested"
+    done < <(find "$tmp" -type f -iname '*.zip')
+
     # Candidate spec documents, minus: Word owner-lock stubs (._*, ~$* — e.g. the
     # 28552 sample media), and pure readme / release-note placeholders. Some zips
     # (e.g. 55.226) ship ONLY a readme and no spec doc — converting it would index
