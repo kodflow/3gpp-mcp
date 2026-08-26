@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // paraSep is the separator a body was split on, and the one it is rebuilt with.
@@ -236,4 +238,66 @@ func (s *Store) availabilityCA(ctx context.Context, specID, prefix string) ([]Cl
 		out = append(out, cr)
 	}
 	return out, rows.Err()
+}
+
+// getClausesCA is GetClauses over the content-addressed tables, in the two steps
+// ADR 0004 measured: select the occurrences, then rebuild only the bodies they
+// point at.
+//
+// Distinct bodies are rebuilt ONCE even when many occurrences share them, which
+// is the common case — 2 752 688 occurrences resolve to 897 556 bodies. Asking
+// for a whole spec-version therefore rebuilds far fewer bodies than it returns
+// clauses.
+func (s *Store) getClausesCA(ctx context.Context, specID, version, clausePrefix string) ([]model.Clause, error) {
+	q := `SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
+	             b.heading, o.is_normative, o.body_id
+	      FROM clause_occ o JOIN bodies b USING (body_id)
+	      WHERE o.spec_id = ?`
+	args := []any{specID}
+	if version != "" {
+		q += ` AND o.version = ?`
+		args = append(args, version)
+	}
+	if clausePrefix != "" {
+		q += ` AND (o.clause_path = ? OR o.clause_path LIKE ?)`
+		args = append(args, clausePrefix, clausePrefix+".%")
+	}
+	q += ` ORDER BY len(o.clause_path), o.clause_path`
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []model.Clause
+	var owner []int64 // owner[i] is the body of out[i] — kept parallel, never re-queried
+	var want []int64
+	seen := map[int64]bool{}
+	for rows.Next() {
+		var c model.Clause
+		var bodyID int64
+		if err := rows.Scan(&c.ChunkID, &c.SpecID, &c.Release, &c.Version,
+			&c.ClausePath, &c.Heading, &c.IsNormative, &bodyID); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+		owner = append(owner, bodyID)
+		if !seen[bodyID] {
+			seen[bodyID] = true
+			want = append(want, bodyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	texts, err := s.bodyTexts(ctx, want)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Text = texts[owner[i]]
+	}
+	return out, nil
 }

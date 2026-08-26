@@ -166,3 +166,50 @@ func TestBodyTextsRebuildsOnlyWhatIsAsked(t *testing.T) {
 		t.Errorf("an empty request must be a no-op, got %v err=%v", empty, err)
 	}
 }
+
+// GetClauses must return the same shape whichever way the corpus stores its
+// text — that is the contract every caller above the store depends on.
+func TestGetClausesRebuildsTheTextItUsedToStore(t *testing.T) {
+	s := caFixture(t)
+	got, err := s.GetClauses(context.Background(), "23.501", "19.0.0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d clauses for Rel-19, want 1", len(got))
+	}
+	c := got[0]
+	want := "every release says this" + paraSep + "new in Rel-19"
+	if c.Text != want {
+		t.Errorf("text = %q, want %q", c.Text, want)
+	}
+	if c.Heading != "AMF registration" || c.ClausePath != "5.2" || c.Release != "Rel-19" {
+		t.Errorf("metadata lost: %+v", c)
+	}
+	if c.ChunkID == 0 {
+		t.Error("chunk_id must survive: it is the only per-occurrence identity")
+	}
+}
+
+// Distinct bodies are rebuilt once even when many occurrences share them. Three
+// releases share one body here, so one rebuild must serve all three.
+func TestSharedBodiesAreRebuiltOnce(t *testing.T) {
+	s := caFixture(t)
+	got, err := s.GetClauses(context.Background(), "23.501", "", "5.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("got %d occurrences, want 4 (Rel-16..19)", len(got))
+	}
+	shared := "every release says this" + paraSep + "dropped in Rel-19"
+	n := 0
+	for _, c := range got {
+		if c.Text == shared {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Fatalf("%d occurrences carry the shared body, want 3 — every one of them must get its text", n)
+	}
+}

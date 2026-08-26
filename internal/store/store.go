@@ -956,6 +956,9 @@ func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, e
 // GetClauses returns clauses for a spec/version, optionally restricted to a
 // clause-path prefix (e.g. "6.2" for one NF section), ordered by clause path.
 func (s *Store) GetClauses(ctx context.Context, specID, version, clausePrefix string) ([]model.Clause, error) {
+	if s.contentAddressed {
+		return s.getClausesCA(ctx, specID, version, clausePrefix)
+	}
 	q := `SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative
 	      FROM clauses WHERE spec_id = ?`
 	args := []any{specID}
