@@ -79,6 +79,9 @@ func main() {
 }
 
 func build(h *sql.DB) error {
+	if err := refuseToShrink(h); err != nil {
+		return err
+	}
 	steps := []struct{ label, sql string }{
 		// Staging carries the body text: it is the join key for the occurrences
 		// and the reference the verification compares against. It does NOT
@@ -221,4 +224,39 @@ func report(h *sql.DB) {
 func die(f string, a ...any) {
 	fmt.Fprintf(os.Stderr, "migrate-paragraphs: "+f+"\n", a...)
 	os.Exit(1)
+}
+
+// refuseToShrink stops the one way this conversion can destroy a corpus.
+//
+// The build derives the tables from whatever `clauses` currently holds, with
+// CREATE OR REPLACE. That is right the first time and on a full rebuild. It is
+// catastrophic on a DELTA: `merge --base` folds only the changed buckets into a
+// fresh `clauses`, so re-deriving from it would replace 2 752 688 occurrences
+// with the handful the delta carried — a corpus silently reduced to its last
+// increment, with every gate still green because the numbers are internally
+// consistent.
+//
+// The conversion is not incremental yet. Until it is, this refuses rather than
+// discovers the problem later: a corpus that already carries occurrences may
+// only be rebuilt from a `clauses` that holds at least as many rows.
+func refuseToShrink(h *sql.DB) error {
+	var occ int64
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		return nil // no occurrences yet: this is the first conversion, nothing to lose
+	}
+	if occ == 0 {
+		return nil
+	}
+	var clauses int64
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&clauses); err != nil {
+		return fmt.Errorf("the corpus carries %d occurrences and no readable `clauses` to rebuild them from: %w", occ, err)
+	}
+	if clauses < occ {
+		return fmt.Errorf(
+			"REFUSING to rebuild: `clauses` holds %d rows but the corpus already carries %d occurrences.\n"+
+				"Re-deriving would replace the corpus with that smaller set. This is what a DELTA merge looks like,\n"+
+				"and the conversion is not incremental yet — rebuild from a full corpus, or extend it to merge",
+			clauses, occ)
+	}
+	return nil
 }

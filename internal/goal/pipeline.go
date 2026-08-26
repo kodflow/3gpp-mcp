@@ -42,7 +42,7 @@ func exe(name string) string {
 
 // goBins are the Go commands the pipeline needs on disk. cmd/server is the
 // product; the others are the offline tools the steps call.
-var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi"}
+var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs"}
 
 // rustBins maps a cargo manifest to the binaries built from it. The embedder is
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own
@@ -78,6 +78,7 @@ func Pipeline() []*Step {
 		stepMerge(),
 		stepEmbed(corpus3GPP()),
 		stepEnrich(),
+		stepParagraphs(),
 		stepIndex(corpus3GPP()),
 		stepValidate(),
 		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment: not
