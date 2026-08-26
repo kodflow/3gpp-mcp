@@ -46,8 +46,8 @@ Stockage      : DuckDB (CGO)           (FTS + VSS HNSW + SQL OLAP)
 Graph (V2)    : KuzuDB embedded (CGO)  (relations NE↔NF, evolutions)
 Embeddings    : ONNX Runtime (CGO) + BGE-M3 (1024 dim, 8k ctx, dense+sparse)
 Reranker      : BGE-reranker-v2-m3 ONNX (optionnel, V2)
-Doc parsing   : encoding/xml + archive/zip (DOCX = ZIP+XML, parsing natif)
-Scraping      : net/http + golang.org/x/net (3GPP FTP — DOCX uniquement)
+Doc parsing   : LibreOffice --convert-to html → rust/parse (cf. §13)
+Scraping      : scripts/corpus.sh + rust/discover (3GPP FTP, archives .zip)
 ```
 
 ### 2.1 Pourquoi **Go + CGO** et rien d'autre
@@ -130,6 +130,10 @@ Ollama / vLLM **peuvent** servir **uniquement en batch offline** pour :
 
 ## 4. Schéma de données (DuckDB)
 
+> **La source de vérité est `internal/store/schema.sql`**, pas ce fichier. Ce qui
+> suit est la forme des tables de base, pour lire le code sans ouvrir la DB. Le
+> corpus en porte **16** au total ; les dix autres sont listées en fin de section.
+
 ```sql
 -- Catalogue de specs
 CREATE TABLE specs (
@@ -142,26 +146,29 @@ CREATE TABLE specs (
 
 -- Versions par release
 CREATE TABLE spec_versions (
-    spec_id      VARCHAR,
-    release      VARCHAR,                 -- 'Rel-18'
-    version      VARCHAR,                 -- '18.5.0'
-    freeze_date  DATE,
-    docx_url     VARCHAR,
+    spec_id         VARCHAR,
+    release         VARCHAR,              -- 'Rel-18'
+    version         VARCHAR,              -- '18.5.0'
+    freeze_date     DATE,
+    docx_url        VARCHAR,
+    status          VARCHAR,
+    metadata_source VARCHAR,              -- d'où viennent freeze_date/status
     PRIMARY KEY(spec_id, release, version)
 );
 
 -- Chunks au niveau clause (jamais token-window arbitraire)
 CREATE TABLE clauses (
-    chunk_id     UBIGINT PRIMARY KEY,
-    spec_id      VARCHAR,
-    release      VARCHAR,
-    version      VARCHAR,
-    clause_path  VARCHAR,                 -- '5.2.3.1'
-    heading      VARCHAR,
-    text         VARCHAR,
-    is_normative BOOLEAN,
-    embedding    FLOAT[1024]              -- HNSW index dessus
-);
+    chunk_id       UBIGINT PRIMARY KEY,
+    spec_id        VARCHAR,
+    release        VARCHAR,
+    version        VARCHAR,
+    clause_path    VARCHAR,               -- '5.2.3.1'
+    heading        VARCHAR,
+    text           VARCHAR,
+    is_normative   BOOLEAN,
+    embedding      FLOAT[1024],           -- HNSW index dessus
+    embedding_hash VARCHAR                -- sha(heading+text+model) : un texte
+);                                        -- identique garde son vecteur au merge
 
 PRAGMA create_fts_index('clauses', 'chunk_id', 'heading', 'text');
 INSTALL vss; LOAD vss;
@@ -188,6 +195,7 @@ CREATE TABLE acronyms (
     domain        VARCHAR,                -- '5GC'|'EPC'|'IMS'|'RAN'
     first_release VARCHAR,
     last_release  VARCHAR,
+    source_series VARCHAR,
     PRIMARY KEY(term, domain)
 );
 
@@ -202,59 +210,112 @@ CREATE TABLE evolutions (
 );
 ```
 
-## 5. Surface MCP — **8 tools, pas plus**
+**Les dix autres tables**, posées par `enrich` (overlays) ou par les sujets :
+
+| Table | Posée par | Contenu |
+|---|---|---|
+| `releases` | seed | `(code, name, status, start_date, freeze_date, freeze_meeting)` — l'ordre des releases n'est pas déductible du semver |
+| `api_operations`, `api_schemas` | `ingest-openapi` | opérations et schémas des YAML OpenAPI 5GC, épinglés au SHA Forge (`search_api`) |
+| `li_events`, `li_event_fields`, `li_nf_clauses`, `asn1_types` | `ingest-li` | registre ASN.1 de TS 33.128 (`li_events`) |
+| `clause_sparse` | `embed --sparse-only` | bras sparse — **produit mais consommé par personne**, cf. §13 |
+| `ingest_log` | `ingest`/`merge` | ce qui a été réellement ingéré, pour que `--resume` interroge le corpus et pas seulement le shard |
+| `schema_meta` | toutes | `(key, value)` : identité d'embedding, état HNSW, version de schéma — c'est ce que le serveur lit pour refuser de démarrer sur un désaccord |
+
+## 5. Surface MCP — **10 tools au cœur, + 1 par sujet**
+
+Le cœur est figé dans `internal/mcp/server.go`. Un **sujet** (vertical métier,
+`internal/subject/`) peut en ajouter via `internal/registry` — c'est le seul
+chemin autorisé pour étendre la surface. Aujourd'hui : 10 + `li_events` = **11**.
 
 | Tool | Signature | Rôle |
 |---|---|---|
-| `search_spec` | `(query, release?, series?, spec_type?, top_k=10, mode='hybrid'|'lexical'|'semantic')` | Retrieval hybride avec citations |
+| `search_spec` | `(query, release?, series?, spec_type?, top_k=10, mode='hybrid' \| 'lexical' \| 'semantic')` | Retrieval hybride avec citations |
 | `get_spec` | `(spec_id, release, version?, clause?)` | Fetch d'une spec ou d'une clause précise |
 | `get_changelog` | `(spec_id, from_release, to_release, clause?)` | Liste des CRs et leur impact |
 | `list_releases` | `(spec_id)` | Toutes les `(release, version, freeze_date)` |
 | `resolve_term` | `(term, release?)` | Définition + domaine + références |
-| `trace_evolution` | `(entity, from_release, to_release)` | Sous-graphe d'évolution (V2) |
+| `trace_evolution` | `(entity, from_release, to_release)` | Sous-graphe d'évolution |
 | `find_cross_references` | `(spec_id, clause?)` | Specs/clauses référencées |
 | `list_specs` | `(release?, series?, working_group?)` | Catalogue filtré |
+| `search_api` | `(query, release?, service?, service_family?, spec_id?, method?, kind?, top_k=10)` | Opérations et schémas OpenAPI 5GC (TS 29.5xx), citations épinglées au SHA |
+| `server_info` | `()` | Capacités de retrieval, et **pourquoi** le sémantique est on/off |
+| `li_events` *(sujet `li`)* | `(nf?, release?, interface?)` | Couverture Lawful Interception TS 33.128 : inventaire X1/X2/X3, ou événements d'un NE/NF |
 
 **Toute réponse contient un bloc `citations: [{spec_id, release, version, clause, url}]`.**
 
 ## 6. Pipeline d'ingestion
 
+Depuis le 2026-08-23, tout passe par **une machine** et une seule commande :
+`cmd/goal` + `internal/goal`, une machine à états de **19 étapes** reprenable.
+Runbook complet : `docs/local-pipeline.md`. Décision : `docs/adr/0003`.
+
 ```
-1. Scraper FTP   : net/http sur https://www.3gpp.org/ftp/Specs/archive/
-                   Filtres : doc_type ∈ {TS,TR}, série ∈ {21..38}, release cible
-2. Parser DOCX   : zip.NewReader → word/document.xml via encoding/xml
-                   Extraction :
-                     - heading hierarchy (w:pStyle Heading1-7)
-                     - clauses (chunks par clause leaf)
-                     - tables (w:tbl + gridSpan/vMerge)
-                     - blocs ASN.1 (w:pStyle="PL")
-                     - cross-refs (w:hyperlink)
-                     - Annexe Change History (table en fin de spec)
-3. Embeddings    : ONNX Runtime + BGE-M3 (CPU OK, GPU optionnel)
-                   Batch de 32 chunks, dimensions 1024
-4. Glossaire     : seed depuis TS 21.905 § 3.1 (définitions) et § 3.2 (acronymes)
-                   + mining regex sur le corpus pour expansion contextuelle
-5. CR pipeline   : (V2) scrape /ftp/tsg_*/ pour les CR documents
-                   parsing du cover sheet (section 4 "Clauses affected")
-6. Écriture DB   : COPY ... FROM ... (DuckDB bulk insert, columnar)
-                   Création des index FTS + HNSW à la fin
+toolchain ─┬─ build-go ── test
+           ├─ build-rust ─────────┐
+           └─ build-embedder ──┐  │
+                               │  │
+             seed ── discover ─┼──┴── fetch ── ingest ── merge ─┬─ embed ─┐
+                                                                └─ enrich ┴─ index
+                                                                             │
+                                                              validate ── smoke
 ```
 
-## 7. Périmètre MVP (V1)
-
-| Item | Inclus en V1 | Reporté |
+| Étape | Fait quoi | Coût mesuré |
 |---|---|---|
-| Releases | **Rel-17, Rel-18, Rel-19** (Phase 1 → Rel-16 en V2) | Phase 1 → Rel-16 |
-| Séries | **23, 24, 29, 33, 38** (~150 specs) | 21, 22, 25, 26, 28, 31, 32, 35, 36, 37 |
-| DOCX parsing | ✓ heading, tables, clauses, annexes | figures vision, formules OMML |
-| FTS BM25 | ✓ DuckDB FTS | tuning de scoring custom |
-| Vecteurs | ✓ HNSW DuckDB VSS | reranker |
-| Glossaire | ✓ TS 21.905 seed + regex miner | extraction LLM offline |
-| Changelog | ✓ Change History Annex | CR-pipeline complet |
-| Graph (KuzuDB) | ❌ V2 | NE→NF evolutions complètes |
-| Ollama batch | ❌ pas nécessaire en V1 | extraction d'entités assistée |
+| `discover` | diffe le status report 3GPP vivant contre l'ancre locale | ~3 s |
+| `fetch` | télécharge le delta et **convertit via LibreOffice → HTML** | 4m10, CPU-bound |
+| `ingest` | parse le HTML en shards DuckDB par série (Rust) | minutes/série |
+| `merge` | plie les shards dans le corpus, réécrit l'ancre, construit le FTS | ~6 min |
+| `embed` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
+| `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
+| `index` | construit et **gèle** le HNSW cosine | 1m46 |
+| `validate` | contrat de complétude + `anchorcheck` | ~30 s |
+| `smoke` | démarre le vrai serveur et prouve que le vectoriel est resté actif | ~30 s |
 
-Objectif V1 : **~2-3 semaines solo dev**, livrable utilisable depuis Claude Code en local.
+Points qui ne se devinent pas en lisant le code :
+
+- **On parse le HTML de LibreOffice, pas le DOCX en natif.** Le chemin
+  `zip.NewReader → word/document.xml` a existé (`internal/ooxml`) et a été retiré.
+  Conséquence : LibreOffice est le goulot d'étranglement, pas le GPU.
+- **`merge` avant `embed`**, l'inverse de l'ancienne CI — cf. §13.
+- **Le batch d'embedding est dynamique**, dimensionné sur `nvidia-smi` et
+  `--vram-fraction`, avec repli réversible sur OOM. Pas de « batch de 32 ».
+- **Chaque étape est adressée par contenu.** `goal plan` donne le différentiel ;
+  `goal run --only <étapes>` exécute un sous-ensemble **sans** sauter les
+  préconditions. Un `goal run` nu après un changement dans `internal/goal`
+  refait 45 min de GPU pour rien : `--only` est impératif.
+- **`goal status` ne recalcule rien**, il relit l'état persisté. Seul
+  `goal plan` fait le différentiel.
+
+## 7. Périmètre réel du corpus
+
+Le cadrage MVP « Rel-17/18/19, séries 23/24/29/33/38, ~150 specs » est **dépassé**.
+Ce que le corpus contient au 2026-08-26, mesuré :
+
+| | |
+|---|---|
+| Clauses | **2 752 688** |
+| Specs distinctes / versions | **3 568** / **20 163** |
+| Séries | **31** — 03, 21 à 38, 41 à 52, 55 |
+| Releases | **19** — Rel-4 à Rel-20 (plus Phase 1/2 sur les vieilles séries) |
+| Opérations API 5GC | **8 562** (+ 27 889 schémas) |
+| Événements LI | **405** (Rel-19), 1 697 champs, 1 039 types ASN.1 |
+| ETSI | **14** livrables Lawful Interception, base séparée |
+
+| Capacité | État |
+|---|---|
+| FTS BM25 (DuckDB) | ✓ |
+| Vecteurs HNSW cosine (VSS), gelés | ✓ |
+| Reranker BGE-v2-m3 | ✓ seam optionnelle (build tag `onnx`) |
+| Glossaire TS 21.905 + miner | ✓ |
+| Changelog (Change History Annex) | ✓ ; pipeline CR complet toujours reporté |
+| OpenAPI 5GC / registre LI | ✓ overlays, cf. `docs/local-pipeline.md` |
+| Bras sparse | produit, **jamais consommé** — cf. §13 |
+| Graph KuzuDB | ❌ jamais construit |
+
+**Plancher d'embedding : `Rel-99`.** Tout ce qui est antérieur reste
+délibérément à `NULL` et n'est jamais compté par le contrat — un `validate` qui
+oublie de transmettre ce plancher recale un corpus complet.
 
 ## 8. Pièges identifiés (à éviter dans le code)
 
@@ -267,56 +328,89 @@ Objectif V1 : **~2-3 semaines solo dev**, livrable utilisable depuis Claude Code
 7. **TS ≠ TR.** TS = normatif (~700+ actives), TR = informatif/étude. Toujours filtrer par défaut sur TS.
 8. **Frozen ≠ stable.** Rel-18 frozen en juin 2024 mais ASN.1 + corrections continuent ~12 mois. Distinguer drafts (`xx.0.0`) vs versions stables.
 
-## 9. Structure de repo (cible)
+## 9. Structure de repo (réelle, 2026-08-26)
 
 ```
 3gpp-mcp/
 ├── cmd/
-│   ├── ingest/          # build the DuckDB snapshot from the converted corpus
-│   ├── server/          # MCP server (stdio + SSE) + bootstrap subcommand
-│   ├── merge/           # fuse per-shard DuckDB snapshots into one DB
-│   ├── discover/        # decide which series need (re)indexing (CI matrix)
-│   ├── ingest-catalog/  # overlay DynaReport metadata onto a DB (additive)
-│   ├── ingest-openapi/  # load the 5GC OpenAPI corpus into a DB (additive)
+│   ├── goal/            # LE point d'entrée : la machine à états 19 étapes
+│   ├── server/          # MCP server (stdio + HTTP) + bootstrap subcommand
+│   ├── validate/        # contrat de complétude des données
+│   ├── anchorcheck/     # l'ancre ne doit pas revendiquer du texte absent
+│   ├── discover-etsi/   # énumère les livrables ETSI LI
 │   ├── li-audit/        # cross-check an LI event catalogue vs indexed text
+│   ├── embedid/         # imprime l'identité d'embedding (source unique)
+│   ├── export-delta/    # exporte le delta d'un corpus
+│   ├── dbcount/         # comptages de sanité sur une DB
+│   ├── split/           # découpe un corpus en shards
 │   └── bench/           # offline retrieval benchmark (IR metrics)
+├── rust/                # LE CÔTÉ ÉCRITURE (cf. docs/adr/0001)
+│   ├── parse/           # HTML LibreOffice → ParsedSpec
+│   ├── ingest/          # parse → shards DuckDB (+ branche --etsi)
+│   ├── discover/        # diff status report ↔ ancre, plan de réparation
+│   ├── embedder/        # embedder dense GPU (ONNX Runtime + CUDA)
+│   ├── embed-core/      # tokenisation et fenêtrage partagés
+│   ├── identity/        # EmbedIdentity, miroir de contracts/identity.toml
+│   └── store/           # bins : merge, embed_io, overlay, freeze_hnsw
 ├── internal/
+│   ├── goal/            # la machine à états : DAG, fingerprints, runner, état
 │   ├── model/           # Spec, Clause, Change, Acronym, Evolution
-│   ├── store/           # DuckDB (FTS + HNSW) wrappers, sharded reads
-│   ├── ingest/          # ingestion pipeline orchestration + evolutions seed
-│   ├── htmlparse/       # LibreOffice-HTML → ParsedSpec (primary parser)
-│   ├── ooxml/           # native .docx → ParsedSpec (zip+xml, merged tables)
+│   ├── store/           # DuckDB (FTS + HNSW) wrappers, sharded reads, schema.sql
 │   ├── catalog/         # DynaReport metadata overlay (WG, title, freeze_date)
-│   ├── openapi/         # 5GC OpenAPI (YAML) ingest → api_* tables
+│   ├── enrichmeta/      # métadonnées d'enrichissement
+│   ├── etsicat/         # catalogue ETSI (énumération + résolution)
+│   ├── evolseed/        # seed des évolutions NE → NF
 │   ├── embed/           # BGE-M3 ONNX embedder seam (build tag onnx)
 │   ├── rerank/          # optional BGE-reranker-v2-m3 seam (build tag onnx)
 │   ├── onnxrt/          # shared ONNX Runtime init (process-global)
 │   ├── search/          # intent router + BM25/vector backends + RRF
 │   ├── releaseview/     # release-scoped clause views
 │   ├── eval/            # IR eval harness (graded queries + metrics)
+│   ├── metrics/         # compteurs de service
+│   ├── retry/           # backoff partagé (403 ≠ transitoire, cf. §8)
 │   ├── bootstrap/       # self-provisioning: fetch DB snapshot + models
 │   ├── mcp/             # Tools MCP (search_spec, get_changelog, ...)
 │   ├── registry/        # wires the set of enabled subjects
-│   └── subject/         # domain-vertical plugins (glossary, li/asn1)
+│   ├── subject/         # domain-vertical plugins (glossary, li/asn1)
+│   └── subjectmeta/     # métadonnées et empreintes des sujets
+├── contracts/
+│   ├── identity.toml            # l'identité d'embedding, source unique
+│   └── accepted-absences.txt    # absences légitimes, AVEC leur raison
+├── scripts/
+│   ├── local/           # toolchain portable Windows (bootstrap + env)
+│   ├── lib/             # helpers de conversion partagés
+│   ├── corpus.sh        # download → unzip → LibreOffice → HTML
+│   ├── etsi-corpus.sh   # idem côté ETSI
+│   ├── fetch-5g-apis.sh # overlay OpenAPI 5GC
+│   ├── fetch-li-asn.sh  # overlay registre ASN.1 TS 33.128
+│   └── *_test.sh        # suites shell, exécutées par l'étape `test`
 ├── data/              # gitignored
-│   ├── 3gpp.duckdb
-│   ├── 3gpp.kuzu/
+│   ├── 3gpp.duckdb    # le corpus
+│   ├── etsi.duckdb    # ETSI, SÉPARÉ, jamais fusionné
+│   ├── sources/       # origin (zip), convert (html), asn, 5g-apis
 │   └── models/
 │       └── bge-m3.onnx
-├── docs/              # MkDocs si réactivé, architecture, ADRs
+├── .local/            # gitignored : toolchain, binaires, shards, logs, état
+├── docs/              # local-pipeline.md, adr/, architecture, research
+├── mk/                # fragments Makefile (local.mk)
 ├── tests/
 ├── .devcontainer/     # template kodflow synchronisé via /update
 ├── .claude/           # commandes/agents/hooks via image template
-├── .github/           # CI (workflows synchronisés)
+├── .github/           # CI (crons corpus désactivés, cf. §13)
 ├── .githooks/
-├── .taskmaster/
 ├── .vscode/
+├── .mcp.json          # branchement client du serveur local
 ├── AGENTS.md          # specs des agents IA utilisés
 ├── CLAUDE.md          # ce fichier
 ├── Makefile           # build, ingest, serve, test
 ├── go.mod
 └── README.md
 ```
+
+**Ce qui a disparu et ne reviendra pas** : `cmd/ingest`, `cmd/merge`,
+`cmd/discover`, `cmd/ingest-catalog`, `cmd/ingest-openapi`, `internal/ingest`,
+`internal/htmlparse`, `internal/ooxml`, `internal/openapi` — le côté écriture est
+passé en Rust (`docs/adr/0001`). `data/3gpp.kuzu/` n'a jamais existé.
 
 ## 10. Workflow de dev assumé avec Claude Code
 
@@ -382,6 +476,21 @@ Les décisions ci-dessous sont **figées**. Une PR/MR proposant l'inverse doit �
 - ❌ Pas d'OCR
 - ❌ Pas de chunking par token-window arbitraire — toujours clause-aware
 - ❌ Pas de résumés côté serveur — Claude synthétise
+- ✅ **`merge` AVANT `embed`** (l'inverse de l'ancienne CI). `ingest` rebase les
+  `chunk_id` à ~0 par shard : partager un ledger entre shards fait **sauter des
+  clauses par collision**, en silence. Après le merge les ids sont uniques, donc
+  un ledger unique est sûr *et* donne la dédup de contenu sur tout le corpus
+  (2,74× de GPU économisé, mesuré).
+- ✅ **fp32, pas fp16.** La précision fait partie de l'`EmbedIdentity` : basculer
+  coûte un re-embed intégral du corpus.
+- ⚠️ **Le bras sparse est produit mais consommé par personne.** Son fold au bake
+  n'a jamais été écrit, donc la couche n'atteint pas l'image servie. Ne pas
+  relancer de campagne GPU dessus tant que le consommateur n'existe pas.
+- ❌ **Ne pas réactiver les crons corpus** de `.github/workflows/` (marqueur
+  `# [local-pipeline] trigger desactive`, `workflow_dispatch` conservé) : ils
+  échouaient ~28 fois par jour contre une infra qui n'indexe plus.
+- ✅ **ETSI reste SÉPARÉ** (`etsi.duckdb`), jamais fusionné dans `3gpp.duckdb`.
+  Le serveur fédère à la lecture via `--etsi-db`.
 
 ## 14. Liens utiles
 
