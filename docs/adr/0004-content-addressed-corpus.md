@@ -157,6 +157,27 @@ for a whole spec-version — the honest cost — and not measurable for a search
 returning ten hits. The alternative, keeping the text materialised to avoid it,
 is the 1.53 GB this change exists to remove.
 
+### …but the view IS what replaces the table, for everything that reads metadata
+
+The conclusion above was drawn from queries that select the text, and it is only
+true of them. Measured afterwards: **DuckDB prunes the text column when it is not
+selected.** Through the view, over 2 752 688 rows:
+
+| | |
+|---|---:|
+| `count(*)` | **0.62 s** |
+| `count(DISTINCT release)` | **0.44 s** |
+
+So when `clauses` is dropped a VIEW takes its name, and every caller that reads
+metadata off it keeps working untouched — `cmd/validate`'s counts,
+`cmd/anchorcheck`'s (spec, release, version) sweep, `cmd/split`, the sparse join.
+Only the paths that genuinely need text were converted in Go, and those are the
+ones that would have paid the 5.34 s.
+
+`CREATE TABLE IF NOT EXISTS clauses` is a no-op against an existing view of that
+name — verified, and pinned by a test, because a silent resurrection would put an
+empty table under the corpus and make it read as empty.
+
 ## Consequences
 
 - The read side is converted, not wrapped: two steps at each call site that
@@ -169,3 +190,39 @@ is the 1.53 GB this change exists to remove.
   clause_path)`.
 - Projected whole-corpus effect: **~30 GB → ~10 GB**, which also moves the data
   image (14 GB today).
+
+## Where it stands, and what is deliberately not done
+
+Executed and measured on the real corpus:
+
+| | |
+|---|---:|
+| Corpus before | 30.25 GB |
+| Corpus after | **12.36 GB** |
+| Occurrences verified byte-for-byte | 2 752 688 / 2 752 688 |
+| Vectors indexed | 821 146 (was 2 752 688 references to them) |
+| HNSW build | 6 m 33 |
+| BM25 over paragraphs | 46 s |
+| Lexical nDCG@10 | 0.014 → **0.072** |
+| `smoke` | 45 s → **4 s** |
+
+`paragraphs` is a pipeline step between `enrich` and `index`, so a fresh clone
+produces this shape rather than the old one. That position is also why the Rust
+write side needs no change at all: it keeps producing `clauses` with its text and
+its vectors, and converting afterwards carries those vectors onto the bodies that
+own them.
+
+**The conversion is not incremental.** It derives the tables from whatever
+`clauses` holds, which is right on a full corpus and destructive on a delta:
+`merge --base` folds only the changed buckets, so re-deriving would replace
+2 752 688 occurrences with the increment — and every gate would stay green,
+because the numbers would agree with each other. `migrate-paragraphs` therefore
+REFUSES to rebuild a corpus that already carries more occurrences than `clauses`
+has rows. Making it merge instead of replace is the next piece of work, and until
+it exists a delta run must be followed by a full re-derivation.
+
+**One limit worth stating in answers, not just in code.** The dedup unit is the
+exact byte string, so a re-wrapped line reads as a change. TS 23.501 §5.4.4a
+shows it: Rel-15 and Rel-16 carry the same sentence with a line break moved, and
+`trace_clause` reports two paragraphs. A normalised hash alongside the exact one
+would fix it and is not done.
