@@ -1043,3 +1043,45 @@ func TestGoalHelperProcess(t *testing.T) {
 		os.Exit(0)
 	}
 }
+
+// --- the LI registry ------------------------------------------------------
+
+// Rel-17 sorts before Rel-19 and the walk is lexical, so "the first match" is
+// the WRONG match: it would document the LI events of a spec three releases
+// behind the text the corpus serves.
+func TestTheLIRegistryComesFromTheNewestRelease(t *testing.T) {
+	c, _ := newTestCtx(t)
+	for _, rel := range []string{"Rel-17", "Rel-18", "Rel-19", "Rel-9"} {
+		dir := filepath.Join(c.dataPath("sources"), "asn", rel)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "TS33128Payloads.asn"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := findASN(c)
+	if !strings.Contains(filepath.ToSlash(got), "/Rel-19/") {
+		t.Fatalf("the newest release must win, got %q", got)
+	}
+}
+
+func TestNoRegistryIsNotAnError(t *testing.T) {
+	c, _ := newTestCtx(t)
+	if got := findASN(c); got != "" {
+		t.Fatalf("an absent registry must read as absent, got %q", got)
+	}
+}
+
+func TestAReleaseNumberIsReadFromThePathNotTheName(t *testing.T) {
+	for path, want := range map[string]int{
+		"data/sources/asn/Rel-19/TS33128Payloads.asn": 19,
+		"data/sources/asn/Rel-9/TS33128Payloads.asn":  9,
+		"data/asn/TS33128Payloads.asn":                -1,
+		"data/sources/asn/Rel-XX/TS33128Payloads.asn": -1,
+	} {
+		if got := releaseNumber(filepath.FromSlash(path)); got != want {
+			t.Fatalf("releaseNumber(%q) = %d, want %d", path, got, want)
+		}
+	}
+}
