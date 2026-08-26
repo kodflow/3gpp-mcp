@@ -56,5 +56,25 @@ func run(ctx context.Context, path string) error {
 	}
 	fmt.Printf("spec_versions=%d\n", sv)
 	fmt.Printf("api_operations=%d\n", ao)
+	// The bake needs two more facts, and both must come from the DB rather than
+	// from a log. corpus-data-image.yml used to read its vectorised count out of
+	// the overlay's stdout, and the comment there records what that cost: the
+	// Rust rewrite changed the wording, the greps were never repointed, and the
+	// count silently read 0 for months. A number taken from the thing being
+	// measured cannot drift that way.
+	//
+	// Counting through `clauses` is deliberate. On a content-addressed corpus
+	// (ADR 0004) that name is a view and the embedding comes off `bodies`, so
+	// this counts OCCURRENCES that resolve to a vector — the same unit the old
+	// lexical+overlay corpus reported, which keeps the bake's >= 2,000,000
+	// threshold meaning what it always meant. Measured at 5.2 s on the real
+	// corpus: DuckDB never rebuilds the text, because nothing selects it.
+	var vec int64
+	if err := s.QueryRowContext(ctx,
+		`SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&vec); err != nil {
+		return fmt.Errorf("count clauses with vectors: %w", err)
+	}
+	fmt.Printf("clauses_with_vectors=%d\n", vec)
+	fmt.Printf("embedding_model=%s\n", s.GetMeta(ctx, "embedding_model"))
 	return nil
 }
