@@ -48,6 +48,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The 3GPP layer tar is 12.4 GB. A dead one left behind by a failed push is
+# 12.4 GB of silence, so every work dir is registered here and swept on EXIT —
+# not on RETURN, because `die` exits, and a RETURN trap would fail to fire on
+# exactly the path where it matters.
+WORKDIRS=""
+cleanup() { for d in $WORKDIRS; do rm -rf "$d" 2>/dev/null; done; }
+trap cleanup EXIT
+
 log() { printf '[publish] %s\n' "$*"; }
 die() { printf '[publish][error] %s\n' "$*" >&2; exit 1; }
 
@@ -94,9 +102,14 @@ fi
 SCOPES="$(curl -sS -I -H "Authorization: token $TOKEN" https://api.github.com/user 2>/dev/null \
           | tr -d '\r' | grep -i '^x-oauth-scopes:' | cut -d: -f2- | sed 's/^ *//')"
 log "token scopes: ${SCOPES:-<none reported>}"
-case ",$(echo "$SCOPES" | tr -d ' '),"  in
+case ",$(echo "$SCOPES" | tr -d ' ')," in
   *,write:packages,*) ;;
-  *) die "this token cannot write packages (it has: ${SCOPES:-none}).
+  *)
+    # A dry run pushes nothing, so it must not need a credential to exercise the
+    # tar, the disk guard and the cleanup — those are the parts worth rehearsing
+    # before an 8 GB upload, and requiring a token to rehearse them is how a
+    # script goes untested until the day it matters.
+    MSG="this token cannot write packages (it has: ${SCOPES:-none}).
 
    Easiest, and what CI does — a classic PAT, no browser dance:
      1. https://github.com/settings/tokens/new  -> tick write:packages + read:packages
@@ -104,7 +117,10 @@ case ",$(echo "$SCOPES" | tr -d ' '),"  in
      3. re-run this script
 
    Or, in a REAL terminal (it opens a browser and will NOT work backgrounded):
-     gh auth refresh -h github.com -s write:packages,read:packages";;
+     gh auth refresh -h github.com -s write:packages,read:packages"
+    [ "$DRY" = 1 ] || die "$MSG"
+    log "DRY RUN — continuing without write:packages; a real push would refuse:"
+    printf '%s\n' "   $MSG" >&2;;
 esac
 
 # publish_one <package> <local file> <name inside the image>
@@ -114,18 +130,36 @@ publish_one() {
   [ -s "$src" ] || { log "no $src — skipping $pkg"; return 0; }
 
   local work; work="$(mktemp -d "$ROOT/.local/publish-XXXXXX")" || die "mktemp"
+  # crane needs the layer as a FILE (-f takes a path, not a stream), so a 12.4 GB
+  # tar has to exist on disk for the duration of the push. Registered for the
+  # EXIT sweep above.
+  WORKDIRS="$WORKDIRS $work"
+
+  # Refuse before writing rather than fill the volume and fail halfway.
+  local need avail
+  need=$(( $(stat -c %s "$src") / 1024 + 524288 ))   # the file + 512 MB headroom
+  avail=$(df -Pk "$ROOT/.local" | awk 'NR==2{print $4}')
+  [ "$avail" -gt "$need" ] || die "$pkg needs ~$((need/1048576)) GB free for the layer tar, $((avail/1048576)) GB available"
+
   # The member sits at the ROOT of the tar so it lands at /$member in the image:
   # corpus-data-image.yml does `docker cp "$cid:/$member"` and nothing else.
-  log "$pkg: staging $member ($(du -h "$src" | cut -f1))"
-  cp -f "$src" "$work/$member" || die "copy $src"
-  ( cd "$work" && tar -cf layer.tar "$member" ) || die "tar $member"
-  rm -f "$work/$member"
+  # -C rather than copying the file in first: the copy would cost a SECOND 12.4 GB
+  # and several minutes, to produce a tar that is about to be written regardless.
+  local dir base; dir="$(dirname "$src")"; base="$(basename "$src")"
+  log "$pkg: taring $member ($(du -h "$src" | cut -f1)) straight from $dir/"
+  if [ "$base" = "$member" ]; then
+    tar -cf "$work/layer.tar" -C "$dir" "$base" || die "tar $member"
+  else
+    cp -f "$src" "$work/$member" || die "copy $src"
+    ( cd "$work" && tar -cf layer.tar "$member" ) || die "tar $member"
+    rm -f "$work/$member"
+  fi
   log "$pkg: layer is $(du -h "$work/layer.tar" | cut -f1) uncompressed (crane gzips it on the wire)"
 
   local date_tag; date_tag="$(date -u +%F)"
   if [ "$DRY" = 1 ]; then
     log "DRY RUN — would push $repo:$date_tag and retag :latest"
-    rm -rf "$work"; return 0
+    return 0
   fi
 
   printf %s "$TOKEN" | "$CRANE" auth login ghcr.io -u "$OWNER" --password-stdin \
@@ -135,7 +169,6 @@ publish_one() {
   "$CRANE" append --oci-empty-base -f "$work/layer.tar" -t "$repo:$date_tag" \
     || die "crane append failed for $pkg"
   "$CRANE" tag "$repo:$date_tag" latest || die "crane tag latest failed for $pkg"
-  rm -rf "$work"
   log "$pkg: published $repo:$date_tag (+ :latest)"
 
   # ANTI-LEAK. Verbatim standards text must not become a public package.
