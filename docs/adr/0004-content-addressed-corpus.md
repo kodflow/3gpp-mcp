@@ -298,7 +298,10 @@ And the in-image guard, `check-data`, was the weakest of the three checks in the
 table above: `hnsw_state == "frozen"` and nothing else, not even that the index
 existed. It is the last gate before a corpus starts answering queries.
 
-The full image itself has not been built. That needs a container runtime this
+CI's `image-smoke` builds the **light** target on every push and passes on this
+branch, so the Dockerfile — schema changes included — does build. The **full**
+target, the one that inherits the ~12 GB data layer and runs the `check-data`
+guard against it, has never been built. That needs a container runtime this
 machine does not have, and installing one is not a thing to do unasked.
 
 ## Consequences

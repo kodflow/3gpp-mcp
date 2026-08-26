@@ -50,7 +50,9 @@ absence accepted to get there.
   resolves through the 3GPP archive endpoint; `scripts/fetch-li-asn.sh` is new),
   so `enrich` no longer depends on files someone fetched by hand.
 - `scripts/local/build-image.sh` builds both images from a locally produced
-  corpus, ETSI included. Written but **not exercised**: no Docker runtime here.
+  corpus, ETSI included. The `full` image itself has never been built — no
+  container runtime here — but the script was dry-run end to end against a stub
+  `docker`, and CI's `image-smoke` builds the `light` target on every push.
 
 - `cmd/goal` + `internal/goal`: a 20-step resumable state machine that owns the
   whole build — toolchain, build, seed, discover, fetch, ingest, merge, embed,
