@@ -132,6 +132,17 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithNumber("top_k", mcp.Description("max results (default 10)")),
 	), h.searchAPI)
 
+	s.AddTool(mcp.NewTool("trace_clause",
+		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which releases carry each "+
+			"statement, when it was introduced, and whether it is gone from the newest release. "+
+			"With from_release and to_release, the paragraphs the clause gained and lost between them. "+
+			"Clause-level lineage cannot see this: a clause that changed one sentence looks entirely new to it."),
+		mcp.WithString("spec_id", mcp.Required(), mcp.Description("e.g. 23.501")),
+		mcp.WithString("clause", mcp.Required(), mcp.Description("exact clause path, e.g. 5.4.4a")),
+		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two")),
+		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two")),
+	), h.traceClause)
+
 	s.AddTool(mcp.NewTool("server_info",
 		mcp.WithDescription("Report the server's retrieval capabilities and why semantic search is on/off "+
 			"(so a client knows whether to use mode=semantic). Read-only, no arguments."),
@@ -701,4 +712,63 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// traceClause answers how a clause's TEXT evolved, paragraph by paragraph.
+//
+// The existing lineage tools work at clause granularity, which cannot see the
+// change that matters most in a spec: a clause that gains or loses one sentence
+// between releases looks, to them, exactly like a clause that was rewritten.
+// Since the corpus stores each paragraph once (ADR 0004), "which releases carry
+// this sentence" is a lookup rather than a diff.
+//
+// With from/to it answers the narrower question — what this clause gained and
+// lost between two releases — as a set operation on paragraph ids, never a text
+// comparison.
+func (h *handlers) traceClause(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	specID, err := r.RequireString("spec_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	clause, err := r.RequireString("clause")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	st := h.storeFor(specID)
+	if !st.ContentAddressed() {
+		return mcp.NewToolResultError(
+			"this corpus does not carry paragraph-level provenance — it predates the content-addressed " +
+				"storage (ADR 0004). Clause-level lineage is still available through get_spec and list_releases."), nil
+	}
+
+	from := r.GetString("from_release", "")
+	to := r.GetString("to_release", "")
+	if from != "" && to != "" {
+		added, removed, kept, dErr := st.ClauseDelta(ctx, specID, clause, from, to)
+		if dErr != nil {
+			return mcp.NewToolResultErrorFromErr("trace_clause delta failed", dErr), nil
+		}
+		return jsonResult(map[string]any{
+			"spec_id": specID, "clause": clause, "from": from, "to": to,
+			"added": added, "removed": removed, "unchanged_paragraphs": kept,
+		})
+	}
+
+	traces, lErr := st.ParagraphLineage(ctx, specID, clause)
+	if lErr != nil {
+		return mcp.NewToolResultErrorFromErr("trace_clause failed", lErr), nil
+	}
+	return jsonResult(map[string]any{
+		"spec_id": specID, "clause": clause, "paragraphs": traces,
+	})
+}
+
+// storeFor routes an id to the corpus that owns it. ETSI ids are served by the
+// second store when one is attached; everything else is 3GPP. The two are never
+// merged, so the routing has to be explicit.
+func (h *handlers) storeFor(specID string) store.Reader {
+	if h.etsi != nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(specID)), "ETSI") {
+		return h.etsi
+	}
+	return h.st
 }

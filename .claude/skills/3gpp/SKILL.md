@@ -1,11 +1,13 @@
 ---
 name: 3gpp
 description: >
-  Answer ANY question touching 3GPP / telecom standards (5GC, EPC, IMS, RAN, NAS,
-  SBI/OpenAPI, Lawful Interception, releases Rel-8…Rel-19, TS/TR specs, NF/NE,
-  interfaces N1/N2/N4/S1/X2, procedures) by DEEP retrieval over the 3gpp-mcp
-  server — never from memory. Triggers on spec ids (TS 23.501), acronyms (AMF,
-  SMF, MME, PCF…), procedure names, release comparisons, or "/3gpp <question>".
+  Answer ANY question touching 3GPP **or ETSI** standards (5GC, EPC, IMS, RAN,
+  NAS, SBI/OpenAPI, Lawful Interception, releases Rel-8…Rel-20, TS/TR specs,
+  ETSI TS 103 221 / 102 232 / 101 671, NF/NE, interfaces N1/N2/N4/S1/X1/X2/X3,
+  procedures) by DEEP retrieval over the 3gpp-mcp server — never from memory. The
+  server carries BOTH corpora and answers across them in one place. Triggers on
+  spec ids (TS 23.501, ETSI TS 103 221), acronyms (AMF, SMF, MME, PCF, LEMF,
+  MDF…), procedure names, release comparisons, or "/3gpp <question>".
 ---
 
 # /3gpp — strict cited 3GPP answering over the 3gpp-mcp server
@@ -19,6 +21,47 @@ The server is a retrieval engine: it returns exact spec fragments with citations
 `{spec_id, release, version, clause, url}` and NEVER summarises. You do the
 reasoning. **Cite-or-silent**: a claim without a citation does not go in the
 answer. If retrieval returns nothing usable, say so — invent nothing.
+
+## Two corpora, one server — and when the second one is the answer
+
+The server carries **3GPP and ETSI side by side**, never merged. `list_specs`
+unions them; `get_spec` and `list_releases` route an `ETSI …` id to the ETSI
+corpus and everything else to 3GPP. You do not choose a backend — you ask, and
+ids decide.
+
+**Lawful Interception is the case where forgetting ETSI produces a wrong answer.**
+3GPP defines what a network element must report (TS 33.126 requirements, 33.127
+architecture, 33.128 the ASN.1 payloads); ETSI defines how it is delivered
+(TS 103 221 the X1 provisioning interface, TS 102 232 the handover
+delivery family, TS 101 671 the legacy HI, TS 103 120 the warrant interface).
+A question about "the AMF's registration event" is 3GPP; the same question about
+"how that event reaches the LEMF" is ETSI. **When a question touches LI, search
+BOTH** — a 3GPP-only answer to a delivery question is confidently incomplete.
+
+The ETSI corpus is the 14-deliverable LI suite, not all of ETSI. If a question
+needs an ETSI deliverable that is not indexed, say so rather than reaching for
+memory.
+
+## Provenance at the sentence level — `trace_clause`
+
+`get_changelog` tells you a CR touched a clause. `trace_clause` tells you what
+the clause actually SAYS differently, paragraph by paragraph: which releases
+carry each statement, when it was introduced, and whether it is gone from the
+newest release.
+
+Use it whenever the question is about evolution rather than about current state:
+
+- *"when did X appear / is X still true in Rel-19?"* — `trace_clause` with
+  `spec_id` + `clause`, then read `introduced`, `last_seen`, `obsolete`;
+- *"what changed between Rel-18 and Rel-19?"* — the same call with
+  `from_release` and `to_release`: it returns the paragraphs added and removed.
+
+Why it beats a clause-level answer: a clause that gained one sentence looks
+entirely new to release-level lineage. `trace_clause` isolates the sentence.
+
+Two honest limits to carry into the answer: the unit is the exact text, so a
+re-wrapped line reads as a change; and the ETSI corpus does not carry
+paragraph-level provenance — the tool says so plainly instead of guessing.
 
 ## Deep-research protocol (MANDATORY — never answer from a single tool call)
 
@@ -37,8 +80,13 @@ ambiguous: `list_specs` / `list_releases` to pin `(release, version)`.
 3. one reformulation from a different angle (synonym, the procedure name instead
    of the NF, the EN canonical term instead of the user's wording).
 Add the domain tools when they apply: `search_api` (5GC SBI/OpenAPI, TS 29.5xx),
-`li_events` (LI, TS 33.128), `get_changelog` (diff/évolution between releases),
+`li_events` (LI, TS 33.128), `get_changelog` (which CRs touched a clause),
+`trace_clause` (what the clause SAYS differently, paragraph by paragraph),
 `trace_evolution` (NE↔NF lineage, e.g. MME → AMF+SMF).
+
+**On an LI question, one of these rounds must be ETSI.** Search the delivery
+side (X1 provisioning, X2/X3 handover, HI1/HI2/HI3) as well as the 3GPP
+reporting side, or the answer covers half the chain.
 
 **C — Read, don't skim.** For the top 2–3 hits: `get_spec` the FULL clause (and
 its parent when the snippet looks truncated) — never quote from a search snippet
@@ -72,6 +120,7 @@ append a closing `│`, never pad with spaces.
 │ Interfaces : <N1 · N2 · N4 · … | S1 · X2 · …>
 │ Procédure  : <Registration | PDU Session Establishment | …>
 │ Specs      : <TS 23.501 · TS 23.502 · …>
+│ Corpus     : <3GPP | ETSI | 3GPP + ETSI>   ← name BOTH when both were searched
 │ WG         : <SA2 · CT1 · …>
 │ Type       : <TS (normatif)|TR>
 │ Évolution  : <MME (4G) → AMF + SMF (5G) | —>
