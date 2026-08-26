@@ -70,7 +70,18 @@ else
 fi
 log "image-data/ = $(du -sh image-data | cut -f1)"
 
-ROWS="$(.local/bin/dbcount.exe --db "$CORPUS" 2>/dev/null | head -1 | tr -d '\r')"
+# The label is io.kodflow.3gpp.duckdb.rows, so it has to carry a row count.
+# `dbcount | head -1` gave it "spec_versions=20163" — the first line of a
+# multi-line report, which is a catalogue size, not the corpus's rows. An
+# operator reading that label off a pulled image would be told the wrong thing
+# about what they pulled, which is the whole reason the label exists.
+#
+# Ask the corpus directly. On a converted corpus `clauses` is a view over the
+# occurrences and count(*) through it is 0.62 s, because DuckDB prunes the text
+# column it never selects (ADR 0004).
+ROWS="$(.local/bin/q.exe "$CORPUS" "SELECT count(*) FROM clauses" 2>/dev/null | tail -1 | tr -d '\r')"
+case "$ROWS" in ''|*[!0-9]*) ROWS="unknown";; esac
+log "corpus carries $ROWS clause rows"
 
 log "building 3gpp-data:$TAG"
 docker build -f Dockerfile.data \
@@ -83,8 +94,27 @@ if [ "$DATA_ONLY" = 1 ]; then
 fi
 
 log "building 3gpp-mcp:$TAG on top of it"
-docker build -f Dockerfile \
-  --build-arg "DATA_IMAGE=3gpp-data:$TAG" \
+# --target full is NOT optional. `light` is the LAST stage in the Dockerfile, on
+# purpose (a bare `docker build .` must produce the one target that needs no data
+# image), so omitting --target here silently builds the lexical-only image and
+# ignores DATA_IMAGE entirely — a light image wearing the full image's tag.
+#
+# DATA_CONTRACT_FLAGS comes from scripts/data-contract.sh, the same source CI
+# uses, so the in-image guard checks the same contract here as there instead of
+# falling back to its two-flag default. That guard runs `check-data` against the
+# inherited layer and fails the BUILD — the last place an incomplete corpus can
+# be caught before it is answering queries.
+CONTRACT="$(bash "$ROOT/scripts/data-contract.sh" 2>/dev/null)"
+log "data contract: ${CONTRACT:-<Dockerfile default>}"
+# AN ARRAY, NOT A STRING. `${CONTRACT:+--build-arg "DATA_CONTRACT_FLAGS=$CONTRACT"}`
+# looks quoted and is not: the expansion is word-split afterwards, so docker
+# received --build-arg DATA_CONTRACT_FLAGS=--require-fts followed by --require-hnsw
+# and --require-embed-complete as loose positional arguments. Caught by running
+# this script against a stub `docker` that prints its argv, which is the only way
+# a quoting bug like this shows itself short of a real build.
+build_args=(--build-arg "DATA_IMAGE=3gpp-data:$TAG")
+[ -n "$CONTRACT" ] && build_args+=(--build-arg "DATA_CONTRACT_FLAGS=$CONTRACT")
+docker build -f Dockerfile --target full "${build_args[@]}" \
   -t "3gpp-mcp:$TAG" . || die "full image build failed"
 
 log "done:"
