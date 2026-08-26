@@ -1043,7 +1043,10 @@ mod repair_tests {
         let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
         assert_eq!(c.holes_not_in_report, 1);
         assert_eq!(c.emitted, 0, "nothing to fetch without a version");
-        assert_eq!(c.unencodable, 1, "and it must be reported, not silently gone");
+        assert_eq!(
+            c.unencodable, 1,
+            "and it must be reported, not silently gone"
+        );
         assert!(lines.is_empty());
     }
 
