@@ -53,13 +53,66 @@ pub struct ClauseIn {
     pub text: String,
     pub is_normative: bool,
 }
+/// The three `CREATE INDEX ... ON clauses` statements in schema.sql are bracketed
+/// by these markers. They are the only part of the schema that cannot be applied
+/// to a converted corpus, and the markers live in the file both languages read,
+/// so this and internal/store.schemaFor strip exactly the same statements.
+const CLAUSE_INDEX_BEGIN: &str = "-- @clauses-indexes-begin";
+const CLAUSE_INDEX_END: &str = "-- @clauses-indexes-end";
+
+/// schema_for returns the schema to apply, minus the `clauses` indexes when that
+/// name resolves to a VIEW.
+///
+/// After ADR 0004's --drop-clauses the corpus serves `clauses` as a view over the
+/// occurrences, and DuckDB refuses to index a view:
+///
+/// ```text
+/// Binder Error: can only create an index on a base table
+/// ```
+///
+/// execute_batch is all-or-nothing, so without this EVERY write-side tool dies at
+/// bootstrap on a converted corpus, before reading a row — `freeze-hnsw` included,
+/// whose entire job is to index a corpus in exactly that state.
+///
+/// The other tools must not run on a converted corpus at all: the pipeline calls
+/// `migrate-paragraphs --restore` first (see internal/goal). This is not that
+/// guarantee, and does not try to be. It is the narrower rule that you cannot put
+/// an index on a view.
+fn schema_for(conn: &Connection) -> String {
+    let is_view: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM duckdb_views()
+              WHERE database_name = current_database() AND schema_name = 'main'
+                AND view_name = 'clauses'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !is_view {
+        return SCHEMA_SQL.to_string();
+    }
+    match (
+        SCHEMA_SQL.find(CLAUSE_INDEX_BEGIN),
+        SCHEMA_SQL.find(CLAUSE_INDEX_END),
+    ) {
+        (Some(i), Some(j)) if j >= i => {
+            format!(
+                "{}{}",
+                &SCHEMA_SQL[..i],
+                &SCHEMA_SQL[j + CLAUSE_INDEX_END.len()..]
+            )
+        }
+        _ => SCHEMA_SQL.to_string(),
+    }
+}
 
 impl Store {
     /// open_rw opens (creating if absent) the DuckDB file read-write and bootstraps the
     /// schema idempotently.
     pub fn open_rw(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open duckdb rw {path}"))?;
-        conn.execute_batch(SCHEMA_SQL).context("bootstrap schema")?;
+        conn.execute_batch(&schema_for(&conn))
+            .context("bootstrap schema")?;
 
         // A WRITER MUST BE ABLE TO BIND AN HNSW INDEX THAT IS ALREADY THERE.
         //
@@ -2294,6 +2347,62 @@ mod tests {
             .expect("FTS must be buildable on the copied corpus");
 
         drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ADR 0004 leaves `clauses` as a VIEW over the occurrences. schema.sql carries
+    // three CREATE INDEX statements against that name, and DuckDB answers them with
+    // "can only create an index on a base table"; execute_batch is all-or-nothing,
+    // so every write-side tool used to die at bootstrap on a converted corpus,
+    // before reading a row. freeze-hnsw, whose whole job is to index a corpus in
+    // exactly that state, included.
+    #[test]
+    fn open_rw_bootstraps_a_corpus_that_serves_clauses_as_a_view() {
+        let dir = std::env::temp_dir().join(format!("storers-viewrw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("converted.duckdb");
+        let _ = std::fs::remove_file(&p);
+        let path = p.to_str().unwrap().to_string();
+
+        {
+            let s = Store::open_rw(&path).unwrap();
+            s.raw()
+                .execute_batch(
+                    "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                     INSERT INTO clauses(chunk_id,spec_id,heading,text) VALUES (1,'23.501','h','t');
+                     -- what --drop-clauses leaves behind, in miniature
+                     DROP TABLE clauses;
+                     CREATE VIEW clauses AS
+                       SELECT 1::UBIGINT AS chunk_id, '23.501' AS spec_id, NULL AS release,
+                              NULL AS version, NULL AS clause_path, 'h' AS heading, 't' AS text,
+                              true AS is_normative, NULL::FLOAT[1024] AS embedding,
+                              NULL AS embedding_hash;",
+                )
+                .unwrap();
+        }
+
+        // The whole assertion: this open used to fail, and the corpus is readable
+        // through the view afterwards.
+        let s = Store::open_rw(&path).expect("open_rw must bootstrap a converted corpus");
+        let n: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the view still answers after the schema was applied");
+
+        // And the three indexes it could not create are genuinely absent, rather
+        // than the statements having silently succeeded against something else.
+        let idx: i64 = s
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE index_name IN
+                   ('clauses_spec','clauses_rel','clauses_path')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 0, "a view cannot carry those indexes");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

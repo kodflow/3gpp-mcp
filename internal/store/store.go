@@ -89,9 +89,69 @@ func (s *Store) DB() *sql.DB { return s.db }
 // and index built). When false, SearchClauses falls back to LIKE scoring.
 func (s *Store) FTSAvailable() bool { return s.ftsAvailable }
 
+// clauseIndexMarkers bracket the three `CREATE INDEX ... ON clauses` statements
+// in schema.sql. They are the only part of the schema that cannot be applied to
+// a converted corpus, and the marker is in the file itself so the Rust side
+// (Store::open_rw) strips exactly the same statements from exactly the same
+// source.
+const (
+	clauseIndexBegin = "-- @clauses-indexes-begin"
+	clauseIndexEnd   = "-- @clauses-indexes-end"
+)
+
+// schemaFor returns the schema to apply to this database. It is the whole file,
+// minus the `clauses` indexes when that name resolves to a VIEW.
+//
+// After ADR 0004's --drop-clauses the corpus serves `clauses` as a view over the
+// occurrences, and DuckDB refuses `CREATE INDEX ... ON <view>`:
+//
+//	Binder Error: can only create an index on a base table
+//
+// execute_batch is all-or-nothing, so a tool that bootstraps this schema
+// read-write against a converted corpus dies there — before it has read a single
+// row. It is a loud failure rather than a silent one, which is the good news;
+// the bad news is that it stops `freeze-hnsw`, whose whole job is to index a
+// corpus in exactly that state.
+func schemaFor(clausesIsAView bool) string {
+	if !clausesIsAView {
+		return schemaSQL
+	}
+	return SchemaForView()
+}
+
+// clausesIsView reports whether the corpus serves `clauses` as a VIEW, which is
+// what ADR 0004's --drop-clauses leaves behind. Several pieces of DDL are legal
+// against a table and rejected against a view, and each rejection takes down the
+// whole bootstrap.
+func clausesIsView(db *sql.DB) bool {
+	var isView bool
+	if err := db.QueryRow(`SELECT count(*) > 0 FROM duckdb_views()
+		WHERE database_name = current_database() AND schema_name = 'main' AND view_name = 'clauses'`).
+		Scan(&isView); err != nil {
+		return false
+	}
+	return isView
+}
+
+// SchemaForView is the schema with the `clauses` indexes removed — what a corpus
+// serving `clauses` as a view can actually have applied to it. Exported so a test
+// can assert the difference between this and SchemaSQL, which is the whole point
+// of the markers.
+func SchemaForView() string {
+	i := strings.Index(schemaSQL, clauseIndexBegin)
+	j := strings.Index(schemaSQL, clauseIndexEnd)
+	if i < 0 || j < i {
+		return schemaSQL
+	}
+	return schemaSQL[:i] + schemaSQL[j+len(clauseIndexEnd):]
+}
+
 // migrate applies the embedded schema idempotently and records the version.
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(schemaSQL); err != nil {
+	// Asked once, because two statements below depend on it and a converted
+	// corpus answers yes to both.
+	clausesIsAView := clausesIsView(s.db)
+	if _, err := s.db.Exec(schemaFor(clausesIsAView)); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if _, err := s.db.Exec(
@@ -105,9 +165,16 @@ func (s *Store) migrate() error {
 	// column is already present (fresh DBs created from schema.sql above). This
 	// is metadata ABOUT embeddings, so it deliberately does NOT bump
 	// schema_version / SchemaVersion (lexical content is unchanged).
-	if _, err := s.db.Exec(
-		`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
-		return fmt.Errorf("add embedding_hash column: %w", err)
+	// Not on a converted corpus: `clauses` is a view there, DuckDB answers an
+	// ALTER TABLE against it with "Can only modify view with ALTER VIEW
+	// statement", and the view already exposes embedding_hash off `bodies`. The
+	// upgrade is for a lexical snapshot from an older binary, which is by
+	// definition not converted.
+	if !clausesIsAView {
+		if _, err := s.db.Exec(
+			`ALTER TABLE clauses ADD COLUMN IF NOT EXISTS embedding_hash VARCHAR`); err != nil {
+			return fmt.Errorf("add embedding_hash column: %w", err)
+		}
 	}
 	// Additive upgrade (plan PR-4): provenance on the subject-owned global
 	// `acronyms` table. Without an owning-series column the incremental merge

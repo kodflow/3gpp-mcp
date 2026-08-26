@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
+
+	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
 // fixture builds a throwaway corpus whose clauses cover the cases that decide
@@ -258,7 +260,19 @@ func TestTheSchemaDoesNotResurrectTheTable(t *testing.T) {
 	if err := drop(h); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.Exec(`CREATE TABLE IF NOT EXISTS clauses (chunk_id UBIGINT, spec_id VARCHAR)`); err != nil {
+	// The REAL schema, not a two-column stand-in. The stand-in only exercised
+	// CREATE TABLE IF NOT EXISTS, which is a harmless no-op against a view — while
+	// schema.sql also carries three CREATE INDEX ... ON clauses, and DuckDB answers
+	// those with "can only create an index on a base table". execute_batch is
+	// all-or-nothing, so that one line took down every write-side tool at bootstrap
+	// on a converted corpus, and this test passed throughout.
+	if _, err := h.Exec(store.SchemaSQL()); err == nil {
+		t.Fatal("the raw schema applied cleanly to a view — the CREATE INDEX guard is no longer needed, or the markers moved")
+	} else if !strings.Contains(err.Error(), "can only create an index on a base table") {
+		t.Fatalf("unexpected failure applying the raw schema: %v", err)
+	}
+	// What the store actually applies strips those three statements.
+	if _, err := h.Exec(store.SchemaForView()); err != nil {
 		t.Fatalf("re-applying the schema over the view failed: %v", err)
 	}
 	var isView int

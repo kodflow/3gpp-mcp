@@ -48,9 +48,18 @@ CREATE TABLE IF NOT EXISTS clauses (
                                          -- Lets the decoupled embed step re-embed ONLY
                                          -- clauses whose text or model changed (micro-granular).
 );
+-- Bracketed because these three cannot be applied to a converted corpus: after
+-- ADR 0004's --drop-clauses, `clauses` is a VIEW, and DuckDB answers
+-- `CREATE INDEX ... ON <view>` with "can only create an index on a base table".
+-- Every tool that bootstraps this schema read-write would fail before doing
+-- anything. Both readers of this file (internal/store.migrate, Store::open_rw)
+-- drop everything between the markers when the name resolves to a view. They
+-- index columns the view computes anyway; the tables underneath carry their own.
+-- @clauses-indexes-begin
 CREATE INDEX IF NOT EXISTS clauses_spec   ON clauses (spec_id);
 CREATE INDEX IF NOT EXISTS clauses_rel    ON clauses (release);
 CREATE INDEX IF NOT EXISTS clauses_path   ON clauses (spec_id, clause_path);
+-- @clauses-indexes-end
 
 -- ---------------------------------------------------------------------------
 -- CONTENT-ADDRESSED STORAGE (ADR 0004)

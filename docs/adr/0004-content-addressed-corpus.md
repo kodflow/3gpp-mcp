@@ -178,6 +178,41 @@ ones that would have paid the 5.34 s.
 name — verified, and pinned by a test, because a silent resurrection would put an
 empty table under the corpus and make it read as empty.
 
+**That was true and it was not enough, and the gap is instructive.** The test
+asserted it against a two-column stand-in for the schema. The real `schema.sql`
+also carries three `CREATE INDEX ... ON clauses`, and DuckDB answers those with
+
+```
+Binder Error: can only create an index on a base table
+```
+
+Schema application is all-or-nothing on both sides — Go's `Exec`, Rust's
+`execute_batch` — so that one statement took down **every write-side tool at
+bootstrap**, before it read a row: `merge`, `embed-io`, the three `enrich`
+ingesters, and `freeze-hnsw`, whose entire job is to index a corpus in exactly
+that state. Go's `migrate()` had a second one, `ALTER TABLE clauses ADD COLUMN
+IF NOT EXISTS embedding_hash` → *"Can only modify view with ALTER VIEW
+statement"*.
+
+Nothing was silently wrong, which is the one piece of luck here: the tools
+refused to open rather than corrupting anything. But a conversion whose stated
+premise is "the write side needs no change" has to mean the write side can still
+*open* the corpus.
+
+So the three index statements are bracketed in `schema.sql` by
+`-- @clauses-indexes-begin` / `-- @clauses-indexes-end`, and both readers of that
+file strip them when the name resolves to a view. The markers live in the shared
+file precisely so the two languages cannot drift; the test now applies the real
+schema and asserts the raw form still fails.
+
+Opening is not writing. `merge` and `embed` genuinely modify `clauses`, and no
+guard makes an UPDATE against a view work — those call
+`migrate-paragraphs --restore` first (below). `freeze-hnsw` is the one that must
+work *on* the converted shape, and it is the Go `cmd/freeze-hnsw` for that
+reason: `internal/store.hnswTarget` puts the index on whichever table holds the
+vectors, so it builds `bodies_hnsw` over 897 556 vectors instead of failing to
+build `clauses_hnsw` over 2 752 688 references to them.
+
 ## Consequences
 
 - The read side is converted, not wrapped: two steps at each call site that
