@@ -696,7 +696,9 @@ mod nested_heading_tests {
             clauses.iter().map(|c| &c.heading).collect::<Vec<_>>()
         );
         assert!(
-            clauses.iter().any(|c| c.text.contains("capture the discussions")),
+            clauses
+                .iter()
+                .any(|c| c.text.contains("capture the discussions")),
             "the prose after the headings must land in a clause"
         );
     }
@@ -763,7 +765,8 @@ mod salvage_tests {
     // only when that walk produced nothing.
     #[test]
     fn a_well_formed_document_is_not_salvaged() {
-        let html = "<html><body><h1>6.1 Requirements</h1><p>1 is not a heading here.</p></body></html>";
+        let html =
+            "<html><body><h1>6.1 Requirements</h1><p>1 is not a heading here.</p></body></html>";
         let (clauses, _, degraded) = parse_html_clauses(html, "23.501", "Rel-19", "19.7.0");
         assert_eq!(clauses.len(), 1, "the structured walk owns this document");
         assert!(!degraded, "a clean parse must not be flagged degraded");
@@ -799,7 +802,14 @@ mod suffix_tests {
         ] {
             let m = parse_filename_meta(&format!("convert/Rel-14/{name}.html"))
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(m.spec_id, if name.starts_with("30531") { "30.531" } else { "26.917" });
+            assert_eq!(
+                m.spec_id,
+                if name.starts_with("30531") {
+                    "30.531"
+                } else {
+                    "26.917"
+                }
+            );
         }
     }
 

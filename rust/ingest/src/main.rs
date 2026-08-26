@@ -359,10 +359,14 @@ fn main() -> Result<()> {
         // The corpus is the durable record of what is already held. When the caller
         // names it, a document it already carries is skipped whatever the shard
         // remembers. --corpus is optional: without it the old behaviour stands.
-        let already: std::collections::HashSet<(String, String)> = match Some(args.corpus.as_str()) {
+        let already: std::collections::HashSet<(String, String)> = match Some(args.corpus.as_str())
+        {
             Some(c) if !c.is_empty() && std::path::Path::new(c).exists() => {
                 let v = store.corpus_versions_with_text(c)?;
-                eprintln!("ingest: corpus already holds {} (spec, version) pair(s)", v.len());
+                eprintln!(
+                    "ingest: corpus already holds {} (spec, version) pair(s)",
+                    v.len()
+                );
                 v.into_iter().collect()
             }
             _ => std::collections::HashSet::new(),
@@ -432,9 +436,18 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
 
         let got = read_html(p.to_str().unwrap()).expect("a non-UTF-8 document must still be read");
-        assert!(got.contains("procédure"), "Latin-1 accents must survive: {got}");
-        assert!(got.contains('\u{2019}'), "the CP1252 quote must decode, not vanish: {got}");
-        assert!(!got.contains('\u{FFFD}'), "nothing may be replaced by U+FFFD: {got}");
+        assert!(
+            got.contains("procédure"),
+            "Latin-1 accents must survive: {got}"
+        );
+        assert!(
+            got.contains('\u{2019}'),
+            "the CP1252 quote must decode, not vanish: {got}"
+        );
+        assert!(
+            !got.contains('\u{FFFD}'),
+            "nothing may be replaced by U+FFFD: {got}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

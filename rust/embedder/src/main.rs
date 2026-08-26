@@ -809,7 +809,10 @@ mod tests {
             "Status Message: bfc_arena.cc:376 onnxruntime::BFCArena::AllocateRawInternal ",
             "Available memory of 1177295872 is smaller than requested bytes of 1233125376",
         ));
-        assert!(is_oom(&e), "capped-arena exhaustion must trigger the backoff");
+        assert!(
+            is_oom(&e),
+            "capped-arena exhaustion must trigger the backoff"
+        );
     }
 
     #[test]

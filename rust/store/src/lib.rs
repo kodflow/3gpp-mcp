@@ -363,7 +363,8 @@ impl Store {
                 [],
             )
             .context("restore_stashed_vectors")?;
-        self.conn.execute_batch("DROP TABLE IF EXISTS carry_vecs;")?;
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS carry_vecs;")?;
         Ok(n)
     }
 
@@ -1863,8 +1864,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(id, 10, "the vector must land on the NEW row, not the deleted one");
-        assert_eq!(hash, "sha-h1", "the hash travels with the vector it describes");
+        assert_eq!(
+            id, 10,
+            "the vector must land on the NEW row, not the deleted one"
+        );
+        assert_eq!(
+            hash, "sha-h1",
+            "the hash travels with the vector it describes"
+        );
 
         // The rewritten clause must stay unvectorised: handing it a stale vector would be
         // worse than the GPU cost this whole mechanism exists to avoid.
@@ -1934,7 +1941,10 @@ mod tests {
             ("24.501".to_string(), "Rel-19".to_string()),
             ("34.123-1".to_string(), "Rel-10".to_string()),
         ];
-        assert_eq!(got, want, "a bucket at the SAME version must not be replaced");
+        assert_eq!(
+            got, want,
+            "a bucket at the SAME version must not be replaced"
+        );
 
         // A CATALOGUED BUT TEXTLESS BUCKET IS A HOLE, AND MUST STILL BE FOLDED.
         //
@@ -2212,8 +2222,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.duckdb");
         let dst = dir.join("dst.duckdb");
-        for p in [&src, &dst] { let _ = std::fs::remove_file(p); }
-        let (s1, d1) = (src.to_str().unwrap().to_string(), dst.to_str().unwrap().to_string());
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+        }
+        let (s1, d1) = (
+            src.to_str().unwrap().to_string(),
+            dst.to_str().unwrap().to_string(),
+        );
         {
             let s = Store::open_rw(&s1).unwrap();
             s.raw().execute_batch(
@@ -2223,32 +2238,60 @@ mod tests {
                    FROM range(2000) t(i);").unwrap();
             s.enable_fts().unwrap();
             s.checkpoint().unwrap();
-            let n: i64 = s.raw().query_row(
-                "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'", [], |r| r.get(0)).unwrap();
+            let n: i64 = s
+                .raw()
+                .query_row(
+                    "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             eprintln!("SOURCE: {n} table(s) internes FTS");
             assert!(n > 0, "la source doit bien avoir un index FTS");
         }
         Store::copy_database_compact(&s1, &d1).unwrap();
         let d = Store::open_rw(&d1).unwrap();
 
-        let n: i64 = d.raw().query_row(
-            "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'", [], |r| r.get(0)).unwrap();
+        let n: i64 = d
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE 'fts_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 0, "the FTS index must not be copied — merge rebuilds it");
 
         // Everything that is NOT rebuildable must still make the trip.
-        let rows: i64 = d.raw().query_row("SELECT count(*) FROM clauses", [], |r| r.get(0)).unwrap();
+        let rows: i64 = d
+            .raw()
+            .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(rows, 2000, "every clause must survive the copy");
-        let specs: i64 = d.raw().query_row("SELECT count(*) FROM specs", [], |r| r.get(0)).unwrap();
+        let specs: i64 = d
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(specs, 1, "the catalogue travels too");
 
         // And the secondary indexes, dropped for the bulk insert, must be back.
-        let idx: i64 = d.raw().query_row(
-            "SELECT count(*) FROM duckdb_indexes() WHERE index_name IN
-               ('clauses_spec','clauses_rel','clauses_path')", [], |r| r.get(0)).unwrap();
-        assert_eq!(idx, 3, "the secondary indexes must be rebuilt after the bulk insert");
+        let idx: i64 = d
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE index_name IN
+               ('clauses_spec','clauses_rel','clauses_path')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 3,
+            "the secondary indexes must be rebuilt after the bulk insert"
+        );
 
         // The rebuild itself must still work on the copy.
-        d.enable_fts().expect("FTS must be buildable on the copied corpus");
+        d.enable_fts()
+            .expect("FTS must be buildable on the copied corpus");
 
         drop(d);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2315,7 +2358,6 @@ mod import_via_read_json {
     }
 }
 
-
 #[cfg(test)]
 mod import_bench {
     use super::*;
@@ -2336,10 +2378,16 @@ mod import_bench {
         use std::io::Write;
         let f = std::fs::File::create(path).unwrap();
         let mut w = std::io::BufWriter::new(f);
-        let v: Vec<String> = (0..DENSE_DIM).map(|i| format!("{:.6}", i as f32 * 1e-4)).collect();
+        let v: Vec<String> = (0..DENSE_DIM)
+            .map(|i| format!("{:.6}", i as f32 * 1e-4))
+            .collect();
         let joined = v.join(",");
         for i in 1..=n {
-            writeln!(w, "{{\"chunk_id\":{i},\"hash\":\"h{i}\",\"vec\":[{joined}]}}").unwrap();
+            writeln!(
+                w,
+                "{{\"chunk_id\":{i},\"hash\":\"h{i}\",\"vec\":[{joined}]}}"
+            )
+            .unwrap();
         }
         w.flush().unwrap();
     }
@@ -2367,16 +2415,24 @@ mod import_bench {
                 let j: serde_json::Value = serde_json::from_str(line).unwrap();
                 ids.push(j["chunk_id"].as_u64().unwrap());
                 vecs.push(
-                    j["vec"].as_array().unwrap().iter()
-                        .map(|x| x.as_f64().unwrap() as f32).collect::<Vec<f32>>(),
+                    j["vec"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_f64().unwrap() as f32)
+                        .collect::<Vec<f32>>(),
                 );
                 hs.push(j["hash"].as_str().unwrap().to_string());
                 if ids.len() >= 512 {
                     a.set_embeddings_batch(&ids, &vecs, &hs).unwrap();
-                    ids.clear(); vecs.clear(); hs.clear();
+                    ids.clear();
+                    vecs.clear();
+                    hs.clear();
                 }
             }
-            if !ids.is_empty() { a.set_embeddings_batch(&ids, &vecs, &hs).unwrap(); }
+            if !ids.is_empty() {
+                a.set_embeddings_batch(&ids, &vecs, &hs).unwrap();
+            }
         }
         let old = t0.elapsed();
 
@@ -2391,15 +2447,29 @@ mod import_bench {
         assert_eq!(embedded, N as i64, "every clause must end up embedded");
 
         // Same result, not just same count: spot-check a value survived.
-        let av: f32 = a.raw()
-            .query_row("SELECT embedding[3] FROM clauses WHERE chunk_id = 7", [], |r| r.get(0)).unwrap();
-        let bv: f32 = b.raw()
-            .query_row("SELECT embedding[3] FROM clauses WHERE chunk_id = 7", [], |r| r.get(0)).unwrap();
+        let av: f32 = a
+            .raw()
+            .query_row(
+                "SELECT embedding[3] FROM clauses WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let bv: f32 = b
+            .raw()
+            .query_row(
+                "SELECT embedding[3] FROM clauses WHERE chunk_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!((av - bv).abs() < 1e-6, "paths disagree: {av} vs {bv}");
 
         eprintln!(
             "IMPORT BENCH n={N}: row-loop {:?}, set-based {:?}  ({:.1}x)",
-            old, new, old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+            old,
+            new,
+            old.as_secs_f64() / new.as_secs_f64().max(1e-9)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
