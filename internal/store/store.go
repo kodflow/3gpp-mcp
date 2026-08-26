@@ -43,6 +43,10 @@ type Store struct {
 	// published lexical snapshot still carry the old `clauses` table, and the
 	// same Store serves both.
 	contentAddressed bool
+	// paraFTS: BM25 exists over `paragraphs`. A separate fact from
+	// ftsAvailable, which is about `clauses` — a corpus can be migrated and not
+	// yet re-indexed, and search must degrade rather than fail on it.
+	paraFTS bool
 }
 
 // Open opens (or creates) the DuckDB file at path and applies the schema.
@@ -758,6 +762,13 @@ type SearchQuery struct {
 func (s *Store) SearchClauses(ctx context.Context, q SearchQuery) ([]model.SearchHit, error) {
 	if q.TopK <= 0 {
 		q.TopK = 10
+	}
+	// Ranking `clauses` ranks VERSIONS: on this corpus the whole twelve-hit
+	// window for "CHECK_IMEI" was one clause repeated across twelve releases,
+	// and the spec that answers it never entered the window. Scoring
+	// deduplicated paragraphs and collapsing to one hit per clause is the fix.
+	if s.contentAddressed {
+		return s.searchClausesCA(ctx, q)
 	}
 	filterSQL, filterArgs := filterClause(q.Filter)
 
