@@ -1262,6 +1262,12 @@ const (
 // a Go post-filter over an over-fetched neighbour set instead. NULL-embedding
 // rows are dropped in Go (they sort last and carry a NULL distance).
 func (s *Store) SearchVectors(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
+	// On a content-addressed corpus the vectors live on `bodies`, one per
+	// distinct text, so the nearest-neighbour scan sees 897 556 rows instead of
+	// 2 752 688 copies of them.
+	if s.contentAddressed {
+		return s.searchVectorsCA(ctx, vec, f, topK)
+	}
 	if topK <= 0 {
 		topK = 10
 	}
