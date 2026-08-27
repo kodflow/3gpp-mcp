@@ -95,10 +95,18 @@ func ghcrToken(ctx context.Context, repo string) (string, error) {
 	return token, err
 }
 
-type ghcrLayer struct{ digest, title string }
+// ghcrLayer is one layer of an OCI manifest. size comes from the manifest and is
+// what makes a resumable pull possible (see ghcr_corpus.go): without it, a
+// partial file left on disk cannot be told from a complete one.
+type ghcrLayer struct {
+	digest, title string
+	size          int64
+}
 
-// ghcrLayers reads an OCI manifest and returns its layers' digest + filename
-// (the org.opencontainers.image.title annotation set by `oras push`).
+// ghcrLayers reads an OCI manifest and returns its layers' digest + size +
+// filename (the org.opencontainers.image.title annotation set by `oras push`;
+// `crane append` sets no title, which is why the corpus path matches on the tar
+// member's name instead).
 func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, error) {
 	u := "https://ghcr.io/v2/" + repo + "/manifests/" + ref
 	var out []ghcrLayer
@@ -119,6 +127,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		var m struct {
 			Layers []struct {
 				Digest      string            `json:"digest"`
+				Size        int64             `json:"size"`
 				Annotations map[string]string `json:"annotations"`
 			} `json:"layers"`
 		}
@@ -127,7 +136,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		}
 		layers := make([]ghcrLayer, 0, len(m.Layers))
 		for _, l := range m.Layers {
-			layers = append(layers, ghcrLayer{digest: l.Digest, title: l.Annotations["org.opencontainers.image.title"]})
+			layers = append(layers, ghcrLayer{digest: l.Digest, size: l.Size, title: l.Annotations["org.opencontainers.image.title"]})
 		}
 		if len(layers) == 0 {
 			return fmt.Errorf("ghcr manifest %s has no layers", repo)
