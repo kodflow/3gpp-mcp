@@ -242,7 +242,7 @@ jobs:
           set -euo pipefail
           source scripts/lib/retry.sh
           retry docker pull moby/buildkit:buildx-stable-1
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       # GHCR_PAT (not github.token): pushing with the CI token auto-links the image
       # to this PUBLIC repo → it inherits PUBLIC visibility. A PAT push stays
       # unlinked → born PRIVATE. (Same reason as corpus-matrix.)
@@ -378,7 +378,7 @@ jobs:
           pattern: digests-${{ matrix.variant }}-*
           path: /tmp/digests
           merge-multiple: true
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
