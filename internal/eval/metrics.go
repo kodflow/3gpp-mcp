@@ -147,6 +147,24 @@ func idealDCG(rels []Relevant, k int) float64 {
 	return idcg
 }
 
+// recall is the fraction of judged relevant clauses credited within the top k.
+//
+// IT MUST USE THE SAME NOTION OF RELEVANCE AS ndcg AND mrr. It did not: this
+// function matched the clause string EXACTLY, while gradeOf/bestUnusedGrade —
+// and therefore nDCG, MRR and Success@1 — deliberately credit a descendant or
+// ancestor of a target at grade 1, so that "retrieving finer detail still
+// counts".
+//
+// The disagreement was not academic. On the committed LI/5GC set the harness
+// reported nDCG@10 = 0.072 and MRR = 0.042 next to **Recall@10 = 0.000**: a
+// ranking that did surface a parent of the target was scored as having found
+// nothing at all, and the one number an operator reads as "does retrieval work"
+// said no. Two metrics over one query set must not answer two different
+// questions — that is how a green gate ends up guarding nothing.
+//
+// Credit is per judgement and at most once (the same bestUnusedGrade bookkeeping
+// nDCG uses), so several retrieved descendants of one target cannot push recall
+// above 1.
 func recall(ranked []Ref, rels []Relevant, k int) float64 {
 	total := 0
 	for _, r := range rels {
@@ -157,18 +175,17 @@ func recall(ranked []Ref, rels []Relevant, k int) float64 {
 	if total == 0 {
 		return 0
 	}
-	found := map[string]bool{}
+	used := make([]bool, len(rels))
+	credited := 0
 	for i, hit := range ranked {
 		if i >= k {
 			break
 		}
-		for _, r := range rels {
-			if r.Grade > 0 && r.SpecID == hit.SpecID && r.Clause == hit.Clause {
-				found[r.SpecID+"/"+r.Clause] = true
-			}
+		if bestUnusedGrade(hit, rels, used) > 0 {
+			credited++
 		}
 	}
-	return float64(len(found)) / float64(total)
+	return float64(credited) / float64(total)
 }
 
 func mrr(ranked []Ref, rels []Relevant, k int) float64 {
