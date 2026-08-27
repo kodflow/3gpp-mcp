@@ -4,26 +4,50 @@
 > gets it — without ever putting the corpus in git, and without accumulating
 > versions.
 
-## The model: one rolling `latest`, the DB is the state
+> [!IMPORTANT]
+> **The corpus does NOT travel on the GitHub Release.** This document used to
+> describe it doing exactly that, which put the documented design in direct
+> contradiction with [`DATA_NOTICE.md`](../DATA_NOTICE.md): the DB holds verbatim
+> 3GPP/ETSI clause text, and no release asset of this public repository may carry
+> it. It also stopped fitting — GitHub caps an asset at 2 GB, the
+> content-addressed corpus is 12.36 GB.
+>
+> Sections further down that describe publishing or pulling `3gpp.duckdb.zst`
+> from the release describe the **retired** flow. They are kept because the
+> reasoning about volumes, deltas and clobbering still applies — only the channel
+> changed.
+
+## The model: binaries roll on `latest`, the corpus lives in a private package
 
 There is **exactly one GitHub Release, tagged `latest`**. It holds the current
-binaries **and** the current indexed DB. Assets are replaced in place
-(clobbered); the release is never deleted, old artifacts never accumulate — no
-version history, no disk-space creep.
+binaries and small **metadata** only. Assets are replaced in place (clobbered);
+the release is never deleted, old artifacts never accumulate — no version
+history, no disk-space creep.
+
+The corpus is pushed by `scripts/local/publish-corpus.sh` to
+`ghcr.io/<owner>/3gpp-corpus`, a **private** package, as one layer holding
+`/3gpp.duckdb`.
 
 ```
-GitHub Release `latest` (the only one)
+GitHub Release `latest` (the only one) — PUBLIC, carries no clause text
 ├── mcp-3gpp_linux_amd64.tar.zst   (+ .sha256)   ← Release workflow, on push to main
 ├── mcp-3gpp_darwin_arm64.tar.zst  (+ .sha256)   ← Release workflow
-└── 3gpp.duckdb.zst                (+ .sha256)   ← Corpus Sync cron (C4)
+└── corpus-index.json                            ← the delta anchor:
+                                                    spec|release → highest indexed
+                                                    version. A version list, no text.
 
-Client:  mcp-3gpp bootstrap → pulls releases/latest/download/3gpp.duckdb.zst
-                              (stable URL, sha256-verified) → serve (offline)
+ghcr.io/<owner>/3gpp-corpus:latest — PRIVATE, one layer = /3gpp.duckdb
+ghcr.io/<owner>/etsi-corpus:latest — PRIVATE, one layer = /etsi.duckdb
+
+Client:  mcp-3gpp bootstrap → GHCR manifest → layer (Range-resumable,
+                              digest-verified) → /3gpp.duckdb → serve (offline)
+                              needs read:packages; see docs/install.md
 ```
 
-**Why no versions:** the user wants a single frozen `latest` with old ones
-deleted to avoid disk abuse. The DB itself records what specs/versions are
-indexed, so the DB *is* the state — no manifest history needed.
+**Why no versions:** a single frozen `latest`, old ones deleted, to avoid disk
+abuse. The DB itself records what specs/versions are indexed, so the DB *is* the
+state — no manifest history needed. The same rule holds on the GHCR side: a dated
+tag plus a rolling `:latest`.
 
 ## Volumes & where things live
 
