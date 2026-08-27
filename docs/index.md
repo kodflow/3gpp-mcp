@@ -1,75 +1,54 @@
-<!-- /docs-generated: {"date":"2026-03-14T00:00:00Z","commit":"edab48d","pages":14,"agents":79,"commands":17} -->
-# DevContainer Template
+# 3gpp-mcp — documentation
 
-**A complete dev environment with 79 AI agents, 17 commands, and 25 languages — ready in one command.**
+An **MCP server** that exposes the 3GPP corpus — Phase 1 (1992) to the latest
+Release — as a locally queryable index, returning **cited specification
+fragments**, never summaries. Claude reasons; the index serves.
 
-[Get Started :material-arrow-right:](#quick-start){ .md-button .md-button--primary }
+> This page used to be the landing page of the `devcontainer-template` this
+> repository was generated from ("79 AI agents, 17 commands, 25 languages"). It
+> documented a different project.
 
----
+## What is in the corpus today
 
-## What It Does
+Measured on the built corpus, not estimated — see [`local-pipeline.md`](./local-pipeline.md):
 
-| Feature | Description |
-|---------|-------------|
-| **25 languages** | Python, Go, Rust, Node.js, Java, C/C++, Ruby, PHP, and 17 others — each with linter, formatter and tests |
-| **79 AI agents** | Language specialists (25), DevOps (9), OS (22), orchestrators and executors — orchestrated by Claude Code |
-| **17 commands** | `/plan`, `/do`, `/review`, `/git`, `/test`, `/lint`, `/docs`, `/feature`... cover the entire dev cycle |
-| **Automatic hooks** | Format, lint, tests, secret detection — triggered on every edit |
-| **MCP servers** | GitHub, GitLab (core) + context7, ktn-linter (fragments) + Playwright (browser feature) |
-| **Built-in VPN** | OpenVPN, WireGuard, IPsec, PPTP — auto-connect on startup |
-| **1Password secrets** | Secure management via `/secret` with vault-like convention |
+| | |
+|---|---:|
+| Clause occurrences | 2 752 688 |
+| Distinct specs / versions | 3 568 / 20 163 |
+| Series / releases | 31 / Rel-4 → Rel-20 (plus Phase 1–2 on the old series) |
+| 5GC API operations | 8 562 (+27 889 schemas) |
+| LI events (Rel-19) | 405 |
+| ETSI deliverables (separate DB) | 14 |
+| MCP tools | 11 |
 
-## How It Works
+## Start here
 
-```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': {
-  'primaryColor': '#9D76FB1a',
-  'primaryBorderColor': '#9D76FB',
-  'primaryTextColor': '#d4d8e0',
-  'lineColor': '#d4d8e0',
-  'textColor': '#d4d8e0'
-}}}%%
-flowchart LR
-    A[VS Code] -->|"Reopen in Container"| B[DevContainer]
-    B --> C[Base Image<br/>Ubuntu 24.04<br/>25 languages]
-    C --> D[Claude Code<br/>79 agents<br/>17 commands]
-    D --> E[MCP Servers<br/>GitHub, GitLab<br/>context7]
-    E --> F[Production code<br/>tested, linted<br/>reviewed]
-```
+| If you want to… | Read |
+|---|---|
+| Use the server as a client | [`install.md`](./install.md) |
+| Understand what it is for | [`vision.md`](./vision.md) |
+| Understand how it is built | [`architecture.md`](./architecture.md) |
+| Build the corpus yourself, on one machine with a GPU | [`local-pipeline.md`](./local-pipeline.md) |
+| Know how retrieval is scored | [`eval-baseline.md`](./eval-baseline.md) |
+| Know how the index is shaped | [`INDEXING.md`](./INDEXING.md) |
+| Know how data is stored and shipped | [`data-pipeline.md`](./data-pipeline.md) |
 
-VS Code opens the DevContainer, which contains all the tools. Claude Code orchestrates the specialized agents that produce automatically validated code.
+## Decisions of record
 
-## Quick Start
+| ADR | Decision |
+|---|---|
+| [0001](./adr/0001-write-side-rust-read-side-go.md) | Write side in Rust, read side in Go |
+| [0002](./adr/0002-data-completeness-contract.md) | The data-completeness contract |
+| [0003](./adr/0003-local-goal-pipeline.md) | The corpus is built on one machine, by `goal` |
+| [0004](./adr/0004-content-addressed-corpus.md) | The corpus is content-addressed at paragraph granularity |
 
-**Prerequisites**: [VS Code](https://code.visualstudio.com/) + [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) + [Docker](https://docs.docker.com/get-docker/)
+The frozen stack and the explicit lock-ins ("no Python at query time", "ETSI
+stays separate", "merge before embed") live in [`../CLAUDE.md`](../CLAUDE.md).
 
-1. **Create a repo from the template**
-    ```bash
-    gh repo create my-project --template kodflow/devcontainer-template --clone
-    cd my-project
-    code .
-    ```
+## A word on the data
 
-2. **Open in the container**
-    - `Ctrl+Shift+P` → `Dev Containers: Reopen in Container`
-    - Wait for the build (~5 min the first time, ~30s after)
-
-3. **Configure** (optional)
-    - Create `.devcontainer/.env` with your tokens:
-    ```env
-    GIT_USER=YourName
-    GIT_EMAIL=your@email.com
-    GITHUB_TOKEN=ghp_xxx
-    ```
-
-4. **Start working**
-    ```
-    /warmup              # Load project context
-    /plan "my feature"   # Plan the implementation
-    /do                  # Execute the plan
-    /git --commit        # Commit properly
-    ```
-
----
-
-DevContainer Template · MIT · [GitHub](https://github.com/kodflow/devcontainer-template)
+The corpus holds **verbatim 3GPP/ETSI specification text**. Free to download is
+not free to redistribute: the published corpus is a **private** package, and no
+release asset of this repository carries it. Read
+[`../DATA_NOTICE.md`](../DATA_NOTICE.md) before moving any artifact anywhere.
