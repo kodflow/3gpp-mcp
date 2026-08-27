@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 )
 
 // This file is the SINGLE SOURCE OF TRUTH for the local pipeline: what the steps
@@ -247,15 +250,23 @@ func stepBuildRust() *Step {
 
 // --------------------------------------------------------------------- seed
 
+// stepSeed pulls the published corpus as a STARTING POINT, so a fresh machine
+// does not have to re-ingest 20 163 spec versions to get going.
+//
+// It used to curl `releases/download/latest/3gpp.duckdb.zst`. That asset is a
+// full-text DuckDB on a public repository, which DATA_NOTICE.md forbids — so the
+// pipeline that builds the corpus was itself a consumer of the breach, not just
+// the client binary. It now goes through the private GHCR package, exactly like
+// `mcp-3gpp bootstrap` (internal/bootstrap/ghcr_corpus.go).
+//
+// Seeding is an OPTIMISATION, never a requirement: with no credential the step
+// leaves the corpus absent and says so, and the pipeline builds it from 3gpp.org
+// the licit way — slower, and the path that has to keep working regardless.
 func stepSeed() *Step {
-	const (
-		seedURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.zst"
-		idxURL  = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/corpus-index.json"
-	)
 	return &Step{
 		Name:    "seed",
-		Version: 1,
-		Doc:     "seed the corpus from the published lexical snapshot (skipped when a local corpus already exists)",
+		Version: 2, // bumped: the source changed, so a cached success must not carry over
+		Doc:     "seed the corpus from the published snapshot on the private GHCR package (skipped when a local corpus already exists, or when no credential is available)",
 		Deps:    []string{"build-go"},
 		Impl:    []string{"internal/goal/pipeline.go"},
 		Heavy:   true,
@@ -273,6 +284,11 @@ func stepSeed() *Step {
 		},
 		Run: func(c *Ctx) error {
 			db := c.dataPath("3gpp.duckdb")
+			// seededNow records whether THIS run produced the corpus from the
+			// published package. It is what lets seedAnchor adopt the published
+			// anchor without hashing 12.36 GB to re-derive a fact we already know.
+			seededNow := false
+
 			// NEVER clobber a corpus that is more advanced than the snapshot.
 			// The snapshot is a starting point, not an authority.
 			if st, err := os.Stat(db); err == nil && st.Size() > 0 {
@@ -281,20 +297,21 @@ func stepSeed() *Step {
 				if err := os.MkdirAll(c.Data, 0o755); err != nil {
 					return err
 				}
-				zst := db + ".zst"
-				c.Log.Printf("downloading the published lexical snapshot (~670 MB)")
-				if err := c.Retry(RetryNetwork, "seed download", func() error {
-					return c.Run(Cmd{Name: "curl", Args: []string{"-fL", "--retry", "3", "-o", zst, seedURL}, Echo: true})
-				}); err != nil {
-					return err
+				pat, origin, cerr := bootstrap.GHCRCredential("")
+				if cerr != nil {
+					c.Log.Printf("no GHCR credential (set GHCR_PAT, or write a read:packages token to .local/ghcr.pat) — "+
+						"NOT seeding. %s stays absent and the pipeline will build it from 3gpp.org, which is slower and equally correct.",
+						db)
+					return nil
 				}
-				c.Log.Printf("decompressing")
-				if err := c.Run(Cmd{Name: "zstd", Args: []string{"-d", "--long=27", "-f", zst, "-o", db}}); err != nil {
-					return err
+				src := bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+				c.Log.Printf("seeding from %s (credential from %s) — large, and it resumes if interrupted", src, origin)
+				if err := bootstrap.FetchCorpus(context.Background(), src, pat, db, c.Log.Printf); err != nil {
+					return fmt.Errorf("seed from %s: %w", src, err)
 				}
-				_ = os.Remove(zst)
+				seededNow = true
 			}
-			if err := seedAnchor(c, db); err != nil {
+			if err := seedAnchor(c, db, seededNow); err != nil {
 				return err
 			}
 			reportAnchorHoles(c, db)
@@ -426,35 +443,30 @@ func stepDiscover() *Step {
 // When it cannot be proven, the anchor is deliberately left absent: discover then
 // does a full pass, which is slow but never silently incomplete. Erring towards
 // "do too much" is the only acceptable direction here.
-func seedAnchor(c *Ctx, db string) error {
+func seedAnchor(c *Ctx, db string, seededNow bool) error {
 	idx := filepath.Join(c.Local, "corpus-index.json")
 	if fileNonEmpty(idx) {
 		c.Log.Printf("delta anchor already present")
 		return nil
 	}
 
-	const shaURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.sha256"
+	// corpus-index.json is "spec|release -> highest indexed version" — a version
+	// list, no clause text — so it stays a public release asset. The published
+	// `3gpp.duckdb.sha256` beside it does NOT: it existed only to identify the
+	// full-text asset that DATA_NOTICE forbids, and it goes with it.
 	const idxURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/corpus-index.json"
 
-	want, err := c.Output(Cmd{Name: "curl", Args: []string{"-fsSL", "--max-time", "60", shaURL}})
-	if err != nil {
-		c.Log.Printf("published checksum unavailable — leaving the anchor absent (next discover is a FULL pass)")
-		return nil
-	}
-	want = strings.Fields(strings.TrimSpace(want))[0]
-
-	c.Log.Printf("hashing the local corpus to decide whether the published anchor describes it")
-	got, err := sha256File(db)
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(got, want) {
-		c.Log.Printf("local corpus (%s) is NOT the published snapshot (%s) — the published anchor would over-claim, so it is not used", got[:12], want[:12])
+	// The question this used to answer by downloading a checksum and hashing
+	// 12.36 GB — "is the local corpus the published one?" — is already answered
+	// by whether THIS run just seeded it. Deriving a fact we hold is how the
+	// checksum became a second, drifting source of truth about the same thing.
+	if !seededNow {
+		c.Log.Printf("the local corpus was not seeded from the published package, so the published anchor would over-claim — not using it")
 		c.Log.Printf("the next discover will be a FULL pass; the first merge then writes a correct anchor")
 		return nil
 	}
 
-	c.Log.Printf("local corpus matches the published snapshot — adopting its anchor")
+	c.Log.Printf("the corpus was just seeded from the published package — adopting its anchor")
 	tmp := idx + ".new"
 	if err := c.Run(Cmd{Name: "curl", Args: []string{"-fsSL", "--max-time", "120", "-o", tmp, idxURL}}); err != nil {
 		c.Log.Printf("published anchor unavailable — leaving it absent (FULL pass)")

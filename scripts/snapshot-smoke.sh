@@ -3,8 +3,8 @@
 #
 # The pipeline verifies the producer thoroughly: `goal run` validates the corpus
 # it built and `stepSmoke` starts the real server against the local DB. None of
-# that exercises the path an actual user takes — download the published artefact
-# into an empty directory and serve it — and that path is where the damage has
+# that exercises the path an actual user takes — `bootstrap` into an empty cache
+# and serve what lands there — and that path is where the damage has
 # historically been:
 #
 #   * the bootstrap URL 404'd for months (`/releases/latest/download/` is a
@@ -24,7 +24,6 @@
 # vector search is ENABLED.
 set -uo pipefail
 
-BASE="https://github.com/kodflow/3gpp-mcp/releases/download/latest"
 KEEP=0
 DIR=""
 while [[ $# -gt 0 ]]; do
@@ -49,40 +48,45 @@ trap cleanup EXIT
 
 log "fresh directory: $DIR"
 
-# --- 1. the artefact, from the URL a user's binary actually uses ---------------
-# Not a hand-written URL: read it out of the shipped source so a constant that
-# drifts breaks this check instead of silently breaking users.
-DB_URL="$(grep -oE 'https://github.com/[^"]*3gpp\.duckdb\.zst' "$ROOT/cmd/server/bootstrap.go" | head -1)"
-[[ -n "$DB_URL" ]] || fail "could not read the DB URL out of cmd/server/bootstrap.go"
-log "bootstrap URL as compiled in: $DB_URL"
+# --- 1. the artefact, by RUNNING the command a consumer runs -------------------
+#
+# This step used to grep the download URL out of cmd/server/bootstrap.go and
+# curl it by hand. That is the defect class this repository keeps paying for: a
+# check that RE-IMPLEMENTS what it gates eventually asks a different question
+# than the code it gates, and then it passes. It also could not survive the
+# corpus moving off the public release — the grep simply found nothing.
+#
+# So the consumer path is now exercised by running the consumer's command:
+# `mcp-3gpp bootstrap` into an empty cache. Whatever bootstrap does — private
+# GHCR package, credential resolution, Range-resumed layer pull, digest
+# verification, tar extraction — is what gets tested, because it is what runs.
+BOOTSTRAP="$ROOT/.local/bin/server"
+[[ -x "$BOOTSTRAP" ]] || BOOTSTRAP="$ROOT/.local/bin/server.exe"
+[[ -x "$BOOTSTRAP" ]] || fail "no binary at .local/bin/server — run 'make goal ARGS=\"--only build-go\"' first"
 
-# A redirect to a release that lacks the asset is the exact F03 failure, and curl
-# reports it as a plain 404 only if we follow redirects and check the final code.
-code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 60 "$DB_URL")"
-[[ "$code" == "200" ]] || fail "the compiled-in bootstrap URL answers HTTP $code (F03 regression?)"
-
-log "downloading the snapshot (~670 MB)"
-curl -fL --retry 3 --max-time 1800 -o "$DIR/3gpp.duckdb.zst" "$DB_URL" || fail "download failed"
-
-# --- 2. digests, from the manifest when it exists ------------------------------
-if curl -fsSL --max-time 60 -o "$DIR/corpus-manifest.json" "$BASE/corpus-manifest.json" 2>/dev/null; then
-  log "manifest found — verifying the artefact against it"
-  want="$(grep -oE '"sha256"[[:space:]]*:[[:space:]]*"[a-f0-9]+"' "$DIR/corpus-manifest.json" | head -1 | grep -oE '[a-f0-9]{64}')"
-  got="$(sha256sum "$DIR/3gpp.duckdb.zst" | cut -d' ' -f1)"
-  [[ "$want" == "$got" ]] || fail "manifest digest $want != downloaded $got"
-  log "digest OK"
-else
-  log "WARNING: no published corpus-manifest.json — the artefact is UNVERIFIED"
+# The corpus package is private on purpose (DATA_NOTICE: verbatim standards
+# text). Without a credential this check cannot run at all, and saying so is
+# better than a red build that means "no token here".
+if [[ -z "${GHCR_PAT:-}" && -z "${GITHUB_TOKEN:-}" && ! -s "$ROOT/.local/ghcr.pat" ]]; then
+  log "SKIPPED: no GHCR credential (GHCR_PAT, GITHUB_TOKEN or .local/ghcr.pat)."
+  log "The consumer path pulls a PRIVATE package; a token with read:packages is required."
+  exit 0
 fi
 
-log "decompressing (~6.5 GB)"
-zstd -d --long=27 -f "$DIR/3gpp.duckdb.zst" -o "$DIR/3gpp.duckdb" || fail "decompression failed"
-rm -f "$DIR/3gpp.duckdb.zst"
+log "running the real consumer command: bootstrap into an empty cache"
+MCP3GPP_CACHE="$DIR" "$BOOTSTRAP" bootstrap || fail "bootstrap failed — this is the path every new user takes"
+[[ -s "$DIR/3gpp.duckdb" ]] || fail "bootstrap reported success but $DIR/3gpp.duckdb is absent or empty"
+log "bootstrap produced $(du -h "$DIR/3gpp.duckdb" | cut -f1) at $DIR/3gpp.duckdb"
 
-# --- 3. serve it, the way a client does ----------------------------------------
-SERVER="$ROOT/.local/bin/server"
-[[ -x "$SERVER" ]] || SERVER="$ROOT/.local/bin/server.exe"
-[[ -x "$SERVER" ]] || fail "no server binary at .local/bin/server — run 'make goal ARGS=\"--only build-go\"' first"
+# bootstrap verifies the layer against the digest the registry manifest names, so
+# there is no second hand-rolled digest check to drift from it. What is worth
+# asserting here is that it recorded the identity it pulled — that sidecar is
+# what a later start reads to decide whether the cache is current.
+[[ -s "$DIR/3gpp.duckdb.digest" ]] || fail "bootstrap left no .digest sidecar; a later serve would re-pull the whole corpus"
+log "recorded corpus identity: $(cut -c1-24 < "$DIR/3gpp.duckdb.digest")…"
+
+# --- 2. serve it, the way a client does ----------------------------------------
+SERVER="$BOOTSTRAP"
 
 log "starting the server against the DOWNLOADED corpus"
 req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"snapshot-smoke","version":"1"}}}
