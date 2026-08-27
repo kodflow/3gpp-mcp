@@ -40,7 +40,19 @@ sha2 = "0.10"
 # (Go/onnxrt) and embed (this cdylib) must share ONE onnxruntime in the process, not
 # load two (different versions → symbol clash). Runtime contexts (Kaggle kernels,
 # the prod image) set ORT_DYLIB_PATH to the shipped libonnxruntime.so.
-ort = { version = "=2.0.0-rc.9", features = ["ndarray", "load-dynamic"], optional = true }
+#
+# `default-features = false` is REQUIRED, not tidiness — the same trap already
+# paid for in rust/embedder/Cargo.toml, which this crate did not inherit. ort's
+# default feature set is ["ndarray", "half", "download-binaries", "copy-dylibs"]
+# and cargo features are ADDITIVE: asking for load-dynamic while leaving the
+# defaults on still enables download-binaries, and ort-sys then panics at build
+# time with "downloaded binaries not available for target
+# x86_64-pc-windows-gnu". The comment above therefore claimed load-dynamic while
+# the flags kept download-binaries, and this crate could not be built at all on
+# the mingw host the whole local pipeline runs on — the one host that needs it,
+# since embed_ffi is what makes the corpus's 821 146 vectors reachable at query
+# time.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.20", optional = true }
 anyhow = { version = "1", optional = true }
