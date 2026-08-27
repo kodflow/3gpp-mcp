@@ -40,3 +40,30 @@ func TestSearchModeDegrade(t *testing.T) {
 		}
 	}
 }
+
+// TestModeServedNamesWhatActuallyRan is the counterpart to TestSearchModeDegrade.
+// That test pins that a mode we cannot serve still returns results; this one pins
+// that we SAY so. The degrade is correct behaviour and was, until now, silent:
+// hits from a "semantic" request with no embedder come back shaped exactly like
+// semantic ones, so a client had no way to tell it was handed BM25.
+func TestModeServedNamesWhatActuallyRan(t *testing.T) {
+	t.Setenv("EMBEDDER", "off") // no query vectors reachable
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	eng := New(st)
+
+	for requested, want := range map[string]string{
+		"lexical":  "lexical",
+		"semantic": "lexical", // degraded — and it must say lexical, not semantic
+		"hybrid":   "lexical",
+		"":         "lexical",
+	} {
+		if got := eng.ModeServed(requested); got != want {
+			t.Errorf("ModeServed(%q) = %q, want %q — a mode that did not run must not be reported as served",
+				requested, got, want)
+		}
+	}
+}
