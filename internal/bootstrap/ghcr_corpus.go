@@ -98,11 +98,11 @@ var ErrNoGHCRCredential = errors.New("no GHCR credential")
 // WHERE it came from so a wrong-token failure is diagnosable. Order mirrors
 // scripts/local/publish-corpus.sh so the read side and the write side agree:
 //
-//	1. the explicit argument (--ghcr-token)
-//	2. $GHCR_PAT      — what CI uses
-//	3. $GITHUB_TOKEN  — what a GitHub Actions runner already has
-//	4. .local/ghcr.pat — a gitignored file, so the token never has to be typed
-//	   into a shell (history) or pasted into a transcript
+//  1. the explicit argument (--ghcr-token)
+//  2. $GHCR_PAT      — what CI uses
+//  3. $GITHUB_TOKEN  — what a GitHub Actions runner already has
+//  4. .local/ghcr.pat — a gitignored file, so the token never has to be typed
+//     into a shell (history) or pasted into a transcript
 //
 // `gh auth token` is deliberately NOT consulted: the CLI's own token is an OAuth
 // token whose package scopes come from a device flow, and a binary that shells
