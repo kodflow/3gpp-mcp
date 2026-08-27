@@ -216,6 +216,44 @@ func (e *Engine) EmbedderModelID() string { return e.emb.ModelID() }
 // RerankerEnabled reports whether the cross-encoder reranker is available.
 func (e *Engine) RerankerEnabled() bool { return e.rr.Enabled() }
 
+// ModeServed reports the retrieval mode this engine can ACTUALLY run for a
+// requested one, so a caller can say which it got instead of implying it got
+// what it asked for.
+//
+// Search degrades on purpose — a "semantic" request with no embedder falls back
+// to lexical rather than returning nothing. That is the right behaviour and the
+// wrong silence: the results come back shaped exactly like semantic ones, and
+// nothing in the payload says the requested arm never ran. For a server whose
+// whole doctrine is "cite, never guess", answering a different question than the
+// one asked without saying so is the same failure in a smaller box.
+//
+// This reports what the ENGINE knows: whether a query can be vectorised at all.
+// It deliberately does not try to predict an empty vector arm on a corpus with
+// no vectors — that is what server_info's `hnsw` field is for.
+func (e *Engine) ModeServed(requested string) string {
+	lex := !e.offLexical.Load()
+	vec := e.emb.Enabled() && !e.offVector.Load()
+
+	switch requested {
+	case "lexical":
+		return "lexical"
+	case "semantic":
+		if vec {
+			return "semantic"
+		}
+		return "lexical"
+	default: // "" and "hybrid"
+		switch {
+		case vec && lex:
+			return "hybrid"
+		case vec:
+			return "semantic"
+		default:
+			return "lexical"
+		}
+	}
+}
+
 // Request parameterises a search. Mode selects which retrieval arms run:
 // "" / "hybrid" = lexical ⊕ vector, "lexical" = BM25 only, "semantic" = vector
 // only (degrades to lexical when no embedder/vectors — never returns nothing).
