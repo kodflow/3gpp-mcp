@@ -23,7 +23,12 @@ builds:
       - -s -w -X main.Version={{ .Version }}
     goos: [darwin]
     goarch: [amd64, arm64]
-  # Semantic-capable variant (-tags onnx). ONNX Runtime is dlopen'd at runtime
+  # RERANKER variant (-tags onnx). NOT semantic search, despite the asset name:
+  # since the write-side->Rust cutover, `-tags onnx` alone means "reranker, no
+  # embed" (internal/embed/embed_noop.go), so mode=semantic degrades to lexical.
+  # Real query-embed needs onnx,embed_ffi + the rust/embed-core cdylib — see the
+  # long note in .goreleaser.yaml.
+  # ONNX Runtime is dlopen'd at runtime
   # (bootstrap --semantic fetches it + the model), so no extra link deps.
   # arm64 only: Microsoft stopped publishing onnxruntime-osx-x86_64 at 1.25.0,
   # so an onnx binary on Intel Mac would have no ORT to dlopen at runtime.

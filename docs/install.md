@@ -117,7 +117,40 @@ rather than refusing to start. It never re-hashes 12.36 GB to decide whether an
 update exists: the published layer digests are recorded beside the DB, so the
 check is one manifest request.
 
-## 5. Verify
+## 5. Which builds can actually do semantic search
+
+The corpus carries 821 146 vectors and a frozen HNSW index, but reaching them at
+query time needs a **query embedder**, and not every build has one. Since the
+write-side→Rust cutover, `-tags onnx` alone means *reranker, no embed*.
+
+| What you run | Lexical | Reranker | Semantic |
+|---|:--:|:--:|:--:|
+| `mcp-3gpp_*` release archive | ✅ | — | — |
+| `mcp-3gpp-onnx_*` release archive | ✅ | ✅ | **—** |
+| `ghcr.io/kodflow/3gpp-mcp:edge` (the `full` image) | ✅ | ✅ | ✅ |
+| local build, `-tags onnx,embed_ffi` + `embed-core --features ort` | ✅ | ✅ | ✅ |
+
+A build without an embedder does not fail a `mode=semantic` request — it answers
+lexically. It now **says so**: the response carries `mode` (what actually ran)
+and, when that differs from what you asked, `mode_requested` and
+`mode_degraded`. `server_info` gives the reason.
+
+To build the semantic pair yourself:
+
+```sh
+cargo build --release --manifest-path rust/embed-core/Cargo.toml --features ort
+go build -tags "duckdb_use_lib,onnx,embed_ffi" -o server ./cmd/server
+# at run time, the cdylib and libonnxruntime must be loadable:
+export ORT_DYLIB_PATH=<…>/libonnxruntime.so   # onnxruntime.dll on Windows
+export EMBED_MODEL_DIR=<…>/models/bge-m3
+```
+
+Check it took: `server_info` must report `semantic: true` **and**
+`embedding_model_client == embedding_model_db`. Equal ids are what guarantee the
+query vector was produced by the same model as the corpus; different ids mean
+the vectors cannot be compared and the server refuses rather than pretending.
+
+## 6. Verify
 
 ```sh
 mcp-3gpp version
