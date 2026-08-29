@@ -22,6 +22,34 @@ import (
 // hnsw-metric-omitted-from-strip-cleanup / strip-meta-test-tautological).
 var VectorMetaKeys = []string{
 	"hnsw_state", "hnsw_metric", "embedding_dim", "embedding_count", "embedding_model",
+	"hnsw_m", "hnsw_ef_construction",
+}
+
+// The HNSW build parameters, and why they are not DuckDB's defaults.
+//
+// The index was created with `WITH (metric = 'cosine')` and nothing else, so it
+// took VSS's defaults: M = 16, ef_construction = 64. Those are sized for small,
+// low-dimensional sets. This index carries 821 146 vectors of 1024 dimensions,
+// where a sparser graph costs recall the serve path can never get back — an
+// approximate index that misses a neighbour returns a worse answer with no error
+// and no way for a caller to tell.
+//
+// M = 32 doubles the connections per node; ef_construction = 128 doubles the
+// candidate list the builder explores. Both are BUILD-time and INDEX-SIZE costs
+// paid once, against a recall gain paid back on every query. They are recorded in
+// schema_meta because an index whose parameters are not written down cannot be
+// compared against the next one.
+//
+// Overridable, like the memory ceilings: an operator rebuilding on a smaller box
+// may want the defaults back.
+func hnswM() string              { return envOrDefault("HNSW_M", "32") }
+func hnswEfConstruction() string { return envOrDefault("HNSW_EF_CONSTRUCTION", "128") }
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // OpenReadOnly opens the DuckDB file in read-only mode — the serve posture: no
@@ -117,7 +145,7 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	// and in build time.
 	idx, table := s.hnswTarget()
 	if _, err := s.db.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine')`); err != nil {
+		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine', M = `+hnswM()+`, ef_construction = `+hnswEfConstruction()+`)`); err != nil {
 		return fmt.Errorf("create hnsw on %s: %w", table, err) // (6)
 	}
 	if err := s.checkpoint(ctx); err != nil { // (7) serialise the index into the file
@@ -131,6 +159,7 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	for k, v := range map[string]string{
 		"hnsw_metric": "cosine", "embedding_dim": "1024",
 		"embedding_count": fmt.Sprintf("%d", count), "embedding_model": model,
+		"hnsw_m": hnswM(), "hnsw_ef_construction": hnswEfConstruction(),
 	} {
 		_ = s.SetMeta(k, v)
 	}
