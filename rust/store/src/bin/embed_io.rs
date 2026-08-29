@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         } else {
             store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
         };
-        let wl = store.clauses_needing_embedding(args.limit, floor_ord)?;
+        let wl = store.clauses_needing_embedding(args.limit, floor_ord, &args.embed_identity)?;
         let f = std::fs::File::create(out).with_context(|| format!("create {out}"))?;
         let mut w = BufWriter::new(f);
         for it in &wl {
@@ -221,7 +221,7 @@ fn main() -> Result<()> {
             store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
         };
         // null_embeddings_at_floor = embeddable + still-NULL clauses at/above the floor.
-        let null_at_floor = store.clauses_needing_embedding(0, floor_ord)?.len();
+        let null_at_floor = store.clauses_needing_embedding(0, floor_ord, "")?.len();
         let total = store.count_clauses()?;
         let null_all = store.count_null_embeddings()?;
         println!(
