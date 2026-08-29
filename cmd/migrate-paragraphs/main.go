@@ -26,6 +26,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -87,7 +88,14 @@ func main() {
 		return
 	}
 	if !*verifyOnly {
-		if err := build(h); err != nil {
+		// An already-converted corpus is a SUCCESS with no work, not a failure: the
+		// pipeline passes --drop-clauses unconditionally and must be able to re-run
+		// `paragraphs` on a corpus it already converted. See alreadyConverted.
+		switch err := build(h); {
+		case errors.Is(err, errAlreadyConverted):
+			report(h)
+			return
+		case err != nil:
 			die("build: %v", err)
 		}
 	}
@@ -103,6 +111,11 @@ func main() {
 }
 
 func build(h *sql.DB) error {
+	if done, err := alreadyConverted(h); err != nil {
+		return err
+	} else if done {
+		return errAlreadyConverted
+	}
 	if err := refuseToShrink(h); err != nil {
 		return err
 	}
@@ -364,6 +377,60 @@ func report(h *sql.DB) {
 func die(f string, a ...any) {
 	fmt.Fprintf(os.Stderr, "migrate-paragraphs: "+f+"\n", a...)
 	os.Exit(1)
+}
+
+// errAlreadyConverted ends the run as a success: there is nothing to convert.
+var errAlreadyConverted = errors.New("already converted")
+
+// alreadyConverted reports whether `clauses` is the compatibility VIEW, which is the
+// one input the rebuild must never run against.
+//
+// THE REBUILD IS NOT IDEMPOTENT, AND ITS COMMENTS USED TO SAY IT WAS.
+//
+// The steps run in order: staging reads `clauses`, then `paragraphs` and `body_seq` are
+// REPLACED with fresh row_number() ids, and only then is `clause_occ` re-derived — also
+// `FROM clauses`. When `clauses` is a real table that ordering is harmless, because the
+// table owes nothing to the tables being replaced. When it is the VIEW, it is defined as
+// clause_occ ⋈ bodies ⋈ body_seq ⋈ paragraphs, so by the time `clause_occ` is rebuilt the
+// view is joining freshly renumbered paragraphs against the OLD body_ids still in
+// clause_occ. It resolves almost nothing.
+//
+// Measured on 2026-08-29 against the real corpus: `clause_occ` went from 2 752 688 rows
+// to 140 047, and `verify` then passed — 140047/140047 rebuild byte-for-byte — because it
+// compares the rebuild against the same broken view. Every count agreed with every other
+// count about a corpus that had lost 95% of its occurrences. Only `drop` failed, and only
+// because `DROP TABLE clauses` cannot drop a view.
+//
+// refuseToShrink cannot catch this: it runs BEFORE the rebuild, when `clauses` (the view)
+// and `clause_occ` still report the same 2 752 688 rows.
+//
+// So the case is refused at the entrance instead. It costs nothing to detect and it is
+// exactly the case the pipeline hits every time it re-runs `paragraphs` on a corpus that
+// is already content-addressed — which internal/goal's step comment claimed was "a no-op
+// re-derivation". It is now genuinely a no-op, rather than being described as one.
+func alreadyConverted(h *sql.DB) (bool, error) {
+	var kind string
+	if err := h.QueryRow(
+		`SELECT COALESCE(max(table_type),'') FROM information_schema.tables WHERE table_name='clauses'`,
+	).Scan(&kind); err != nil {
+		return false, fmt.Errorf("inspecting the shape of `clauses`: %w", err)
+	}
+	if !strings.EqualFold(kind, "VIEW") {
+		return false, nil
+	}
+	// A view over nothing is not a converted corpus; let the normal paths report it.
+	var occ int64
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		return false, fmt.Errorf("`clauses` is a view but clause_occ is unreadable: %w", err)
+	}
+	if occ == 0 {
+		return false, nil
+	}
+	fmt.Fprintf(os.Stderr,
+		"  `clauses` is already the compatibility view over %d occurrence(s) — the corpus is\n"+
+			"  content-addressed and there is nothing to convert. Rebuilding from the view would\n"+
+			"  renumber paragraphs/body_seq under clause_occ's feet and destroy it.\n", occ)
+	return true, nil
 }
 
 // refuseToShrink stops the one way this conversion can destroy a corpus.

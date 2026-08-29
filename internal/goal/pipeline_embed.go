@@ -989,9 +989,16 @@ func stepParagraphs() *Step {
 		Run: func(c *Ctx) error {
 			db := c.dataPath("3gpp.duckdb")
 			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
-			// --drop-clauses is safe to pass unconditionally: the tool refuses to
-			// drop anything unless its own verification passed first, and on an
-			// already-converted corpus the build is a no-op re-derivation.
+			// --drop-clauses is safe to pass unconditionally, but NOT for the reason
+			// this comment used to give. It claimed the build was "a no-op
+			// re-derivation" on an already-converted corpus. It was the opposite: the
+			// rebuild reads `clauses`, which on such a corpus is the VIEW over the
+			// very tables it replaces, so re-deriving clause_occ joined freshly
+			// renumbered paragraphs against the old body_ids and cut 2 752 688
+			// occurrences down to 140 047 — with verify passing, because it compares
+			// the rebuild against the same broken view. Measured 2026-08-29.
+			// cmd/migrate-paragraphs now DECLINES that input up front
+			// (alreadyConverted), so the step really is the no-op it is described as.
 			return c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
 				"--db", db, "--drop-clauses",
 			}, Echo: true})
