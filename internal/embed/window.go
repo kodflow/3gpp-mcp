@@ -10,11 +10,20 @@ import (
 // EMBED_WINDOWING=mean_pool path is enabled.
 const defaultWindowWords = 300
 
-// TODO(#208): this mean_pool windowing is the RECALL-correct long-clause strategy but
-// currently exists ONLY in Go. The production embedder is Rust (rust/embedder), which
-// truncates — so the canonical config is truncate@1024 until this is ported to Rust
-// (mirror windowText + meanPoolL2). Windowing is now an EmbedIdentity component, so the
-// switch to mean_pool will bump the identity and force a clean re-embed.
+// This is the REFERENCE implementation of the mean_pool WORD SPLIT. The production
+// embedder is Rust (rust/embedder/src/window.rs), which mirrors these two functions
+// exactly; the pair is pinned by testdata/window_parity.json (window_parity_test.go),
+// because windowing is an EmbedIdentity component and a silent divergence would
+// embed the corpus under one split while queries used another.
+//
+// The Rust side WRAPS this with two things Go does not need, because Go no longer
+// embeds the corpus — it only embeds queries, which are short:
+//
+//   - it windows a clause only when the clause does not fit in max_tokens whole, so
+//     a clause that was never truncated keeps the vector it already had;
+//   - it re-splits any window that still reaches max_tokens, because 3GPP tables and
+//     ASN.1 tokenise at over 3 tokens/word and 300-word windows hit the cap 10.8% of
+//     the time on this corpus.
 //
 // windowText splits text into ≤maxWords word-windows (no overlap), respecting
 // word boundaries (never mid-word). Short text → a single window. Used to embed
