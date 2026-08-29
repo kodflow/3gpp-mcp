@@ -4,58 +4,66 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"strings"
+	"path/filepath"
 
 	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 )
 
-// The rolling "latest" GitHub release is the single source of the indexed DB.
-// There is no version history: the DB's identity is its sha256 sidecar.
+// WHERE THE CORPUS COMES FROM, AND WHY IT MOVED.
 //
-// NOTE THE PATH SHAPE: `/releases/download/latest/…`, not
-// `/releases/latest/download/…`.
+// It used to be the rolling `latest` GitHub Release asset, hardcoded here as the
+// DEFAULT. That was wrong twice over, and the default is what made it serious —
+// the out-of-the-box path was the non-compliant one:
 //
-// The second form looks equivalent and is not. `/releases/latest/` is a GitHub
-// ALIAS that resolves to the most recent NON-PRERELEASE release, which in this
-// repository is the `models` tag (it carries the ORT and BGE-M3 bundles) — not
-// the release literally tagged `latest`. So the alias redirected to a release
-// that does not hold the DB and every bootstrap ended in a 404. The project knew
-// (corpus-image.yml records "the runtime DB-bootstrap URL … 404s") and worked
-// around it by baking the DB into the image instead of correcting two constants.
+//   - DATA_NOTICE.md forbids it. The DB holds verbatim 3GPP/ETSI clause text, and
+//     the notice is explicit that no Release asset of this public repository may
+//     carry a full-text DuckDB database.
+//   - It no longer fits. GitHub caps an asset at 2 GB; the content-addressed
+//     corpus is 12.36 GB (~7.9 GB compressed).
 //
-// Pinned by TestBootstrapURLsTargetTheLatestTag.
+// The corpus therefore comes from the PRIVATE GHCR package that
+// scripts/local/publish-corpus.sh already publishes. It needs a credential, by
+// design — see internal/bootstrap/ghcr_corpus.go.
+//
+// `--db-url` survives as an explicit override for a mirror you host yourself.
+// Nothing points at a github.com release asset any more, which is what
+// TestBootstrapDefaultsAreNotAPublicReleaseAsset pins.
 const (
-	defaultDBURL    = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.zst"
-	defaultDBSHAURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/3gpp.duckdb.sha256"
+	// envGHCROwner / envCorpusTag let a deployment repoint the corpus without a
+	// rebuild (a fork, a staging tag) while keeping the default zero-config.
+	envGHCROwner = "MCP3GPP_GHCR_OWNER"
+	envCorpusTag = "MCP3GPP_CORPUS_TAG"
 )
 
-// remoteSHA fetches the published sha256 sidecar and returns its hash field
-// (lowercase). Best-effort: returns "" on any error so callers can degrade.
-func remoteSHA(ctx context.Context, url string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := bootstrap.HTTPClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if err != nil {
-		return ""
-	}
-	if fields := strings.Fields(string(b)); len(fields) > 0 {
-		return strings.ToLower(fields[0])
-	}
-	return ""
+// corpusSource is the 3GPP corpus package this binary provisions from.
+func corpusSource() bootstrap.CorpusSource {
+	return bootstrap.Corpus3GPP(os.Getenv(envGHCROwner), os.Getenv(envCorpusTag))
 }
+
+// etsiSource is the ETSI Lawful-Interception corpus, served alongside and never
+// merged (CLAUDE.md §13).
+func etsiSource() bootstrap.CorpusSource {
+	return bootstrap.CorpusETSI(os.Getenv(envGHCROwner), os.Getenv(envCorpusTag))
+}
+
+// bootstrapLog prefixes progress the same way the rest of the binary does.
+func bootstrapLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[bootstrap] "+format+"\n", args...)
+}
+
+// credentialAdvice is the one message that turns "401" into something a user can
+// act on. It names every accepted source, because the failure it explains is the
+// first thing a new user hits.
+const credentialAdvice = `the corpus package is PRIVATE — it carries verbatim 3GPP/ETSI specification text.
+
+Provide a GitHub token with read:packages, by any of:
+  - export GHCR_PAT=<token>          (or GITHUB_TOKEN, on a CI runner)
+  - mcp-3gpp bootstrap --ghcr-token <token>
+  - write it to .local/ghcr.pat      (when running from a checkout; gitignored)
+
+Create one at https://github.com/settings/tokens/new — tick read:packages.
+If you build the corpus yourself, skip all of this and point --db at it.`
 
 // ensureDB guarantees the per-user cache holds a usable indexed DB, pulling it
 // from the rolling "latest" release when absent and refreshing it when the
@@ -74,25 +82,41 @@ func ensureDB(ctx context.Context, allowUpdate bool) (string, error) {
 		return dbPath, nil
 	}
 
-	want := remoteSHA(ctx, defaultDBSHAURL) // "" if unreachable
-	if have {
-		if want == "" {
-			return dbPath, nil // offline: keep cache
-		}
-		if cur, err := bootstrap.SHA256File(dbPath); err == nil && cur == want {
-			return dbPath, nil // already current
-		}
-		fmt.Fprintln(os.Stderr, "[3gpp-mcp] DB update available — pulling latest…")
-	} else {
-		fmt.Fprintln(os.Stderr, "[3gpp-mcp] no cached DB — pulling latest…")
-	}
-
-	if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: defaultDBURL, SHA256: want, Dest: dbPath}); err != nil {
-		if have { // degrade: prefer a stale-but-working DB over failing serve
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] DB update failed (%v) — using cached DB\n", err)
+	src := corpusSource()
+	pat, origin, cerr := bootstrap.GHCRCredential("")
+	if cerr != nil {
+		if have { // degrade: a cached corpus serves fine without a credential
 			return dbPath, nil
 		}
-		return "", fmt.Errorf("pull DB from %s: %w", defaultDBURL, err)
+		return "", fmt.Errorf("no cached corpus at %s and no credential to fetch one.\n\n%s", dbPath, credentialAdvice)
+	}
+
+	// One manifest GET decides whether a 7.9 GB transfer is needed at all.
+	published, ierr := bootstrap.CorpusIdentity(ctx, src, pat)
+	switch {
+	case ierr != nil && have:
+		// Offline, throttled, or a token that lost its scope: keep serving.
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] could not check %s for updates (%v) — using the cached corpus\n", src, ierr)
+		return dbPath, nil
+	case ierr != nil:
+		return "", fmt.Errorf("no cached corpus and %s is unreachable: %w", src, ierr)
+	}
+
+	if have {
+		if bootstrap.CachedCorpusIdentity(dbPath) == published {
+			return dbPath, nil // already current
+		}
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] a newer corpus is published on %s — pulling it (credential from %s)…\n", src, origin)
+	} else {
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] no cached corpus — pulling %s (credential from %s). This is large; it resumes if interrupted.\n", src, origin)
+	}
+
+	if err := bootstrap.FetchCorpus(ctx, src, pat, dbPath, bootstrapLog); err != nil {
+		if have { // degrade: prefer a stale-but-working corpus over failing serve
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] corpus update failed (%v) — using the cached corpus\n", err)
+			return dbPath, nil
+		}
+		return "", fmt.Errorf("pull the corpus from %s: %w", src, err)
 	}
 	return dbPath, nil
 }
@@ -105,13 +129,24 @@ func ensureDB(ctx context.Context, allowUpdate bool) (string, error) {
 func runBootstrap(args []string) error {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	cache := fs.String("cache", "", "cache dir (default: per-user cache, or $MCP3GPP_CACHE)")
-	dbURL := fs.String("db-url", "", "URL of the indexed DuckDB snapshot (.duckdb or .duckdb.zst)")
-	dbSHA := fs.String("db-sha256", "", "expected SHA-256 of the decompressed DB (recommended)")
-	skipDB := fs.Bool("skip-db", false, "do not fetch the DB (models/ONNX Runtime only) — for image bakes that provide the DB separately")
+	dbURL := fs.String("db-url", "", "OVERRIDE: fetch the corpus from this URL (.duckdb or .duckdb.zst) instead of the GHCR package — for a mirror you host yourself")
+	dbSHA := fs.String("db-sha256", "", "with --db-url, the expected SHA-256 of the decompressed DB (recommended)")
+	etsiURL := fs.String("etsi-url", "", "with --db-url, fetch the ETSI corpus from this URL too (a 3GPP mirror URL says nothing about where the ETSI one lives)")
+	etsiSHA := fs.String("etsi-sha256", "", "with --etsi-url, the expected SHA-256 of the decompressed ETSI DB (recommended)")
+	ghcrToken := fs.String("ghcr-token", "", "GitHub token with read:packages for the private corpus package (default: $GHCR_PAT, $GITHUB_TOKEN, or .local/ghcr.pat)")
+	force := fs.Bool("force", false, "re-fetch the corpus even when the cache already holds the published one")
+	skipDB := fs.Bool("skip-db", false, "do not fetch the corpus (models/ONNX Runtime only) — for image bakes that provide it separately")
+	withETSI := fs.Bool("etsi", false, "also fetch the ETSI Lawful-Interception corpus (23 MB), served alongside the 3GPP one")
 	semantic := fs.Bool("semantic", false, "also fetch BGE-M3 + reranker models and ONNX Runtime (~5 GB)")
 	noReranker := fs.Bool("no-reranker", false, "with --semantic, fetch only the BGE-M3 embedder + ONNX Runtime, NOT the optional reranker (smaller, fewer flaky fetches)")
 	ortVer := fs.String("ort-version", bootstrap.DefaultORTVersion, "ONNX Runtime version")
 	_ = fs.Parse(args)
+
+	// The symmetric silence: --etsi-url is only consulted on the mirror path, so
+	// passing it without --db-url would be dropped as quietly as --etsi once was.
+	if *etsiURL != "" && *dbURL == "" {
+		return fmt.Errorf("--etsi-url only applies with --db-url; on the default path the ETSI corpus comes from its own private GHCR package")
+	}
 
 	if *cache != "" {
 		_ = os.Setenv("MCP3GPP_CACHE", *cache)
@@ -123,18 +158,53 @@ func runBootstrap(args []string) error {
 		if err != nil {
 			return err
 		}
-		// No --db-url? Default to the rolling "latest" release, resolving its
-		// published sha256 so the download is verified out of the box.
-		url, sha := *dbURL, *dbSHA
-		if url == "" {
-			url = defaultDBURL
-			if sha == "" {
-				sha = remoteSHA(ctx, defaultDBSHAURL)
+		switch {
+		case *dbURL != "":
+			// Explicit mirror: a plain verified download, exactly as before.
+			bootstrapLog("corpus %s → %s", *dbURL, dbPath)
+			if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: *dbURL, SHA256: *dbSHA, Dest: dbPath}); err != nil {
+				return err
 			}
-		}
-		fmt.Fprintf(os.Stderr, "[bootstrap] DB %s → %s\n", url, dbPath)
-		if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: url, SHA256: sha, Dest: dbPath}); err != nil {
-			return err
+			// --etsi used to be accepted here and silently dropped: the ETSI fetch
+			// lived only in the default branch, so `bootstrap --db-url … --etsi`
+			// exited 0 having created no etsi.duckdb, and serve then ran 3GPP-only
+			// with nothing in the output to explain the missing half.
+			if *withETSI {
+				if *etsiURL == "" {
+					return fmt.Errorf("--etsi with --db-url also needs --etsi-url: a mirror that carries your 3GPP corpus has to carry the ETSI one too, and the private GHCR package is consulted only on the default path")
+				}
+				etsiPath := filepath.Join(filepath.Dir(dbPath), "etsi.duckdb")
+				bootstrapLog("corpus %s → %s", *etsiURL, etsiPath)
+				if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: *etsiURL, SHA256: *etsiSHA, Dest: etsiPath}); err != nil {
+					return err
+				}
+			}
+		default:
+			if *force {
+				// The identity recorded beside the cache is what marks it current,
+				// so removing it is precisely what makes the next fetch transfer
+				// again. Without this the check added to FetchCorpus would leave a
+				// corrupt-but-current cache with no way back short of rm.
+				_ = os.Remove(bootstrap.DigestPath(dbPath))
+			}
+			pat, origin, cerr := bootstrap.GHCRCredential(*ghcrToken)
+			if cerr != nil {
+				return fmt.Errorf("%s", credentialAdvice)
+			}
+			bootstrapLog("corpus %s → %s (credential from %s)", corpusSource(), dbPath, origin)
+			if err := bootstrap.FetchCorpus(ctx, corpusSource(), pat, dbPath, bootstrapLog); err != nil {
+				return err
+			}
+			if *withETSI {
+				etsiPath := filepath.Join(filepath.Dir(dbPath), "etsi.duckdb")
+				if *force {
+					_ = os.Remove(bootstrap.DigestPath(etsiPath))
+				}
+				bootstrapLog("corpus %s → %s", etsiSource(), etsiPath)
+				if err := bootstrap.FetchCorpus(ctx, etsiSource(), pat, etsiPath, bootstrapLog); err != nil {
+					return err
+				}
+			}
 		}
 	}
 

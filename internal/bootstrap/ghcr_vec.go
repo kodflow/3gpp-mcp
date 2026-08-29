@@ -13,6 +13,16 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// registryBase is the OCI registry every pull in this package targets, and
+// registryService the value its token endpoint wants in `service=`. They are
+// vars rather than consts for exactly one reason: the tests point the whole
+// token → manifest → blob chain at an httptest server. Nothing in the shipped
+// code rewrites them.
+var (
+	registryBase    = "https://ghcr.io"
+	registryService = "ghcr.io"
+)
+
 // vecImage is the GHCR package holding the Option-B vector sub-bases; the repo is
 // "<owner>/<vecImage>" (e.g. kodflow/3gpp-vec). Published by corpus-matrix's
 // publish-vec job as an OCI artifact (one zstd layer per sub-base + the manifest).
@@ -71,7 +81,7 @@ func FetchVecBases(ctx context.Context, owner, dir string) (string, error) {
 
 // ghcrToken fetches an anonymous pull token for a public GHCR repository.
 func ghcrToken(ctx context.Context, repo string) (string, error) {
-	u := "https://ghcr.io/token?service=ghcr.io&scope=repository:" + repo + ":pull"
+	u := registryBase + "/token?service=" + registryService + "&scope=repository:" + repo + ":pull"
 	var token string
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -95,12 +105,20 @@ func ghcrToken(ctx context.Context, repo string) (string, error) {
 	return token, err
 }
 
-type ghcrLayer struct{ digest, title string }
+// ghcrLayer is one layer of an OCI manifest. size comes from the manifest and is
+// what makes a resumable pull possible (see ghcr_corpus.go): without it, a
+// partial file left on disk cannot be told from a complete one.
+type ghcrLayer struct {
+	digest, title string
+	size          int64
+}
 
-// ghcrLayers reads an OCI manifest and returns its layers' digest + filename
-// (the org.opencontainers.image.title annotation set by `oras push`).
+// ghcrLayers reads an OCI manifest and returns its layers' digest + size +
+// filename (the org.opencontainers.image.title annotation set by `oras push`;
+// `crane append` sets no title, which is why the corpus path matches on the tar
+// member's name instead).
 func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, error) {
-	u := "https://ghcr.io/v2/" + repo + "/manifests/" + ref
+	u := registryBase + "/v2/" + repo + "/manifests/" + ref
 	var out []ghcrLayer
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -119,6 +137,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		var m struct {
 			Layers []struct {
 				Digest      string            `json:"digest"`
+				Size        int64             `json:"size"`
 				Annotations map[string]string `json:"annotations"`
 			} `json:"layers"`
 		}
@@ -127,7 +146,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		}
 		layers := make([]ghcrLayer, 0, len(m.Layers))
 		for _, l := range m.Layers {
-			layers = append(layers, ghcrLayer{digest: l.Digest, title: l.Annotations["org.opencontainers.image.title"]})
+			layers = append(layers, ghcrLayer{digest: l.Digest, size: l.Size, title: l.Annotations["org.opencontainers.image.title"]})
 		}
 		if len(layers) == 0 {
 			return fmt.Errorf("ghcr manifest %s has no layers", repo)
@@ -140,7 +159,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 
 // ghcrPullBlob downloads a blob by digest to dest, zstd-decompressing if asked.
 func ghcrPullBlob(ctx context.Context, repo, digest, token, dest string, decompress bool) error {
-	u := "https://ghcr.io/v2/" + repo + "/blobs/" + digest
+	u := registryBase + "/v2/" + repo + "/blobs/" + digest
 	// Idempotent (writes .part then renames) → safe to retry on transient drops.
 	return netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

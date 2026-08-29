@@ -97,6 +97,75 @@ jobs:
           go test -race -count=1 -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
 
+  # --- Stage 1 (parallel): the DATA_NOTICE guard -----------------------------
+  #
+  # DATA_NOTICE.md says that while this repository is public, no Release asset,
+  # Actions artifact, log or public container layer may carry clauses.text or a
+  # full-text DuckDB. That was written down and then broken for months: the
+  # rolling `latest` release carried 3gpp.duckdb.zst (670 MB) and
+  # 3gpp.delta.duckdb.zst (168 MB), and cmd/server hardcoded that URL as its
+  # DEFAULT, so the out-of-the-box path was the non-compliant one.
+  #
+  # A rule nothing checks is a rule that is already broken and does not know it.
+  # This job is the check. It has two halves, and the SOURCE half is the one that
+  # prevents a recurrence: it fails on any code that points the corpus at a
+  # github.com release asset again, which no amount of deleting bytes would stop.
+  data-notice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # --- half 1: the source must not re-point the corpus at a release asset --
+      # Comments and tests legitimately DISCUSS the retired URL (the whole point
+      # of the test that pins this rule is to name what it forbids), so match a
+      # real reference: a corpus artefact on a github.com release path, outside a
+      # comment.
+      - name: no corpus artefact URL in the shipped source
+        run: |
+          set -euo pipefail
+          hits="$(git grep -nE 'https://github\.com/[^"]*/releases/[^"]*\.duckdb' -- \
+                    'cmd/**/*.go' 'internal/**/*.go' 'rust/**/*.rs' 'scripts/**' \
+                    ':!*_test.go' \
+                  | grep -vE ':[[:space:]]*(//|#)' || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::a corpus artefact is being fetched from a GitHub release again:"
+            echo "$hits"
+            echo "DATA_NOTICE.md: the corpus is verbatim 3GPP/ETSI text and must travel"
+            echo "on the PRIVATE GHCR package. See internal/bootstrap/ghcr_corpus.go."
+            exit 1
+          fi
+          echo "OK: nothing in the shipped source pulls a corpus artefact from a release."
+
+      # --- half 2: the published release must not carry one --------------------
+      # Advisory on a fork PR (no token, and a fork cannot fix the upstream
+      # release anyway); binding everywhere else.
+      - name: no corpus artefact published on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          assets="$(gh release view latest --repo "$GITHUB_REPOSITORY" \
+                      --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          if [ -z "$assets" ]; then
+            echo "::notice::could not read the 'latest' release — skipping the published-asset half"
+            exit 0
+          fi
+          bad="$(printf '%s\n' "$assets" | grep -E '\.duckdb(\.|$)' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::the public 'latest' release carries corpus artefact(s):"
+            printf '  %s\n' $bad
+            echo ""
+            echo "DATA_NOTICE.md forbids this: the corpus is verbatim 3GPP/ETSI"
+            echo "specification text, and free to download is not free to redistribute."
+            echo "Remove them with:"
+            for a in $bad; do echo "  gh release delete-asset latest $a"; done
+            exit 1
+          fi
+          echo "OK: the release carries binaries and metadata only."
+
   # --- Stage 1 (parallel): scripts + config sanity ---------------------------
   scripts-config:
     runs-on: ubuntu-latest

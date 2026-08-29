@@ -29,7 +29,26 @@ builds:
       - goos: linux
         goarch: arm64 # GNU cross-toolchain — ABI-matches the prebuilt arm64 lib
         env: [CC=aarch64-linux-gnu-gcc, CXX=aarch64-linux-gnu-g++]
-  # Semantic-capable variant: -tags onnx compiles the BGE-M3/reranker backend.
+  # RERANKER variant. It is NOT semantic search, despite the asset name.
+  #
+  # This comment used to read "Semantic-capable variant: -tags onnx compiles the
+  # BGE-M3/reranker backend". That was true until the write-side->Rust cutover
+  # (Phase 11b) REMOVED the Go ONNX embed backend. internal/embed/embed_noop.go
+  # has been explicit ever since: any build without `embed_ffi` returns
+  # Disabled{}, and "`-tags onnx` alone now means reranker, no embed".
+  #
+  # So this binary carries the cross-encoder reranker and NO query embedder. A
+  # mode=semantic or mode=hybrid request degrades to lexical and the corpus's
+  # 821 146 vectors are unreachable from it. search_spec now reports that in
+  # `mode` / `mode_degraded`, and server_info gives the reason.
+  #
+  # Real semantic search needs `-tags onnx,embed_ffi` plus the rust/embed-core
+  # cdylib built with --features ort and loadable at run time. That is what the
+  # `full` image builds (corpus-image.yml: build_tags: onnx,embed_ffi) and what a
+  # local build produces. Doing it here means cross-building that cdylib for
+  # every target and shipping it in the archive: not done — and, now, not
+  # pretended either.
+  #
   # onnxruntime_go dlopens libonnxruntime at runtime (no extra link deps), so the
   # DuckDB GNU toolchain is unchanged; `bootstrap --semantic` fetches ORT + model.
   - id: mcp-3gpp-linux-onnx
