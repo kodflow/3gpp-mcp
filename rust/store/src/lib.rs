@@ -953,13 +953,18 @@ impl Store {
         // preserve_insertion_order is pure cost here: HNSW is an unordered structure
         // and the scan feeding it has no ORDER BY, so holding the row order only
         // widens the materialisation that has to spill.
+        // MUST match internal/store/hnsw.go's hnswM/hnswEfConstruction: two builders that
+        // disagree produce two different graphs over the same vectors, and nothing downstream
+        // can tell which one it is querying. Same env overrides, same defaults.
+        let m = std::env::var("HNSW_M").unwrap_or_else(|_| "32".into());
+        let efc = std::env::var("HNSW_EF_CONSTRUCTION").unwrap_or_else(|_| "128".into());
         let sql = format!(
             "CHECKPOINT;
              SET memory_limit = '{buf}';
              SET preserve_insertion_order = false;
              {knobs}
              INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
-             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
+             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine', M = {m}, ef_construction = {efc});
              CHECKPOINT;"
         );
         self.conn.execute_batch(&sql).map_err(|e| {
@@ -986,6 +991,8 @@ impl Store {
             ("embedding_dim", "1024"),
             ("embedding_count", &count.to_string()),
             ("embedding_model", model),
+            ("hnsw_m", &m),
+            ("hnsw_ef_construction", &efc),
         ] {
             self.set_meta(k, v)?;
         }
