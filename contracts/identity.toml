@@ -29,7 +29,9 @@ family = "bge-m3"
 revision = "5617a9f"            # pinned BAAI/bge-m3 HF commit (BGEModelRevision)
 tokenizer_revision = "5617a9f"
 precision = ["fp32", "fp16"]    # fp16 corpus and fp32 query must never share one HNSW
-windowing = "truncate"          # canonical; "mean_pool" is the urgent Rust port (#208)
+windowing = "mean_pool"         # #208: embed the whole clause. Rust also (a) windows only
+                                # a clause that does not fit whole and (b) re-splits any
+                                # window still reaching max_tokens, so nothing truncates.
 max_tokens = 1024               # DefaultMaxTokens; truncation length (Go == Rust)
 
 [clause_hash]
