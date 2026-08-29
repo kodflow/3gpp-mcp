@@ -583,17 +583,49 @@ impl Store {
         Ok(v)
     }
 
-    /// clauses_needing_embedding streams the work-list (never-embedded, embeddable
-    /// clauses), oldest chunk first, capped at `limit` (0 = all). Mirrors the Go
-    /// ClausesNeedingEmbedding ResumeOnly path so the Rust embedder can read the
-    /// work-list straight from the DB instead of a JSONL bridge.
-    pub fn clauses_needing_embedding(&self, limit: usize, floor_ord: i64) -> Result<Vec<WorkItem>> {
+    /// clauses_needing_embedding streams the work-list, oldest chunk first, capped at
+    /// `limit` (0 = all).
+    ///
+    /// WHAT "NEEDING" MEANS depends on the identity. Normally it is "has no vector yet".
+    /// But `EmbedIdentity` folds in the model, precision, windowing and max_tokens, and a
+    /// corpus embedded under one identity must never be queried or indexed under another —
+    /// that is the whole reason the identity exists. So when the DB is stamped with a
+    /// DIFFERENT identity than the one this run embeds under, every embeddable clause needs
+    /// re-embedding, vector or not.
+    ///
+    /// This used to ask `embedding IS NULL` alone. The #208 switch from truncate to
+    /// mean_pool therefore archived the ledger, exported an EMPTY work-list, and reported
+    /// "every clause already carries a vector — nothing to do" — a re-embed that silently
+    /// did not happen, on a corpus every vector of which was now stale. Same defect class
+    /// as validate/check-data/LoadVSS: the gate asked a different question than the thing
+    /// it gated.
+    ///
+    /// `want_identity` empty = ask the old question (callers that have no identity to hand).
+    pub fn clauses_needing_embedding(
+        &self,
+        limit: usize,
+        floor_ord: i64,
+        want_identity: &str,
+    ) -> Result<Vec<WorkItem>> {
+        let stamped = self.get_meta("embedding_model").unwrap_or_default();
+        let identity_changed =
+            !want_identity.is_empty() && !stamped.is_empty() && stamped != want_identity;
+        if identity_changed {
+            eprintln!(
+                "embed work-list: corpus is stamped {stamped}, this run embeds {want_identity} — every embeddable clause is stale and re-enters the work-list"
+            );
+        }
+        let vector_filter = if identity_changed {
+            ""
+        } else {
+            "embedding IS NULL AND "
+        };
         // Carry `release` so the floor (release ordinal ≥ floor_ord) is applied in Rust — the
         // Rel-99→3 special makes a pure-SQL ordinal awkward (== Go ClausesNeedingEmbedding
         // FloorOrd). floor_ord ≤ 0 = no floor.
         let sql = format!(
             "SELECT chunk_id, COALESCE(release,''), COALESCE(heading,''), COALESCE(text,'') FROM clauses
-             WHERE embedding IS NULL AND {EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
+             WHERE {vector_filter}{EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare worklist")?;
         let rows = stmt
@@ -1569,7 +1601,7 @@ mod tests {
             .unwrap();
         // clause 3 has empty text → not embeddable.
         assert_eq!(s.count_null_embeddings().unwrap(), 2);
-        let wl = s.clauses_needing_embedding(0, 0).unwrap();
+        let wl = s.clauses_needing_embedding(0, 0, "").unwrap();
         assert_eq!(wl.len(), 2);
 
         let v = vec![0.1f32; DENSE_DIM];

@@ -195,17 +195,25 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	}
 
 	worklist := t.ledgerPath(c) + ".worklist"
-	c.Log.Printf("exporting the work list for %s (clauses with no vector, floor=%q)", t.DB, t.Floor(c))
+	c.Log.Printf("exporting the work list for %s (floor=%q, identity=%s)", t.DB, t.Floor(c), id)
 	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
 		"--db", db, "--export-worklist", worklist, "--embed-floor", t.Floor(c),
+		// Without the identity the export asks "which clauses have no vector"; with it,
+		// it can also answer "which vectors were made by a different embedder".
+		"--embed-identity", id,
 	}}); err != nil {
 		return err
 	}
 	todo := countLines(worklist)
 	c.Checkpoint("worklist", strconv.Itoa(todo))
 	if todo == 0 {
-		c.Log.Printf("every clause already carries a vector — nothing to do")
-		return nil
+		c.Log.Printf("every clause already carries a vector under %s — nothing to embed", id)
+		// DECLINE rather than return nil. The ledger is a declared output of this step,
+		// and with nothing to embed there is no ledger to produce — the identity switch
+		// even archives the previous one. Returning nil made the runner report
+		// "declared output missing after a successful run" and fail a step that had
+		// correctly decided there was no work.
+		return fmt.Errorf("%w: no clause needs a vector under %s", ErrDeclined, id)
 	}
 
 	// THE WORKLIST READS THROUGH THE VIEW; THE WRITE-BACK CANNOT.
