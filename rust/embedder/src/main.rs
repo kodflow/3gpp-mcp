@@ -412,14 +412,21 @@ fn main() -> Result<()> {
     //   2. By TOKENS: any window that still reaches MAX_TOKENS is halved and re-tokenised,
     //      repeatedly, until it fits.
     //
-    // Step 2 is not defensive padding. Measured on this corpus, 300-word windows — the
-    // size the Go reference chose for ~1.3 tokens/word prose — hit the 1024-token cap
-    // 10.8% of the time, because 3GPP tables and ASN.1 tokenise at over 3 tokens/word. A
-    // word-only port would have kept dropping those tails. Shrinking the word window does
-    // not close it either (160 words still truncated 0.5%, and no word count can bound a
-    // single space-free ASN.1 blob) while multiplying the windows, and therefore the GPU
-    // hours, by 9 instead of 5. Splitting only the offenders cost +11.5% windows and ended
-    // at zero.
+    // Step 2 is not defensive padding. Measured on this corpus at the ORIGINAL 300-word /
+    // 1024-token pairing, 300-word windows — the size the Go reference chose for
+    // ~1.3 tokens/word prose — hit the cap 10.8% of the time, because 3GPP tables and
+    // ASN.1 tokenise at over 3 tokens/word. A word-only port would have kept dropping
+    // those tails. Shrinking the word window did not close it either (160 words still
+    // truncated 0.5%, and no word count can bound a single space-free ASN.1 blob) while
+    // multiplying the windows, and therefore the GPU hours, by 9 instead of 5. Splitting
+    // only the offenders cost +11.5% windows and ended at zero.
+    //
+    // The pairing is now 600 words / 2048 tokens — the same ratio, so the same argument
+    // holds and step 2 stays necessary for the same reason. What changes is the volume it
+    // has to handle: a clause that needed two 300-word windows now needs one, and the
+    // 131 932 multi-window clauses of the 2026-08-29 run should fall sharply. That number
+    // is the one to re-read from RESULT windowing after the first run at the new pairing,
+    // rather than assumed.
     //
     // From here down the unit of work is a WINDOW, not a clause: dedup, length-sorting and
     // batching all operate on windows, and only the writer folds them back into clauses.

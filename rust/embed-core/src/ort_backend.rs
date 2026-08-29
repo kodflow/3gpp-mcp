@@ -1,5 +1,5 @@
 //! ort_backend — the REAL BGE-M3 ONNX inference behind embed-core's C ABI (feature `ort`).
-//! A single-query, serve-side mirror of rust/embedder/src/model.rs: same MAX_TOKENS=1024
+//! A single-query, serve-side mirror of rust/embedder/src/model.rs: same MAX_TOKENS=2048
 //! truncate strategy, same dense-output-BY-NAME binding (`sentence_embedding`, never index 0),
 //! same CLS-vs-pooled handling, same L2-normalise — so a query vector is bit-identical to the
 //! corpus vector the embedder wrote (cosine-comparable). The session is lazy-initialised once
@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use tokenizers::{Tokenizer, TruncationParams};
 
 /// Same identity-bound truncation length as the corpus embedder (must stay in lockstep).
-const MAX_TOKENS: usize = 1024;
+const MAX_TOKENS: usize = 2048;
 /// Dense head declared name (bound by name, never index 0 — dual-head export safety).
 const DENSE_OUTPUT: &str = "sentence_embedding";
 

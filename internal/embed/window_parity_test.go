@@ -84,7 +84,7 @@ func parityCases() []parityCase {
 		{Name: "several-windows", MaxWords: 300, Text: repeatWords("w", 750)},
 		{Name: "small-max-words", MaxWords: 7, Text: repeatWords("w", 20)},
 		// max_words < 1 must fall back to the default, not panic or yield one window.
-		{Name: "zero-max-words-uses-default", MaxWords: 0, Text: repeatWords("w", 400)},
+		{Name: "zero-max-words-uses-default", MaxWords: 0, Text: repeatWords("w", 700)},
 		// Multi-byte content must split on words, never inside a rune.
 		{Name: "non-ascii", MaxWords: 3, Text: "réf ↔ ASN.1 « clause » naïve fenêtre"},
 		// A trailing window of exactly one word.

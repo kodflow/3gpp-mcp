@@ -5,10 +5,16 @@ import (
 	"strings"
 )
 
-// defaultWindowWords bounds a window so it stays comfortably under BGE-M3's
-// maxTokens (512) for typical prose (~1.3 tokens/word). Used only when the
+// defaultWindowWords bounds a window so it stays comfortably under the model's
+// maxTokens for typical prose (~1.3 tokens/word). Used only when the
 // EMBED_WINDOWING=mean_pool path is enabled.
-const defaultWindowWords = 300
+//
+// 600, paired with DefaultMaxTokens = 2048, and it MUST equal rust/embedder's
+// DEFAULT_WINDOW_WORDS — window_parity.json is the fixture both sides assert
+// against, and it pins max_words per case, so it does not catch a drift in this
+// default. (The old comment said 512; the Go side had already moved to 1024 and
+// the number was never updated. That is the drift this note exists to stop.)
+const defaultWindowWords = 600
 
 // This is the REFERENCE implementation of the mean_pool WORD SPLIT. The production
 // embedder is Rust (rust/embedder/src/window.rs), which mirrors these two functions

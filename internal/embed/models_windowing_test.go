@@ -14,12 +14,12 @@ func TestModelSpecWindowingMaxTokensDefaults(t *testing.T) {
 	explicit.Windowing = WindowingTruncate
 	explicit.MaxTokens = DefaultMaxTokens
 	if omit.embedParts().Identity() != explicit.embedParts().Identity() {
-		t.Fatal("omitting windowing/max_tokens must yield the canonical truncate/1024 identity — else registries that omit them diverge from the embedded default")
+		t.Fatal("omitting windowing/max_tokens must yield the canonical truncate/2048 identity — else registries that omit them diverge from the embedded default")
 	}
 
 	p := omit.embedParts()
-	if p.Windowing != WindowingTruncate || p.MaxTokens != "1024" {
-		t.Fatalf("defaults: windowing=%q max_tokens=%q, want %q/1024", p.Windowing, p.MaxTokens, WindowingTruncate)
+	if p.Windowing != WindowingTruncate || p.MaxTokens != "2048" {
+		t.Fatalf("defaults: windowing=%q max_tokens=%q, want %q/2048", p.Windowing, p.MaxTokens, WindowingTruncate)
 	}
 
 	// A mean_pool spec must produce a DIFFERENT identity (the urgent Rust port will
