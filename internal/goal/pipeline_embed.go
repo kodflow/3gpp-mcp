@@ -216,17 +216,19 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 		return fmt.Errorf("%w: no clause needs a vector under %s", ErrDeclined, id)
 	}
 
-	// THE WORKLIST READS THROUGH THE VIEW; THE WRITE-BACK CANNOT.
+	// NO WRITE-SHAPE RESTORE HERE ANY MORE.
 	//
-	// On a content-addressed corpus (ADR 0004) `clauses` is a view, and DuckDB
-	// answers an UPDATE against it with a hard error. Reading is fine — the
-	// filters land on `clause_occ` and `bodies` before any text is rebuilt, which
-	// is why the export above costs seconds and not hours — so the restore is
-	// deferred to here, AFTER the count. A run with nothing to embed then pays
-	// nothing at all, which is the common case once the corpus is complete.
-	if err := ensureWriteShape(c, db); err != nil {
-		return err
-	}
+	// This used to call ensureWriteShape, because the import did `UPDATE clauses` and
+	// DuckDB refuses that against a view. The cost was enormous and entirely avoidable:
+	// restoring rematerialises every clause's text, which took the real corpus from
+	// 11.5 GB to 38.8 GB in 5m36 — before a single vector existed — and the run then
+	// needed a full re-compaction to give the space back. Measured on 2026-08-29, that
+	// alone is what made a re-embed need ~64 GB free and fail on a machine with 33.
+	//
+	// The import now writes where the vectors actually live: `bodies`, 821 146 rows
+	// instead of 2 752 688, straight through the view's own join. `merge` still restores
+	// (it deletes and re-inserts rows of `clauses`, which really does need the table);
+	// `embed` no longer has any reason to.
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
