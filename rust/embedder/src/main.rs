@@ -66,6 +66,10 @@ use crate::model::Bge;
 /// BGE-M3 dense dimensionality (must match clauses.embedding FLOAT[1024]).
 const DENSE_DIM: usize = 1024;
 
+/// How often the CPU tokenisation phase reports. It is minutes of work with the GPU
+/// idle, and a silent phase that long reads as a hang.
+const TOK_PROGRESS_EVERY: usize = 100_000;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "embedder",
@@ -451,10 +455,27 @@ fn main() -> Result<()> {
         // Pass 1: does the whole clause fit? Those that do are finished here, with the
         // ORIGINAL text — the same bytes the pre-windowing embedder handed the tokenizer.
         {
+            // Tokenising the whole work-list is CPU-only and takes tens of minutes on a
+            // corpus this size, with the GPU idle. Saying nothing for that long is
+            // indistinguishable from a hang — which is exactly how it looked the first
+            // time it ran — so it reports, on the same PROGRESS channel as the GPU pass.
+            let tok_start = Instant::now();
+            let mut next_tok_log = TOK_PROGRESS_EVERY;
             let idx: Vec<usize> = (0..cw.len()).collect();
             for chunk in idx.chunks(TOK_WINDOW) {
                 let batch: Vec<String> = chunk.iter().map(|&c| cw[c][0].clone()).collect();
                 let rows = bge.encode(&batch).context("tokenise clauses whole")?;
+                if chunk[0] + chunk.len() >= next_tok_log {
+                    let done = chunk[0] + chunk.len();
+                    let secs = tok_start.elapsed().as_secs_f64().max(0.001);
+                    let rate = done as f64 / secs;
+                    let eta = ((total.saturating_sub(done)) as f64 / rate.max(0.001)) as u64;
+                    eprintln!(
+                        "PROGRESS tokenising {done}/{total} ({}%) {rate:.0} clause/s eta {eta}s",
+                        done * 100 / total.max(1)
+                    );
+                    next_tok_log = done + TOK_PROGRESS_EVERY;
+                }
                 for (&c, ids) in chunk.iter().zip(rows) {
                     if ids.len() < crate::model::MAX_TOKENS {
                         cids[c][0] = Some(ids);
