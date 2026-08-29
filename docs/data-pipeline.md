@@ -70,7 +70,13 @@ which is the second, independent reason it travels as an OCI layer.
 |---|---|---|
 | `ci.yml` | push/PR `main` | gofmt + vet + `go test -race` matrix {ubuntu, macos}. Lint = ktn-linter (hooks), not golangci-lint. |
 | `release.yml` | push `main` (code paths) + manual | Build binaries natively per-OS → `gh release upload latest … --clobber`. |
-| `corpus-sync.yml` | cron + manual | **stub**: refresh the DB and push it to the private corpus package. |
+| `rust-bins.yml` | push `main` (rust paths) + manual | Build the Rust binaries per-OS and attach them to `latest`. |
+| `corpus-image.yml` | push `main` + manual | Bake and push the serving image (`full` and `light`) to GHCR. |
+| `corpus-data-image.yml` | manual | Bake the data layer from the published corpus package. |
+| `post-commit.yml` | PR | Gate commit trailers and authorship. |
+
+There is **no scheduled corpus-sync workflow**. Refreshing the corpus is a
+local operation today — see below for why, and what it would take to automate.
 
 ### Corpus sync — incremental, DB-as-state
 
@@ -81,15 +87,23 @@ corpus is **never** fully re-ingested in CI. Each run is a delta:
    manifest request when the cache already holds it, a Range-resumable,
    digest-verified layer pull when it does not.
 2. Diff the live 3gpp.org listing against what the DB already contains.
-3. Download **only the missing specs** → convert (LibreOffice) → `ingest --append`.
+3. Download **only the missing specs** → convert (LibreOffice) →
+   `rust/ingest --resume`, whose ledger can be pointed at the published corpus
+   so it asks what is ALREADY HELD rather than what this shard remembers.
 4. Push the refreshed corpus back to the package with
    `scripts/local/publish-corpus.sh`, which re-asserts that the package is
    private before it uploads.
 
 Kept deliberately simple: "download what's missing, append, re-publish." No
-dated releases, no elaborate delta engine. Blocked only on an `ingest --append`
-path in `cmd/ingest`. A full rebuild, whenever needed, runs locally on a machine
-with a GPU — never on hosted CI.
+dated releases, no elaborate delta engine.
+
+**The incremental path is not the blocker — it exists.** `rust/ingest --resume`
+is ledger-backed and corpus-aware, and `goal run` drives the whole 20-step
+pipeline (discover → fetch → ingest → merge → embed → enrich → index →
+validate → smoke, plus the ETSI arm). What is missing is only the scheduled
+workflow that runs it unattended, and the reason is the runner: the embed step
+wants a GPU and a hosted runner has ~14 GB disk / 7 GB RAM. A full rebuild runs
+locally on a machine with a GPU — never on hosted CI.
 
 ## Client experience
 
