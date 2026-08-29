@@ -1,9 +1,13 @@
 # Installing the 3GPP MCP server
 
-`mcp-3gpp` is a single static binary. It exposes the 3GPP corpus to any MCP
-client (Claude Code, etc.) over stdio. There is **no service to run, no Python,
-and no Ollama/LLM to install** — the binary is a *retrieval* engine; your MCP
-client does the reasoning.
+`mcp-3gpp` as released is a single self-contained binary. It exposes the 3GPP
+corpus to any MCP client (Claude Code, etc.) over stdio. There is **no service to
+run, no Python, and no Ollama/LLM to install** — the binary is a *retrieval*
+engine; your MCP client does the reasoning.
+
+The *semantic* build is the one exception to "self-contained": it loads the
+`embed-core` cdylib and ONNX Runtime at run time. The published archives are the
+lexical and reranker builds — see "the semantic pair" below.
 
 It needs data it does not ship, downloaded once into a per-user cache
 (`~/.cache/mcp-3gpp/`, override with `MCP3GPP_CACHE`):

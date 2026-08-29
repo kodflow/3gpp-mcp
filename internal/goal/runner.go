@@ -394,6 +394,21 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	rec.DurationSec = time.Since(begin).Seconds()
 	rec.FinishedAt = time.Now().UTC()
 
+	// A decline is not a failure. The step ran, found the conditions for its work
+	// absent, and produced none of its outputs on purpose — so the gates below,
+	// which describe a run that DID the work, must not be applied to it.
+	if Declined(runErr) {
+		rec.Status = StatusSuccess
+		rec.Declined = true
+		rec.Error = ""
+		if err := r.store.Save(rec); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "  status       \033[33mDECLINED\033[0m after %.1fs — %s\n",
+			rec.DurationSec, firstLine(runErr.Error()))
+		return nil
+	}
+
 	if runErr != nil {
 		rec.Status = StatusFailed
 		rec.Error = runErr.Error()

@@ -1,7 +1,6 @@
 package goal
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -302,11 +301,11 @@ func stepSeed() *Step {
 					c.Log.Printf("no GHCR credential (set GHCR_PAT, or write a read:packages token to .local/ghcr.pat) — "+
 						"NOT seeding. %s stays absent and the pipeline will build it from 3gpp.org, which is slower and equally correct.",
 						db)
-					return nil
+					return fmt.Errorf("%w: no GHCR credential for the corpus package", ErrDeclined)
 				}
 				src := bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
 				c.Log.Printf("seeding from %s (credential from %s) — large, and it resumes if interrupted", src, origin)
-				if err := bootstrap.FetchCorpus(context.Background(), src, pat, db, c.Log.Printf); err != nil {
+				if err := bootstrap.FetchCorpus(c.Context, src, pat, db, c.Log.Printf); err != nil {
 					return fmt.Errorf("seed from %s: %w", src, err)
 				}
 				seededNow = true

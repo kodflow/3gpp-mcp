@@ -74,7 +74,11 @@ if [[ -z "${GHCR_PAT:-}" && -z "${GITHUB_TOKEN:-}" && ! -s "$ROOT/.local/ghcr.pa
 fi
 
 log "running the real consumer command: bootstrap into an empty cache"
-MCP3GPP_CACHE="$DIR" "$BOOTSTRAP" bootstrap || fail "bootstrap failed — this is the path every new user takes"
+# Run it from $ROOT. GHCRCredential resolves .local/ghcr.pat relative to the
+# WORKING DIRECTORY, while the guard above tested $ROOT/.local/ghcr.pat — so a
+# run started outside the repo passed the check and then failed to find the
+# very credential the check said was there.
+( cd "$ROOT" && MCP3GPP_CACHE="$DIR" "$BOOTSTRAP" bootstrap ) || fail "bootstrap failed — this is the path every new user takes"
 [[ -s "$DIR/3gpp.duckdb" ]] || fail "bootstrap reported success but $DIR/3gpp.duckdb is absent or empty"
 log "bootstrap produced $(du -h "$DIR/3gpp.duckdb" | cut -f1) at $DIR/3gpp.duckdb"
 

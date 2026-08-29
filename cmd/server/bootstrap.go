@@ -131,6 +131,8 @@ func runBootstrap(args []string) error {
 	cache := fs.String("cache", "", "cache dir (default: per-user cache, or $MCP3GPP_CACHE)")
 	dbURL := fs.String("db-url", "", "OVERRIDE: fetch the corpus from this URL (.duckdb or .duckdb.zst) instead of the GHCR package — for a mirror you host yourself")
 	dbSHA := fs.String("db-sha256", "", "with --db-url, the expected SHA-256 of the decompressed DB (recommended)")
+	etsiURL := fs.String("etsi-url", "", "with --db-url, fetch the ETSI corpus from this URL too (a 3GPP mirror URL says nothing about where the ETSI one lives)")
+	etsiSHA := fs.String("etsi-sha256", "", "with --etsi-url, the expected SHA-256 of the decompressed ETSI DB (recommended)")
 	ghcrToken := fs.String("ghcr-token", "", "GitHub token with read:packages for the private corpus package (default: $GHCR_PAT, $GITHUB_TOKEN, or .local/ghcr.pat)")
 	force := fs.Bool("force", false, "re-fetch the corpus even when the cache already holds the published one")
 	skipDB := fs.Bool("skip-db", false, "do not fetch the corpus (models/ONNX Runtime only) — for image bakes that provide it separately")
@@ -139,6 +141,12 @@ func runBootstrap(args []string) error {
 	noReranker := fs.Bool("no-reranker", false, "with --semantic, fetch only the BGE-M3 embedder + ONNX Runtime, NOT the optional reranker (smaller, fewer flaky fetches)")
 	ortVer := fs.String("ort-version", bootstrap.DefaultORTVersion, "ONNX Runtime version")
 	_ = fs.Parse(args)
+
+	// The symmetric silence: --etsi-url is only consulted on the mirror path, so
+	// passing it without --db-url would be dropped as quietly as --etsi once was.
+	if *etsiURL != "" && *dbURL == "" {
+		return fmt.Errorf("--etsi-url only applies with --db-url; on the default path the ETSI corpus comes from its own private GHCR package")
+	}
 
 	if *cache != "" {
 		_ = os.Setenv("MCP3GPP_CACHE", *cache)
@@ -156,6 +164,20 @@ func runBootstrap(args []string) error {
 			bootstrapLog("corpus %s → %s", *dbURL, dbPath)
 			if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: *dbURL, SHA256: *dbSHA, Dest: dbPath}); err != nil {
 				return err
+			}
+			// --etsi used to be accepted here and silently dropped: the ETSI fetch
+			// lived only in the default branch, so `bootstrap --db-url … --etsi`
+			// exited 0 having created no etsi.duckdb, and serve then ran 3GPP-only
+			// with nothing in the output to explain the missing half.
+			if *withETSI {
+				if *etsiURL == "" {
+					return fmt.Errorf("--etsi with --db-url also needs --etsi-url: a mirror that carries your 3GPP corpus has to carry the ETSI one too, and the private GHCR package is consulted only on the default path")
+				}
+				etsiPath := filepath.Join(filepath.Dir(dbPath), "etsi.duckdb")
+				bootstrapLog("corpus %s → %s", *etsiURL, etsiPath)
+				if err := bootstrap.Fetch(ctx, bootstrap.Artifact{URL: *etsiURL, SHA256: *etsiSHA, Dest: etsiPath}); err != nil {
+					return err
+				}
 			}
 		default:
 			if *force {

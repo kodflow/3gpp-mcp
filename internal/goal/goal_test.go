@@ -2,6 +2,8 @@ package goal
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1244,5 +1246,63 @@ func TestTheIndexIsBuiltAfterTheConversion(t *testing.T) {
 	}
 	if !strings.Contains(deps, "paragraphs") {
 		t.Fatalf("index deps = %q — it would index `clauses` and lose the index when that table goes", deps)
+	}
+}
+
+// TestADeclinedStepDoesNotBlockWhatDependsOnIt pins the no-credential seed path.
+//
+// `seed` declines when there is no GHCR credential, so the corpus gets built
+// from 3gpp.org instead — slower and equally correct. But its declared output,
+// data/3gpp.duckdb, is then legitimately absent, and the runner called that
+// "declared output missing after a successful run". The step was recorded
+// FAILED and `discover`, which depends on it, never ran: the fallback the log
+// message promised could not execute at all.
+func TestADeclinedStepDoesNotBlockWhatDependsOnIt(t *testing.T) {
+	ctx, store := newTestCtx(t)
+	write(t, filepath.Join(ctx.Root, "src", "a.go"), "package a")
+	write(t, filepath.Join(ctx.Root, "src", "b.go"), "package b")
+
+	var ranA, ranB int
+	declining := &Step{
+		Name: "a", Version: 1, Impl: []string{"src/a.go"}, Heavy: true,
+		Outputs: func(c *Ctx) []string { return []string{filepath.Join(c.Root, "never-written")} },
+		// Validation describes a run that did the work; a decline must not reach it.
+		Validate: func(c *Ctx) error { return errors.New("Validate ran on a declined step") },
+		Run: func(c *Ctx) error {
+			ranA++
+			return fmt.Errorf("%w: no credential in this test", ErrDeclined)
+		},
+	}
+	dependant := counter("b", []string{"a"}, []string{"src/b.go"}, "out-b", &ranB)
+
+	r, err := NewRunner([]*Step{declining, dependant}, ctx, store, func() string { return "tc" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Execute(nil, false); err != nil {
+		t.Fatalf("a declined step failed the run: %v", err)
+	}
+
+	rec, err := store.Load("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != StatusSuccess || !rec.Declined {
+		t.Fatalf("declined step recorded status=%q declined=%v, want success/true", rec.Status, rec.Declined)
+	}
+	if len(rec.Outputs) != 0 {
+		t.Fatalf("a declined step claimed outputs: %v", rec.Outputs)
+	}
+	if ranB != 1 {
+		t.Fatalf("the dependant ran %d times, want 1 — a decline must not block it", ranB)
+	}
+
+	// A decline is not cached as done. Its outputs are still absent, so the next
+	// run re-evaluates it — which is how a credential that appears later is used.
+	if _, err := r.Execute(nil, false); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if ranA != 2 {
+		t.Fatalf("the declined step ran %d times over two runs, want 2 — a decline must not be treated as done", ranA)
 	}
 }
