@@ -157,7 +157,7 @@ mod tests {
         // Deliberately NOT unit norm: Go returns vecs[idx[0]] as-is, and re-normalising
         // here would make the single-window path disagree with the corpus already on disk.
         let v = vec![0.5f32, 0.5, 0.5, 0.5];
-        assert_eq!(mean_pool_l2(&[v.clone()]), Some(v));
+        assert_eq!(mean_pool_l2(std::slice::from_ref(&v)), Some(v));
     }
 
     #[test]
