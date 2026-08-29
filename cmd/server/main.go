@@ -270,17 +270,27 @@ func serve(args []string) error {
 	// Optional SPLIT ETSI corpus: a SECOND read-only store over etsi.duckdb, served
 	// ALONGSIDE the 3GPP DB (never merged). The handlers route "ETSI …" ids to it and
 	// union list_specs. Best-effort: a missing/bad etsi.duckdb degrades to 3GPP-only.
+	// Default to the ETSI corpus sitting beside the resolved 3GPP one. That is
+	// exactly where `bootstrap --etsi` writes it, and without this default the
+	// 23 MB it downloads were ignored at serve time unless the user happened to
+	// pass --etsi-db as well — a flag they had no reason to think was required.
+	etsiPath, etsiWhy := *etsiDB, "--etsi-db"
+	if etsiPath == "" {
+		if beside := filepath.Join(filepath.Dir(effDB), "etsi.duckdb"); fileExists(beside) {
+			etsiPath, etsiWhy = beside, "found beside the corpus"
+		}
+	}
 	var etsiSt *store.Store
-	if *etsiDB != "" {
-		if es, eerr := store.OpenReadOnly(*etsiDB); eerr != nil {
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] --etsi-db %s unavailable, serving 3GPP only: %v\n", *etsiDB, eerr)
+	if etsiPath != "" {
+		if es, eerr := store.OpenReadOnly(etsiPath); eerr != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus %s (%s) unavailable, serving 3GPP only: %v\n", etsiPath, etsiWhy, eerr)
 		} else {
 			_ = es.LoadFTS(ctx)
 			_ = es.LoadVSS(ctx)
 			_ = es.LoadSparse(ctx)
 			etsiSt = es
 			defer func() { _ = etsiSt.Close() }()
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus attached (split, not merged): %s\n", *etsiDB)
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus attached (split, not merged): %s\n", etsiPath)
 		}
 	}
 

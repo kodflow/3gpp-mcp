@@ -12,10 +12,10 @@
 > it. It also stopped fitting — GitHub caps an asset at 2 GB, the
 > content-addressed corpus is 12.36 GB.
 >
-> Sections further down that describe publishing or pulling `3gpp.duckdb.zst`
-> from the release describe the **retired** flow. They are kept because the
-> reasoning about volumes, deltas and clobbering still applies — only the channel
-> changed.
+> The sections below describe the flow that is actually in use. The reasoning
+> about volumes, deltas and clobbering carried over from the retired one; the
+> instructions did not, because a warning at the top does not make an
+> executable `gh release upload` of the corpus safe to follow.
 
 ## The model: binaries roll on `latest`, the corpus lives in a private package
 
@@ -56,12 +56,13 @@ tag plus a rolling `:latest`.
 | Go source | small | git | ✅ |
 | 3GPP DOCX/.doc sources | ~20 GB | transient on the sync runner | ❌ |
 | Converted HTML | derived | transient on the sync runner | ❌ |
-| Indexed DB `3gpp.duckdb` | ~1.7 GB (≈0.8 GB zstd) | Release `latest` asset | ❌ |
+| Indexed DB `3gpp.duckdb` | 12.36 GB (≈7.9 GB gzip) | `ghcr.io/<owner>/3gpp-corpus`, private | ❌ |
 | BGE-M3 / reranker / ONNX RT | ~2.3 GB | HuggingFace (fetched by `bootstrap --semantic`) | ❌ |
 
 The corpus never enters git or a Release as raw files. Models stay on
 HuggingFace (`model.onnx_data` is 2.2 GB — over the 2 GB Release-asset cap
-anyway). The DB compresses under the 2 GB cap.
+anyway). The corpus does not fit either: 7.9 GB compressed against a 2 GB cap,
+which is the second, independent reason it travels as an OCI layer.
 
 ## Workflows
 
@@ -69,56 +70,61 @@ anyway). The DB compresses under the 2 GB cap.
 |---|---|---|
 | `ci.yml` | push/PR `main` | gofmt + vet + `go test -race` matrix {ubuntu, macos}. Lint = ktn-linter (hooks), not golangci-lint. |
 | `release.yml` | push `main` (code paths) + manual | Build binaries natively per-OS → `gh release upload latest … --clobber`. |
-| `corpus-sync.yml` | cron + manual | **C4 (stub)**: refresh the DB and clobber it onto `latest`. |
+| `corpus-sync.yml` | cron + manual | **stub**: refresh the DB and push it to the private corpus package. |
 
-### Corpus Sync (C4) — incremental, DB-as-state
+### Corpus sync — incremental, DB-as-state
 
 The hard constraint: a hosted runner has ~14 GB disk / 7 GB RAM, so the ~20 GB
 corpus is **never** fully re-ingested in CI. Each run is a delta:
 
-1. Pull the current `3gpp.duckdb.zst` from `latest`.
+1. Pull the current corpus from `ghcr.io/<owner>/3gpp-corpus:latest` — one
+   manifest request when the cache already holds it, a Range-resumable,
+   digest-verified layer pull when it does not.
 2. Diff the live 3gpp.org listing against what the DB already contains.
 3. Download **only the missing specs** → convert (LibreOffice) → `ingest --append`.
-4. `gh release upload latest 3gpp.duckdb.zst --clobber` (single asset replaced;
-   the old one is gone).
+4. Push the refreshed corpus back to the package with
+   `scripts/local/publish-corpus.sh`, which re-asserts that the package is
+   private before it uploads.
 
 Kept deliberately simple: "download what's missing, append, re-publish." No
-ghcr mirror, no dated releases, no elaborate delta engine. Blocked only on an
-`ingest --append` path in `cmd/ingest` (next coding phase). A full rebuild,
-when ever needed, runs locally / on a large runner — never on hosted CI.
+dated releases, no elaborate delta engine. Blocked only on an `ingest --append`
+path in `cmd/ingest`. A full rebuild, whenever needed, runs locally on a machine
+with a GPU — never on hosted CI.
 
 ## Client experience
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kodflow/3gpp-mcp/main/scripts/install.sh | sh
-mcp-3gpp bootstrap     # pulls latest DB (+ --semantic for models), sha256-verified
+export GHCR_PAT=<token with read:packages>
+mcp-3gpp bootstrap     # pulls the corpus from the private package, digest-verified
 mcp-3gpp serve         # MCP over stdio, offline from here
 ```
 
-`install.sh` and `bootstrap` resolve `releases/latest/download/…` — a stable URL
-that always points at the one current version.
+`install.sh` resolves `releases/latest/download/…` for the **binary** — a stable
+URL that always points at the one current build. The corpus does not travel that
+way and needs a credential; `docs/install.md` explains how to get one.
 
-### Auto-update: the `.sha256` is the version signal
+### Auto-update: the manifest digest is the version signal
 
-The DB has no version number — its **sha256 is its identity**. `corpus-sync`
-publishes `3gpp.duckdb.zst` plus `3gpp.duckdb.sha256` (hash of the *decompressed*
-DB). At `serve` **startup** (never at query time — local-first):
+The DB has no version number — the **digests of its layer are its identity**.
+`bootstrap` records them beside the cached file as `3gpp.duckdb.digest`. At
+`serve` **startup** (never at query time — local-first):
 
-1. Best-effort GET the tiny `3gpp.duckdb.sha256` from `latest`.
-2. Compare to the hash of the cached DB.
-   - differs / no cache → pull the new `3gpp.duckdb.zst`, verify, atomic swap;
-   - same → use cache, **no download** (the 0.8 GB moves only when it changed);
-   - offline / fetch error → keep the cached DB (degrade-don't-block).
+1. One authenticated manifest GET returns the published layer digests.
+2. Compare to the sidecar next to the cached DB.
+   - differs / no cache → pull the layer, verify it against the digest, atomic
+     swap;
+   - same → use cache, **no download** (the ~7.9 GB moves only when it changed);
+   - offline / fetch error / credential gone → keep the cached DB
+     (degrade-don't-block).
 3. Opt-out via `--no-update` / `MCP3GPP_NO_UPDATE=1` (air-gapped).
 
-`internal/bootstrap.Fetch` already skips the download when the cached file's
-sha256 matches the `Artifact.SHA256`, so this is a thin `CheckAndUpdateDB` on
-top.
+The same comparison guards `bootstrap` itself and the pipeline's `seed` step:
+it lives in `bootstrap.FetchCorpus`, so no caller has to remember it.
 
 ## Open items
 
-- Implement `ingest --append` + wire `corpus-sync.yml` (C4).
-- Wire `bootstrap`'s default DB URL to `releases/latest/download/3gpp.duckdb.zst`
-  so `--db-url` is optional.
-- First publish of the DB asset (seed `latest` from the existing local
-  `data/3gpp.duckdb`).
+- Implement `ingest --append` + wire the corpus-sync workflow.
+- [#208](https://github.com/kodflow/3gpp-mcp/issues/208): mean_pool windowing in
+  the Rust embedder. It changes `EmbedIdentity`, so it re-embeds the whole
+  corpus — a decision to take before a campaign, never during one.

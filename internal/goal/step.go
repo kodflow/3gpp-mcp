@@ -37,8 +37,27 @@ package goal
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrDeclined is returned by a Run that deliberately did nothing and therefore
+// produced none of its declared Outputs. It is not a failure and not work to
+// retry: the step looked, found the conditions for its work absent, and said so.
+//
+// The runner records a declined step as a success with no outputs and SKIPS the
+// output and validation gates, because those gates describe a run that did the
+// work. Without this, `seed` — which declines when no GHCR credential is present
+// so the corpus is built from 3gpp.org instead — was recorded as
+// "declared output missing after a successful run", and every step depending on
+// it was blocked. The documented no-credential path could not run at all.
+//
+// The next run still re-evaluates a declined step: its outputs are absent, so
+// the plan marks it stale. A credential that appears later is picked up.
+var ErrDeclined = errors.New("step declined: nothing to do")
+
+// Declined reports whether err is a deliberate decline rather than a failure.
+func Declined(err error) bool { return errors.Is(err, ErrDeclined) }
 
 // Status is the terminal state of a step's last attempt.
 type Status string
@@ -182,6 +201,10 @@ type Record struct {
 	Environment map[string]string `json:"environment,omitempty"`
 	Impl        map[string]string `json:"implementation,omitempty"`
 	Error       string            `json:"error,omitempty"`
+	// Declined marks a step that ran, found nothing to do, and produced none
+	// of its outputs on purpose. Recorded as a success so dependants proceed,
+	// flagged so the run report does not read as if the work happened.
+	Declined bool `json:"declined,omitempty"`
 	// Checkpoint is free-form per-step resume detail (how many items done, which
 	// shard was in flight). It survives a failure so the next run resumes.
 	Checkpoint map[string]string `json:"checkpoint,omitempty"`

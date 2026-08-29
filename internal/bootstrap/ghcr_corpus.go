@@ -211,7 +211,10 @@ func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func
 	// index 0 costs nothing and keeps this correct if the bake ever adds one.
 	var lastErr error
 	for _, l := range layers {
-		blob := dest + ".layer"
+		// Keyed by digest: a partial layer left by an earlier tag is not a prefix of
+		// a different one, and resuming onto it appends new bytes to stale ones —
+		// caught only by the digest check, after the whole transfer.
+		blob := dest + ".layer." + strings.ReplaceAll(l.digest, ":", "-")
 		log("pulling %s layer %s (%s)", s, shortDigest(l.digest), humanBytes(l.size))
 		if err := ghcrPullBlobResumable(ctx, s.Repo(), l.digest, tok, blob, l.size, log); err != nil {
 			lastErr = err
@@ -256,6 +259,12 @@ func ghcrPullToken(ctx context.Context, repo, user, pat string) (string, error) 
 			return err
 		}
 		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// A rejected credential is a decision, not a hiccup. retry.Permanent
+			// already covered the BLOB response; the token exchange is where a bad
+			// PAT actually fails first, and it retried the same rejection 5 times.
+			return retry.Permanent(fmt.Errorf("token endpoint: %s (check the token's read:packages scope)", resp.Status))
+		}
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("token endpoint: %s", resp.Status)
 		}
@@ -369,7 +378,11 @@ func ghcrPullBlobResumable(ctx context.Context, repo, digest, token, dest string
 func verifyBlobDigest(path, digest string) error {
 	algo, want, ok := strings.Cut(digest, ":")
 	if !ok || algo != "sha256" {
-		return nil // an algorithm we cannot check is not an algorithm we should fake
+		// An algorithm this build cannot check is not an algorithm to wave
+		// through. Returning nil here reported success for an artefact whose
+		// digest was never verified, and FetchCorpus then extracted it as
+		// though the manifest chain had been proven end to end.
+		return fmt.Errorf("layer digest %q is not sha256 — refusing an artefact this build cannot verify", digest)
 	}
 	f, err := os.Open(path)
 	if err != nil {
