@@ -131,15 +131,24 @@ mod tests {
 
     #[test]
     fn exactly_max_words_is_still_one_window() {
-        let text = (0..300).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let text = (0..300)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(window_text(&text, 300).len(), 1);
-        let text301 = (0..301).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let text301 = (0..301)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(window_text(&text301, 300).len(), 2);
     }
 
     #[test]
     fn zero_max_words_falls_back_to_the_default() {
-        let text = (0..400).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let text = (0..400)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(window_text(&text, 0).len(), 2); // 400 at 300 -> 2
     }
 
