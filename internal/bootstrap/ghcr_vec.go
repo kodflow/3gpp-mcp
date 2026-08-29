@@ -13,6 +13,16 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// registryBase is the OCI registry every pull in this package targets, and
+// registryService the value its token endpoint wants in `service=`. They are
+// vars rather than consts for exactly one reason: the tests point the whole
+// token → manifest → blob chain at an httptest server. Nothing in the shipped
+// code rewrites them.
+var (
+	registryBase    = "https://ghcr.io"
+	registryService = "ghcr.io"
+)
+
 // vecImage is the GHCR package holding the Option-B vector sub-bases; the repo is
 // "<owner>/<vecImage>" (e.g. kodflow/3gpp-vec). Published by corpus-matrix's
 // publish-vec job as an OCI artifact (one zstd layer per sub-base + the manifest).
@@ -71,7 +81,7 @@ func FetchVecBases(ctx context.Context, owner, dir string) (string, error) {
 
 // ghcrToken fetches an anonymous pull token for a public GHCR repository.
 func ghcrToken(ctx context.Context, repo string) (string, error) {
-	u := "https://ghcr.io/token?service=ghcr.io&scope=repository:" + repo + ":pull"
+	u := registryBase + "/token?service=" + registryService + "&scope=repository:" + repo + ":pull"
 	var token string
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -108,7 +118,7 @@ type ghcrLayer struct {
 // `crane append` sets no title, which is why the corpus path matches on the tar
 // member's name instead).
 func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, error) {
-	u := "https://ghcr.io/v2/" + repo + "/manifests/" + ref
+	u := registryBase + "/v2/" + repo + "/manifests/" + ref
 	var out []ghcrLayer
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -149,7 +159,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 
 // ghcrPullBlob downloads a blob by digest to dest, zstd-decompressing if asked.
 func ghcrPullBlob(ctx context.Context, repo, digest, token, dest string, decompress bool) error {
-	u := "https://ghcr.io/v2/" + repo + "/blobs/" + digest
+	u := registryBase + "/v2/" + repo + "/blobs/" + digest
 	// Idempotent (writes .part then renames) → safe to retry on transient drops.
 	return netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

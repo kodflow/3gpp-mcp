@@ -194,6 +194,19 @@ func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func
 		identity = append(identity, l.digest)
 	}
 
+	// The manifest is already in hand, so the question "is the cache already this
+	// corpus" costs nothing more to ask here — and asking it HERE is what makes it
+	// true for every caller. `serve` had its own check; `bootstrap` and the
+	// pipeline's seed step did not, so re-running either transferred 7.9 GB to
+	// reproduce a file that was already on disk, byte for byte. docs/install.md
+	// promised the opposite ("re-running bootstrap once the cache is populated
+	// costs one manifest request"); now it is the code that keeps the promise.
+	if joined := strings.Join(identity, ","); joined != "" &&
+		fileExists(dest) && CachedCorpusIdentity(dest) == joined {
+		log("%s is already current (%s) — nothing to transfer", s, shortDigest(identity[0]))
+		return nil
+	}
+
 	// The corpus images carry exactly one layer. Iterating rather than assuming
 	// index 0 costs nothing and keeps this correct if the bake ever adds one.
 	var lastErr error
@@ -228,7 +241,7 @@ func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func
 // With no PAT it asks for an anonymous token, which succeeds only for a public
 // package — the caller's error message is what makes that distinction useful.
 func ghcrPullToken(ctx context.Context, repo, user, pat string) (string, error) {
-	u := "https://ghcr.io/token?service=ghcr.io&scope=repository:" + repo + ":pull"
+	u := registryBase + "/token?service=" + registryService + "&scope=repository:" + repo + ":pull"
 	var token string
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -271,7 +284,7 @@ func ghcrPullBlobResumable(ctx context.Context, repo, digest, token, dest string
 			return verifyBlobDigest(dest, digest)
 		}
 	}
-	u := "https://ghcr.io/v2/" + repo + "/blobs/" + digest
+	u := registryBase + "/v2/" + repo + "/blobs/" + digest
 
 	err := netRetry(ctx, func() error {
 		var have int64
