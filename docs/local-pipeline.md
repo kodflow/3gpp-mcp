@@ -295,6 +295,8 @@ should use. `.mcp.json` at the repo root wires it into any `mcpServers` client:
   (F04); spending GPU on an index with no consumer is the mistake.
 - **fp16.** Precision is part of the EmbedIdentity, so switching costs a full
   re-embed. fp32 is chosen once, on purpose (F12).
-- **`mean_pool` windowing.** `truncate@1024` is canonical and consistent across
-  Rust, Go and `contracts/identity.toml`. Flipping it bumps the identity — a
-  decision to take before a campaign, never during one (F15).
+- **`mean_pool` windowing.** Done (#208). `truncate@1024` dropped the tail of
+  long clauses; the Rust embedder now windows a clause that does not fit whole and
+  re-splits any window still reaching max_tokens, so `truncated_windows` is 0.
+  The identity moved `61ba446c0814` -> `6bf1f9a47710`, which is a full re-embed —
+  taken deliberately, before a campaign (F15).
