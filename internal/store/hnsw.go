@@ -22,7 +22,7 @@ import (
 // hnsw-metric-omitted-from-strip-cleanup / strip-meta-test-tautological).
 var VectorMetaKeys = []string{
 	"hnsw_state", "hnsw_metric", "embedding_dim", "embedding_count", "embedding_model",
-	"hnsw_m", "hnsw_ef_construction",
+	"hnsw_m", "hnsw_ef_construction", "hnsw_ef_search",
 }
 
 // The HNSW build parameters, and why they are not DuckDB's defaults.
@@ -44,6 +44,13 @@ var VectorMetaKeys = []string{
 // may want the defaults back.
 func hnswM() string              { return envOrDefault("HNSW_M", "32") }
 func hnswEfConstruction() string { return envOrDefault("HNSW_EF_CONSTRUCTION", "128") }
+
+// ef_search is the QUERY-time candidate list, and the one parameter here paid on
+// every search rather than once at build. Left unset, the index carries VSS's own
+// default and duckdb_settings() reports hnsw_ef_search as NULL — so nothing in the
+// corpus records how hard the serve path actually looks for a neighbour. Baking it
+// into the index makes that part of the artefact instead of part of the runtime.
+func hnswEfSearch() string { return envOrDefault("HNSW_EF_SEARCH", "128") }
 
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -145,7 +152,7 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	// and in build time.
 	idx, table := s.hnswTarget()
 	if _, err := s.db.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine', M = `+hnswM()+`, ef_construction = `+hnswEfConstruction()+`)`); err != nil {
+		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine', M = `+hnswM()+`, ef_construction = `+hnswEfConstruction()+`, ef_search = `+hnswEfSearch()+`)`); err != nil {
 		return fmt.Errorf("create hnsw on %s: %w", table, err) // (6)
 	}
 	if err := s.checkpoint(ctx); err != nil { // (7) serialise the index into the file
@@ -160,6 +167,7 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 		"hnsw_metric": "cosine", "embedding_dim": "1024",
 		"embedding_count": fmt.Sprintf("%d", count), "embedding_model": model,
 		"hnsw_m": hnswM(), "hnsw_ef_construction": hnswEfConstruction(),
+		"hnsw_ef_search": hnswEfSearch(),
 	} {
 		_ = s.SetMeta(k, v)
 	}

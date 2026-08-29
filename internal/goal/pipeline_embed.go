@@ -440,10 +440,22 @@ func stepIndex(t corpusTarget) *Step {
 			// The vector index is a DERIVED CACHE of the vectors. Its identity is
 			// the embed identity plus the index parameters; anything else (the
 			// server code, the docs) must not invalidate it.
+			//
+			// "the index parameters" has to mean ALL of them. This map listed only
+			// metric and dim while the build also takes M, ef_construction and
+			// ef_search, so changing the graph's shape left the fingerprint identical
+			// and the step SKIPPED — a corpus served by an index built to parameters
+			// nobody asked for, with the plan reporting it as up to date. The
+			// build-side defaults live in internal/store (hnswM/hnswEfConstruction/
+			// hnswEfSearch) and are read here through the same env overrides, so the
+			// fingerprint tracks what the build will actually do.
 			return map[string]string{
-				"embed_identity": embedIdentityForPlan(c),
-				"metric":         "cosine",
-				"dim":            "1024",
+				"embed_identity":       embedIdentityForPlan(c),
+				"metric":               "cosine",
+				"dim":                  "1024",
+				"hnsw_m":               envOr("HNSW_M", "32"),
+				"hnsw_ef_construction": envOr("HNSW_EF_CONSTRUCTION", "128"),
+				"hnsw_ef_search":       envOr("HNSW_EF_SEARCH", "128"),
 			}, nil
 		},
 		Heavy: true,

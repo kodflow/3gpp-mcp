@@ -958,13 +958,14 @@ impl Store {
         // can tell which one it is querying. Same env overrides, same defaults.
         let m = std::env::var("HNSW_M").unwrap_or_else(|_| "32".into());
         let efc = std::env::var("HNSW_EF_CONSTRUCTION").unwrap_or_else(|_| "128".into());
+        let efs = std::env::var("HNSW_EF_SEARCH").unwrap_or_else(|_| "128".into());
         let sql = format!(
             "CHECKPOINT;
              SET memory_limit = '{buf}';
              SET preserve_insertion_order = false;
              {knobs}
              INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
-             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine', M = {m}, ef_construction = {efc});
+             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine', M = {m}, ef_construction = {efc}, ef_search = {efs});
              CHECKPOINT;"
         );
         self.conn.execute_batch(&sql).map_err(|e| {
@@ -993,6 +994,7 @@ impl Store {
             ("embedding_model", model),
             ("hnsw_m", &m),
             ("hnsw_ef_construction", &efc),
+            ("hnsw_ef_search", &efs),
         ] {
             self.set_meta(k, v)?;
         }
