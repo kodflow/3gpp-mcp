@@ -132,6 +132,7 @@ func runBootstrap(args []string) error {
 	dbURL := fs.String("db-url", "", "OVERRIDE: fetch the corpus from this URL (.duckdb or .duckdb.zst) instead of the GHCR package — for a mirror you host yourself")
 	dbSHA := fs.String("db-sha256", "", "with --db-url, the expected SHA-256 of the decompressed DB (recommended)")
 	ghcrToken := fs.String("ghcr-token", "", "GitHub token with read:packages for the private corpus package (default: $GHCR_PAT, $GITHUB_TOKEN, or .local/ghcr.pat)")
+	force := fs.Bool("force", false, "re-fetch the corpus even when the cache already holds the published one")
 	skipDB := fs.Bool("skip-db", false, "do not fetch the corpus (models/ONNX Runtime only) — for image bakes that provide it separately")
 	withETSI := fs.Bool("etsi", false, "also fetch the ETSI Lawful-Interception corpus (23 MB), served alongside the 3GPP one")
 	semantic := fs.Bool("semantic", false, "also fetch BGE-M3 + reranker models and ONNX Runtime (~5 GB)")
@@ -157,6 +158,13 @@ func runBootstrap(args []string) error {
 				return err
 			}
 		default:
+			if *force {
+				// The identity recorded beside the cache is what marks it current,
+				// so removing it is precisely what makes the next fetch transfer
+				// again. Without this the check added to FetchCorpus would leave a
+				// corrupt-but-current cache with no way back short of rm.
+				_ = os.Remove(bootstrap.DigestPath(dbPath))
+			}
 			pat, origin, cerr := bootstrap.GHCRCredential(*ghcrToken)
 			if cerr != nil {
 				return fmt.Errorf("%s", credentialAdvice)
@@ -167,6 +175,9 @@ func runBootstrap(args []string) error {
 			}
 			if *withETSI {
 				etsiPath := filepath.Join(filepath.Dir(dbPath), "etsi.duckdb")
+				if *force {
+					_ = os.Remove(bootstrap.DigestPath(etsiPath))
+				}
 				bootstrapLog("corpus %s → %s", etsiSource(), etsiPath)
 				if err := bootstrap.FetchCorpus(ctx, etsiSource(), pat, etsiPath, bootstrapLog); err != nil {
 					return err
