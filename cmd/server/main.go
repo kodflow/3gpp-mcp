@@ -116,7 +116,7 @@ func serve(args []string) error {
 	etsiDB := fs.String("etsi-db", "", "optional ETSI corpus DuckDB (etsi.duckdb) served ALONGSIDE the 3GPP DB — kept SPLIT, not merged; get_spec/list_releases route 'ETSI …' ids here and list_specs unions it. Empty = 3GPP only.")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
-	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
+	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't check the corpus package for a newer corpus at startup (air-gapped, or to pin what you have)")
 	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
 	vecGHCR := fs.String("vec-ghcr", "", "Option B: pull vector sub-bases from ghcr.io/<owner>/3gpp-vec:latest into the cache and serve them (empty = off)")
 	httpAddr := fs.String("http", "", "serve MCP over Streamable HTTP on this addr (e.g. 127.0.0.1:8765) + a landing page at /; empty = stdio (the default, unchanged). A non-loopback bind exposes the corpus — gate it.")
