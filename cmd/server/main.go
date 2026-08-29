@@ -116,7 +116,7 @@ func serve(args []string) error {
 	etsiDB := fs.String("etsi-db", "", "optional ETSI corpus DuckDB (etsi.duckdb) served ALONGSIDE the 3GPP DB — kept SPLIT, not merged; get_spec/list_releases route 'ETSI …' ids here and list_specs unions it. Empty = 3GPP only.")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
-	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't pull/refresh the DB from the rolling 'latest' release at startup")
+	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't check the corpus package for a newer corpus at startup (air-gapped, or to pin what you have)")
 	vecManifest := fs.String("vec-manifest", "", "Option B: JSON listing per-series vectorized sub-bases to ATTACH for scatter-gather vector search (empty = single-DB vectors)")
 	vecGHCR := fs.String("vec-ghcr", "", "Option B: pull vector sub-bases from ghcr.io/<owner>/3gpp-vec:latest into the cache and serve them (empty = off)")
 	httpAddr := fs.String("http", "", "serve MCP over Streamable HTTP on this addr (e.g. 127.0.0.1:8765) + a landing page at /; empty = stdio (the default, unchanged). A non-loopback bind exposes the corpus — gate it.")
@@ -270,17 +270,27 @@ func serve(args []string) error {
 	// Optional SPLIT ETSI corpus: a SECOND read-only store over etsi.duckdb, served
 	// ALONGSIDE the 3GPP DB (never merged). The handlers route "ETSI …" ids to it and
 	// union list_specs. Best-effort: a missing/bad etsi.duckdb degrades to 3GPP-only.
+	// Default to the ETSI corpus sitting beside the resolved 3GPP one. That is
+	// exactly where `bootstrap --etsi` writes it, and without this default the
+	// 23 MB it downloads were ignored at serve time unless the user happened to
+	// pass --etsi-db as well — a flag they had no reason to think was required.
+	etsiPath, etsiWhy := *etsiDB, "--etsi-db"
+	if etsiPath == "" {
+		if beside := filepath.Join(filepath.Dir(effDB), "etsi.duckdb"); fileExists(beside) {
+			etsiPath, etsiWhy = beside, "found beside the corpus"
+		}
+	}
 	var etsiSt *store.Store
-	if *etsiDB != "" {
-		if es, eerr := store.OpenReadOnly(*etsiDB); eerr != nil {
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] --etsi-db %s unavailable, serving 3GPP only: %v\n", *etsiDB, eerr)
+	if etsiPath != "" {
+		if es, eerr := store.OpenReadOnly(etsiPath); eerr != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus %s (%s) unavailable, serving 3GPP only: %v\n", etsiPath, etsiWhy, eerr)
 		} else {
 			_ = es.LoadFTS(ctx)
 			_ = es.LoadVSS(ctx)
 			_ = es.LoadSparse(ctx)
 			etsiSt = es
 			defer func() { _ = etsiSt.Close() }()
-			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus attached (split, not merged): %s\n", *etsiDB)
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus attached (split, not merged): %s\n", etsiPath)
 		}
 	}
 

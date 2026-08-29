@@ -9,6 +9,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -277,12 +278,17 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	mode, rerank := r.GetString("mode", ""), r.GetBool("rerank", false)
 	want := offset + pageSize + 1
 	etsiScoped := strings.HasPrefix(filter.SpecID, "ETSI ")
+	// Which engine the reported mode must describe. An ETSI-scoped query runs
+	// ONLY on the ETSI engine, which carries its own embedder and its own
+	// toggles, so reading h.eng below described an engine that never ran.
+	servingEng := h.eng
 	var hits []model.SearchHit
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
 		ef := filter
 		ef.Release = ""
+		servingEng = h.etsiEng
 		hits, err = h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank})
 	} else {
 		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
@@ -327,6 +333,22 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	resp := map[string]any{
 		"query": q, "intent": string(search.Classify(q)),
 		"count": len(out), "hits": out, "citations": cites,
+	}
+	// Say which retrieval actually ran. Search degrades a mode it cannot serve
+	// (semantic with no embedder -> lexical), which is the right behaviour and
+	// the wrong silence: the hits come back shaped identically and nothing marked
+	// the substitution, so a client that asked for mode=semantic was handed BM25
+	// with no way to tell.
+	requested := mode
+	if requested == "" {
+		requested = "hybrid"
+	}
+	served := servingEng.ModeServed(mode)
+	resp["mode"] = served
+	if served != requested {
+		resp["mode_requested"] = requested
+		resp["mode_degraded"] = fmt.Sprintf(
+			"requested %q, served %q — call server_info for why semantic is unavailable", requested, served)
 	}
 	if next != "" {
 		resp["next_cursor"] = next

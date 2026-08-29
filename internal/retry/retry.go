@@ -9,14 +9,47 @@ package retry
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"time"
 )
+
+// permanent marks an error that retrying cannot fix. It exists because this
+// policy's default — "every error is transient" — is wrong for exactly one
+// common shape: a rejected credential. A private GHCR package answers a bad or
+// unscoped token with 401/403 on every attempt, so without this the caller sits
+// through the whole 2s→30s schedule to be told what the first response said.
+type permanent struct{ error }
+
+func (p permanent) Unwrap() error { return p.error }
+
+// Permanent marks err as not worth retrying. Do returns the WRAPPED error, so a
+// caller comparing with errors.Is/As sees what fn actually reported and never
+// has to know this wrapper exists. Permanent(nil) is nil: a nil error is still a
+// success, not a permanent failure.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return permanent{err}
+}
+
+// unwrapPermanent returns the underlying error and whether it was marked.
+func unwrapPermanent(err error) (error, bool) {
+	var p permanent
+	if errors.As(err, &p) {
+		return p.error, true
+	}
+	return err, false
+}
 
 // Do calls fn up to attempts times (attempts < 1 is treated as 1). On a non-nil
 // error it sleeps for min(max, base*2^(n-1)) + jitter[0,base) and retries, until
 // fn succeeds, the attempts are exhausted, or ctx is cancelled. It returns nil on
 // success, ctx.Err() if the context ends during a backoff, or fn's last error.
+//
+// An error fn wraps in Permanent stops the loop immediately and is returned
+// unwrapped — retrying a rejected credential only delays the diagnosis.
 //
 // base<=0 disables the sleep (back-to-back retries); pass a real base in
 // production so a hammered endpoint gets breathing room. The jitter desynchronises
@@ -29,6 +62,9 @@ func Do(ctx context.Context, attempts int, base, max time.Duration, fn func() er
 	for n := 1; ; n++ {
 		if err = fn(); err == nil {
 			return nil
+		}
+		if bare, stop := unwrapPermanent(err); stop {
+			return bare
 		}
 		if n >= attempts {
 			return err
