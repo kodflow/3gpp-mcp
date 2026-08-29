@@ -531,7 +531,10 @@ fn main() -> Result<()> {
     // A window that reaches MAX_TOKENS was still truncated: its tail did not reach
     // the model. Windowing exists to make that number zero, so the run reports it
     // rather than leaving the loss invisible the way plain truncation did.
-    let truncated = slots.iter().filter(|s| s.ids.len() >= crate::model::MAX_TOKENS).count();
+    let truncated = slots
+        .iter()
+        .filter(|s| s.ids.len() >= crate::model::MAX_TOKENS)
+        .count();
     let multi = win_count.iter().filter(|&&n| n > 1).count();
     eprintln!(
         "RESULT windowing strategy=mean_pool max_words={} clauses={total} windows={windows_total} multi_window_clauses={multi} windowed_clauses={windowed_clauses} truncated_windows={truncated} forced_splits={forced_splits} unsplittable={unsplittable} ratio={:.2}x",
