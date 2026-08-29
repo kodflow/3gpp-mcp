@@ -30,23 +30,21 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tokenizers::{Tokenizer, TruncationParams};
 
-/// Tokenizer truncation length and long-clause strategy = truncate (embed only the
-/// first MAX_TOKENS tokens). BGE-M3 supports 8192, but full self-attention at
-/// batch×seq² blows up GPU memory; 1024 keeps the attention buffer bounded and captures
-/// the discriminative head of a clause.
+/// Tokenizer truncation length. BGE-M3 supports 8192, but full self-attention at
+/// batch×seq² blows up GPU memory; 1024 keeps the attention buffer bounded.
 ///
-/// MAX_TOKENS (1024) and the truncate strategy are EmbedIdentity components on the Go
-/// side (model.EmbedParts.MaxTokens / .Windowing, default 1024 / "truncate"). This
-/// value MUST equal the Go registry's max_tokens (embed.DefaultMaxTokens) — they are
-/// kept in lockstep so the identity Go hands us via --embed-identity matches what we
-/// actually do. Changing it here REQUIRES bumping the Go registry (and forces a clean
-/// re-embed via the identity change). The mean_pool long-clause strategy (better recall
-/// on long normative clauses) is the urgent Rust port tracked in issue #208; until it
-/// lands the canonical corpus config is truncate@1024.
-//
-// TODO(#208): port internal/embed/window.go mean_pool (window ≤300 words, embed each,
-// mean-pool + L2) here, then flip the registry windowing to mean_pool (identity bump
-// ⇒ clean re-embed). MUST be GPU-validated for Go↔Rust parity before any 31-series bake.
+/// Since #208 the long-clause strategy is `mean_pool`, not truncate: `window.rs` splits a
+/// clause into ≤300-word windows before tokenisation, so a window is ~400 tokens and this
+/// limit is a BACKSTOP that normal content never reaches — not the thing that decides what
+/// gets embedded. A single pathological "word" longer than 1024 tokens would still be
+/// truncated here, which is the correct behaviour and is why the limit stays.
+///
+/// MAX_TOKENS (1024) and the windowing strategy are both EmbedIdentity components on the
+/// Go side (model.EmbedParts.MaxTokens / .Windowing). This value MUST equal the Go
+/// registry's max_tokens (embed.DefaultMaxTokens) and the strategy MUST match the
+/// registry's `windowing`, so the identity Go hands us via --embed-identity describes what
+/// we actually do. Changing either REQUIRES bumping the Go registry, and that forces a
+/// clean re-embed of the whole corpus.
 pub const MAX_TOKENS: usize = 1024;
 
 /// DENSE_OUTPUT is the declared name of BGE-M3's dense (sentence-embedding) head —

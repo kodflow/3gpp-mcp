@@ -33,8 +33,9 @@ mod batch;
 mod gpu;
 mod hash;
 mod model;
+mod window;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -92,6 +93,15 @@ struct Args {
     /// the written hash matches Go's ClauseHash and importing causes no re-embed churn.
     #[arg(long)]
     embed_identity: String,
+
+    /// Words per embedding window (mean_pool). The default is measured, not
+    /// inherited: 300 comes from the Go reference, which sized it for ~1.3
+    /// tokens/word prose, and 3GPP tables and ASN.1 tokenise at over 3 — so 300-word
+    /// windows still hit MAX_TOKENS and still dropped their tails, which is the whole
+    /// defect #208 is about. Exposed so the value can be re-measured against
+    /// truncated_windows when the corpus or the tokenizer changes.
+    #[arg(long, default_value_t = crate::window::DEFAULT_WINDOW_WORDS)]
+    window_words: usize,
 
     /// CPU-fallback batch size (used only when no GPU is detected). On GPU the batch is
     /// sized dynamically from VRAM (see --vram-fraction / --max-batch).
@@ -175,19 +185,36 @@ struct VecRecord {
     vec: Vec<f32>,
 }
 
-/// Prepared is a work item after tokenisation: the id row plus the metadata needed to
-/// write its output record. AsRef<[i64]> lets model.embed_ids consume a slice of these
-/// directly, without cloning the id vectors per batch.
-struct Prepared {
-    chunk_id: u64,
-    hash: String,
+/// Slot is one MODEL INPUT after windowing and tokenisation: a single window of one
+/// clause, plus enough identity to fold it back. Windowing turns the clause→input
+/// relation from 1:1 into 1:N, and mean-pooling turns it back at the writer.
+///
+/// The clause's own metadata (chunk_id, hash) is NOT duplicated here — a long clause has
+/// hundreds of windows and would carry hundreds of copies of the same String. It stays in
+/// the parallel `chunk_ids` / `hashes` vectors, indexed by `clause`.
+struct Slot {
+    clause: u32,
+    window: u32,
     ids: Vec<i64>,
 }
 
-impl AsRef<[i64]> for Prepared {
+impl AsRef<[i64]> for Slot {
     fn as_ref(&self) -> &[i64] {
         &self.ids
     }
+}
+
+/// Pending holds the window vectors of a MULTI-window clause until every one has come
+/// back from the GPU. Single-window clauses never land here: they are written straight
+/// through, exactly as before windowing existed.
+///
+/// The vectors are kept in WINDOW ORDER, not arrival order, and pooled only when the
+/// clause is complete — mean_pool_l2 sums in f64 and float addition is not associative,
+/// so pooling in arrival order would make the result depend on how the batcher happened
+/// to sort the work, and no two runs would agree.
+struct Pending {
+    windows: Vec<Vec<f32>>,
+    filled: u32,
 }
 
 /// Resume is what a prior (partial) run left in the output ledger: the chunk_ids already
@@ -359,41 +386,175 @@ fn main() -> Result<()> {
         arena_cap,
     )?;
 
-    // Tokenise the whole work-list once (windowed to bound transient memory). The ids let
-    // us length-sort and size batches by token budget without re-tokenising at inference.
-    let mut prepared: Vec<Prepared> = Vec::with_capacity(total);
+    // WINDOWING (issue #208). A clause the model cannot see whole is embedded in pieces
+    // and the pieces are pooled into one vector. Truncation used to drop the tail of a
+    // long clause — the body of a big table, the second half of an ASN.1 block, the
+    // closing normative paragraphs — so a query that matched only there could not reach
+    // the clause at all.
+    //
+    // WINDOW ONLY WHAT WOULD OTHERWISE BE TRUNCATED. The Go reference windows on a word
+    // count alone, which also re-writes clauses that were never truncated: measured here,
+    // a 302-word clause that fitted in 1024 tokens came back at cosine 0.81 against its
+    // old vector, for no recall gain at all. So the first question is not "is this long?"
+    // but "does the model actually lose any of it?" — tokenise the clause whole, and if it
+    // fits, that IS the window and the vector does not move. Every vector that changes,
+    // changes because content was previously being dropped, which is what makes the
+    // re-embed auditable.
+    //
+    // Clauses that do NOT fit are split twice, and the second split is what makes the
+    // guarantee real:
+    //
+    //   1. By WORDS (`window::window_text`), mirroring internal/embed/window.go.
+    //   2. By TOKENS: any window that still reaches MAX_TOKENS is halved and re-tokenised,
+    //      repeatedly, until it fits.
+    //
+    // Step 2 is not defensive padding. Measured on this corpus, 300-word windows — the
+    // size the Go reference chose for ~1.3 tokens/word prose — hit the 1024-token cap
+    // 10.8% of the time, because 3GPP tables and ASN.1 tokenise at over 3 tokens/word. A
+    // word-only port would have kept dropping those tails. Shrinking the word window does
+    // not close it either (160 words still truncated 0.5%, and no word count can bound a
+    // single space-free ASN.1 blob) while multiplying the windows, and therefore the GPU
+    // hours, by 9 instead of 5. Splitting only the offenders cost +11.5% windows and ended
+    // at zero.
+    //
+    // From here down the unit of work is a WINDOW, not a clause: dedup, length-sorting and
+    // batching all operate on windows, and only the writer folds them back into clauses.
+    let mut win_count: Vec<u32> = Vec::with_capacity(total);
+    let mut slots: Vec<Slot> = Vec::with_capacity(total);
+    let mut forced_splits = 0usize;
+    let mut unsplittable = 0usize;
+    let mut windowed_clauses = 0usize;
     {
         const TOK_WINDOW: usize = 8192;
-        let mut idx = 0usize;
-        for w in texts.chunks(TOK_WINDOW) {
-            let rows = bge.encode(w).context("tokenise work-list window")?;
-            for ids in rows {
-                prepared.push(Prepared {
-                    chunk_id: chunk_ids[idx],
-                    hash: std::mem::take(&mut hashes[idx]),
-                    ids,
+        // Drain `texts` into the window texts rather than holding both: the work-list text
+        // is already the largest thing in this process. Every clause starts as ONE window
+        // holding its whole text; the pass below keeps that window if the model can see all
+        // of it, and only splits the ones it cannot.
+        let mut cw: Vec<Vec<String>> = Vec::with_capacity(total);
+        for t in texts.drain(..) {
+            cw.push(vec![t]);
+        }
+        drop(texts);
+        let mut cids: Vec<Vec<Option<Vec<i64>>>> = vec![vec![None]; cw.len()];
+
+        // Halve a window on a word boundary. Returns None for a single word, the only case
+        // where the tail is genuinely unreachable — counted, never hidden.
+        fn halve(s: &str) -> Option<(String, String)> {
+            let words: Vec<&str> = s.split_whitespace().collect();
+            if words.len() < 2 {
+                return None;
+            }
+            let mid = words.len() / 2;
+            Some((words[..mid].join(" "), words[mid..].join(" ")))
+        }
+
+        // Pass 1: does the whole clause fit? Those that do are finished here, with the
+        // ORIGINAL text — the same bytes the pre-windowing embedder handed the tokenizer.
+        {
+            let idx: Vec<usize> = (0..cw.len()).collect();
+            for chunk in idx.chunks(TOK_WINDOW) {
+                let batch: Vec<String> = chunk.iter().map(|&c| cw[c][0].clone()).collect();
+                let rows = bge.encode(&batch).context("tokenise clauses whole")?;
+                for (&c, ids) in chunk.iter().zip(rows) {
+                    if ids.len() < crate::model::MAX_TOKENS {
+                        cids[c][0] = Some(ids);
+                    } else {
+                        // The model would truncate this one. Split it by words and let the
+                        // convergence loop below take over.
+                        cw[c] = window::window_text(&cw[c][0], args.window_words);
+                        cids[c] = vec![None; cw[c].len()];
+                        windowed_clauses += 1;
+                    }
+                }
+            }
+        }
+
+        // Pass 2: tokenise the windows, splitting any that still reach the cap, until none do.
+        loop {
+            let pending: Vec<(usize, usize)> = cids
+                .iter()
+                .enumerate()
+                .flat_map(|(c, ws)| {
+                    ws.iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.is_none())
+                        .map(move |(w, _)| (c, w))
+                })
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            let mut to_split: Vec<(usize, usize)> = Vec::new();
+            for chunk in pending.chunks(TOK_WINDOW) {
+                let batch: Vec<String> = chunk.iter().map(|&(c, w)| cw[c][w].clone()).collect();
+                let rows = bge.encode(&batch).context("tokenise window batch")?;
+                for (&(c, w), ids) in chunk.iter().zip(rows) {
+                    if ids.len() >= crate::model::MAX_TOKENS {
+                        if halve(&cw[c][w]).is_some() {
+                            to_split.push((c, w));
+                            continue;
+                        }
+                        // One word longer than the model's context. Nothing left to split.
+                        unsplittable += 1;
+                    }
+                    cids[c][w] = Some(ids);
+                }
+            }
+            if to_split.is_empty() {
+                break;
+            }
+            // Descending, so splicing never invalidates an index still to be processed.
+            to_split.sort_unstable_by(|a, b| b.cmp(a));
+            for (c, w) in to_split {
+                let (l, r) = halve(&cw[c][w]).expect("checked splittable");
+                cw[c][w] = l;
+                cw[c].insert(w + 1, r);
+                cids[c][w] = None;
+                cids[c].insert(w + 1, None);
+                forced_splits += 1;
+            }
+        }
+
+        for (c, ws) in cids.into_iter().enumerate() {
+            win_count.push(ws.len() as u32);
+            for (w, ids) in ws.into_iter().enumerate() {
+                slots.push(Slot {
+                    clause: c as u32,
+                    window: w as u32,
+                    ids: ids.expect("every window tokenised"),
                 });
-                idx += 1;
             }
         }
     }
-    drop(texts);
 
-    // DEDUP identical model inputs. Clauses with the same (truncated) token-id sequence
-    // produce the SAME vector, and 3GPP reuses a clause verbatim across many releases, so
-    // the work-list is highly redundant. Group by id sequence, embed each DISTINCT input
-    // once, and fan the vector out to every chunk_id in the group. Pure win, zero quality
-    // loss — typically the dominant lever on a multi-release corpus.
-    let mut groups = dedup_by_ids(prepared.iter().map(|p| p.ids.as_slice()));
+    let windows_total = slots.len();
+    // A window that reaches MAX_TOKENS was still truncated: its tail did not reach
+    // the model. Windowing exists to make that number zero, so the run reports it
+    // rather than leaving the loss invisible the way plain truncation did.
+    let truncated = slots.iter().filter(|s| s.ids.len() >= crate::model::MAX_TOKENS).count();
+    let multi = win_count.iter().filter(|&&n| n > 1).count();
+    eprintln!(
+        "RESULT windowing strategy=mean_pool max_words={} clauses={total} windows={windows_total} multi_window_clauses={multi} windowed_clauses={windowed_clauses} truncated_windows={truncated} forced_splits={forced_splits} unsplittable={unsplittable} ratio={:.2}x",
+        args.window_words,
+        windows_total as f64 / total.max(1) as f64
+    );
+
+    // DEDUP identical model inputs. Windows with the same token-id sequence produce the
+    // SAME vector, and 3GPP reuses a clause verbatim across many releases, so the work is
+    // highly redundant. Group by id sequence, embed each DISTINCT window once, and fan the
+    // vector out to every window slot in the group. Pure win, zero quality loss — and
+    // windowing makes it BETTER, because two clauses that differ only in their tail now
+    // share every window they have in common instead of nothing.
+    let mut groups = dedup_by_ids(slots.iter().map(|s| s.ids.as_slice()));
     let distinct = groups.len();
     // Length-bucket the DISTINCT inputs by representative token length so each batch holds
     // similar-length sequences and the dynamic batcher sizes by true sequence length.
-    groups.sort_by_key(|g| prepared[g[0]].ids.len());
-    let lens: Vec<usize> = groups.iter().map(|g| prepared[g[0]].ids.len()).collect();
+    groups.sort_by_key(|g| slots[g[0]].ids.len());
+    let lens: Vec<usize> = groups.iter().map(|g| slots[g[0]].ids.len()).collect();
     log_distribution(&lens);
     eprintln!(
-        "RESULT dedup clauses={total} distinct={distinct} factor={:.2}x (only distinct inputs hit the GPU)",
-        total as f64 / distinct.max(1) as f64
+        "RESULT dedup windows={windows_total} distinct={distinct} factor={:.2}x (only distinct inputs hit the GPU)",
+        windows_total as f64 / distinct.max(1) as f64
     );
 
     // Size the memory model from the FREE VRAM measured after the model loaded (so the
@@ -461,6 +622,10 @@ fn main() -> Result<()> {
     let mut done_n = 0usize;
     let mut next_log = PROGRESS_EVERY;
     let mut batches_since_probe = 0usize;
+    // Window vectors of clauses that are not complete yet. Only MULTI-window
+    // clauses ever land here (18.1% of this corpus), and each leaves the moment its
+    // last window arrives, so the map holds the in-flight tail, not the corpus.
+    let mut pending: HashMap<usize, Pending> = HashMap::new();
     let mut k_at_window_start = mem.k_attn;
     eprintln!("PROGRESS 0/{total} (0%) starting…");
 
@@ -470,7 +635,7 @@ fn main() -> Result<()> {
         // Embed only the representative (first member) of each distinct group this batch.
         let batch_ids: Vec<&[i64]> = groups[i..end]
             .iter()
-            .map(|g| prepared[g[0]].ids.as_slice())
+            .map(|g| slots[g[0]].ids.as_slice())
             .collect();
         PEAK_BATCH.fetch_max(batch_ids.len(), AtomicOrdering::Relaxed);
         let vecs = run_adaptive(&bge, &mut mem, &batch_ids)
@@ -478,17 +643,58 @@ fn main() -> Result<()> {
         if vecs.len() != end - i {
             anyhow::bail!("embed returned {} vecs for {} inputs", vecs.len(), end - i);
         }
-        // Fan each distinct vector out to every chunk_id that shares its token sequence.
+        // Fan each distinct vector out to every window slot that shares its token
+        // sequence, then fold a clause's windows back into ONE vector.
         for (g, vec) in groups[i..end].iter().zip(vecs) {
             if vec.len() != DENSE_DIM {
                 anyhow::bail!("distinct got dim {}, want {}", vec.len(), DENSE_DIM);
             }
             for &m in g {
-                let p = &prepared[m];
+                let clause = slots[m].clause as usize;
+                let wslot = slots[m].window as usize;
+                let n = win_count[clause] as usize;
+                let pooled: Vec<f32> = if n == 1 {
+                    // The common case. One window — the clause fitted whole — and the
+                    // vector is returned unchanged. Measured against the corpus it
+                    // replaces: cosine 0.999994, worst component delta 3.9e-04. NOT
+                    // bit-identical, and cannot be: windowing changes how work is
+                    // batched, and a GEMM reduces in a different order at a different
+                    // batch shape. That is run-to-run float noise, not a drift.
+                    vec.clone()
+                } else {
+                    {
+                        let p = pending.entry(clause).or_insert_with(|| Pending {
+                            windows: std::iter::repeat_with(Vec::new).take(n).collect(),
+                            filled: 0,
+                        });
+                        if p.windows[wslot].is_empty() {
+                            p.filled += 1;
+                        }
+                        p.windows[wslot] = vec.clone();
+                        if p.filled < win_count[clause] {
+                            // More windows of this clause are still in flight. Length-sorting
+                            // scatters them across batches, so a clause completes when its
+                            // LAST window lands, not when its first does.
+                            continue;
+                        }
+                    }
+                    let p = pending.remove(&clause).expect("pending present");
+                    match window::mean_pool_l2(&p.windows) {
+                        Some(v) => v,
+                        None => {
+                            anyhow::bail!("clause {clause} pooled to nothing from {n} windows")
+                        }
+                    }
+                };
+                if pooled.len() != DENSE_DIM {
+                    anyhow::bail!("pooled got dim {}, want {}", pooled.len(), DENSE_DIM);
+                }
                 let rec = VecRecord {
-                    chunk_id: p.chunk_id,
-                    hash: p.hash.clone(),
-                    vec: vec.clone(),
+                    chunk_id: chunk_ids[clause],
+                    // Taken, not cloned: a clause is written exactly once, and a long one
+                    // would otherwise clone the same String per window.
+                    hash: std::mem::take(&mut hashes[clause]),
+                    vec: pooled,
                 };
                 serde_json::to_writer(&mut w, &rec).context("serialize vector")?;
                 w.write_all(b"\n")?;
@@ -544,6 +750,21 @@ fn main() -> Result<()> {
             eprintln!("PROGRESS {done_n}/{total} ({pct}%) {rate:.1} clause/s eta {eta}s");
             next_log = done_n + PROGRESS_EVERY;
         }
+    }
+    // Every clause must have been folded back. A non-empty map here means some
+    // clause never received all its windows — the vector for it was never written,
+    // and the run would otherwise finish "successfully" with a hole in the ledger.
+    if !pending.is_empty() {
+        let stuck: Vec<String> = pending
+            .iter()
+            .take(5)
+            .map(|(c, p)| format!("clause {c}: {}/{} windows", p.filled, p.windows.len()))
+            .collect();
+        anyhow::bail!(
+            "{} clause(s) never completed their windows, e.g. {}",
+            pending.len(),
+            stuck.join(", ")
+        );
     }
     eprintln!("PROGRESS {total}/{total} (100%) done");
     // Machine-checkable evidence that the memory discipline held, emitted by the
