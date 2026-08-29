@@ -39,13 +39,13 @@ use tokenizers::{Tokenizer, TruncationParams};
 /// gets embedded. A single pathological "word" longer than 1024 tokens would still be
 /// truncated here, which is the correct behaviour and is why the limit stays.
 ///
-/// MAX_TOKENS (1024) and the windowing strategy are both EmbedIdentity components on the
+/// MAX_TOKENS (2048) and the windowing strategy are both EmbedIdentity components on the
 /// Go side (model.EmbedParts.MaxTokens / .Windowing). This value MUST equal the Go
 /// registry's max_tokens (embed.DefaultMaxTokens) and the strategy MUST match the
 /// registry's `windowing`, so the identity Go hands us via --embed-identity describes what
 /// we actually do. Changing either REQUIRES bumping the Go registry, and that forces a
 /// clean re-embed of the whole corpus.
-pub const MAX_TOKENS: usize = 1024;
+pub const MAX_TOKENS: usize = 2048;
 
 /// DENSE_OUTPUT is the declared name of BGE-M3's dense (sentence-embedding) head —
 /// the value the Go model registry declares (`output: sentence_embedding`). We bind
@@ -125,8 +125,16 @@ impl Bge {
             .unwrap_or_else(|| session.outputs[0].name.clone());
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_json).map_err(|e| anyhow!("load tokenizer: {e}"))?;
-        // TRUNCATE to MAX_TOKENS so a long clause never tokenises past the model's
-        // position-embedding table (the Expand-node broadcast crash).
+        // TRUNCATE to MAX_TOKENS. The hard ceiling this protects is the model's
+        // POSITION TABLE, which is 8194 wide (data/models/bge-m3/Constant_7_attr__value
+        // is 65 552 bytes = 8194 int64): past it the graph's Expand node fails with
+        // "left operand cannot broadcast … LeftShape {1,8194} RightShape {64,10493}".
+        //
+        // MAX_TOKENS is 2048, well under that, and the gap is deliberate — it is an
+        // ATTENTION-memory budget, not a correctness limit. Attention is O(n²), so the
+        // batch planner sizes batches from the sequence length and the OOM backoff
+        // halves what it still gets wrong. See internal/embed.DefaultMaxTokens for why
+        // 2048 rather than the 1024 that #196 chose for a T4.
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: MAX_TOKENS,

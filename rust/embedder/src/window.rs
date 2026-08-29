@@ -24,7 +24,15 @@
 
 /// Bounds a window so it stays comfortably under the model's token limit for typical
 /// prose (~1.3 tokens/word). Mirrors Go's `defaultWindowWords`.
-pub const DEFAULT_WINDOW_WORDS: usize = 300;
+///
+/// 600, paired with MAX_TOKENS = 2048. The pair matters more than either number: at
+/// ~1.3 tokens/word a 600-word window is ~780 tokens, and even at the >3 tokens/word
+/// that 3GPP tables and ASN.1 actually reach it lands near 1800 — still inside 2048, so
+/// the token-level re-split stays the exception it was designed to be rather than the
+/// rule. The previous 300/1024 pairing had the same ratio; doubling both halves the
+/// window count on long clauses, and every window removed is one less vector diluting
+/// the mean.
+pub const DEFAULT_WINDOW_WORDS: usize = 600;
 
 /// window_text splits `text` into ≤`max_words` word-windows (no overlap), never breaking
 /// a word. Short text yields a single window holding the ORIGINAL text.
@@ -145,11 +153,14 @@ mod tests {
 
     #[test]
     fn zero_max_words_falls_back_to_the_default() {
-        let text = (0..400)
+        // Sized off DEFAULT_WINDOW_WORDS, not a literal, so raising the default cannot
+        // silently turn this into a one-window case that asserts nothing.
+        let n = DEFAULT_WINDOW_WORDS + 100;
+        let text = (0..n)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(window_text(&text, 0).len(), 2); // 400 at 300 -> 2
+        assert_eq!(window_text(&text, 0).len(), 2); // default+100 -> default, then 100
     }
 
     #[test]
