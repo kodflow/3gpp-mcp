@@ -94,10 +94,10 @@ if [ "$DATA_ONLY" = 1 ]; then
 fi
 
 log "building 3gpp-mcp:$TAG on top of it"
-# --target full is NOT optional. `light` is the LAST stage in the Dockerfile, on
-# purpose (a bare `docker build .` must produce the one target that needs no data
-# image), so omitting --target here silently builds the lexical-only image and
-# ignores DATA_IMAGE entirely — a light image wearing the full image's tag.
+# --target full is NOT optional. `smoketest` is the LAST stage in the Dockerfile,
+# on purpose (a bare `docker build .` must produce the one target that needs no
+# data image), so omitting --target here silently builds the CI smoke stage and
+# ignores DATA_IMAGE entirely — a corpus-less image wearing the product tag.
 #
 # DATA_CONTRACT_FLAGS comes from scripts/data-contract.sh, the same source CI
 # uses, so the in-image guard checks the same contract here as there instead of

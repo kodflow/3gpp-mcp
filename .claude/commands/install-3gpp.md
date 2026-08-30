@@ -7,14 +7,13 @@ description: Register the 3gpp-mcp server in Claude Code (stdio via Docker, or H
 Register the **3gpp-mcp** retrieval server so Claude can query the 3GPP corpus with
 exact citations. Two transports — pick one.
 
-## Image variants — pick by need
+## The image — there is one, and it carries everything
 
 | Tag | Contents | Use when |
 |-----|----------|----------|
-| **`:full` = `:latest`** | onnx binary + corpus DB + vector sub-bases + BGE-M3 model **baked in** (as `.zst`) | semantic search, offline / "just works" on pull (larger image; decompresses once into `/data` on first start) |
-| **`:light`** | binary only (lexical/BM25); bootstraps the DB from the network on first run | small image, lexical-only is enough, or you provide data yourself |
+| **`:latest`** (alias `:full`) | onnx binary + corpus DB + vectors + BGE-M3 model **baked in** (as `.zst`) | always — semantic search, offline, decompresses once into `/data` on first start |
 
-> FULL stdio with `--rm` re-decompresses every run. Mount a **named volume** so the
+> stdio with `--rm` re-decompresses every run. Mount a **named volume** so the
 > one-time decompression persists: `-v 3gpp-mcp-data:/data`.
 
 ## Option A — HTTP hébergé (labs.making.codes, recommandé, zéro install)
@@ -39,8 +38,6 @@ Readiness: `GET https://labs.making.codes/healthz` → `{"status":"ready"}`.
 docker pull ghcr.io/kodflow/3gpp-mcp:latest                       # full (semantic)
 claude mcp add 3gpp -- docker run -i --rm -v 3gpp-mcp-data:/data \
   ghcr.io/kodflow/3gpp-mcp:latest serve
-# lexical-only, smallest:
-# claude mcp add 3gpp -- docker run -i --rm ghcr.io/kodflow/3gpp-mcp:light serve
 ```
 
 ## Option C — HTTP (a self-hosted shared/long-running server)
@@ -52,8 +49,8 @@ claude mcp add --transport http 3gpp http://localhost:8765/mcp
 ```
 
 Readiness: `GET /healthz` reports `503 {"status":"loading"}` while the corpus/vectors
-load, then `200 {"status":"ready"}` — wait for `ready` before querying (a baked full
-image is ready almost instantly; light/first-run pulls the DB so loads longer).
+load, then `200 {"status":"ready"}` — wait for `ready` before querying (the baked
+image is ready almost instantly; a first run on an empty volume decompresses first).
 
 ## Install the /3gpp skill (strict cited answers + deep-research protocol)
 
