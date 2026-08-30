@@ -195,30 +195,40 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	}
 
 	worklist := t.ledgerPath(c) + ".worklist"
-	c.Log.Printf("exporting the work list for %s (clauses with no vector, floor=%q)", t.DB, t.Floor(c))
+	c.Log.Printf("exporting the work list for %s (floor=%q, identity=%s)", t.DB, t.Floor(c), id)
 	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
 		"--db", db, "--export-worklist", worklist, "--embed-floor", t.Floor(c),
+		// Without the identity the export asks "which clauses have no vector"; with it,
+		// it can also answer "which vectors were made by a different embedder".
+		"--embed-identity", id,
 	}}); err != nil {
 		return err
 	}
 	todo := countLines(worklist)
 	c.Checkpoint("worklist", strconv.Itoa(todo))
 	if todo == 0 {
-		c.Log.Printf("every clause already carries a vector — nothing to do")
-		return nil
+		c.Log.Printf("every clause already carries a vector under %s — nothing to embed", id)
+		// DECLINE rather than return nil. The ledger is a declared output of this step,
+		// and with nothing to embed there is no ledger to produce — the identity switch
+		// even archives the previous one. Returning nil made the runner report
+		// "declared output missing after a successful run" and fail a step that had
+		// correctly decided there was no work.
+		return fmt.Errorf("%w: no clause needs a vector under %s", ErrDeclined, id)
 	}
 
-	// THE WORKLIST READS THROUGH THE VIEW; THE WRITE-BACK CANNOT.
+	// NO WRITE-SHAPE RESTORE HERE ANY MORE.
 	//
-	// On a content-addressed corpus (ADR 0004) `clauses` is a view, and DuckDB
-	// answers an UPDATE against it with a hard error. Reading is fine — the
-	// filters land on `clause_occ` and `bodies` before any text is rebuilt, which
-	// is why the export above costs seconds and not hours — so the restore is
-	// deferred to here, AFTER the count. A run with nothing to embed then pays
-	// nothing at all, which is the common case once the corpus is complete.
-	if err := ensureWriteShape(c, db); err != nil {
-		return err
-	}
+	// This used to call ensureWriteShape, because the import did `UPDATE clauses` and
+	// DuckDB refuses that against a view. The cost was enormous and entirely avoidable:
+	// restoring rematerialises every clause's text, which took the real corpus from
+	// 11.5 GB to 38.8 GB in 5m36 — before a single vector existed — and the run then
+	// needed a full re-compaction to give the space back. Measured on 2026-08-29, that
+	// alone is what made a re-embed need ~64 GB free and fail on a machine with 33.
+	//
+	// The import now writes where the vectors actually live: `bodies`, 821 146 rows
+	// instead of 2 752 688, straight through the view's own join. `merge` still restores
+	// (it deletes and re-inserts rows of `clauses`, which really does need the table);
+	// `embed` no longer has any reason to.
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
@@ -430,10 +440,22 @@ func stepIndex(t corpusTarget) *Step {
 			// The vector index is a DERIVED CACHE of the vectors. Its identity is
 			// the embed identity plus the index parameters; anything else (the
 			// server code, the docs) must not invalidate it.
+			//
+			// "the index parameters" has to mean ALL of them. This map listed only
+			// metric and dim while the build also takes M, ef_construction and
+			// ef_search, so changing the graph's shape left the fingerprint identical
+			// and the step SKIPPED — a corpus served by an index built to parameters
+			// nobody asked for, with the plan reporting it as up to date. The
+			// build-side defaults live in internal/store (hnswM/hnswEfConstruction/
+			// hnswEfSearch) and are read here through the same env overrides, so the
+			// fingerprint tracks what the build will actually do.
 			return map[string]string{
-				"embed_identity": embedIdentityForPlan(c),
-				"metric":         "cosine",
-				"dim":            "1024",
+				"embed_identity":       embedIdentityForPlan(c),
+				"metric":               "cosine",
+				"dim":                  "1024",
+				"hnsw_m":               envOr("HNSW_M", "32"),
+				"hnsw_ef_construction": envOr("HNSW_EF_CONSTRUCTION", "128"),
+				"hnsw_ef_search":       envOr("HNSW_EF_SEARCH", "128"),
 			}, nil
 		},
 		Heavy: true,
@@ -979,9 +1001,16 @@ func stepParagraphs() *Step {
 		Run: func(c *Ctx) error {
 			db := c.dataPath("3gpp.duckdb")
 			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
-			// --drop-clauses is safe to pass unconditionally: the tool refuses to
-			// drop anything unless its own verification passed first, and on an
-			// already-converted corpus the build is a no-op re-derivation.
+			// --drop-clauses is safe to pass unconditionally, but NOT for the reason
+			// this comment used to give. It claimed the build was "a no-op
+			// re-derivation" on an already-converted corpus. It was the opposite: the
+			// rebuild reads `clauses`, which on such a corpus is the VIEW over the
+			// very tables it replaces, so re-deriving clause_occ joined freshly
+			// renumbered paragraphs against the old body_ids and cut 2 752 688
+			// occurrences down to 140 047 — with verify passing, because it compares
+			// the rebuild against the same broken view. Measured 2026-08-29.
+			// cmd/migrate-paragraphs now DECLINES that input up front
+			// (alreadyConverted), so the step really is the no-op it is described as.
 			return c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
 				"--db", db, "--drop-clauses",
 			}, Echo: true})

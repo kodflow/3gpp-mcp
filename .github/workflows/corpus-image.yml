@@ -185,17 +185,37 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # LIGHT: bake the SAME lexical corpus DB as full, but WITHOUT the vector
-      # sub-bases or the BGE-M3 model → offline lexical (BM25), small image. The
-      # distributed corpus DB is already lexical (vectors are the separate 3gpp-vec
-      # Option-B overlay, not an embedding column), so "light" = full minus the
-      # vec/model, NOT a strip step. (Baking is required: the runtime DB-bootstrap
-      # URL — releases/latest/download — 404s, so an empty light would have no DB.)
-      - name: Light — bake the lexical DB only (zst), no vectors/model
+      # LIGHT: bake the corpus DB, build the binary WITHOUT the BGE-M3 model and
+      # WITHOUT the onnx/embed_ffi tags → the server can only answer lexically (BM25).
+      #
+      # This is NOT a strip step, and since ADR 0004 that costs something worth
+      # stating plainly instead of leaving the old claim in place. The `3gpp-vec`
+      # Option-B overlay this comment used to describe is GONE — corpus-matrix.yml
+      # was retired in #248 and the corpus now carries its vectors as a column — so
+      # `docker cp /3gpp.duckdb` copies the vectors along with the text. Measured on
+      # light-edge/amd64: a 7.24 GiB data layer, 7.32 GiB total, against 11.69 GiB
+      # for full. "light" is lighter only by the model and the ORT stack; the
+      # vectors ride along and this binary can never use them.
+      #
+      # (Baking is required: bootstrap now pulls the corpus from the PRIVATE GHCR
+      # package and needs a read:packages credential, which no published image
+      # carries, so an unbaked light would start with no DB at all.)
+      - name: Light — bake the corpus DB (zst), no BGE-M3 model
         if: matrix.variant == 'light'
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
           TAG: ${{ github.event.inputs.release_tag || 'latest' }}
+          # The two LIGHT legs (amd64 + arm64) pull the SAME ~11.6 GB corpus image
+          # at the same time, and GHCR answers the pair with TOOMANYREQUESTS. The
+          # default budget — 5 attempts over 3/6/12/26 s — spends 47 s and gives up
+          # while the limit is still closed; that is exactly how this workflow died
+          # on the merge of #263. Widen the budget for THIS pull only, using the
+          # tunables retry.sh already documents: 8 attempts capped at 180 s is about
+          # 13 min of patience, longer than the window, and costs nothing when the
+          # pull succeeds on the first try.
+          RETRY_MAX: "8"
+          RETRY_BASE: "15"
+          RETRY_MAX_DELAY: "180"
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh

@@ -295,6 +295,21 @@ should use. `.mcp.json` at the repo root wires it into any `mcpServers` client:
   (F04); spending GPU on an index with no consumer is the mistake.
 - **fp16.** Precision is part of the EmbedIdentity, so switching costs a full
   re-embed. fp32 is chosen once, on purpose (F12).
-- **`mean_pool` windowing.** `truncate@1024` is canonical and consistent across
-  Rust, Go and `contracts/identity.toml`. Flipping it bumps the identity — a
-  decision to take before a campaign, never during one (F15).
+- **`mean_pool` windowing.** Done (#208). `truncate@1024` dropped the tail of
+  long clauses; the Rust embedder now windows a clause that does not fit whole and
+  re-splits any window still reaching max_tokens. Measured on the 2026-08-29 run
+  at the 300-word / 1024-token pairing: 2 771 904 windows over 2 207 218 clauses,
+  131 932 of them multi-window, 49 277 forced token splits, and
+  `truncated_windows = 11` — not 0, as this line used to claim. The 11 are the 11
+  `unsplittable`: a single word longer than the model's context, typically a
+  space-free ASN.1 blob, where there is nothing left to split. That is 0.0004% of
+  the windows against the tails of 131 932 clauses before the fix.
+- **2048 tokens / 600-word windows.** The pairing moved after the 1024 cap was
+  traced to #196, which sized it for a Kaggle T4 at a fixed batch of 64 — a
+  premise retired twice over (no T4 path, and 2b1482b made the batch VRAM-aware
+  with OOM backoff). TeleEmbedBench (arXiv 2604.17778) measures 2048 as optimal
+  for 3GPP specifically. Expect the multi-window count to fall sharply; re-read it
+  from `RESULT windowing` rather than assuming.
+- **Identity history.** `61ba446c0814` (truncate@1024) -> `6bf1f9a47710`
+  (mean_pool@1024, #208) -> `38067f8c6efe` (mean_pool@2048). Each step is a full
+  re-embed, taken deliberately before a campaign (F15).

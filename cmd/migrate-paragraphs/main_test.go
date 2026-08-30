@@ -560,3 +560,108 @@ func TestDroppingTheTableRestampsTheVectorMarkers(t *testing.T) {
 		t.Errorf("hnsw_state = %q after the vectors moved to a table with no index, want building", state)
 	}
 }
+
+// TestRepairViewRecoversAnInterruptedRestore pins the state that actually happened: the
+// embed step's --restore filled the disk, the run was killed, and `clauses` was left as
+// an EMPTY base table shadowing the view. The corpus served nothing while every byte of
+// it was still there. Neither --drop-clauses (it refuses to rebuild from 0 rows, rightly)
+// nor --restore (it would redo the materialisation that filled the disk) recovers it.
+func TestRepairViewRecoversAnInterruptedRestore(t *testing.T) {
+	h := fixture(t)
+	if err := build(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := drop(h); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the wreck: the view replaced by an empty table of the same name.
+	if _, err := h.Exec(`DROP VIEW clauses`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`CREATE TABLE clauses (
+		chunk_id UBIGINT, spec_id VARCHAR, release VARCHAR, version VARCHAR,
+		clause_path VARCHAR, heading VARCHAR, text VARCHAR, is_normative BOOLEAN,
+		embedding FLOAT[1024], embedding_hash VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 0 {
+		t.Fatalf("the wreck should serve 0 rows, got %d", before)
+	}
+
+	if err := repairView(h); err != nil {
+		t.Fatalf("repair-view: %v", err)
+	}
+
+	var kind string
+	if err := h.QueryRow(
+		`SELECT table_type FROM information_schema.tables WHERE table_name='clauses'`).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(kind, "VIEW") {
+		t.Fatalf("`clauses` is %q, want VIEW", kind)
+	}
+	var after, occ int
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		t.Fatal(err)
+	}
+	if after != occ || after == 0 {
+		t.Fatalf("the view serves %d rows over %d occurrences", after, occ)
+	}
+	// And the text must come back, not just the row count.
+	var text string
+	if err := h.QueryRow(
+		`SELECT text FROM clauses WHERE spec_id='23.503'`).Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "a\n\n\n\nb" {
+		t.Fatalf("reconstructed %q, want the blank run preserved", text)
+	}
+}
+
+// TestRepairViewRefusesAnythingElse is the point of the operation being narrow. It drops
+// a table, so it must fire ONLY on the wreck it is named for.
+func TestRepairViewRefusesAnythingElse(t *testing.T) {
+	t.Run("a populated clauses table is a corpus, not a wreck", func(t *testing.T) {
+		h := fixture(t) // clauses is a real table WITH rows
+		err := repairView(h)
+		if err == nil {
+			t.Fatal("repaired a corpus that was never converted — it would have been destroyed")
+		}
+		if !strings.Contains(err.Error(), "rows") {
+			t.Fatalf("the refusal should say why: %v", err)
+		}
+	})
+
+	t.Run("an empty clauses over no occurrences has nothing to serve", func(t *testing.T) {
+		h := fixture(t)
+		if _, err := h.Exec(`DELETE FROM clauses`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Exec(`CREATE TABLE clause_occ (chunk_id UBIGINT, body_id INTEGER)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := repairView(h); err == nil {
+			t.Fatal("installed a view over nothing, which would look like a healthy empty corpus")
+		}
+	})
+
+	t.Run("an already-converted corpus is left alone", func(t *testing.T) {
+		h := fixture(t)
+		if err := build(h); err != nil {
+			t.Fatal(err)
+		}
+		if err := drop(h); err != nil {
+			t.Fatal(err)
+		}
+		if err := repairView(h); err != nil {
+			t.Fatalf("a healthy converted corpus must be a no-op, got %v", err)
+		}
+	})
+}

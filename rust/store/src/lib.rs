@@ -583,17 +583,49 @@ impl Store {
         Ok(v)
     }
 
-    /// clauses_needing_embedding streams the work-list (never-embedded, embeddable
-    /// clauses), oldest chunk first, capped at `limit` (0 = all). Mirrors the Go
-    /// ClausesNeedingEmbedding ResumeOnly path so the Rust embedder can read the
-    /// work-list straight from the DB instead of a JSONL bridge.
-    pub fn clauses_needing_embedding(&self, limit: usize, floor_ord: i64) -> Result<Vec<WorkItem>> {
+    /// clauses_needing_embedding streams the work-list, oldest chunk first, capped at
+    /// `limit` (0 = all).
+    ///
+    /// WHAT "NEEDING" MEANS depends on the identity. Normally it is "has no vector yet".
+    /// But `EmbedIdentity` folds in the model, precision, windowing and max_tokens, and a
+    /// corpus embedded under one identity must never be queried or indexed under another —
+    /// that is the whole reason the identity exists. So when the DB is stamped with a
+    /// DIFFERENT identity than the one this run embeds under, every embeddable clause needs
+    /// re-embedding, vector or not.
+    ///
+    /// This used to ask `embedding IS NULL` alone. The #208 switch from truncate to
+    /// mean_pool therefore archived the ledger, exported an EMPTY work-list, and reported
+    /// "every clause already carries a vector — nothing to do" — a re-embed that silently
+    /// did not happen, on a corpus every vector of which was now stale. Same defect class
+    /// as validate/check-data/LoadVSS: the gate asked a different question than the thing
+    /// it gated.
+    ///
+    /// `want_identity` empty = ask the old question (callers that have no identity to hand).
+    pub fn clauses_needing_embedding(
+        &self,
+        limit: usize,
+        floor_ord: i64,
+        want_identity: &str,
+    ) -> Result<Vec<WorkItem>> {
+        let stamped = self.get_meta("embedding_model").unwrap_or_default();
+        let identity_changed =
+            !want_identity.is_empty() && !stamped.is_empty() && stamped != want_identity;
+        if identity_changed {
+            eprintln!(
+                "embed work-list: corpus is stamped {stamped}, this run embeds {want_identity} — every embeddable clause is stale and re-enters the work-list"
+            );
+        }
+        let vector_filter = if identity_changed {
+            ""
+        } else {
+            "embedding IS NULL AND "
+        };
         // Carry `release` so the floor (release ordinal ≥ floor_ord) is applied in Rust — the
         // Rel-99→3 special makes a pure-SQL ordinal awkward (== Go ClausesNeedingEmbedding
         // FloorOrd). floor_ord ≤ 0 = no floor.
         let sql = format!(
             "SELECT chunk_id, COALESCE(release,''), COALESCE(heading,''), COALESCE(text,'') FROM clauses
-             WHERE embedding IS NULL AND {EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
+             WHERE {vector_filter}{EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare worklist")?;
         let rows = stmt
@@ -728,6 +760,49 @@ impl Store {
     /// never cost the whole ledger — `ignore_errors` skips them exactly as the
     /// hand-rolled loop did, and the width filter drops any vector that is not
     /// DENSE_DIM wide rather than letting one bad cast abort the import.
+    /// clauses_is_view reports whether the corpus is content-addressed (ADR 0004): on a
+    /// converted corpus `clauses` is a VIEW over clause_occ ⋈ bodies and the vectors live
+    /// on `bodies`; on a raw one it is the table that holds them.
+    pub fn clauses_is_view(&self) -> Result<bool> {
+        let t: String = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(max(table_type),'') FROM information_schema.tables
+                  WHERE table_name = 'clauses'",
+                [],
+                |r| r.get(0),
+            )
+            .context("inspect the shape of `clauses`")?;
+        Ok(t.eq_ignore_ascii_case("VIEW"))
+    }
+
+    /// check_body_ledger_agreement guards the collapse the body-level write performs.
+    ///
+    /// Many occurrences share one body, and they share it precisely because their text is
+    /// identical — so they carry the same vector and the same hash, and folding them onto
+    /// one row is sound. That is an invariant, not a hope. A body whose occurrences
+    /// disagree means the ledger and the corpus describe different text, and the write
+    /// would pick one of them at random; refuse instead.
+    fn check_body_ledger_agreement(&self) -> Result<()> {
+        let conflicts: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM (
+                   SELECT o.body_id FROM _ledger l JOIN clause_occ o USING (chunk_id)
+                    GROUP BY o.body_id HAVING count(DISTINCT l.embedding_hash) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .context("check that occurrences of a body agree on their vector")?;
+        if conflicts > 0 {
+            anyhow::bail!(
+                "{conflicts} body/bodies whose occurrences carry different embedding hashes — \
+                 the ledger and the corpus disagree about their text; refusing to write one at random"
+            );
+        }
+        Ok(())
+    }
+
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
         let p = path.replace('\\', "/").replace('\'', "''");
         self.conn
@@ -748,19 +823,47 @@ impl Store {
             .query_row("SELECT count(*) FROM _ledger", [], |r| r.get(0))
             .context("count staged ledger rows")?;
 
+        // WHERE THE VECTORS ACTUALLY LIVE. On a content-addressed corpus (ADR 0004)
+        // `clauses` is a view and DuckDB refuses to UPDATE it, which is why the embed step
+        // used to run `migrate-paragraphs --restore` first — rematerialising every clause's
+        // text and taking the corpus from 11.5 GB to 38.8 GB before a single vector was
+        // computed, then needing a full re-compaction to give the space back. Writing to
+        // `bodies` costs none of that and touches 821 146 rows instead of 2 752 688.
+        //
         // The cast to the FIXED width happens only here: staging is FLOAT[] (variable),
         // the column is FLOAT[1024], and the filter above has already guaranteed every
         // surviving row is exactly that wide.
-        self.conn
-            .execute_batch(&format!(
+        let to_bodies = self.clauses_is_view()?;
+        if to_bodies {
+            self.check_body_ledger_agreement()?;
+        }
+        let apply = if to_bodies {
+            format!(
+                "UPDATE bodies SET embedding = d.vec::FLOAT[{DENSE_DIM}],
+                                   embedding_hash = d.embedding_hash
+                   FROM (SELECT o.body_id,
+                                any_value(l.vec) AS vec,
+                                any_value(l.embedding_hash) AS embedding_hash
+                           FROM _ledger l JOIN clause_occ o USING (chunk_id)
+                          GROUP BY o.body_id) AS d
+                  WHERE bodies.body_id = d.body_id;"
+            )
+        } else {
+            format!(
                 "UPDATE clauses SET embedding = l.vec::FLOAT[{DENSE_DIM}],
                                     embedding_hash = l.embedding_hash
-                 FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;
-                 DROP TABLE _ledger;
-                 COMMIT;"
-            ))
-            .context("apply ledger to clauses")?;
-
+                   FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;"
+            )
+        };
+        self.conn
+            .execute_batch(&format!("{apply} DROP TABLE _ledger; COMMIT;"))
+            .with_context(|| {
+                if to_bodies {
+                    "apply ledger to bodies"
+                } else {
+                    "apply ledger to clauses"
+                }
+            })?;
         let embedded: i64 = self
             .conn
             .query_row(
@@ -850,13 +953,19 @@ impl Store {
         // preserve_insertion_order is pure cost here: HNSW is an unordered structure
         // and the scan feeding it has no ORDER BY, so holding the row order only
         // widens the materialisation that has to spill.
+        // MUST match internal/store/hnsw.go's hnswM/hnswEfConstruction: two builders that
+        // disagree produce two different graphs over the same vectors, and nothing downstream
+        // can tell which one it is querying. Same env overrides, same defaults.
+        let m = std::env::var("HNSW_M").unwrap_or_else(|_| "32".into());
+        let efc = std::env::var("HNSW_EF_CONSTRUCTION").unwrap_or_else(|_| "128".into());
+        let efs = std::env::var("HNSW_EF_SEARCH").unwrap_or_else(|_| "128".into());
         let sql = format!(
             "CHECKPOINT;
              SET memory_limit = '{buf}';
              SET preserve_insertion_order = false;
              {knobs}
              INSTALL vss; LOAD vss; SET hnsw_enable_experimental_persistence = true;
-             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine');
+             CREATE INDEX IF NOT EXISTS clauses_hnsw ON clauses USING HNSW (embedding) WITH (metric = 'cosine', M = {m}, ef_construction = {efc}, ef_search = {efs});
              CHECKPOINT;"
         );
         self.conn.execute_batch(&sql).map_err(|e| {
@@ -883,6 +992,9 @@ impl Store {
             ("embedding_dim", "1024"),
             ("embedding_count", &count.to_string()),
             ("embedding_model", model),
+            ("hnsw_m", &m),
+            ("hnsw_ef_construction", &efc),
+            ("hnsw_ef_search", &efs),
         ] {
             self.set_meta(k, v)?;
         }
@@ -1543,6 +1655,124 @@ impl Store {
 mod tests {
     use super::*;
 
+    /// The embed step used to rematerialise every clause's text just to have a table it
+    /// could UPDATE — 11.5 GB to 38.8 GB on the real corpus, before any vector existed.
+    /// This pins the write going where the vectors actually live, including the case that
+    /// makes it possible at all: several occurrences sharing one body.
+    #[test]
+    fn a_content_addressed_corpus_takes_its_vectors_on_bodies() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "DROP TABLE IF EXISTS clauses;
+                 INSERT INTO paragraphs(para_id, part) VALUES (1,'alpha'),(2,'beta');
+                 INSERT INTO bodies(body_id, heading) VALUES (10,'A'),(20,'B');
+                 INSERT INTO body_seq(body_id, ord, para_id) VALUES (10,0,1),(20,0,2);
+                 -- chunk 1 and 3 are the SAME body: one clause reused across releases.
+                 INSERT INTO clause_occ(chunk_id, spec_id, release, version, clause_path, body_id, is_normative)
+                   VALUES (1,'23.501','Rel-18','18.0','5.1',10,true),
+                          (2,'23.501','Rel-18','18.0','5.2',20,true),
+                          (3,'23.501','Rel-19','19.0','5.1',10,true);
+                 CREATE OR REPLACE VIEW clauses AS
+                   SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path, b.heading,
+                          (SELECT string_agg(p.part, chr(10)||chr(10) ORDER BY s.ord)
+                             FROM body_seq s JOIN paragraphs p USING (para_id)
+                            WHERE s.body_id = o.body_id) AS text,
+                          o.is_normative, b.embedding, b.embedding_hash
+                   FROM clause_occ o JOIN bodies b USING (body_id);",
+            )
+            .unwrap();
+        assert!(
+            s.clauses_is_view().unwrap(),
+            "the fixture must be converted"
+        );
+
+        let vec_a = (0..DENSE_DIM).map(|i| (i % 7) as f32).collect::<Vec<_>>();
+        let vec_b = (0..DENSE_DIM).map(|i| (i % 5) as f32).collect::<Vec<_>>();
+        let json = |chunk: u64, hash: &str, v: &[f32]| {
+            let nums: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+            format!(
+                "{{\"chunk_id\":{chunk},\"hash\":\"{hash}\",\"vec\":[{}]}}",
+                nums.join(",")
+            )
+        };
+        // chunks 1 and 3 share body 10, so they carry the same hash and the same vector.
+        let ledger = format!(
+            "{}\n{}\n{}\n",
+            json(1, "hash-a", &vec_a),
+            json(2, "hash-b", &vec_b),
+            json(3, "hash-a", &vec_a)
+        );
+        let path = std::env::temp_dir().join("ledger_bodies_test.jsonl");
+        std::fs::write(&path, ledger).unwrap();
+
+        let (staged, embedded) = s.import_ledger(path.to_str().unwrap()).unwrap();
+        assert_eq!(staged, 3, "three ledger rows staged");
+        assert_eq!(
+            embedded, 3,
+            "all three occurrences read a vector through the view"
+        );
+
+        let bodies_with_vec: i64 = s
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM bodies WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bodies_with_vec, 2,
+            "two bodies hold the vectors, not three copies"
+        );
+        let hash_of_10: String = s
+            .raw()
+            .query_row(
+                "SELECT embedding_hash FROM bodies WHERE body_id = 10",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash_of_10, "hash-a");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The collapse is only sound because occurrences of one body have identical text.
+    /// If the ledger says otherwise, writing either vector would be a coin toss.
+    #[test]
+    fn disagreeing_occurrences_of_one_body_are_refused() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "DROP TABLE IF EXISTS clauses;
+                 INSERT INTO paragraphs(para_id, part) VALUES (1,'alpha');
+                 INSERT INTO bodies(body_id, heading) VALUES (10,'A');
+                 INSERT INTO body_seq(body_id, ord, para_id) VALUES (10,0,1);
+                 INSERT INTO clause_occ(chunk_id, spec_id, release, version, clause_path, body_id, is_normative)
+                   VALUES (1,'23.501','Rel-18','18.0','5.1',10,true),
+                          (2,'23.501','Rel-19','19.0','5.1',10,true);
+                 CREATE OR REPLACE VIEW clauses AS
+                   SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path, b.heading,
+                          '' AS text, o.is_normative, b.embedding, b.embedding_hash
+                   FROM clause_occ o JOIN bodies b USING (body_id);",
+            )
+            .unwrap();
+        let v = (0..DENSE_DIM).map(|i| i as f32).collect::<Vec<_>>();
+        let nums: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+        let ledger = format!(
+            "{{\"chunk_id\":1,\"hash\":\"one\",\"vec\":[{n}]}}\n{{\"chunk_id\":2,\"hash\":\"TWO\",\"vec\":[{n}]}}\n",
+            n = nums.join(",")
+        );
+        let path = std::env::temp_dir().join("ledger_conflict_test.jsonl");
+        std::fs::write(&path, ledger).unwrap();
+        let err = s.import_ledger(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("different embedding hashes"),
+            "expected a refusal naming the disagreement, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn schema_bootstraps_and_meta_roundtrips() {
         let s = Store::in_memory().unwrap();
@@ -1569,7 +1799,7 @@ mod tests {
             .unwrap();
         // clause 3 has empty text → not embeddable.
         assert_eq!(s.count_null_embeddings().unwrap(), 2);
-        let wl = s.clauses_needing_embedding(0, 0).unwrap();
+        let wl = s.clauses_needing_embedding(0, 0, "").unwrap();
         assert_eq!(wl.len(), 2);
 
         let v = vec![0.1f32; DENSE_DIM];

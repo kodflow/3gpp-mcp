@@ -25,6 +25,9 @@ models:
     precision: fp32
     dim: 1024
     normalization: l2
+    windowing: mean_pool     # <- #208: embed the whole clause, not its first 1024
+    max_tokens: 2048         #    tokens, at the chunk size TeleEmbedBench measures as
+                             #    optimal for 3GPP. Bumps EmbedIdentity, so it re-embeds.
     revision: 5617a9f
     tokenizer_revision: 5617a9f
     inputs: [input_ids, attention_mask]
