@@ -100,7 +100,10 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	), h.resolveTerm)
 
 	s.AddTool(mcp.NewTool("trace_evolution",
-		mcp.WithDescription("NE<->NF evolution subgraph (V2/KuzuDB; empty in V1)."),
+		mcp.WithDescription("How a 4G/legacy network element maps to its 5GC network function(s), "+
+			"with the TS 23.501 clause that justifies each edge. NE->NF is many-to-many: "+
+			"MME alone splits across AMF, SMF and SMSF. Pass a 5GC name to see what it "+
+			"replaced, or an EPC name to see what replaced it."),
 		mcp.WithString("entity", mcp.Required()),
 		mcp.WithString("from_release", mcp.Description("")),
 		mcp.WithString("to_release", mcp.Description("")),
