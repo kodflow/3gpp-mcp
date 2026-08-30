@@ -279,37 +279,14 @@ jobs:
           # the bootstrap; it is NOT shipped in this data image.
           RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap models/ORT" \
             retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db
-          # 3) THE QUERY MODEL SHIPS AT THE CORPUS'S PRECISION — fp32, NOT fp16.
-          #
-          # This step used to convert BGE-M3 to fp16 (keep_io_types) and bake only
-          # that, halving the model layer. It also silently turned semantic search
-          # OFF in every image it produced, because PRECISION IS PART OF THE EMBED
-          # IDENTITY. Measured with cmd/embedid, one field changed at a time:
-          #
-          #     fp32 + mean_pool/2048  ->  38067f8c6efe   (what the corpus carries)
-          #     fp16 + mean_pool/2048  ->  a different id, always
-          #
-          # so the server booting from the image computed a client identity its own
-          # corpus could never match, the serve-time coherence guard disabled VSS,
-          # and the image answered lexically while shipping 821 146 vectors it could
-          # not use. internal/embed/models.yaml has said so all along: "an fp16
-          # corpus and an fp32 query can never share one HNSW."
-          #
-          # Nothing caught it. image-smoke asserts no semantic behaviour, and the
-          # 2026-08-27 semantic proof was run against a LOCAL fp32 build, not the
-          # image. The label was the only witness, and it was telling the truth to
-          # an empty room: io.kodflow.3gpp.embedding.identity=536f8138e190 sitting
-          # beside a source.corpus digest whose DB says 38067f8c6efe.
-          #
-          # The cost is ~1.1 GB of layer. The alternative is shipping a semantic
-          # image that cannot do semantic.
-          #
-          # WINDOWING AND MAX_TOKENS MUST BE DECLARED HERE. They default to
-          # truncate/1024 when omitted (see internal/embed/models.yaml), which was
-          # coherent while the corpus used the defaults and became a second
-          # mismatch the moment #208 moved it to mean_pool/2048. Declaring them
-          # keeps this registry pinned to the corpus instead of to a default that
-          # can move underneath it.
+          # 3) THE QUERY MODEL SHIPS AT THE CORPUS'S PRECISION — fp32, not fp16.
+          # Precision folds into the embed identity, so baking the fp16 conversion
+          # made every image compute a client id its own corpus could never match:
+          # the serve guard then disabled VSS and the image answered lexically.
+          # windowing/max_tokens are declared for the same reason — omitted they
+          # default to truncate/1024, which stopped matching when #208 moved the
+          # corpus to mean_pool/2048. Costs ~1.1 GB of layer. Measurements: see the
+          # commit that introduced this.
           cat > image-data/models/models.yaml <<'YAML'
           active: bge-m3
           models:
@@ -338,19 +315,12 @@ jobs:
           EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
           echo "embed identity (baked registry): $EMBED_ID"
           test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
-          # THE REGISTRY AND THE CORPUS MUST AGREE, AND THIS IS WHERE TO FIND OUT.
-          #
-          # Setting the registry correctly once is not a fix; the drift that made
-          # this necessary happened silently, over two separate changes (fp16 for
-          # image size, then #208 moving the corpus to mean_pool/2048), and shipped
-          # both times. The identity is a single opaque digest precisely so that
-          # ONE comparison covers family, revision, tokenizer, dim, normalisation,
-          # precision, windowing and max_tokens at once.
-          #
-          # Compare it to what the DB itself carries. A mismatch here is not a
-          # cosmetic label problem: it is the serve-time coherence guard about to
-          # disable vector search in every image built from this run, which is the
-          # one failure this bake exists to avoid.
+          # THE REGISTRY AND THE CORPUS MUST AGREE — ASK, DO NOT ASSUME.
+          # Setting the registry right once is not a fix: this drifted twice and
+          # shipped both times. The identity is one opaque digest precisely so ONE
+          # comparison covers family/revision/tokenizer/dim/normalisation/precision/
+          # windowing/max_tokens. A mismatch is not a label problem: it is the serve
+          # guard about to disable vector search in every image built from this run.
           DB_ID="$(CGO_ENABLED=1 go run ./cmd/dbcount --db image-data/3gpp.duckdb \
                    | sed -n 's/^embedding_model=//p' | head -1)"
           echo "embed identity (corpus): ${DB_ID:-<none>}"
