@@ -11,8 +11,7 @@ pull `3gpp-data` / `3gpp-vec` / `3gpp-corpus` directly.
 
 | Tag | Contents | Size (pull) |
 |---|---|---|
-| `:full` | binary + ONNX Runtime + fused corpus (lexical **+** fp16 vectors) | ~22 GB (once); code-only updates ≈ 150 MB |
-| `:light` | binary + lexical DB only (BM25, no vectors) | ~1–2 GB |
+| `:latest` (alias `:full`) | binary + ONNX Runtime + fused corpus (lexical **+** vectors) + BGE-M3 fp32 | ~22 GB (once); code-only updates approx 150 MB |
 
 A **code-only** rebuild reuses the data layer by digest, so after the first full
 pull the labs only ever fetches the small top layers on updates.
@@ -37,7 +36,7 @@ it cannot push, delete, or change visibility.
 
 ```bash
 echo "$GHCR_RO_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
-docker pull ghcr.io/kodflow/3gpp-mcp:full     # or :light
+docker pull ghcr.io/kodflow/3gpp-mcp:latest
 ```
 
 Pin by digest in production (immutable, audit-friendly):
@@ -79,7 +78,7 @@ Two independent rotations — do not conflate them.
 
 ### 4a. Image rotation (new corpus or new code)
 
-The CI publishes `:full` / `:light` (and dated tags). To roll forward:
+The CI publishes `:latest` (aliased `:full`) and dated tags. To roll forward:
 
 ```bash
 docker pull ghcr.io/kodflow/3gpp-mcp:full     # re-pull moving tag
@@ -102,8 +101,8 @@ Pulls in flight are unaffected; the new token authenticates the next pull.
 
 ## 5. Auto-update (a pull + a read token is all the labs needs)
 
-The labs never rebuilds anything. The CI republishes the moving `:full` / `:light`
-tags whenever the **code** or the **corpus** changes; the labs just re-pulls and
+The labs never rebuilds anything. The CI republishes the moving `:latest` tag
+whenever the **code** or the **corpus** changes; the labs just re-pulls and
 restarts. Pick one of:
 
 **Docker host — a tiny systemd timer (or cron):**

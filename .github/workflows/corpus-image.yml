@@ -1,8 +1,8 @@
 name: Corpus Image
 
-# Build the 3gpp-mcp server image (light + full, multi-arch) and push to GHCR.
+# Build the 3gpp-mcp server image (ONE variant, multi-arch) and push to GHCR.
 #
-# split-data-image design: the FULL variant does NOT bake the corpus anymore —
+# split-data-image design: the image does NOT bake the corpus —
 # it INHERITS the ~22 GB fused data layer from ghcr.io/<owner>/3gpp-data
 # (resolved BY DIGEST in the `resolve` job; baked by corpus-data-image.yml).
 # A code-only change therefore rebuilds ~150 MB of top layers in ~10 min,
@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "3gpp-corpus tag the LIGHT variant bakes its lexical DB from"
+        description: "unused since the light variant was removed; kept so saved dispatches keep working"
         type: string
         default: "latest"
       push:
@@ -149,21 +149,24 @@ jobs:
     # arch's ONNX Runtime (sha256-pinned in the Dockerfile). Each (variant,arch)
     # pushes BY DIGEST; the `manifest` job fuses them into the multi-arch tags.
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90 # no bake anymore — compile + light zst + push
+    timeout-minutes: 90 # no bake anymore — compile + push
     strategy:
       fail-fast: false
+      # ONE IMAGE, EVERYTHING IN IT. The `light` variant is gone.
+      #
+      # It was lighter only by the model and the ORT stack: it still carried the
+      # full data layer, vectors included, and its binary — built with no tags —
+      # could never use them. Measured: 7.32 GiB against 11.69, for an image that
+      # answers lexically while shipping 821 146 vectors. Publishing a second
+      # artefact that silently drops the feature the first one exists for is a
+      # choice nobody was making on purpose.
+      #
+      # Its two legs were also the ones that kept dying on GHCR's rate limit:
+      # they pulled the 10.9 GB corpus DIRECTLY, in parallel, while the full legs
+      # inherit the same bytes from 3gpp-data by digest and never pull it at all.
       matrix:
-        variant: [light, full]
         arch: [amd64, arm64]
         include:
-          - variant: light # binary only; corpus bootstrapped from the network on first run.
-            build_tags: ""
-          - variant: full # onnx (reranker) + embed_ffi (Rust query-embed cdylib) + DB +
-            # vectors + BGE-M3 baked → offline semantic. = :latest. embed_ffi routes
-            # query-embed through rust/embed-core (ort load-dynamic shares the image's
-            # ONE onnxruntime with the Go reranker); the cdylib is built + shipped by the
-            # Dockerfile builder, ORT_DYLIB_PATH points at the baked ORT.
-            build_tags: onnx,embed_ffi
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
@@ -185,63 +188,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # LIGHT: bake the corpus DB, build the binary WITHOUT the BGE-M3 model and
-      # WITHOUT the onnx/embed_ffi tags → the server can only answer lexically (BM25).
-      #
-      # This is NOT a strip step, and since ADR 0004 that costs something worth
-      # stating plainly instead of leaving the old claim in place. The `3gpp-vec`
-      # Option-B overlay this comment used to describe is GONE — corpus-matrix.yml
-      # was retired in #248 and the corpus now carries its vectors as a column — so
-      # `docker cp /3gpp.duckdb` copies the vectors along with the text. Measured on
-      # light-edge/amd64: a 7.24 GiB data layer, 7.32 GiB total, against 11.69 GiB
-      # for full. "light" is lighter only by the model and the ORT stack; the
-      # vectors ride along and this binary can never use them.
-      #
-      # (Baking is required: bootstrap now pulls the corpus from the PRIVATE GHCR
-      # package and needs a read:packages credential, which no published image
-      # carries, so an unbaked light would start with no DB at all.)
-      - name: Light — bake the corpus DB (zst), no BGE-M3 model
-        if: matrix.variant == 'light'
-        env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          TAG: ${{ github.event.inputs.release_tag || 'latest' }}
-          # The two LIGHT legs (amd64 + arm64) pull the SAME ~11.6 GB corpus image
-          # at the same time, and GHCR answers the pair with TOOMANYREQUESTS. The
-          # default budget — 5 attempts over 3/6/12/26 s — spends 47 s and gives up
-          # while the limit is still closed; that is exactly how this workflow died
-          # on the merge of #263. Widen the budget for THIS pull only, using the
-          # tunables retry.sh already documents: 8 attempts capped at 180 s is about
-          # 13 min of patience, longer than the window, and costs nothing when the
-          # pull succeeds on the first try.
-          RETRY_MAX: "8"
-          RETRY_BASE: "15"
-          RETRY_MAX_DELAY: "180"
-        run: |
-          set -euo pipefail
-          source scripts/lib/retry.sh
-          rm -rf image-data && mkdir -p image-data
-          retry bash -c 'echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin'
-          img="ghcr.io/${{ github.repository_owner }}/3gpp-corpus:${TAG}"
-          retry docker pull "$img"
-          cid=$(docker create "$img" /noop)
-          docker cp "$cid:/3gpp.duckdb" image-data/3gpp.duckdb
-          docker rm "$cid" >/dev/null
-          test -s image-data/3gpp.duckdb
-          CGO_ENABLED=1 go run ./cmd/validate --db image-data/3gpp.duckdb \
-            --require-fts --min-clauses 1 --max-empty-meta 100000
-          zstd -q --long=27 image-data/3gpp.duckdb -o image-data/3gpp.duckdb.zst
-          rm -f image-data/3gpp.duckdb
-          du -sh image-data/* 2>/dev/null || true
-
       # crane: the `full` image is assembled by REBASE, not by `FROM ${DATA_IMAGE}`.
       # We build only the small top layers (target: fulltop, ~200 MB) then crane-rebase
       # them onto 3gpp-data@digest — the ~22 GB data layer is referenced by digest and
       # NEVER materialised in buildkit (that materialisation is what ENOSPC-killed the
       # old full build on stock runners, even with Docker on /mnt). crane streams blobs
-      # by reference (cross-repo mount within GHCR), so a full build is now ~light-sized
-      # on disk. Install it on the full leg only.
+      # by reference (cross-repo mount within GHCR), so the build stays small on disk.
       - name: Install crane (rebase the full image onto the data layer, disk-safe)
-        if: matrix.variant == 'full'
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh
@@ -286,7 +239,7 @@ jobs:
       # Build the SINGLE-arch image and push it BY DIGEST (no tags here — the `manifest`
       # job fuses the per-arch digests into the multi-arch tags). provenance:false keeps
       # the per-arch push a plain manifest so `imagetools` composes it cleanly.
-      # target: `light` bakes image-data/ (zst); `full` builds the SMALL `fulltop` stage
+      # target: the SMALL `fulltop` stage
       # (FROM the shared debian base, NO data layer) — the data layer is grafted on by
       # the crane rebase step below, never materialised in buildkit (disk-safe).
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -294,11 +247,11 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          target: ${{ matrix.variant == 'full' && 'fulltop' || matrix.variant }}
+          target: fulltop
           platforms: linux/${{ matrix.arch }}
           build-args: |
-            BUILD_TAGS=${{ matrix.build_tags }}
-            VARIANT=${{ matrix.variant }}
+            BUILD_TAGS=onnx,embed_ffi
+            VARIANT=full
             VERSION=${{ github.sha }}
             DATA_IMAGE=${{ needs.resolve.outputs.data_image }}
             DATA_CREATED=${{ needs.resolve.outputs.data_created }}
@@ -318,7 +271,7 @@ jobs:
       # it). The rebased per-arch digest replaces the fulltop digest for the manifest job.
       - name: Rebase full onto 3gpp-data (crane, disk-safe)
         id: rebase
-        if: ${{ matrix.variant == 'full' && github.event.inputs.push != 'false' }}
+        if: ${{ github.event.inputs.push != 'false' }}
         env:
           REPO: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
           DATA_REPO: ghcr.io/${{ github.repository_owner }}/3gpp-data
@@ -353,16 +306,14 @@ jobs:
         if: ${{ github.event.inputs.push != 'false' }}
         run: |
           mkdir -p /tmp/digests
-          if [ "${{ matrix.variant }}" = "full" ]; then
-            d='${{ steps.rebase.outputs.digest }}'   # the rebased (data-bearing) image
-          else
-            d='${{ steps.build.outputs.digest }}'
-          fi
+          # The rebased image, never the built one: `build` produces the ~200 MB top
+          # layers alone, and it is the crane rebase that puts them on the data layer.
+          d='${{ steps.rebase.outputs.digest }}'
           touch "/tmp/digests/${d#sha256:}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: ${{ github.event.inputs.push != 'false' }}
         with:
-          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
+          name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -378,24 +329,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Tag discipline: a CODE push publishes ONLY the *-edge tag (never moves the
-          # pullable moving tag), so a code change can never put :latest on top of a
-          # stale/incomplete data layer. The moving tags (light / latest / full) move
-          # only on the latest-publishing paths (post-data-bake workflow_run / manual
-          # dispatch). enable= is resolved at matrix-expansion time from github.event.
-          - variant: light
-            tag_lines: |
-              type=raw,value=light,enable=${{ github.event_name != 'push' }}
-              type=raw,value=light-edge,enable=${{ github.event_name == 'push' }}
-          - variant: full
-            tag_lines: |
+          # Tag discipline: a CODE push publishes ONLY :edge (never moves the pullable
+          # moving tag), so a code change can never put :latest on top of a stale or
+          # incomplete data layer. :latest moves only on the latest-publishing paths
+          # (post-data-bake workflow_run / manual dispatch). enable= is resolved at
+          # matrix-expansion time from github.event.
+          #
+          # `:full` is kept as an alias of `:latest` for anyone who pinned it while the
+          # two variants existed. It now names the only image there is.
+          - tag_lines: |
               type=raw,value=latest,enable=${{ github.event_name != 'push' }}
               type=raw,value=full,enable=${{ github.event_name != 'push' }}
               type=raw,value=edge,enable=${{ github.event_name == 'push' }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: digests-${{ matrix.variant }}-*
+          pattern: digests-*
           path: /tmp/digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -410,7 +359,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/3gpp-mcp
           tags: |
             ${{ matrix.tag_lines }}
-            type=sha,prefix=${{ matrix.variant }}-,format=short
+            type=sha,format=short
       - name: Create multi-arch manifest from the per-arch digests
         working-directory: /tmp/digests
         run: |
@@ -427,9 +376,9 @@ jobs:
           # Inspect the tag actually published this run: moving tag on the latest paths,
           # the *-edge tag on a code push (tag discipline).
           if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${{ matrix.variant == 'full' && 'edge' || 'light-edge' }}"
+            tag="edge"
           else
-            tag="${{ matrix.variant == 'full' && 'latest' || 'light' }}"
+            tag="latest"
           fi
           docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/3gpp-mcp:$tag" \
             | grep -E "Platform|MediaType" | head
@@ -439,7 +388,6 @@ jobs:
       # fully indexed via the check-data inheritance guard, so the only remaining
       # step to fix a degraded prod is the redeploy. ([[project_served_stale_data_layer]])
       - name: Coordination summary (deploy signal)
-        if: ${{ matrix.variant == 'full' }}
         run: |
           set -euo pipefail
           REPO=ghcr.io/${{ github.repository_owner }}/3gpp-mcp
