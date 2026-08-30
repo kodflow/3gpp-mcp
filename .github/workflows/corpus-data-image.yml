@@ -1,7 +1,7 @@
 name: Corpus Data Image
 
 # =============================================================================
-# Bake the fused corpus (lexical DB + fp16 vectors + BGE-M3 fp16) into the
+# Bake the fused corpus (lexical DB + vectors + BGE-M3 fp32) into the
 # data base image ghcr.io/<owner>/3gpp-data — the build-time base the 3gpp-mcp
 # full image inherits its ~14 GB data layer from via `FROM` (plan
 # split-data-image, follow-up of #125). Splitting data from code means a
@@ -196,7 +196,7 @@ jobs:
       # identity overlay #128, sympy #130, DUCK guard #131/#135, models-release
       # restore #132/#133, embedding_model stamp #133, compaction on the
       # emptiest disk #136/#137).
-      - name: Bake fused raw DB (identity overlay) + fp16 BGE-M3
+      - name: Bake fused raw DB (identity overlay) + fp32 BGE-M3
         id: bake
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
@@ -271,43 +271,58 @@ jobs:
             scripts/restore-bge.sh image-data/models
           fi
           # 2b) ONNX Runtime + (BGE-M3 only if 2a fell through) via the provisioner —
-          #    ORT is needed by the fp16 conversion toolchain context only at bake; it
+          #    ORT is only needed by the bootstrap below; it
           #    is NOT shipped in this data image (arch-specific → mcp layer).
           CGO_ENABLED=1 go build -tags onnx -o /tmp/mcp ./cmd/server
           # Bake BOTH models: BGE-M3 (embedder) AND the BGE-reranker-v2-m3 cross-encoder
           # (drop --no-reranker) so serve can turn the reranker on. ORT here is only for
-          # the fp16 conversion toolchain; it is NOT shipped in this data image.
+          # the bootstrap; it is NOT shipped in this data image.
           RETRY_MAX=4 RETRY_BASE=15 RETRY_LABEL="bootstrap models/ORT" \
             retry /tmp/mcp bootstrap --cache "$PWD/image-data" --semantic --skip-db
-          # 3) fp16 conversion (keep_io_types) — kernel-identical recipe.
-          python3 -m pip install --quiet onnx onnxruntime sympy packaging
-          mkdir -p image-data/models/bge-m3-fp16
-          cat > /tmp/convfp16.py <<'PY'
-          import onnx
-          from onnxruntime.transformers.onnx_model import OnnxModel
-          m = onnx.load("image-data/models/bge-m3/model.onnx")
-          om = OnnxModel(m)
-          om.convert_float_to_float16(keep_io_types=True)
-          onnx.save(om.model, "image-data/models/bge-m3-fp16/model.onnx",
-                    save_as_external_data=True, all_tensors_to_one_file=True,
-                    location="model.onnx_data")
-          print("fp16_saved")
-          PY
-          python3 /tmp/convfp16.py
-          cp image-data/models/bge-m3/tokenizer.json image-data/models/bge-m3-fp16/
-          rm -rf image-data/models/bge-m3
+          # 3) THE QUERY MODEL SHIPS AT THE CORPUS'S PRECISION — fp32, NOT fp16.
+          #
+          # This step used to convert BGE-M3 to fp16 (keep_io_types) and bake only
+          # that, halving the model layer. It also silently turned semantic search
+          # OFF in every image it produced, because PRECISION IS PART OF THE EMBED
+          # IDENTITY. Measured with cmd/embedid, one field changed at a time:
+          #
+          #     fp32 + mean_pool/2048  ->  38067f8c6efe   (what the corpus carries)
+          #     fp16 + mean_pool/2048  ->  a different id, always
+          #
+          # so the server booting from the image computed a client identity its own
+          # corpus could never match, the serve-time coherence guard disabled VSS,
+          # and the image answered lexically while shipping 821 146 vectors it could
+          # not use. internal/embed/models.yaml has said so all along: "an fp16
+          # corpus and an fp32 query can never share one HNSW."
+          #
+          # Nothing caught it. image-smoke asserts no semantic behaviour, and the
+          # 2026-08-27 semantic proof was run against a LOCAL fp32 build, not the
+          # image. The label was the only witness, and it was telling the truth to
+          # an empty room: io.kodflow.3gpp.embedding.identity=536f8138e190 sitting
+          # beside a source.corpus digest whose DB says 38067f8c6efe.
+          #
+          # The cost is ~1.1 GB of layer. The alternative is shipping a semantic
+          # image that cannot do semantic.
+          #
+          # WINDOWING AND MAX_TOKENS MUST BE DECLARED HERE. They default to
+          # truncate/1024 when omitted (see internal/embed/models.yaml), which was
+          # coherent while the corpus used the defaults and became a second
+          # mismatch the moment #208 moved it to mean_pool/2048. Declaring them
+          # keeps this registry pinned to the corpus instead of to a default that
+          # can move underneath it.
           cat > image-data/models/models.yaml <<'YAML'
-          active: bge-m3-fp16
+          active: bge-m3
           models:
-            - name: bge-m3-fp16
+            - name: bge-m3
               family: bge-m3
-              dir: /data/mcp-3gpp/models/bge-m3-fp16
-              precision: fp16
+              dir: /data/mcp-3gpp/models/bge-m3
+              precision: fp32
               dim: 1024
               normalization: l2
+              windowing: mean_pool
+              max_tokens: 2048
               revision: 5617a9f
               tokenizer_revision: 5617a9f
-              tokenizer_dir: /data/mcp-3gpp/models/bge-m3-fp16
               inputs: [input_ids, attention_mask]
               output: sentence_embedding
           YAML
@@ -323,6 +338,29 @@ jobs:
           EMBED_ID="$(EMBED_MODELS_CONFIG="$PWD/image-data/models/models.yaml" go run ./cmd/embedid)"
           echo "embed identity (baked registry): $EMBED_ID"
           test -n "$EMBED_ID" || { echo "::error::empty embed identity from cmd/embedid"; exit 1; }
+          # THE REGISTRY AND THE CORPUS MUST AGREE, AND THIS IS WHERE TO FIND OUT.
+          #
+          # Setting the registry correctly once is not a fix; the drift that made
+          # this necessary happened silently, over two separate changes (fp16 for
+          # image size, then #208 moving the corpus to mean_pool/2048), and shipped
+          # both times. The identity is a single opaque digest precisely so that
+          # ONE comparison covers family, revision, tokenizer, dim, normalisation,
+          # precision, windowing and max_tokens at once.
+          #
+          # Compare it to what the DB itself carries. A mismatch here is not a
+          # cosmetic label problem: it is the serve-time coherence guard about to
+          # disable vector search in every image built from this run, which is the
+          # one failure this bake exists to avoid.
+          DB_ID="$(CGO_ENABLED=1 go run ./cmd/dbcount --db image-data/3gpp.duckdb \
+                   | sed -n 's/^embedding_model=//p' | head -1)"
+          echo "embed identity (corpus): ${DB_ID:-<none>}"
+          if [ -n "$DB_ID" ] && [ "$DB_ID" != "$EMBED_ID" ]; then
+            echo "::error::baked registry is $EMBED_ID but the corpus was embedded with $DB_ID —"
+            echo "::error::the server would compute a client identity its own corpus cannot match,"
+            echo "::error::disable VSS, and serve this image lexically. Fix image-data/models/models.yaml"
+            echo "::error::(precision / windowing / max_tokens all fold into the identity)."
+            exit 1
+          fi
 
           # 5) VECTORS — TWO ARCHITECTURES MEET HERE.
           #
@@ -420,7 +458,7 @@ jobs:
             grep -qE 'embedding_model="[^"]+"' /tmp/overlay.log || { echo "::error::embedding_model not stamped — serve would refuse semantic"; exit 1; }
           fi
           test -s image-data/3gpp.duckdb                          || { echo "::error::baked DB missing"; exit 1; }
-          test -s image-data/models/bge-m3-fp16/model.onnx_data   || { echo "::error::fp16 BGE-M3 weights missing"; exit 1; }
+          test -s image-data/models/bge-m3/model.onnx_data        || { echo "::error::BGE-M3 fp32 weights missing"; exit 1; }
           test -s image-data/models/models.yaml                   || { echo "::error::baked model registry missing"; exit 1; }
           test -s image-data/models/bge-reranker-v2-m3/model.onnx || { echo "::error::reranker model missing (drop --no-reranker?)"; exit 1; }
           # COMPACTION AND THE HNSW BUILD ARE BOTH FUSION CLEANUP.
@@ -609,7 +647,7 @@ jobs:
             [ "$pushed" = 1 ] || { echo "::error::data layer push linux/$arch failed after 5 attempts"; exit 1; }
             # LABELs (metadata-only re-push to the same tag; mirrors Dockerfile.data).
             retry crane mutate "$REPO:stage-$arch" \
-              --label org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp16) base for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
+              --label org.opencontainers.image.description="3GPP corpus data (fused DuckDB + BGE-M3 fp32) base for 3gpp-mcp (PRIVATE — verbatim 3GPP text)" \
               --label io.kodflow.3gpp.data.created="${{ steps.bake.outputs.created }}" \
               --label io.kodflow.3gpp.embedding.identity="${{ steps.bake.outputs.embed_identity }}" \
               --label io.kodflow.3gpp.duckdb.rows="${{ steps.bake.outputs.rows }}" \
