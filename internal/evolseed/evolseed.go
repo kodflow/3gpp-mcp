@@ -37,28 +37,76 @@ func Seed() []model.Evolution {
 		}
 	}
 	return []model.Evolution{
-		// MME splits into AMF (mobility) + SMF (session) + parts.
-		e("MME", "AMF", "SPLIT", "4.2.2", 0.90),
-		e("MME", "SMF", "SPLIT", "4.2.2", 0.75),
+		// ---- EPC / legacy PS core -> 5GC -------------------------------------
+		// Each edge is anchored at the TARGET's own definition clause in 23.501
+		// §6.2 (the NF catalogue), because that is the clause a reader following
+		// the citation actually needs. The earlier seed pointed several of these
+		// at §4.2.x architecture clauses that do not describe the target at all —
+		// PCRF->PCF cited §4.2.5 "Data Storage architectures", eNB->gNB cited
+		// §4.2.6 "Service-based interfaces". A citation that lands on the wrong
+		// clause is worse than none: it looks checkable and is not.
+		//
+		// MME splits into AMF (mobility), SMF (session) and SMSF (SMS over NAS).
+		e("MME", "AMF", "SPLIT", "6.2.1", 0.90),
+		e("MME", "SMF", "SPLIT", "6.2.2", 0.75),
+		e("MME", "SMSF", "SPLIT", "6.2.13", 0.60),
 		// Serving/PDN gateways -> UPF (user plane) and SMF (control).
-		e("SGW", "UPF", "REPLACED_BY", "4.2.3", 0.80),
-		e("PGW", "UPF", "SPLIT", "4.2.3", 0.80),
-		e("PGW", "SMF", "SPLIT", "4.2.3", 0.80),
-		e("PGW-C", "SMF", "RENAME", "4.2.3", 0.85),
-		e("PGW-U", "UPF", "RENAME", "4.2.3", 0.85),
-		// Subscriber data: HSS -> UDM + UDR + AUSF.
-		e("HSS", "UDM", "REPLACED_BY", "4.2.4", 0.80),
-		e("HSS", "UDR", "SPLIT", "4.2.4", 0.65),
-		e("HSS", "AUSF", "SPLIT", "4.2.4", 0.65),
-		// Policy: PCRF -> PCF.
-		e("PCRF", "PCF", "RENAME", "4.2.5", 0.90),
-		// RAN: eNB -> gNB; ePDG -> N3IWF; SGSN legacy -> AMF.
-		e("eNB", "gNB", "RENAME", "4.2.6", 0.85),
-		e("ePDG", "N3IWF", "REPLACED_BY", "4.2.8", 0.80),
-		e("SGSN", "AMF", "REPLACED_BY", "4.2.2", 0.55),
-		// New 5GC functions with no direct 4G predecessor.
+		e("SGW", "UPF", "REPLACED_BY", "6.2.3", 0.80),
+		e("PGW", "UPF", "SPLIT", "6.2.3", 0.80),
+		e("PGW", "SMF", "SPLIT", "6.2.2", 0.80),
+		e("PGW-C", "SMF", "RENAME", "6.2.2", 0.85),
+		e("PGW-U", "UPF", "RENAME", "6.2.3", 0.85),
+		e("TDF", "UPF", "REPLACED_BY", "6.2.3", 0.60),
+		// 2G/3G packet core.
+		e("GGSN", "UPF", "SPLIT", "6.2.3", 0.60),
+		e("GGSN", "SMF", "SPLIT", "6.2.2", 0.60),
+		e("SGSN", "AMF", "REPLACED_BY", "6.2.1", 0.55),
+		// Subscriber data and authentication: HSS fans out to UDM + UDR + AUSF.
+		e("HSS", "UDM", "REPLACED_BY", "6.2.7", 0.80),
+		e("HSS", "UDR", "SPLIT", "6.2.11", 0.65),
+		e("HSS", "AUSF", "SPLIT", "6.2.8", 0.65),
+		e("HSS-FE", "UDM", "RENAME", "6.2.7", 0.70),
+		e("SPR", "UDR", "REPLACED_BY", "6.2.11", 0.65),
+		e("AAA", "AUSF", "REPLACED_BY", "6.2.8", 0.55),
+		e("EIR", "5G-EIR", "RENAME", "6.2.15", 0.85),
+		// Policy and exposure.
+		e("PCRF", "PCF", "RENAME", "6.2.4", 0.90),
+		e("SCEF", "NEF", "REPLACED_BY", "6.2.5", 0.80),
+		e("DRA", "SCP", "REPLACED_BY", "6.2.19", 0.50),
+		// Location.
+		e("E-SMLC", "LMF", "REPLACED_BY", "6.2.16", 0.75),
+		// Access. gNB is a RAN node, not an NF of §6.2, and 23.501 only NAMES it
+		// (§3.2 Abbreviations) — the NG-RAN node itself is described in 38.300 /
+		// 38.401. §3.2 is the honest anchor inside the spec this seed cites: it is
+		// where 23.501 introduces the term, and nothing in §4.2.2 mentions gNB at
+		// all (the citation check catches that).
+		e("eNB", "gNB", "RENAME", "3.2", 0.85),
+		e("ePDG", "N3IWF", "REPLACED_BY", "6.2.9", 0.80),
+		e("TWAG", "TWIF", "REPLACED_BY", "6.2.22", 0.60),
+		// Multicast / broadcast.
+		e("MBMS-GW", "MB-SMF", "REPLACED_BY", "6.2.27", 0.55),
+
+		// ---- 5GC functions with no direct 4G predecessor ----------------------
+		// FromTerm is empty on purpose: these are additions, not evolutions of an
+		// existing element, and pretending otherwise would invent a lineage.
 		e("", "NRF", "EXTENDED_BY", "6.2.6", 0.70),
 		e("", "NSSF", "EXTENDED_BY", "6.2.14", 0.70),
+		e("", "UDSF", "EXTENDED_BY", "6.2.12", 0.70),
+		e("", "SEPP", "EXTENDED_BY", "6.2.17", 0.70),
+		e("", "NWDAF", "EXTENDED_BY", "6.2.18", 0.70),
+		e("", "W-AGF", "EXTENDED_BY", "6.2.20", 0.70),
+		e("", "UCMF", "EXTENDED_BY", "6.2.21", 0.70),
+		e("", "NSSAAF", "EXTENDED_BY", "6.2.23", 0.70),
+		e("", "DCCF", "EXTENDED_BY", "6.2.24", 0.70),
+		e("", "MFAF", "EXTENDED_BY", "6.2.25", 0.70),
+		e("", "ADRF", "EXTENDED_BY", "6.2.26", 0.70),
+		e("", "NSACF", "EXTENDED_BY", "6.2.28", 0.70),
+		e("", "TSCTSF", "EXTENDED_BY", "6.2.29", 0.70),
+		e("", "5G DDNMF", "EXTENDED_BY", "6.2.30", 0.70),
+		e("", "EASDF", "EXTENDED_BY", "6.2.31", 0.70),
+		e("", "TSN AF", "EXTENDED_BY", "6.2.32", 0.70),
+		e("", "NSWOF", "EXTENDED_BY", "6.2.33", 0.70),
+		e("", "EIF", "EXTENDED_BY", "6.2.34", 0.70),
 	}
 }
 
