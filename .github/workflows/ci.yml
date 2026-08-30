@@ -366,7 +366,7 @@ jobs:
           path: retrieval-metrics.json
           if-no-files-found: warn
 
-  # --- Stage 3 (parallel): Docker image smoke (lexical light, no DB/push) -----
+  # --- Stage 3 (parallel): Docker image smoke (compile + boot, no DB/push) ----
   image-smoke:
     needs: [go-quick]
     runs-on: ubuntu-latest
@@ -385,9 +385,10 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          # light explicitly: the multi-target Dockerfile's full target needs a
-          # DATA_IMAGE (the 3gpp-data base) that a smoke build cannot provide.
-          target: light
+          # `smoketest` explicitly: the published target needs a DATA_IMAGE (the
+          # 3gpp-data base, ~11 GB) that a per-PR smoke build has no business pulling.
+          # This stage exists for exactly this job and is never pushed.
+          target: smoketest
           push: false
           load: false
           cache-from: type=gha

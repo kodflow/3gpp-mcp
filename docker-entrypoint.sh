@@ -4,21 +4,9 @@
 # MCP_TRANSPORT=http (optionally MCP_PORT) to expose Streamable HTTP + the landing
 # page instead. bootstrap/version/anything-else pass straight through to the binary.
 #
-# Image variants (built by corpus-image.yml):
-#   :light          — binary only; the corpus DB is bootstrapped from the network
-#                     on first run. Lexical, full stop: this variant is built with
-#                     NO build tags, so it has no query embedder (see
-#                     internal/embed/embed_noop.go) — an onnx build alone would
-#                     not change that either.
-#                     The pull now comes from the PRIVATE
-#                     ghcr.io/<owner>/3gpp-corpus package rather than a public
-#                     release asset (DATA_NOTICE: the corpus is verbatim
-#                     standards text), so it needs a credential:
-#                       docker run -e GHCR_PAT=<token with read:packages> …
-#                     Without one it serves whatever is already in /data; with
-#                     nothing in /data it refuses and prints how to get a token.
-#                     Mount a NAMED volume so the pull is paid once.
-#   :full / :latest — onnx binary + the corpus DB + vector sub-bases + BGE-M3 model
+# THE image (built by corpus-image.yml) — there is only one.
+#
+#   :latest / :full — onnx binary + the corpus DB + vector sub-bases + BGE-M3 model
 #                     BAKED IN as .zst (to keep the image small). This entrypoint
 #                     decompresses them into the /data volume on first start, then
 #                     serves OFFLINE (semantic, no network). Mount a NAMED volume
