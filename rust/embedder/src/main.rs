@@ -495,10 +495,36 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            // ALWAYS close the phase at 100%. The loop above only reports when it crosses a
+            // multiple of TOK_PROGRESS_EVERY, so the last partial batch is silent: on the
+            // 2 207 218-clause corpus the final line read 2 129 920 (96%) and the remaining
+            // 77 298 finished with no output at all. A phase that never says it is done is a
+            // phase you cannot tell from a stall — measured 2026-08-30, it looked stalled for
+            // twenty minutes and was not.
+            let secs = tok_start.elapsed().as_secs_f64().max(0.001);
+            eprintln!(
+                "PROGRESS tokenising {total}/{total} (100%) {:.0} clause/s done in {:.0}s",
+                total as f64 / secs,
+                secs
+            );
         }
 
         // Pass 2: tokenise the windows, splitting any that still reach the cap, until none do.
+        //
+        // IT REPORTS, for the same reason pass 1 does. Pass 1 was instrumented because
+        // "saying nothing for that long is indistinguishable from a hang — which is exactly
+        // how it looked the first time it ran". Pass 2 was left silent, and it inherits the
+        // whole problem: pass 1's last PROGRESS lands on the last multiple of
+        // TOK_PROGRESS_EVERY, so on a 2 207 218-clause corpus it stops at 2 129 920 and the
+        // remaining 77 298 finish quietly BEFORE pass 2 even starts. Measured 2026-08-30: the
+        // counter sat at 96% for over twenty minutes with the process at 1.3 cores, and the
+        // only way to tell work from deadlock was to read this file.
+        //
+        // One line per round is enough — the loop converges in a handful of rounds, each
+        // halving what is left, so the round count itself is the diagnosis.
+        let mut round = 0usize;
         loop {
+            round += 1;
             let pending: Vec<(usize, usize)> = cids
                 .iter()
                 .enumerate()
@@ -512,6 +538,11 @@ fn main() -> Result<()> {
             if pending.is_empty() {
                 break;
             }
+            eprintln!(
+                "PROGRESS re-splitting round {round}: {} window(s) over the {}-token cap",
+                pending.len(),
+                crate::model::MAX_TOKENS
+            );
             let mut to_split: Vec<(usize, usize)> = Vec::new();
             for chunk in pending.chunks(TOK_WINDOW) {
                 let batch: Vec<String> = chunk.iter().map(|&(c, w)| cw[c][w].clone()).collect();
