@@ -9,7 +9,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-bin plan status publish build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+.PHONY: all build build-bin plan steps status publish build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build EVERYTHING (the corpus pipeline)
 
@@ -37,6 +37,27 @@ build: ## Build EVERYTHING: binaries, corpus, vectors, sparse, compaction, index
 plan: ## What `make build` would do, and why — without doing it
 	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
 	.local/bin/goal plan
+
+steps: plan ## Every pipeline step, in DAG order, with what it would do and why
+
+# ONE RULE, EVERY STEP — including the ones added after this line was written.
+#
+#   make build/fetch     make build/embed     make build/sparse
+#   make build/ingest    make build/index     make build/compact
+#
+# `make steps` prints the authoritative list; there is no second copy of it here
+# to drift out of date. Dependencies are NOT run: `-only` executes exactly the
+# step you name, using the recorded state of everything it depends on — which is
+# the point of asking for one step.
+#
+# Two names people reach for that do not exist, because the pipeline's real seams
+# are elsewhere:
+#   `convert` — `fetch` downloads AND converts to HTML (LibreOffice) in one step;
+#               `ingest` is what parses that HTML into shards.
+#   `download` — that is `fetch` too.
+build/%: ## Run ONE pipeline step: make build/fetch, build/ingest, build/embed, build/sparse, build/index … (`make steps` lists them)
+	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
+	.local/bin/goal run -only $*
 
 status: ## Per-step state of the last run
 	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
@@ -130,7 +151,7 @@ convert-smoke: ## Prove the convert fallback chain recovers the hardest specs (n
 
 
 help: ## List targets
-	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_\/%-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 inspect-layers: ## Per-platform layers of the published :latest + the 3gpp-data blob (dedupe eyeball; needs crane + GHCR login)
 	@DATA_PM=$$(crane manifest ghcr.io/kodflow/3gpp-data:latest | jq -r '.manifests[0].digest // empty'); \
