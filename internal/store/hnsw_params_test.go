@@ -94,3 +94,59 @@ func TestHNSWRebuildsOnlyWhenParametersChange(t *testing.T) {
 		t.Errorf("self-match after rebuild = %+v, want clause 6.2", hits)
 	}
 }
+
+// TestHNSWRebuildOnCorpusThatAlreadyCarriesAnIndex reproduces the etsi.duckdb
+// failure of 2026-08-30.
+//
+// The build sequence used to write schema_meta and CHECKPOINT before loading VSS.
+// A checkpoint has to bind every index it flushes, so on a corpus that already
+// carries an HNSW index — exactly what a re-embed campaign re-indexes — DuckDB
+// refused it outright:
+//
+//	Failed to create checkpoint: Missing Extension Error: Cannot bind index
+//	'clauses', unknown index type 'HNSW'.
+//
+// The 3GPP corpus passed the same code minutes earlier only because it carried no
+// index at that moment, so a single-corpus test would have proved nothing. What
+// makes this reproduce is the REOPEN: `store.Open` does not load VSS, which is the
+// state freeze-hnsw actually starts from.
+func TestHNSWRebuildOnCorpusThatAlreadyCarriesAnIndex(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "reindex.duckdb")
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedEmbedded(t, st)
+	if err := st.BuildAndFreezeHNSW(ctx, "bge-m3"); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	if !st.indexExists(ctx, "clauses_hnsw") {
+		t.Fatal("index missing after the first build")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen the way freeze-hnsw does: a fresh connection with VSS NOT loaded,
+	// onto a file that already carries an HNSW index.
+	re, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = re.Close() }()
+	if err := re.BuildAndFreezeHNSW(ctx, "bge-m3"); err != nil {
+		t.Fatalf("re-index of a corpus that already carries an index: %v", err)
+	}
+	if got := re.GetMeta(ctx, "hnsw_state"); got != "frozen" {
+		t.Errorf("hnsw_state = %q, want frozen", got)
+	}
+	hits, err := re.SearchVectors(ctx, oneHot(20), SpecFilter{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Clause.ClausePath != "6.2" {
+		t.Errorf("self-match after re-index = %+v, want clause 6.2", hits)
+	}
+}
