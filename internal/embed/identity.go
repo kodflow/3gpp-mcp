@@ -56,11 +56,25 @@ const (
 	WindowingTruncate = "truncate"
 	WindowingMeanPool = "mean_pool"
 
-	// DefaultMaxTokens is the canonical tokenizer truncation length. 1024 matches the
-	// Rust embedder (rust/embedder MAX_TOKENS) — the production embedder — so the Go
-	// query embedder and the Rust corpus agree. (Go previously truncated at 512, a
+	// DefaultMaxTokens is the canonical tokenizer truncation length. It matches the
+	// Rust embedder (rust/embedder MAX_TOKENS) and rust/embed-core's serve-side mirror,
+	// so the query embedder and the corpus agree. (Go previously truncated at 512, a
 	// silent divergence that this constant + the EmbedIdentity component close.)
-	DefaultMaxTokens = 1024
+	//
+	// 2048, not 1024. The 1024 cap came from #196 and was sized for KAGGLE'S T4: at a
+	// FIXED batch of 64, 8192 tokens asked the BFC arena for 256 GiB of attention
+	// (64 × 16 heads × 8192²) against a 16 GB card. Both premises are gone — the T4
+	// path was retired with the Kaggle workflows, and 2b1482b replaced the fixed batch
+	// with VRAM-aware planning plus OOM backoff, which sizes the batch FROM the
+	// sequence length (measured 2026-08-29: seq1024 → batch 134, and 54 OOM splits
+	// absorbed without a failure). BGE-M3 itself accepts 8192; its position table is
+	// 8194 wide, which is what the Expand-node crash in rust/embedder/src/model.rs is
+	// actually about.
+	//
+	// 2048 is not a guess either: TeleEmbedBench (arXiv 2604.17778) measures chunk size
+	// on 3GPP Release 19 — 310 063 chunks of the corpus this repo serves — and finds
+	// 2048 optimal for 3GPP specifically, where O-RAN and srsRAN peak at 512.
+	DefaultMaxTokens = 2048
 )
 
 // BGEEmbedParts is the canonical EmbedParts for the ACTIVE model in the registry

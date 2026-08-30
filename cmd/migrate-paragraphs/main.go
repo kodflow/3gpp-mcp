@@ -7,6 +7,7 @@
 //	migrate-paragraphs --db data/3gpp.duckdb --verify    # verify only, no writes
 //	migrate-paragraphs --db data/3gpp.duckdb --drop-clauses
 //	migrate-paragraphs --db data/3gpp.duckdb --restore     # the inverse of --drop-clauses
+//	migrate-paragraphs --db data/3gpp.duckdb --repair-view # recover an INTERRUPTED --restore
 //
 // It is ADDITIVE: the new tables are built alongside `clauses`, which is what
 // makes the read side migratable one call at a time instead of in one jump.
@@ -25,9 +26,11 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
@@ -42,6 +45,7 @@ func main() {
 	verifyOnly := flag.Bool("verify", false, "check an already-migrated corpus and exit")
 	dropClauses := flag.Bool("drop-clauses", false, "after a passing verification, drop the now-redundant `clauses` table")
 	restoreFlag := flag.Bool("restore", false, "put `clauses` back as a real table and remove the content-addressed tables (the inverse of --drop-clauses)")
+	repairFlag := flag.Bool("repair-view", false, "recover an INTERRUPTED --restore: drop the empty `clauses` shell it left behind and put the view back")
 	flag.Parse()
 
 	h, err := sql.Open("duckdb", *db)
@@ -66,6 +70,14 @@ func main() {
 	_, _ = h.Exec(`LOAD vss`)
 	_, _ = h.Exec(`SET hnsw_enable_experimental_persistence = true`)
 
+	if *repairFlag {
+		// Narrow by design, and the whole run: there is nothing to verify or report
+		// against a corpus whose `clauses` is the empty shell of a killed restore.
+		if err := repairView(h); err != nil {
+			die("repair-view: %v", err)
+		}
+		return
+	}
 	if *restoreFlag {
 		// Restore replaces the tables the other paths read, so it is the whole
 		// run: verifying afterwards would have nothing left to verify against,
@@ -76,7 +88,14 @@ func main() {
 		return
 	}
 	if !*verifyOnly {
-		if err := build(h); err != nil {
+		// An already-converted corpus is a SUCCESS with no work, not a failure: the
+		// pipeline passes --drop-clauses unconditionally and must be able to re-run
+		// `paragraphs` on a corpus it already converted. See alreadyConverted.
+		switch err := build(h); {
+		case errors.Is(err, errAlreadyConverted):
+			report(h)
+			return
+		case err != nil:
 			die("build: %v", err)
 		}
 	}
@@ -92,6 +111,11 @@ func main() {
 }
 
 func build(h *sql.DB) error {
+	if done, err := alreadyConverted(h); err != nil {
+		return err
+	} else if done {
+		return errAlreadyConverted
+	}
 	if err := refuseToShrink(h); err != nil {
 		return err
 	}
@@ -215,6 +239,15 @@ func drop(h *sql.DB) error {
 	// a no-op — DuckDB refuses to index a view, and schema application is
 	// all-or-nothing — so they are bracketed by markers and both readers of
 	// schema.sql strip them here. See store.SchemaForView.
+	if err := createView(h); err != nil {
+		return err
+	}
+	return restamp(h)
+}
+
+// createView installs the compatibility view. ONE definition, shared by the conversion
+// and by --repair-view, so the two can never install subtly different views.
+func createView(h *sql.DB) error {
 	if _, err := h.Exec(`CREATE OR REPLACE VIEW clauses AS
 		SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path, b.heading,
 		       (SELECT string_agg(p.part, ` + sep + ` ORDER BY s.ord)
@@ -224,23 +257,26 @@ func drop(h *sql.DB) error {
 		FROM clause_occ o JOIN bodies b USING (body_id)`); err != nil {
 		return fmt.Errorf("compatibility view: %w", err)
 	}
+	return nil
+}
 
-	// RE-STAMP WHAT THE CONVERSION JUST CHANGED.
-	//
-	// schema_meta.embedding_count is the corpus telling the server how many
-	// vectors it holds, and the server refuses to use the index if the number
-	// disagrees with reality — the corruption gate in store.LoadVSS. The
-	// conversion collapses 2 752 688 references onto the 821 146 distinct vectors
-	// they point at, so the old number stops being true the moment `clauses` goes.
-	//
-	// Left stale, the gate fires on a perfectly good corpus: "embedding count
-	// drift (meta=2207218 have=821146)", vector search silently degrades to an
-	// exact scan over every vector, and nothing anywhere reports an error. Correct
-	// answers, O(N), no signal. Exactly what these markers exist to prevent.
-	//
-	// hnsw_state goes with it. Whatever index existed was on a table that no
-	// longer exists; unless one is already on `bodies`, the corpus must not claim
-	// to be frozen. The `index` step runs after this one and re-stamps both.
+// restamp RE-STATES WHAT THE CONVERSION JUST CHANGED.
+//
+// schema_meta.embedding_count is the corpus telling the server how many
+// vectors it holds, and the server refuses to use the index if the number
+// disagrees with reality — the corruption gate in store.LoadVSS. The
+// conversion collapses 2 752 688 references onto the 821 146 distinct vectors
+// they point at, so the old number stops being true the moment `clauses` goes.
+//
+// Left stale, the gate fires on a perfectly good corpus: "embedding count
+// drift (meta=2207218 have=821146)", vector search silently degrades to an
+// exact scan over every vector, and nothing anywhere reports an error. Correct
+// answers, O(N), no signal. Exactly what these markers exist to prevent.
+//
+// hnsw_state goes with it. Whatever index existed was on a table that no
+// longer exists; unless one is already on `bodies`, the corpus must not claim
+// to be frozen. The `index` step runs after this one and re-stamps both.
+func restamp(h *sql.DB) error {
 	var vecs int
 	if err := h.QueryRow(`SELECT count(*) FROM bodies WHERE embedding IS NOT NULL`).Scan(&vecs); err != nil {
 		return fmt.Errorf("counting the vectors the corpus now holds: %w", err)
@@ -266,6 +302,70 @@ func drop(h *sql.DB) error {
 	return err
 }
 
+// repairView recovers the one state a killed `--restore` leaves behind.
+//
+// `--restore` materialises `clauses` from the content-addressed tables. Interrupt it —
+// a full disk, a Ctrl-C, a stopped background job — and the table is left in place but
+// EMPTY, shadowing the compatibility view. The corpus then serves nothing at all while
+// every byte of it is still there: clause_occ, bodies, body_seq and paragraphs are
+// untouched, the vectors are untouched, bodies_hnsw is untouched.
+//
+// Neither existing path recovers it. `--drop-clauses` rebuilds the content-addressed
+// tables from `clauses` first, and refuseToShrink correctly stops 0 rows from replacing
+// millions of occurrences. `--restore` would redo the materialisation that filled the
+// disk in the first place. This happened on 2026-08-29 and had to be repaired by hand,
+// which is a bad thing to have to do to a 12 GB corpus with no backup.
+//
+// It is deliberately NARROW because it drops a table: it refuses unless the corpus
+// carries exactly the signature of an interrupted restore.
+func repairView(h *sql.DB) error {
+	var kind string
+	if err := h.QueryRow(
+		`SELECT COALESCE(max(table_type),'') FROM information_schema.tables WHERE table_name='clauses'`,
+	).Scan(&kind); err != nil {
+		return fmt.Errorf("inspecting the shape of `clauses`: %w", err)
+	}
+	if strings.EqualFold(kind, "VIEW") {
+		fmt.Fprintln(os.Stderr, "  `clauses` is already a view — nothing to repair")
+		return nil
+	}
+	if kind == "" {
+		return fmt.Errorf("there is no `clauses` at all; this is not an interrupted restore")
+	}
+
+	// Order matters: a corpus that was never converted has no clause_occ to count, and
+	// "table does not exist" is a far worse thing to tell someone than the real reason.
+	var rows int64
+	if err := h.QueryRow(`SELECT count(*) FROM clauses`).Scan(&rows); err != nil {
+		return fmt.Errorf("counting `clauses`: %w", err)
+	}
+	if rows != 0 {
+		return fmt.Errorf(
+			"`clauses` holds %d rows, so this is a real table with data in it, not the empty\n"+
+				"shell an interrupted restore leaves. Dropping it here could destroy a corpus that\n"+
+				"was never converted. Use --drop-clauses, which verifies before it drops", rows)
+	}
+
+	var occ int64
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		return fmt.Errorf("counting occurrences: %w", err)
+	}
+	if occ == 0 {
+		return fmt.Errorf(
+			"`clauses` is empty AND clause_occ holds nothing: there is no corpus underneath to\n" +
+				"serve through a view. Installing one would produce an empty corpus that looks healthy")
+	}
+
+	fmt.Fprintf(os.Stderr, "  interrupted restore: `clauses` is an empty table over %d occurrence(s)\n", occ)
+	if _, err := h.Exec(`DROP TABLE clauses`); err != nil {
+		return fmt.Errorf("dropping the empty table: %w", err)
+	}
+	if err := createView(h); err != nil {
+		return err
+	}
+	return restamp(h)
+}
+
 func report(h *sql.DB) {
 	var para, bod, seq, occ int64
 	_ = h.QueryRow(`SELECT (SELECT count(*) FROM paragraphs), (SELECT count(*) FROM bodies),
@@ -277,6 +377,60 @@ func report(h *sql.DB) {
 func die(f string, a ...any) {
 	fmt.Fprintf(os.Stderr, "migrate-paragraphs: "+f+"\n", a...)
 	os.Exit(1)
+}
+
+// errAlreadyConverted ends the run as a success: there is nothing to convert.
+var errAlreadyConverted = errors.New("already converted")
+
+// alreadyConverted reports whether `clauses` is the compatibility VIEW, which is the
+// one input the rebuild must never run against.
+//
+// THE REBUILD IS NOT IDEMPOTENT, AND ITS COMMENTS USED TO SAY IT WAS.
+//
+// The steps run in order: staging reads `clauses`, then `paragraphs` and `body_seq` are
+// REPLACED with fresh row_number() ids, and only then is `clause_occ` re-derived — also
+// `FROM clauses`. When `clauses` is a real table that ordering is harmless, because the
+// table owes nothing to the tables being replaced. When it is the VIEW, it is defined as
+// clause_occ ⋈ bodies ⋈ body_seq ⋈ paragraphs, so by the time `clause_occ` is rebuilt the
+// view is joining freshly renumbered paragraphs against the OLD body_ids still in
+// clause_occ. It resolves almost nothing.
+//
+// Measured on 2026-08-29 against the real corpus: `clause_occ` went from 2 752 688 rows
+// to 140 047, and `verify` then passed — 140047/140047 rebuild byte-for-byte — because it
+// compares the rebuild against the same broken view. Every count agreed with every other
+// count about a corpus that had lost 95% of its occurrences. Only `drop` failed, and only
+// because `DROP TABLE clauses` cannot drop a view.
+//
+// refuseToShrink cannot catch this: it runs BEFORE the rebuild, when `clauses` (the view)
+// and `clause_occ` still report the same 2 752 688 rows.
+//
+// So the case is refused at the entrance instead. It costs nothing to detect and it is
+// exactly the case the pipeline hits every time it re-runs `paragraphs` on a corpus that
+// is already content-addressed — which internal/goal's step comment claimed was "a no-op
+// re-derivation". It is now genuinely a no-op, rather than being described as one.
+func alreadyConverted(h *sql.DB) (bool, error) {
+	var kind string
+	if err := h.QueryRow(
+		`SELECT COALESCE(max(table_type),'') FROM information_schema.tables WHERE table_name='clauses'`,
+	).Scan(&kind); err != nil {
+		return false, fmt.Errorf("inspecting the shape of `clauses`: %w", err)
+	}
+	if !strings.EqualFold(kind, "VIEW") {
+		return false, nil
+	}
+	// A view over nothing is not a converted corpus; let the normal paths report it.
+	var occ int64
+	if err := h.QueryRow(`SELECT count(*) FROM clause_occ`).Scan(&occ); err != nil {
+		return false, fmt.Errorf("`clauses` is a view but clause_occ is unreadable: %w", err)
+	}
+	if occ == 0 {
+		return false, nil
+	}
+	fmt.Fprintf(os.Stderr,
+		"  `clauses` is already the compatibility view over %d occurrence(s) — the corpus is\n"+
+			"  content-addressed and there is nothing to convert. Rebuilding from the view would\n"+
+			"  renumber paragraphs/body_seq under clause_occ's feet and destroy it.\n", occ)
+	return true, nil
 }
 
 // refuseToShrink stops the one way this conversion can destroy a corpus.

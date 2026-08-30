@@ -22,6 +22,41 @@ import (
 // hnsw-metric-omitted-from-strip-cleanup / strip-meta-test-tautological).
 var VectorMetaKeys = []string{
 	"hnsw_state", "hnsw_metric", "embedding_dim", "embedding_count", "embedding_model",
+	"hnsw_m", "hnsw_ef_construction", "hnsw_ef_search",
+}
+
+// The HNSW build parameters, and why they are not DuckDB's defaults.
+//
+// The index was created with `WITH (metric = 'cosine')` and nothing else, so it
+// took VSS's defaults: M = 16, ef_construction = 64. Those are sized for small,
+// low-dimensional sets. This index carries 821 146 vectors of 1024 dimensions,
+// where a sparser graph costs recall the serve path can never get back — an
+// approximate index that misses a neighbour returns a worse answer with no error
+// and no way for a caller to tell.
+//
+// M = 32 doubles the connections per node; ef_construction = 128 doubles the
+// candidate list the builder explores. Both are BUILD-time and INDEX-SIZE costs
+// paid once, against a recall gain paid back on every query. They are recorded in
+// schema_meta because an index whose parameters are not written down cannot be
+// compared against the next one.
+//
+// Overridable, like the memory ceilings: an operator rebuilding on a smaller box
+// may want the defaults back.
+func hnswM() string              { return envOrDefault("HNSW_M", "32") }
+func hnswEfConstruction() string { return envOrDefault("HNSW_EF_CONSTRUCTION", "128") }
+
+// ef_search is the QUERY-time candidate list, and the one parameter here paid on
+// every search rather than once at build. Left unset, the index carries VSS's own
+// default and duckdb_settings() reports hnsw_ef_search as NULL — so nothing in the
+// corpus records how hard the serve path actually looks for a neighbour. Baking it
+// into the index makes that part of the artefact instead of part of the runtime.
+func hnswEfSearch() string { return envOrDefault("HNSW_EF_SEARCH", "128") }
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // OpenReadOnly opens the DuckDB file in read-only mode — the serve posture: no
@@ -103,12 +138,30 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	if count == 0 {
 		return fmt.Errorf("no embeddings to index")
 	}
+	// VSS FIRST, BEFORE THE FIRST WRITE — NOT AFTER THE CHECKPOINT.
+	//
+	// This used to run SetMeta then CHECKPOINT and only then EnableVSS, matching
+	// the written order of the build sequence. It works exactly once: on a corpus
+	// that carries no HNSW index yet. Re-index a corpus that already has one and
+	// DuckDB refuses the checkpoint outright —
+	//
+	//   Failed to create checkpoint: Missing Extension Error: Cannot bind index
+	//   'clauses', unknown index type 'HNSW'. You need to load the extension that
+	//   provides this index type before table 'clauses' can be modified.
+	//
+	// — because a checkpoint has to bind every index it flushes, and the extension
+	// that knows what an HNSW index IS was still two lines away. Measured on
+	// data/etsi.duckdb (2026-08-30): the 3GPP corpus passed the same code minutes
+	// earlier only because it happened to carry no index at that moment.
+	//
+	// Loading the extension has no ordering requirement of its own, so it goes
+	// first and the WAL is still clean before the index work starts.
+	if err := s.EnableVSS(ctx); err != nil { // (5, moved) extension + persistence flag
+		return err
+	}
 	_ = s.SetMeta("hnsw_state", "building")
 
 	if err := s.checkpoint(ctx); err != nil { // (4) clean WAL before custom index
-		return err
-	}
-	if err := s.EnableVSS(ctx); err != nil { // (5) extension + persistence flag
 		return err
 	}
 	// The index follows the vectors. On a content-addressed corpus they live on
@@ -116,8 +169,28 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	// 2 752 688 copies of 897 556 vectors, paying the duplication again in RAM
 	// and in build time.
 	idx, table := s.hnswTarget()
+	// AN EXISTING INDEX MUST BE DROPPED BEFORE ITS PARAMETERS CAN CHANGE.
+	//
+	// `CREATE INDEX IF NOT EXISTS` cannot re-shape a graph that is already there:
+	// it succeeds by doing nothing. The freeze markers below are written either
+	// way, so a build asked for different parameters would leave the corpus
+	// claiming M/ef_construction/ef_search it was never built to — the fingerprint
+	// re-runs the step, the step reports success, and the artefact lies.
+	//
+	// Dropping unconditionally would be worse: it would pay a full rebuild on
+	// every run of a step whose whole purpose is to be skippable. So compare
+	// first, and rebuild only when the recorded parameters actually disagree.
+	// After EnableVSS, so DROP INDEX recognises the custom index type.
+	if s.indexExists(ctx, idx) && s.hnswParamsDiffer(ctx) {
+		if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
+			return fmt.Errorf("drop hnsw %s built to other parameters: %w", idx, err)
+		}
+		if err := s.checkpoint(ctx); err != nil {
+			return err
+		}
+	}
 	if _, err := s.db.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine')`); err != nil {
+		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine', M = `+hnswM()+`, ef_construction = `+hnswEfConstruction()+`, ef_search = `+hnswEfSearch()+`)`); err != nil {
 		return fmt.Errorf("create hnsw on %s: %w", table, err) // (6)
 	}
 	if err := s.checkpoint(ctx); err != nil { // (7) serialise the index into the file
@@ -131,6 +204,8 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	for k, v := range map[string]string{
 		"hnsw_metric": "cosine", "embedding_dim": "1024",
 		"embedding_count": fmt.Sprintf("%d", count), "embedding_model": model,
+		"hnsw_m": hnswM(), "hnsw_ef_construction": hnswEfConstruction(),
+		"hnsw_ef_search": hnswEfSearch(),
 	} {
 		_ = s.SetMeta(k, v)
 	}
@@ -227,6 +302,21 @@ func (s *Store) indexExists(ctx context.Context, name string) bool {
 		return false
 	}
 	return n > 0
+}
+
+// hnswParamsDiffer reports whether the index the corpus carries was built to
+// different parameters than the ones this build would use.
+//
+// schema_meta is the only record of them: duckdb_indexes() does not report the
+// WITH clause an HNSW index was created with, so the corpus's own claim is what
+// there is to compare against. A corpus indexed before the parameters were
+// written down reports "" for all three, which differs from any real value — the
+// fail-safe direction, since an index of unknown shape is exactly one worth
+// rebuilding.
+func (s *Store) hnswParamsDiffer(ctx context.Context) bool {
+	return s.GetMeta(ctx, "hnsw_m") != hnswM() ||
+		s.GetMeta(ctx, "hnsw_ef_construction") != hnswEfConstruction() ||
+		s.GetMeta(ctx, "hnsw_ef_search") != hnswEfSearch()
 }
 
 func (s *Store) embeddingCount(ctx context.Context) (int, error) {

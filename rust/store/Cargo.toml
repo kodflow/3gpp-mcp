@@ -46,3 +46,7 @@ path = "src/bin/freeze_hnsw.rs"
 [[bin]]
 name = "overlay"
 path = "src/bin/overlay.rs"
+
+[[bin]]
+name = "compact"
+path = "src/bin/compact.rs"
