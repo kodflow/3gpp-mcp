@@ -937,7 +937,7 @@ func (t corpusTarget) indexDeps() []string {
 		// vectors move to `bodies` in that step, and an index built before it
 		// would index the table the step is about to drop.
 		// build-go because the index is now built by cmd/freeze-hnsw.
-		return []string{"embed", "enrich", "paragraphs", "build-go"}
+		return []string{"embed", "enrich", "paragraphs", "compact", "build-go"}
 	}
 	return []string{"embed" + t.Suffix, "build-go"}
 }
@@ -1014,6 +1014,226 @@ func stepParagraphs() *Step {
 			return c.Run(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
 				"--db", db, "--drop-clauses",
 			}, Echo: true})
+		},
+	}
+}
+
+// ------------------------------------------------------------ sparse arm
+
+// stepBuildSparse builds embed-core-sparse, the bulk learned-lexical producer.
+//
+// SEPARATE FROM build-rust because it is a different crate with different
+// features: rust/embed-core is EXCLUDED from the rust/ workspace and only grows a
+// sparse head when built `--features ort` (plus `cuda` for the GPU box). build-rust
+// compiles the workspace with neither, so it can never produce this binary.
+func stepBuildSparse() *Step {
+	return &Step{
+		Name:      "build-sparse",
+		Version:   1,
+		Doc:       "build the learned-lexical (sparse) corpus producer",
+		Deps:      []string{"toolchain"},
+		Impl:      []string{"rust/embed-core/src"},
+		Toolchain: true,
+		// A box without the sparse model still completes every other step: the
+		// sparse arm is additive, and refusing to build without it would make the
+		// whole pipeline hostage to one optional artefact.
+		Optional: true,
+		Outputs:  func(c *Ctx) []string { return []string{c.rbin("embed-core-sparse")} },
+		Run: func(c *Ctx) error {
+			target := filepath.Join(c.Local, "cargo-target-sparse")
+			feats := "ort"
+			if _, err := os.Stat(filepath.Join(c.Root, ".local", "toolchain", "cuda", "dll")); err == nil {
+				feats = "ort,cuda"
+			}
+			c.Log.Printf("cargo build embed-core-sparse (--features %s)", feats)
+			if err := c.Run(Cmd{
+				Name: "cargo",
+				Args: []string{"build", "--release",
+					"--manifest-path", "rust/embed-core/Cargo.toml",
+					"--features", feats, "--bin", "embed-core-sparse"},
+				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
+				Echo: true,
+			}); err != nil {
+				return err
+			}
+			b, err := os.ReadFile(filepath.Join(target, "release", exe("embed-core-sparse")))
+			if err != nil {
+				return fmt.Errorf("cargo reported success but embed-core-sparse is missing: %w", err)
+			}
+			if err := WriteAtomic(c.rbin("embed-core-sparse"), b); err != nil {
+				return err
+			}
+			if err := os.Chmod(c.rbin("embed-core-sparse"), 0o755); err != nil {
+				return err
+			}
+			return stageRuntimeDLLs(c)
+		},
+	}
+}
+
+// stepSparse fills clause_sparse with the BGE-M3 learned-lexical postings.
+//
+// ADDITIVE, and that is the whole reason it is safe to run late: it never touches
+// the dense vectors or the HNSW index, it only writes rows nothing else writes.
+// A corpus without it answers exactly as before, one arm short — which is the
+// state this repository shipped in for months while every piece of the machinery
+// except the model file was already written.
+//
+// Resumable on the same terms as `embed`: the postings file is append-only and
+// embed-core-sparse skips chunk_ids already in it, so a kill costs the current
+// batch and nothing else.
+func stepSparse() *Step {
+	return &Step{
+		Name:    "sparse",
+		Version: 1,
+		Doc:     "vectorise the learned-lexical (sparse) arm on the GPU",
+		Deps:    []string{"build-sparse", "build-rust", "paragraphs"},
+		Impl:    []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs"},
+		Inputs: func(c *Ctx) ([]string, error) {
+			return []string{c.dataPath("3gpp.duckdb")}, nil
+		},
+		Extra: func(c *Ctx) (map[string]string, error) {
+			return map[string]string{"sparse_identity": sparseIdentityForPlan(c)}, nil
+		},
+		Heavy:    true,
+		Optional: true,
+		Run:      func(c *Ctx) error { return runSparse(c) },
+	}
+}
+
+// sparseIdentityForPlan asks cmd/embedid for the SPARSE identity, the digest
+// `embed-io --import-sparse` stamps into schema_meta.sparse_model. Planning must
+// not fail when the model is absent (embedid returns empty), so an unresolvable
+// identity reads "unresolved" and keeps the step dirty — the fail-safe direction,
+// same contract as embedIdentityForPlan.
+func sparseIdentityForPlan(c *Ctx) string {
+	out, err := c.Output(Cmd{
+		Name: c.bin("embedid"),
+		Args: []string{"--sparse"},
+		Env:  []string{"EMBED_MODEL=" + sparseModelName},
+	})
+	if err != nil {
+		return "unresolved"
+	}
+	if id := strings.TrimSpace(out); id != "" {
+		return id
+	}
+	return "unresolved"
+}
+
+// sparseModelName is the registry entry that carries `sparse_output` — the one
+// model whose ONNX exposes the learned-lexical head.
+const sparseModelName = "bge-m3-sparse"
+
+func runSparse(c *Ctx) error {
+	db := c.dataPath("3gpp.duckdb")
+	modelDir := c.dataPath("models", sparseModelName)
+	if _, err := os.Stat(filepath.Join(modelDir, "model.onnx")); err != nil {
+		// DECLINE, not fail. BAAI publishes no sparse ONNX; it is produced by
+		// scripts/export-bge-m3-sparse.py on a box with torch. Until it exists the
+		// arm simply is not there, and that must not fail a corpus that is
+		// otherwise complete.
+		return fmt.Errorf("%w: no sparse model at %s (run WITH_SPARSE=1 scripts/fetch-model.sh)",
+			ErrDeclined, modelDir)
+	}
+	id := sparseIdentityForPlan(c)
+	if id == "unresolved" {
+		return fmt.Errorf("cmd/embedid --sparse resolved no identity for %s", sparseModelName)
+	}
+	c.Log.Printf("sparse identity: %s", id)
+
+	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
+		return err
+	}
+	work := filepath.Join(c.Local, "vecs", "sparse.worklist")
+	out := filepath.Join(c.Local, "vecs", "sparse.jsonl")
+
+	c.Log.Printf("exporting the sparse work list (floor=%q)", corpus3GPP().Floor(c))
+	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
+		"--db", db, "--export-sparse-worklist", work, "--embed-floor", corpus3GPP().Floor(c),
+	}}); err != nil {
+		return err
+	}
+	todo := countLines(work)
+	c.Checkpoint("sparse_worklist", strconv.Itoa(todo))
+	if todo == 0 {
+		return fmt.Errorf("%w: every clause already carries a sparse posting", ErrDeclined)
+	}
+	c.Log.Printf("%d clause(s) to embed (postings file already holds %d)", todo, countLines(out))
+
+	if err := c.Run(Cmd{Name: c.rbin("embed-core-sparse"), Args: []string{
+		"--in", work, "--out", out, "--batch", envOr("SPARSE_BATCH", "256"),
+	}, Env: append([]string{"EMBED_MODEL_DIR=" + modelDir}, gpuEnv(c)...), Echo: true}); err != nil {
+		c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
+		return err
+	}
+	c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
+
+	c.Log.Printf("importing the postings into clause_sparse (stamping %s)", id)
+	return c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
+		"--db", db, "--import-sparse", out, "--sparse-model", id,
+	}, Echo: true})
+}
+
+// ----------------------------------------------------------- compaction
+
+// stepCompact rewrites the corpus without its dead space, BEFORE the index.
+//
+// DuckDB never returns free blocks to the filesystem: a CHECKPOINT reclaims them
+// for reuse INSIDE the file. Measured on the 2026-08-30 corpus, 46 947 of 229 166
+// blocks were in use — 12.3 GB of data in a 55.9 GB file, and DROP TABLE plus
+// CHECKPOINT moved it by zero bytes. Only a full rewrite compacts, and the result
+// was 10.9 GB.
+//
+// ORDERING IS NOT A PREFERENCE HERE. `COPY FROM DATABASE` does not carry custom
+// indexes, so this must run BEFORE `index` — which is exactly why `index` lists it
+// as a dependency rather than the other way round. Running it after would leave a
+// corpus whose schema_meta says "frozen" about an index that stayed behind.
+func stepCompact() *Step {
+	return &Step{
+		Name:    "compact",
+		Version: 1,
+		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
+		// After every writer: the dense import, the sparse import and the
+		// content-addressed conversion all leave dead blocks behind.
+		Deps:  []string{"build-rust", "paragraphs"},
+		Impl:  []string{"rust/store/src/bin/compact.rs"},
+		Heavy: true,
+		Inputs: func(c *Ctx) ([]string, error) {
+			return []string{c.dataPath("3gpp.duckdb")}, nil
+		},
+		Validate: func(c *Ctx) error {
+			// The copy is only believable if the corpus still answers. compact
+			// itself refuses to swap on a clause-count mismatch; this re-asks
+			// afterwards so a swap that somehow landed wrong cannot pass silently.
+			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
+			if err != nil {
+				return err
+			}
+			if !strings.Contains(out, "clauses_with_vectors=") {
+				return fmt.Errorf("dbcount reports no vectorised clauses after compaction")
+			}
+			return nil
+		},
+		Run: func(c *Ctx) error {
+			before, _ := os.Stat(c.dataPath("3gpp.duckdb"))
+			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
+				"--db", c.dataPath("3gpp.duckdb"),
+			}, Echo: true}); err != nil {
+				return err
+			}
+			after, err := os.Stat(c.dataPath("3gpp.duckdb"))
+			if err != nil {
+				return err
+			}
+			if before != nil {
+				c.Log.Printf("corpus %.1f GiB -> %.1f GiB",
+					float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
+			}
+			// The original is kept as <db>.pre-compact by the bin; the pipeline does
+			// not delete it. A corpus is not something to drop on the strength of a
+			// copy verified seconds ago — `validate` and `smoke` still have to run.
+			return nil
 		},
 	}
 }

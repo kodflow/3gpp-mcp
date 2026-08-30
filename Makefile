@@ -9,11 +9,48 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+.PHONY: all build build-bin plan status publish build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
-all: build ## Build the binary
+all: build ## Build EVERYTHING (the corpus pipeline)
 
-build: ## Build static binary into bin/
+# ============================================================================
+#  build / publish — the two entry points. Everything below is a detail of one.
+# ============================================================================
+#
+# `goal` IS the pipeline, and it already does the two things that make a rebuild
+# survivable: every step fingerprints its inputs, its implementation files and its
+# declared environment, so a re-run does only what actually changed; and the heavy
+# steps are resumable, because the embed and sparse ledgers are append-only and
+# keyed by chunk_id. A killed run continues where it stopped. That is what makes
+# `make build` safe to just re-run.
+#
+# ONE WARNING WORTH THE LINE. `goal run` with no -only will re-run `seed`, which
+# cascades discover/fetch/ingest/merge and re-downloads 20 163 spec versions from
+# 3gpp.org. That is correct from a clean checkout and expensive on a machine that
+# already holds the corpus. `make plan` prints what it intends to do, and why, so
+# you find that out before it starts rather than after.
+
+build: ## Build EVERYTHING: binaries, corpus, vectors, sparse, compaction, index, validation
+	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
+	.local/bin/goal run
+
+plan: ## What `make build` would do, and why — without doing it
+	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
+	.local/bin/goal plan
+
+status: ## Per-step state of the last run
+	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
+	.local/bin/goal status
+
+publish: ## Publish the corpus `make build` produced, then bake the images
+	@test -s data/3gpp.duckdb || { echo "no corpus at data/3gpp.duckdb — run: make build"; exit 1; }
+	./scripts/local/publish-corpus.sh
+	@echo ""
+	@echo "corpus published. The images bake on a runner (they need Docker):"
+	@echo "  gh workflow run corpus-data-image.yml -f corpus_tag=latest -f force=true"
+	@echo "  gh workflow run corpus-image.yml      -f release_tag=latest"
+
+build-bin: ## Build the server binary alone into bin/ (no corpus)
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN) ./cmd/server
 
@@ -41,7 +78,7 @@ ingest-catalog: ## Build + overlay authoritative DynaReport metadata (additive; 
 	cargo build --release --manifest-path rust/ingest/Cargo.toml --bin ingest-catalog
 	./rust/target/release/ingest-catalog $(ARGS)
 
-serve: build ## Start MCP server on stdio
+serve: build-bin ## Start MCP server on stdio
 	./$(BUILD_DIR)/$(BIN) serve
 
 test: ## Run unit tests with race detector
@@ -56,7 +93,7 @@ poc: ## Run the Lawful-Interception POC end-to-end test (verbose)
 audit: ## Cross-check the external LI catalogue vs the indexed normative text
 	$(GO) run ./cmd/li-audit
 
-demo: build ## Drive the MCP server over stdio and show every tool's output
+demo: build-bin ## Drive the MCP server over stdio and show every tool's output
 	./scripts/demo.sh
 
 model: ## Bootstrap the real ONNX BGE-M3 semantic backend (~2.3GB, optional)
@@ -84,7 +121,7 @@ tidy: ## Tidy module dependencies
 clean: ## Remove build artefacts
 	rm -rf $(BUILD_DIR)
 
-install: build ## Install binary to $$GOBIN (or $$GOPATH/bin)
+install: build-bin ## Install binary to $$GOBIN (or $$GOPATH/bin)
 	install -m 0755 $(BUILD_DIR)/$(BIN) $${GOBIN:-$$(go env GOPATH)/bin}/$(BIN)
 
 convert-smoke: ## Prove the convert fallback chain recovers the hardest specs (needs LibreOffice + pandoc/antiword/catdoc)
