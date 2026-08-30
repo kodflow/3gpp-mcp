@@ -111,11 +111,64 @@ fn flush_batch(
     txt.clear();
 }
 
+/// flush_window sorts a read-ahead window by text length, then emits it in
+/// `batch`-sized groups.
+///
+/// WHY SORT AT ALL. A batch is padded to its LONGEST member, so a batch drawn in
+/// file order — where a 40-character heading sits next to a 12 000-character
+/// ASN.1 clause — spends most of its forward pass on padding. Measured on the
+/// 2 207 218-clause corpus: the card sat at 88% utilisation but only 5.2 GB of
+/// 19 GB, and throughput barely moved between --batch 64 and --batch 256, which
+/// is what "the batch is full of padding" looks like from the outside.
+///
+/// Sorting a WINDOW rather than the whole file keeps memory bounded (the corpus
+/// work-list is 3 GB) while making each batch nearly homogeneous, which is what
+/// the dense embedder achieves by length-bucketing its windows up front.
+///
+/// Output order changes, and that is safe: every posting line carries its own
+/// chunk_id, and resume is keyed on chunk_id, not on position.
+#[allow(clippy::too_many_arguments)]
+fn flush_window(
+    ids: &mut Vec<u64>,
+    txt: &mut Vec<String>,
+    batch: usize,
+    w: &mut BufWriter<std::fs::File>,
+    embedded: &mut usize,
+    skipped: &mut usize,
+    total: usize,
+    start: std::time::Instant,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    order.sort_unstable_by_key(|&i| txt[i].len());
+
+    let mut bi: Vec<u64> = Vec::with_capacity(batch);
+    let mut bt: Vec<String> = Vec::with_capacity(batch);
+    for &i in &order {
+        bi.push(ids[i]);
+        bt.push(std::mem::take(&mut txt[i]));
+        if bi.len() >= batch {
+            flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start);
+        }
+    }
+    flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start);
+    ids.clear();
+    txt.clear();
+}
+
 fn main() {
     let in_path = arg("--in").expect("--in <worklist.jsonl> required");
     let out_path = arg("--out").expect("--out <postings.jsonl> required");
     let limit: usize = arg("--limit").and_then(|s| s.parse().ok()).unwrap_or(0);
     let batch: usize = arg("--batch").and_then(|s| s.parse().ok()).unwrap_or(64);
+    // Read-ahead window for length-bucketing: filled, sorted by length, then emitted
+    // in `batch`-sized groups. 200 batches deep is tens of MB of text at corpus clause
+    // sizes — bounded, and deep enough that a batch is near-homogeneous in length.
+    let window: usize = arg("--window")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(batch.saturating_mul(200).max(batch));
 
     // The dual-head model must carry the sparse head, else this pass cannot run.
     // has_sparse() lazy-loads the ONNX model; log around it so a slow/hung model load
@@ -191,11 +244,12 @@ fn main() {
         // Match the dense EmbedText join exactly (embedder hash::embed_text).
         buf_ids.push(item.chunk_id);
         buf_txt.push(format!("{}\n{}", item.heading, item.text).replace('\0', " "));
-        if buf_ids.len() >= batch {
+        if buf_ids.len() >= window {
             let before = embedded;
-            flush_batch(
+            flush_window(
                 &mut buf_ids,
                 &mut buf_txt,
+                batch,
                 &mut w,
                 &mut embedded,
                 &mut skipped,
@@ -220,9 +274,10 @@ fn main() {
             }
         }
     }
-    flush_batch(
+    flush_window(
         &mut buf_ids,
         &mut buf_txt,
+        batch,
         &mut w,
         &mut embedded,
         &mut skipped,

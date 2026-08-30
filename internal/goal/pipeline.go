@@ -51,7 +51,7 @@ var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta"
 // step so a machine without a GPU can still complete every other step.
 var rustBins = map[string][]string{
 	"rust/ingest/Cargo.toml":   {"ingest", "ingest-catalog", "ingest-openapi", "ingest-li"},
-	"rust/store/Cargo.toml":    {"merge", "overlay", "freeze-hnsw", "embed-io"},
+	"rust/store/Cargo.toml":    {"merge", "overlay", "freeze-hnsw", "embed-io", "compact"},
 	"rust/discover/Cargo.toml": {"discover"},
 }
 
@@ -73,6 +73,7 @@ func Pipeline() []*Step {
 		stepTest(),
 		stepBuildRust(),
 		stepBuildEmbedder(),
+		stepBuildSparse(),
 		stepSeed(),
 		stepDiscover(),
 		stepFetch(),
@@ -81,6 +82,11 @@ func Pipeline() []*Step {
 		stepEmbed(corpus3GPP()),
 		stepEnrich(),
 		stepParagraphs(),
+		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
+		// does not carry custom indexes), so both sit between the conversion and the
+		// freeze rather than after it.
+		stepSparse(),
+		stepCompact(),
 		stepIndex(corpus3GPP()),
 		stepValidate(),
 		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment: not
