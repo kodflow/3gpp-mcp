@@ -265,14 +265,25 @@ fn embed_sparse_batch_res(texts: &[&str], batch: usize) -> Result<Vec<Option<Vec
         .ok_or_else(|| anyhow!("model has no sparse head ({SPARSE_OUTPUT})"))?;
     let special = |id: u32| matches!(id, 0 | 1 | 2 | 3);
 
-    let mut encoded: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
-    for t in texts {
-        let enc = m
-            .tokenizer
-            .encode(*t, true)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        encoded.push(enc.get_ids().to_vec());
-    }
+    // TOKENISE THE WHOLE BATCH AT ONCE — encode_batch is internally parallel.
+    //
+    // This was a serial `for` over the batch, and on the corpus pass it was THE
+    // bottleneck, not the GPU: measured 2026-08-30 on the 2 207 218-clause sparse
+    // run, 99% of ONE core out of eight while the card sat at 87% / 5.7 GB of 19,
+    // and raising --batch from 64 to 256 moved the rate by nothing (34.9 -> 34.7
+    // clause/s) because the GPU was waiting on this loop either way. A batch knob
+    // that changes throughput by 0.5% is telling you the batch is not the limit.
+    //
+    // rust/embedder already tokenises in parallel for the dense pass — this crate
+    // simply never inherited it, because it was written for the serve path where a
+    // batch is one query.
+    let encoded: Vec<Vec<u32>> = m
+        .tokenizer
+        .encode_batch(texts.to_vec(), true)
+        .map_err(|e| anyhow!("encode_batch: {e}"))?
+        .into_iter()
+        .map(|e| e.get_ids().to_vec())
+        .collect();
     let mut out: Vec<Option<Vec<(u32, f32)>>> = vec![None; texts.len()];
 
     // Short clauses (one window) take the batched path; long ones fall back to the windowed
