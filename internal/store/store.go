@@ -553,13 +553,34 @@ func (s *Store) LoadFTS(ctx context.Context) error {
 			return fmt.Errorf("fts %q: %w", q, err)
 		}
 	}
+	// ASK ABOUT THE INDEX THIS CORPUS ACTUALLY SCORES WITH.
+	//
+	// There are two, and which one matters is decided by the corpus's shape.
+	// searchClausesCA — the content-addressed path — scores with
+	// fts_main_paragraphs. fts_main_clauses is for the old shape, and on a
+	// converted corpus it is a LEFTOVER: `clauses` became a view, so that index
+	// cannot even be rebuilt, and the one still sitting there indexes text that no
+	// longer lives in that table.
+	//
+	// Probing fts_main_clauses therefore reported "fts_available=true" off a stale
+	// index while the code used a different one, and would have reported false for
+	// a freshly built converted corpus that had exactly the right index. Same shape
+	// as validate/check-data/LoadVSS: a check that asks a different question than
+	// the code it gates. The shape is read here rather than taken from
+	// s.contentAddressed so this does not depend on which probe ran first.
+	schema := "fts_main_clauses"
+	var isView bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) > 0 FROM duckdb_views() WHERE view_name = 'clauses'`).Scan(&isView); err == nil && isView {
+		schema = "fts_main_paragraphs"
+	}
 	var n int
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'fts_main_clauses'`).Scan(&n); err != nil {
+		`SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?`, schema).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("no persisted FTS index (ingest with --fts)")
+		return fmt.Errorf("no persisted FTS index %q (ingest with --fts)", schema)
 	}
 	s.ftsAvailable = true
 	return nil
