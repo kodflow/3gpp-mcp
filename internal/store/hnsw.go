@@ -138,12 +138,30 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	if count == 0 {
 		return fmt.Errorf("no embeddings to index")
 	}
+	// VSS FIRST, BEFORE THE FIRST WRITE — NOT AFTER THE CHECKPOINT.
+	//
+	// This used to run SetMeta then CHECKPOINT and only then EnableVSS, matching
+	// the written order of the build sequence. It works exactly once: on a corpus
+	// that carries no HNSW index yet. Re-index a corpus that already has one and
+	// DuckDB refuses the checkpoint outright —
+	//
+	//   Failed to create checkpoint: Missing Extension Error: Cannot bind index
+	//   'clauses', unknown index type 'HNSW'. You need to load the extension that
+	//   provides this index type before table 'clauses' can be modified.
+	//
+	// — because a checkpoint has to bind every index it flushes, and the extension
+	// that knows what an HNSW index IS was still two lines away. Measured on
+	// data/etsi.duckdb (2026-08-30): the 3GPP corpus passed the same code minutes
+	// earlier only because it happened to carry no index at that moment.
+	//
+	// Loading the extension has no ordering requirement of its own, so it goes
+	// first and the WAL is still clean before the index work starts.
+	if err := s.EnableVSS(ctx); err != nil { // (5, moved) extension + persistence flag
+		return err
+	}
 	_ = s.SetMeta("hnsw_state", "building")
 
 	if err := s.checkpoint(ctx); err != nil { // (4) clean WAL before custom index
-		return err
-	}
-	if err := s.EnableVSS(ctx); err != nil { // (5) extension + persistence flag
 		return err
 	}
 	// The index follows the vectors. On a content-addressed corpus they live on
