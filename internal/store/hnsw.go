@@ -151,6 +151,26 @@ func (s *Store) BuildAndFreezeHNSW(ctx context.Context, model string) error {
 	// 2 752 688 copies of 897 556 vectors, paying the duplication again in RAM
 	// and in build time.
 	idx, table := s.hnswTarget()
+	// AN EXISTING INDEX MUST BE DROPPED BEFORE ITS PARAMETERS CAN CHANGE.
+	//
+	// `CREATE INDEX IF NOT EXISTS` cannot re-shape a graph that is already there:
+	// it succeeds by doing nothing. The freeze markers below are written either
+	// way, so a build asked for different parameters would leave the corpus
+	// claiming M/ef_construction/ef_search it was never built to — the fingerprint
+	// re-runs the step, the step reports success, and the artefact lies.
+	//
+	// Dropping unconditionally would be worse: it would pay a full rebuild on
+	// every run of a step whose whole purpose is to be skippable. So compare
+	// first, and rebuild only when the recorded parameters actually disagree.
+	// After EnableVSS, so DROP INDEX recognises the custom index type.
+	if s.indexExists(ctx, idx) && s.hnswParamsDiffer(ctx) {
+		if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS `+idx); err != nil {
+			return fmt.Errorf("drop hnsw %s built to other parameters: %w", idx, err)
+		}
+		if err := s.checkpoint(ctx); err != nil {
+			return err
+		}
+	}
 	if _, err := s.db.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS `+idx+` ON `+table+` USING HNSW (embedding) WITH (metric = 'cosine', M = `+hnswM()+`, ef_construction = `+hnswEfConstruction()+`, ef_search = `+hnswEfSearch()+`)`); err != nil {
 		return fmt.Errorf("create hnsw on %s: %w", table, err) // (6)
@@ -264,6 +284,21 @@ func (s *Store) indexExists(ctx context.Context, name string) bool {
 		return false
 	}
 	return n > 0
+}
+
+// hnswParamsDiffer reports whether the index the corpus carries was built to
+// different parameters than the ones this build would use.
+//
+// schema_meta is the only record of them: duckdb_indexes() does not report the
+// WITH clause an HNSW index was created with, so the corpus's own claim is what
+// there is to compare against. A corpus indexed before the parameters were
+// written down reports "" for all three, which differs from any real value — the
+// fail-safe direction, since an index of unknown shape is exactly one worth
+// rebuilding.
+func (s *Store) hnswParamsDiffer(ctx context.Context) bool {
+	return s.GetMeta(ctx, "hnsw_m") != hnswM() ||
+		s.GetMeta(ctx, "hnsw_ef_construction") != hnswEfConstruction() ||
+		s.GetMeta(ctx, "hnsw_ef_search") != hnswEfSearch()
 }
 
 func (s *Store) embeddingCount(ctx context.Context) (int, error) {
