@@ -202,6 +202,20 @@ jobs:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
           TAG: ${{ github.event.inputs.corpus_tag || 'latest' }}
           GH_TOKEN: ${{ github.token }}
+          # SAME PULL, SAME REGISTRY, SAME LIMIT — 9caf0f1 widened the budget in
+          # corpus-image.yml and left this one on the default, so the identical
+          # failure was still waiting here. It arrived on 2026-08-30, minutes after
+          # a fresh 10.9 GB push of the corpus: GHCR answered TOOMANYREQUESTS and
+          # the default budget — 5 attempts over 3/6/12/26 s — gave up after 50 s
+          # while the limit was still closed.
+          #
+          # This step is the FIRST thing to touch the corpus after it is published,
+          # so it meets the limit at its tightest. Same tunables, same reasoning:
+          # 8 attempts capped at 180 s is about 13 min of patience, and costs
+          # nothing when the pull succeeds on the first try.
+          RETRY_MAX: "8"
+          RETRY_BASE: "15"
+          RETRY_MAX_DELAY: "180"
         run: |
           set -euo pipefail
           source scripts/lib/retry.sh
