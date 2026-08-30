@@ -254,9 +254,17 @@ ENV MCP3GPP_DATA_CREATED=${DATA_CREATED} \
     ORT_DYLIB_PATH=/data/mcp-3gpp/models/onnxruntime/lib/libonnxruntime.so
 USER mcp:mcp
 
-# ---- light: lexical DB.zst baked from the build context ----------------------
-# LAST stage on purpose: a bare `docker build .` (CI image-smoke, casual local
-# builds) defaults to the final stage, and light is the only target that builds
-# without a DATA_IMAGE.
-FROM base AS light
+# ---- smoketest: NOT A PUBLISHED IMAGE ----------------------------------------
+# This was the `light` variant. It is no longer published: it was lighter only by
+# the model and the ORT stack, carried the full data layer including vectors its
+# own binary could not use, and answered lexically while looking like the product.
+#
+# The stage survives because CI needs SOMETHING it can build without a DATA_IMAGE:
+# ci.yml's image-smoke compiles the server and boots it, and pointing that at the
+# real target would make every PR pull an 11 GB data layer. Nothing pushes it.
+#
+# LAST stage on purpose: a bare `docker build .` defaults to the final stage, and
+# this is the only target that builds without a DATA_IMAGE — so a careless build
+# gets the harmless one rather than a broken `fulltop` wearing the product's tag.
+FROM base AS smoketest
 COPY --chown=mcp:mcp image-data/ /data/mcp-3gpp/

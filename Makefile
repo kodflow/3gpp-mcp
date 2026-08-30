@@ -9,7 +9,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help light-artifacts image-light convert-smoke
+.PHONY: all build build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build the binary
 
@@ -90,15 +90,7 @@ install: build ## Install binary to $$GOBIN (or $$GOPATH/bin)
 convert-smoke: ## Prove the convert fallback chain recovers the hardest specs (needs LibreOffice + pandoc/antiword/catdoc)
 	./scripts/convert-smoke.sh
 
-light-artifacts: ## Emit the 2 .zst (full lexical DB + embedding delta) from LEX=<lexical.duckdb>
-	./scripts/light-artifacts.sh
 
-image-light: ## Build the lexical (no-embed) runtime image 3gpp-mcp:light with LEX baked in
-	@test -s "$${LEX:-data/3gpp.lexical.duckdb}" || { echo "set LEX to a lexical DB (merge --strip-embeddings)"; exit 1; }
-	mkdir -p image-data && cp "$${LEX:-data/3gpp.lexical.duckdb}" image-data/3gpp.duckdb
-	docker build --target light -t 3gpp-mcp:light .
-	rm -f image-data/3gpp.duckdb
-	@echo "built 3gpp-mcp:light (lexical DB baked) — run: docker run -i --rm 3gpp-mcp:light serve"
 
 help: ## List targets
 	@awk 'BEGIN{FS=":.*##"; printf "\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
