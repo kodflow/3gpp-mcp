@@ -291,7 +291,11 @@ func stepEnrich() *Step {
 		Deps:    []string{"merge"},
 		// The two fetch scripts are part of this step's implementation now that it
 		// runs them: changing how an overlay is acquired must replay the overlay.
-		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh"},
+		// internal/evolseed is implementation here because this step now APPLIES
+		// the seed: editing an edge must replay the overlay, exactly as editing an
+		// extractor does. Before, the seed's hash moved the published identity
+		// while nothing wrote the seed — see cmd/seed-evolutions.
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -379,7 +383,12 @@ func stepEnrich() *Step {
 			} else {
 				c.Log.Printf("no TS33128Payloads .asn and none could be fetched — li_events stays empty")
 			}
-			return nil
+
+			// The curated NE->NF edge seed. It is applied LAST because it verifies
+			// each citation against the clauses this corpus actually holds, so it
+			// wants the catalogue overlay already in place.
+			c.Log.Printf("NE->NF evolution seed (curated, citations checked against the corpus)")
+			return c.Run(Cmd{Name: c.bin("seed-evolutions"), Args: []string{"--db", db}, Echo: true})
 		},
 	}
 }

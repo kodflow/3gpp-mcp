@@ -43,6 +43,7 @@ func run() error {
 		scope      = fs.String("scope", env("GOAL_SCOPE", ""), "explicit series scope, space separated (empty = automatic delta)")
 		jobs       = fs.String("jobs", env("GOAL_JOBS", "4"), "conversion workers (LibreOffice is RAM-hungry)")
 		embedFloor = fs.String("embed-floor", env("GOAL_EMBED_FLOOR", "Rel-99"), "embed clauses at or above this release")
+		etsiScope  = fs.String("etsi-scope", env("GOAL_ETSI_SCOPE", ""), "ETSI deliverables to index: empty = the built-in LI suite; 'all' = the whole /deliver archive; else a comma-separated id list")
 		dataDir    = fs.String("data", env("GOAL_DATA", ""), "corpus/DB directory (default <repo>/data)")
 		full       = fs.Bool("full", false, "ignore the delta anchor and reindex everything")
 		repair     = fs.Bool("repair", false, "fetch only the repair set: upstream drift UNION corpus holes (proportionate, ~1k specs vs ~20k)")
@@ -102,6 +103,7 @@ func run() error {
 			"scope":          *scope,
 			"jobs":           *jobs,
 			"embed_floor":    *embedFloor,
+			"etsi_scope":     *etsiScope,
 			"model_dir":      filepath.Join(data, "models", "bge-m3"),
 			"contract_flags": dataContractFlags(root),
 			"full":           boolStr(*full),
