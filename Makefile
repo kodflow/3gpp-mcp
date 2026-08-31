@@ -63,13 +63,20 @@ status: ## Per-step state of the last run
 	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
 	.local/bin/goal status
 
-publish: ## Publish the corpus `make build` produced, then bake the images
+# PUBLISH IS LOCAL. The image used to be baked by two workflows that moved ~14 GB
+# per run; they are gone. `make image` cross-compiles the Linux artefacts here
+# (zig — no Docker, no WSL) and composes the OCI image with crane.
+publish: image ## Build the image from the corpus `make build` produced and push it to GHCR
+
+image: ## Build the full image locally and push it to GHCR (:latest)
 	@test -s data/3gpp.duckdb || { echo "no corpus at data/3gpp.duckdb — run: make build"; exit 1; }
-	./scripts/local/publish-corpus.sh
-	@echo ""
-	@echo "corpus published. The images bake on a runner (they need Docker):"
-	@echo "  gh workflow run corpus-data-image.yml -f corpus_tag=latest -f force=true"
-	@echo "  gh workflow run corpus-image.yml      -f release_tag=latest"
+	./scripts/local/build-image.sh
+
+image-local: ## Same, assembled into .local/image/image.tar without pushing
+	./scripts/local/build-image.sh --no-push
+
+image-toolchain: ## Fetch the Linux cross-toolchain the image build needs (zig + Debian libstdc++)
+	./scripts/local/fetch-linux-toolchain.sh
 
 build-bin: ## Build the server binary alone into bin/ (no corpus)
 	@mkdir -p $(BUILD_DIR)
