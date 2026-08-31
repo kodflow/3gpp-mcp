@@ -1,6 +1,46 @@
 # Installing the 3GPP MCP server
 
-`mcp-3gpp` as released is a single self-contained binary. It exposes the 3GPP
+## The short way: pull the image
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/kodflow/3gpp-mcp:latest"]
+    }
+  }
+}
+```
+
+That is the whole installation. The image carries the 3GPP and ETSI corpora, the
+dual-head BGE-M3 (dense + learned-lexical), the cross-encoder reranker and the
+DuckDB `fts`/`vss` extensions, so every retrieval arm works with **no network at
+run time and nothing downloaded on first start**.
+
+Two things to know:
+
+- The package is **private** — it holds verbatim specification text (see
+  [`DATA_NOTICE.md`](../DATA_NOTICE.md)). `docker login ghcr.io` with a token
+  carrying `read:packages` before pulling.
+- **No `VOLUME` is declared, deliberately.** `serve` reads the baked corpus in
+  place, read-only; a volume would make Docker copy ~11 GB into a fresh one on
+  every `--rm` run.
+
+`docker run --rm ghcr.io/kodflow/3gpp-mcp:latest version` prints the build, and
+the `server_info` tool reports which retrieval arms are actually live — ask it
+rather than assuming.
+
+## The long way: the binary
+
+> **Releases are no longer published from CI** — the workflows that built them
+> are gone (they cost resources this project does not have). Build the binary
+> yourself with `make build-bin`, or use the image above, which is the supported
+> path.
+
+`mcp-3gpp` is a single self-contained binary. It exposes the 3GPP
 corpus to any MCP client (Claude Code, etc.) over stdio. There is **no service to
 run, no Python, and no Ollama/LLM to install** — the binary is a *retrieval*
 engine; your MCP client does the reasoning.
