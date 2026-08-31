@@ -328,19 +328,15 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
-		ef := filter
-		ef.Release = ""
 		servingEng = h.etsiEng
-		hits, err = h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank})
+		hits, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
 	} else {
 		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
 		if err == nil && h.etsiEng != nil && filter.SpecID == "" && filter.Series == "" {
-			ef := filter
-			ef.Release = ""
-			if eh, eerr := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank}); eerr == nil && len(eh) > 0 {
+			if eh, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank); eerr == nil && len(eh) > 0 {
 				hits = search.RRF(60, hits, eh)
 			}
 		}
@@ -878,5 +874,49 @@ func etsiDocTypes(specType string) []string {
 		return []string{"TS"}
 	default:
 		return []string{dt} // "" (any) clears the filter, everything else is exact
+	}
+}
+
+// searchETSI runs a query against the ETSI index with that half's own conventions.
+//
+// Two of them, and both were wrong before this existed. The release filter is
+// cleared: ETSI clauses live in their own "ETSI" release space, so a 3GPP baseline
+// like Rel-19 matches nothing there. And the document-type default is the
+// NORMATIVE SET rather than the literal "TS" — the same rule list_specs uses, for
+// the same reason (see etsiDocTypes). Copying the 3GPP filter wholesale meant an
+// unqualified search could never surface an ETSI EN or TR at all: 56% of that
+// corpus was reachable by id and invisible to search, with nothing saying so.
+//
+// One query per type, RRF-merged. RRF is rank-based, so merging two lists from the
+// same engine is the same operation as merging the ETSI list into the 3GPP one —
+// no score calibration is implied between them.
+func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
+	topK int, mode string, rerank bool) ([]model.SearchHit, error) {
+	f.Release = ""
+	var lists [][]model.SearchHit
+	var firstErr error
+	for _, dt := range etsiDocTypes(specType) {
+		ef := f
+		ef.DocType = dt
+		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode, Rerank: rerank})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if len(hits) > 0 {
+			lists = append(lists, hits)
+		}
+	}
+	switch {
+	case len(lists) == 0 && firstErr != nil:
+		return nil, firstErr
+	case len(lists) == 0:
+		return nil, nil
+	case len(lists) == 1:
+		return lists[0], nil
+	default:
+		return search.RRF(60, lists...), nil
 	}
 }
