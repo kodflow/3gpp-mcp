@@ -109,3 +109,45 @@ func EnumerateDeliverables(fetch Fetcher, typeDir string) (ds []Deliverable, fai
 	sort.Slice(ds, func(i, j int) bool { return ds[i].ID < ds[j].ID })
 	return ds, failed
 }
+
+// ThreeGPPRepublication reports whether an ETSI deliverable id is ETSI's
+// republication of a 3GPP specification rather than ETSI's own work.
+//
+// ETSI republishes every 3GPP deliverable under its own numbering by prefixing the
+// 3GPP series with a 1: 3GPP TS 23.501 is ETSI TS 123 501, TR 26.978 is ETSI TR
+// 126 978, TS 55.216 is ETSI TS 155 216. 3GPP's series are 21-38 and 41-55, which
+// maps to the ETSI ranges 121 000-138 999 and 141 000-155 999.
+//
+// This matters because those deliverables are not merely redundant with the 3GPP
+// half of this corpus — they are STRICTLY WORSE. The archive publishes one latest
+// version of each, while the 3GPP side already carries every release: TR 26.978 is
+// in this corpus across fifteen of them. Indexing the republication would spend the
+// download, the conversion and the GPU on a single version of text that is already
+// held in full lineage, under a second id that blurs provenance.
+//
+// Measured on the live archive (7 320 resolvable deliverables): 2 203 are
+// republications, 5 117 are ETSI's own.
+func ThreeGPPRepublication(id string) bool {
+	base := 0
+	digits := 0
+	for _, r := range id {
+		switch {
+		case r >= '0' && r <= '9':
+			if digits == 6 {
+				continue
+			}
+			base = base*10 + int(r-'0')
+			digits++
+		case r == ' ':
+			// the id's internal space, not a separator between base and part
+		default:
+			// "-P": everything from the first part suffix on is irrelevant here
+			digits = 6
+		}
+	}
+	if digits < 6 {
+		return false
+	}
+	series := base/1000 - 100 // 123501 -> 23
+	return (series >= 21 && series <= 38) || (series >= 41 && series <= 55)
+}
