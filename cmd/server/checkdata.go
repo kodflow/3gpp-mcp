@@ -142,20 +142,26 @@ func checkData(args []string) error {
 		if eerr != nil {
 			return fmt.Errorf("open the ETSI corpus %s: %w", *requireETSI, eerr)
 		}
-		var clauses, vectors int64
-		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&clauses)
-		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&vectors)
+		// Convergence is counted over clauses WITH TEXT. A quarter of the ETSI
+		// corpus is headings with an empty body — PDF extraction reads numbered
+		// figure captions and sequence-diagram steps as clauses — and the embedder
+		// rightly produces nothing for them. Measured: 354 of 1 396 empty, all with
+		// a NULL embedding, and zero clauses that have text and no vector.
+		var withText, vectors int64
+		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE length(text) > 0`).Scan(&withText)
+		_ = etsi.QueryRowContext(ctx,
+			`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
 		etsiModel := etsi.GetMeta(ctx, "embedding_model")
 		mainModel := st.GetMeta(ctx, "embedding_model")
 		_ = etsi.Close()
-		fmt.Printf("check-data: etsi=%s clauses=%d vectors=%d embedding_model=%q\n",
-			*requireETSI, clauses, vectors, etsiModel)
+		fmt.Printf("check-data: etsi=%s clauses_with_text=%d vectors=%d embedding_model=%q\n",
+			*requireETSI, withText, vectors, etsiModel)
 		switch {
-		case clauses == 0:
-			return fmt.Errorf("the ETSI corpus %s holds no clauses", *requireETSI)
-		case vectors != clauses:
+		case withText == 0:
+			return fmt.Errorf("the ETSI corpus %s holds no clause with any text", *requireETSI)
+		case vectors != withText:
 			return fmt.Errorf("the ETSI corpus is %d clause(s) short of a vector — the embed pass has not converged",
-				clauses-vectors)
+				withText-vectors)
 		case etsiModel != mainModel:
 			return fmt.Errorf("the ETSI corpus was embedded with %q but the 3GPP one with %q — "+
 				"the serve-time coherence guard would disable vector search on the ETSI half and answer it lexically, silently",

@@ -270,21 +270,25 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		if err != nil {
 			res.add("require-etsi", false, "cannot open %s: %v", cfg.requireETSI, err)
 		} else {
-			var clauses, vectors int64
-			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&clauses)
-			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&vectors)
+			// CONVERGENCE MEANS "no clause WITH TEXT lacks a vector", not
+			// "vectors == clauses". A quarter of the ETSI corpus is headings whose
+			// body is empty — PDF text extraction reads numbered figure captions
+			// and sequence-diagram steps as clauses — and the embedder rightly
+			// produces nothing for them. Measured: 354 of 1 396 clauses empty, all
+			// 354 with a NULL embedding, and ZERO clauses that have text and no
+			// vector. Comparing against the total would therefore have failed every
+			// build on a corpus that had in fact converged, which is a worse gate
+			// than none: it teaches the operator to pass --skip.
+			var withText, vectors int64
+			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE length(text) > 0`).Scan(&withText)
+			_ = etsi.QueryRowContext(ctx,
+				`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
 			etsiModel := etsi.GetMeta(ctx, "embedding_model")
 			mainModel := db.GetMeta(ctx, "embedding_model")
-			// CONVERGENCE, not merely "some vectors". The ETSI corpus has no
-			// release floor, so every clause is embeddable and the pipeline's own
-			// embed-etsi gate already asserts nothing is left null. Accepting
-			// vectors>0 here would pass a half-embedded corpus — precisely the state
-			// an interrupted GPU pass leaves behind, and one where the arm answers,
-			// plausibly, from a fraction of the deliverables.
-			ok := clauses > 0 && vectors == clauses && etsiModel != "" && etsiModel == mainModel
+			ok := withText > 0 && vectors == withText && etsiModel != "" && etsiModel == mainModel
 			res.add("require-etsi", ok,
-				"clauses=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q)",
-				clauses, vectors, clauses-vectors, etsiModel, mainModel)
+				"clauses_with_text=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q)",
+				withText, vectors, withText-vectors, etsiModel, mainModel)
 			_ = etsi.Close()
 		}
 	}
