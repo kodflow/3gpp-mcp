@@ -64,19 +64,24 @@ HuggingFace (`model.onnx_data` is 2.2 GB — over the 2 GB Release-asset cap
 anyway). The corpus does not fit either: 7.9 GB compressed against a 2 GB cap,
 which is the second, independent reason it travels as an OCI layer.
 
-## Workflows
+## Workflows — there is one left
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `ci.yml` | push/PR `main` | gofmt + vet + `go test -race` matrix {ubuntu, macos}. Lint = ktn-linter (hooks), not golangci-lint. |
-| `release.yml` | push `main` (code paths) + manual | Build binaries natively per-OS → `gh release upload latest … --clobber`. |
-| `rust-bins.yml` | push `main` (rust paths) + manual | Build the Rust binaries per-OS and attach them to `latest`. |
-| `corpus-image.yml` | push `main` + manual | Bake and push the serving image (`full` and `light`) to GHCR. |
-| `corpus-data-image.yml` | manual | Bake the data layer from the published corpus package. |
 | `post-commit.yml` | PR | Gate commit trailers and authorship. |
 
-There is **no scheduled corpus-sync workflow**. Refreshing the corpus is a
-local operation today — see below for why, and what it would take to automate.
+`ci.yml`, `release.yml`, `rust-bins.yml`, `corpus-image.yml` and
+`corpus-data-image.yml` are **deleted**. The image ones moved ~14 GB per run,
+which is the resource this project does not have; the rest went with them when
+the build moved onto the machine that already holds the corpus.
+
+Everything they did happens locally now, and the corpus never had a CI path
+anyway — the constraint below (a hosted runner has ~14 GB disk against a ~20 GB
+corpus) was always the reason. `make build` runs the pipeline, `make image`
+cross-compiles the Linux artefacts and pushes
+`ghcr.io/kodflow/3gpp-mcp:latest` with crane; `post-commit.yml` stays because it
+is the status the branch ruleset requires, and deleting it would block every
+merge. See [automation/data-image.md](automation/data-image.md).
 
 ### Corpus sync — incremental, DB-as-state
 

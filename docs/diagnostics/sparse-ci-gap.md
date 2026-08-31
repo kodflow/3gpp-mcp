@@ -1,5 +1,15 @@
 # Diagnostic — pourquoi la CI n'a jamais produit le sparse
 
+> **RÉSOLU (2026-08-31), et pas de la façon envisagée ici.** Ce document reste
+> comme archéologie : il décrit correctement pourquoi le sparse n'existait pas,
+> mais il propose de réparer la CI, et **il n'y a plus de CI**. Les workflows de
+> build sont supprimés ; la passe sparse tourne en local (`make build/sparse`,
+> étape `sparse` du DAG), le modèle bi-tête est cuit dans l'image parce qu'un
+> modèle actif dense-only ferait tomber le bras en silence, et le contrat
+> `DATA_CONTRACT=dense+sparse` refuse de publier un corpus dont
+> `clause_sparse` est vide ou estampillé par un autre modèle.
+> Voir [`../automation/data-image.md`](../automation/data-image.md).
+
 > Date : 2026-06-15 · Branche : `feat/sparse-embed-smoke-proven`
 > Question : « pourquoi l'embed sparse n'a pas marché via la CI alors qu'elle aurait dû
 > détecter qu'il n'existe pas et le faire (uniquement le sparse, sans refaire le dense
