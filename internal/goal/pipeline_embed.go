@@ -1097,23 +1097,52 @@ func stepBuildSparse() *Step {
 // Resumable on the same terms as `embed`: the postings file is append-only and
 // embed-core-sparse skips chunk_ids already in it, so a kill costs the current
 // batch and nothing else.
-func stepSparse() *Step {
+// stepSparse builds the learned-lexical arm for one corpus.
+//
+// It is parameterised for the same reason stepEmbed and stepIndex are: BOTH
+// corpora are served, side by side, and an arm that exists on one of them only
+// is an asymmetry a caller cannot see. search.Engine federates the two stores and
+// simply drops the arm the ETSI one does not have, with no error — so a query
+// that the sparse arm would have answered well on 3GPP falls back to dense+BM25
+// the moment it lands on an ETSI deliverable.
+//
+// Nothing in the machinery was 3GPP-specific; only the paths were.
+func stepSparse(t corpusTarget) *Step {
 	return &Step{
-		Name:    "sparse",
+		Name:    "sparse" + t.Suffix,
 		Version: 1,
-		Doc:     "vectorise the learned-lexical (sparse) arm on the GPU",
-		Deps:    []string{"build-sparse", "build-rust", "paragraphs"},
+		Doc:     "vectorise the learned-lexical (sparse) arm of " + t.DB + " on the GPU",
+		Deps:    t.sparseDeps(),
 		Impl:    []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			return []string{t.dbPath(c)}, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			return map[string]string{"sparse_identity": sparseIdentityForPlan(c)}, nil
 		},
 		Heavy:    true,
 		Optional: true,
-		Run:      func(c *Ctx) error { return runSparse(c) },
+		Run:      func(c *Ctx) error { return runSparse(c, t) },
 	}
+}
+
+// sparseDeps mirrors indexDeps. The 3GPP arm waits for the content-addressed
+// conversion, because the work list is exported from the shape that conversion
+// produces; ETSI has no such step and waits for its own embed.
+func (t corpusTarget) sparseDeps() []string {
+	if t.Suffix == "" {
+		return []string{"build-sparse", "build-rust", "paragraphs"}
+	}
+	return []string{"build-sparse", "build-rust", "embed" + t.Suffix}
+}
+
+// sparseFiles are the work list and postings ledger for a corpus. The 3GPP pair
+// keeps its historical names verbatim: `.local/vecs/sparse.jsonl` is append-only
+// and a campaign in flight resumes from it, so renaming it would silently restart
+// hours of GPU.
+func (t corpusTarget) sparseFiles(c *Ctx) (work, out string) {
+	base := filepath.Join(c.Local, "vecs", "sparse"+t.Suffix)
+	return base + ".worklist", base + ".jsonl"
 }
 
 // sparseIdentityForPlan asks cmd/embedid for the SPARSE identity, the digest
@@ -1140,8 +1169,8 @@ func sparseIdentityForPlan(c *Ctx) string {
 // model whose ONNX exposes the learned-lexical head.
 const sparseModelName = "bge-m3-sparse"
 
-func runSparse(c *Ctx) error {
-	db := c.dataPath("3gpp.duckdb")
+func runSparse(c *Ctx, t corpusTarget) error {
+	db := t.dbPath(c)
 	modelDir := c.dataPath("models", sparseModelName)
 	if _, err := os.Stat(filepath.Join(modelDir, "model.onnx")); err != nil {
 		// DECLINE, not fail. BAAI publishes no sparse ONNX; it is produced by
@@ -1160,12 +1189,11 @@ func runSparse(c *Ctx) error {
 	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
 		return err
 	}
-	work := filepath.Join(c.Local, "vecs", "sparse.worklist")
-	out := filepath.Join(c.Local, "vecs", "sparse.jsonl")
+	work, out := t.sparseFiles(c)
 
-	c.Log.Printf("exporting the sparse work list (floor=%q)", corpus3GPP().Floor(c))
+	c.Log.Printf("exporting the sparse work list of %s (floor=%q)", t.DB, t.Floor(c))
 	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
-		"--db", db, "--export-sparse-worklist", work, "--embed-floor", corpus3GPP().Floor(c),
+		"--db", db, "--export-sparse-worklist", work, "--embed-floor", t.Floor(c),
 	}}); err != nil {
 		return err
 	}
@@ -1215,7 +1243,7 @@ func stepCompact() *Step {
 		// corpus too: compacting it before its vectors are written would rewrite a
 		// file that is about to grow again, which is the one thing a compaction
 		// must not do.
-		Deps:  []string{"build-rust", "paragraphs", "embed-etsi"},
+		Deps:  []string{"build-rust", "paragraphs", "sparse-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
 		Inputs: func(c *Ctx) ([]string, error) {
