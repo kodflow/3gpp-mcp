@@ -39,6 +39,7 @@ func checkData(args []string) error {
 	requireEmbed := fs.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence)")
 	embedFloor := fs.String("embed-floor", "", "release floor for --require-embed-complete; empty = all releases")
 	requireSparse := fs.Bool("require-sparse", false, "fail unless clause_sparse is populated and sparse_model matches this build's sparse identity")
+	requireETSI := fs.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, every one of them carries a vector, and its embedding identity equals --db's")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -129,6 +130,37 @@ func checkData(args []string) error {
 	if *requireSparse && !sparseOK {
 		return fmt.Errorf("sparse incomplete/stale: sparse_available=%v sparse_model=%q expected=%q — "+
 			"run the sparse campaign to convergence before promoting", st.SparseAvailable(), sparseModel, wantSparse)
+	}
+	// The OTHER half of the corpus. The image serves both stores side by side and
+	// internal/mcp recomputes semantic availability PER STORE, so an ETSI corpus at
+	// a stale embedding identity is answered lexically while the 3GPP one is not —
+	// no error, no log line, and a data layer that passes every other check here.
+	// Convergence is asserted too: ETSI has no release floor, so a clause without a
+	// vector is an interrupted pass, not a deliberate omission.
+	if *requireETSI != "" {
+		etsi, eerr := store.OpenReadOnly(*requireETSI)
+		if eerr != nil {
+			return fmt.Errorf("open the ETSI corpus %s: %w", *requireETSI, eerr)
+		}
+		var clauses, vectors int64
+		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&clauses)
+		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&vectors)
+		etsiModel := etsi.GetMeta(ctx, "embedding_model")
+		mainModel := st.GetMeta(ctx, "embedding_model")
+		_ = etsi.Close()
+		fmt.Printf("check-data: etsi=%s clauses=%d vectors=%d embedding_model=%q\n",
+			*requireETSI, clauses, vectors, etsiModel)
+		switch {
+		case clauses == 0:
+			return fmt.Errorf("the ETSI corpus %s holds no clauses", *requireETSI)
+		case vectors != clauses:
+			return fmt.Errorf("the ETSI corpus is %d clause(s) short of a vector — the embed pass has not converged",
+				clauses-vectors)
+		case etsiModel != mainModel:
+			return fmt.Errorf("the ETSI corpus was embedded with %q but the 3GPP one with %q — "+
+				"the serve-time coherence guard would disable vector search on the ETSI half and answer it lexically, silently",
+				etsiModel, mainModel)
+		}
 	}
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil

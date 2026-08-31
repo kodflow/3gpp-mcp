@@ -42,6 +42,7 @@ func main() {
 		requireFTS    = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
 		requireHNSW   = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
 		requireSparse = flag.Bool("require-sparse", false, "fail unless the sparse (clause_sparse) postings are populated (sparse-enabled bakes only)")
+		requireETSI   = flag.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, carries vectors, and was embedded with the SAME identity as --db (an ETSI half at a stale identity is served lexically, silently)")
 		requireEmbed  = flag.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence; floor-aware, unlike --pending-zero)")
 		embedFloor    = flag.String("embed-floor", "", "release floor for --require-embed-complete (e.g. Rel-99); empty = all releases. Below-floor/legacy clauses are intentionally NULL and never counted.")
 		embeddingDim  = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
@@ -59,6 +60,7 @@ func main() {
 
 	res := runChecks(context.Background(), checkCfg{
 		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW, requireSparse: *requireSparse,
+		requireETSI: *requireETSI,
 		requireEmbedComplete: *requireEmbed, embedFloor: *embedFloor,
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
@@ -87,6 +89,7 @@ type checkCfg struct {
 	db                                         string
 	pendingZero, requireFTS, requireHNSW       bool
 	requireSparse                              bool
+	requireETSI                                string
 	requireEmbedComplete                       bool
 	embedFloor                                 string
 	embeddingDim, minClauses                   int
@@ -249,6 +252,41 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		got := db.GetMeta(ctx, "sparse_model")
 		ok := db.SparseAvailable() && (want == "" || got == want)
 		res.add("require-sparse", ok, "sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
+	}
+
+	// require-etsi — the OTHER half of the corpus, which the image serves beside
+	// this one and which no gate could previously talk about.
+	//
+	// The check that matters is the LAST one: both corpora must carry the same
+	// embedding identity. internal/mcp recomputes semantic availability per store
+	// and the serve-time coherence guard disables VSS when a store's model differs
+	// from the client's, so re-embedding 3GPP while ETSI keeps an older identity
+	// drops the ETSI arm to lexical — with no error, on a corpus that looks
+	// complete from every other angle. That is the failure this flag exists for;
+	// the existence and clause-count checks are there so it cannot be satisfied by
+	// an empty file that trivially "agrees".
+	if cfg.requireETSI != "" {
+		etsi, err := store.OpenReadOnly(cfg.requireETSI)
+		if err != nil {
+			res.add("require-etsi", false, "cannot open %s: %v", cfg.requireETSI, err)
+		} else {
+			var clauses, vectors int64
+			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses`).Scan(&clauses)
+			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE embedding IS NOT NULL`).Scan(&vectors)
+			etsiModel := etsi.GetMeta(ctx, "embedding_model")
+			mainModel := db.GetMeta(ctx, "embedding_model")
+			// CONVERGENCE, not merely "some vectors". The ETSI corpus has no
+			// release floor, so every clause is embeddable and the pipeline's own
+			// embed-etsi gate already asserts nothing is left null. Accepting
+			// vectors>0 here would pass a half-embedded corpus — precisely the state
+			// an interrupted GPU pass leaves behind, and one where the arm answers,
+			// plausibly, from a fraction of the deliverables.
+			ok := clauses > 0 && vectors == clauses && etsiModel != "" && etsiModel == mainModel
+			res.add("require-etsi", ok,
+				"clauses=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q)",
+				clauses, vectors, clauses-vectors, etsiModel, mainModel)
+			_ = etsi.Close()
+		}
 	}
 
 	// catalog coverage: specs that have indexed clauses but no catalog title/WG
