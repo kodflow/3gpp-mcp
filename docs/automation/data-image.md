@@ -2,7 +2,7 @@
 
 ## Where it comes from
 
-```
+```sh
 make image          # cross-build, compose, push  ghcr.io/kodflow/3gpp-mcp:latest
 make image-local    # same, stopping at .local/image/image.tar
 make image-toolchain# fetch the Linux cross-toolchain, once
@@ -70,7 +70,7 @@ tree twice, with the files `touch`ed in between, gives one sha256.) A single
 image is then simpler and costs nothing, because the layer order runs from most
 stable to least:
 
-```
+```text
 10-runtime     /etc/passwd, /etc/group, libstdc++, libgomp
 20-duckdb-ext  the fts + vss extensions, prefetched
 30-ort         ONNX Runtime (the only arch-specific piece)

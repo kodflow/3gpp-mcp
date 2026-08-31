@@ -35,12 +35,20 @@ ASSET="${NAME}-${COMMIT:0:8}.tar.zst"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Pack the directory UNDER ITS OWN NAME: the restore scripts untar into a
-# destination and expect DEST/<NAME>/ to appear, so the archive must carry that
-# leading component. Packing the contents alone would scatter the model files
-# into the destination root and every consumer would look in the wrong place.
+# Pack the directory UNDER $NAME, not under its own basename. The restore scripts
+# untar into a destination and expect DEST/<NAME>/ to appear, so the archive must
+# carry that leading component — and NAME is what the caller and the restorer
+# agree on, while the source basename is whatever happens to be on this disk.
+# Archiving `basename "$SRC"` works only while the two coincide; the day they do
+# not, the model extracts under a name nothing looks for and the next image build
+# fails to find it. A symlink is not portable enough here, so the directory is
+# staged under the right name and packed from there.
 echo "[publish-model] packing $SRC as $NAME/ …"
-tar -C "$(dirname "$SRC")" --use-compress-program='zstd -19 -T0' -cf "$tmp/$ASSET" "$(basename "$SRC")"
+stage="$tmp/pack"
+mkdir -p "$stage"
+cp -a "$SRC" "$stage/$NAME"
+tar -C "$stage" --use-compress-program='zstd -19 -T0' -cf "$tmp/$ASSET" "$NAME"
+rm -rf "$stage"
 
 ( cd "$tmp" && sha256sum "$ASSET" > "$ASSET.sha256" )
 echo "[publish-model] $ASSET $(du -h "$tmp/$ASSET" | cut -f1)"

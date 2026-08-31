@@ -162,6 +162,13 @@ func checkData(args []string) error {
 		case vectors != withText:
 			return fmt.Errorf("the ETSI corpus is %d clause(s) short of a vector — the embed pass has not converged",
 				withText-vectors)
+		case etsiModel == "":
+			// An UNSTAMPED corpus must not pass by matching another unstamped one.
+			// Two empty strings compare equal, so a pair of corpora that both lost
+			// their embedding_model would satisfy the identity check below while
+			// having no identity at all — the one thing this flag exists to compare.
+			// cmd/validate already rejects it; this restores the parity.
+			return fmt.Errorf("the ETSI corpus carries no embedding_model — it has an identity to state and does not state it")
 		case etsiModel != mainModel:
 			return fmt.Errorf("the ETSI corpus was embedded with %q but the 3GPP one with %q — "+
 				"the serve-time coherence guard would disable vector search on the ETSI half and answer it lexically, silently",
