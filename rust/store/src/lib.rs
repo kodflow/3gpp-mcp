@@ -889,6 +889,57 @@ impl Store {
         Ok(())
     }
 
+
+    /// set_sparse_many writes MANY clauses' postings in ONE transaction.
+    ///
+    /// set_sparse above is correct and, at corpus scale, unusable: it opens its own
+    /// BEGIN/COMMIT per clause and formats one INSERT statement per term. Importing
+    /// the 3GPP sparse layer that way is 2.2 million transactions and ~110 million
+    /// individually-parsed statements, and it was measured at over seven hours —
+    /// with no progress output, so it looks like a hang for most of them.
+    ///
+    /// This batches both dimensions: one transaction per call, one DELETE naming
+    /// every chunk_id in the batch, and ONE multi-row INSERT for all their terms.
+    /// The per-statement parse cost collapses from 110 million to a few thousand.
+    ///
+    /// Semantics are unchanged, including the part that is easy to lose: a clause
+    /// with NO terms still gets its DELETE, so re-importing genuinely clears a
+    /// previous posting set rather than leaving a stale one behind. That is what
+    /// makes the import idempotent and the work list converge.
+    pub fn set_sparse_many(&self, batch: &[(u64, Vec<(u32, f32)>)]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::with_capacity(64 * 1024);
+        sql.push_str("BEGIN; DELETE FROM clause_sparse WHERE chunk_id IN (");
+        for (i, (chunk_id, _)) in batch.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&chunk_id.to_string());
+        }
+        sql.push_str(");");
+
+        let mut rows = 0usize;
+        for (chunk_id, terms) in batch {
+            for (term_id, weight) in terms {
+                if rows == 0 {
+                    sql.push_str("INSERT INTO clause_sparse(chunk_id, term_id, weight) VALUES ");
+                } else {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({chunk_id},{term_id},{weight})"));
+                rows += 1;
+            }
+        }
+        if rows > 0 {
+            sql.push(';');
+        }
+        sql.push_str("COMMIT;");
+        self.conn.execute_batch(&sql).context("set_sparse_many")?;
+        Ok(())
+    }
+
     /// enable_fts builds the BM25 FTS index over heading+text (best-effort; the caller
     /// degrades to LIKE if the extension is unavailable). == Go EnableFTS.
     pub fn enable_fts(&self) -> Result<()> {

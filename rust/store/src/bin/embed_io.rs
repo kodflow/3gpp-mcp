@@ -183,6 +183,18 @@ fn main() -> Result<()> {
         let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
         let mut total = 0usize;
         let mut skipped = 0usize;
+
+        // BATCHED, and it is not an optimisation detail. One transaction per clause
+        // is 2.2 million transactions and ~110 million individually-parsed INSERT
+        // statements for the 3GPP layer — measured at over SEVEN HOURS, during which
+        // the step prints nothing at all and looks exactly like a hang.
+        //
+        // 2 000 clauses per transaction keeps the generated SQL to a few MB while
+        // collapsing the per-statement cost; the progress line every batch means the
+        // step can no longer be mistaken for a stall.
+        const BATCH: usize = 2_000;
+        let mut batch: Vec<(u64, Vec<(u32, f32)>)> = Vec::with_capacity(BATCH);
+
         for line in BufReader::new(f).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -198,9 +210,18 @@ fn main() -> Result<()> {
                 }
             };
             // An empty-postings clause (heading-only/void text) still counts as "done" so the
-            // worklist converges — write the (empty) posting set, which set_sparse handles.
-            store.set_sparse(r.chunk_id, &r.terms)?;
-            total += 1;
+            // worklist converges — the DELETE is issued for it either way.
+            batch.push((r.chunk_id, r.terms));
+            if batch.len() >= BATCH {
+                store.set_sparse_many(&batch)?;
+                total += batch.len();
+                batch.clear();
+                eprintln!("embed-io: sparse import {total} clause(s)");
+            }
+        }
+        if !batch.is_empty() {
+            store.set_sparse_many(&batch)?;
+            total += batch.len();
         }
         if !args.sparse_model.is_empty() {
             store.set_meta("sparse_model", &args.sparse_model)?;
