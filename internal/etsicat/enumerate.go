@@ -41,15 +41,34 @@ func TokenToID(token string) (string, bool) {
 	return id, true
 }
 
-// EnumerateIDs crawls /deliver/<typeDir>/ → range folders → number tokens and returns
-// every deliverable's canonical id, sorted and de-duplicated. This is the ETSI
-// analogue of 3GPP's status-report parse: it discovers the WHOLE corpus of a type
-// (not a hand-listed scope), so the pipeline can fetch/index/ingest/embed the latest
-// PUBLISHED version of every deliverable — the same completeness 3GPP has.
+// EnumerateIDs crawls one document-type folder and returns the bare ids. Kept for
+// callers that already know the type; EnumerateDeliverables is what the --all crawl
+// wants, because the type has to travel with the id.
+func EnumerateIDs(fetch Fetcher, typeDir string) (ids []string, failed []string) {
+	ds, failed := EnumerateDeliverables(fetch, typeDir)
+	ids = make([]string, 0, len(ds))
+	for _, d := range ds {
+		ids = append(ids, d.ID)
+	}
+	return ids, failed
+}
+
+// EnumerateDeliverables crawls /deliver/<typeDir>/ → range folders → number tokens
+// and returns every deliverable, TAGGED WITH ITS FOLDER, sorted and de-duplicated.
+// This is the ETSI analogue of 3GPP's status-report parse: it discovers the WHOLE
+// corpus of a type (not a hand-listed scope), so the pipeline can fetch/index/
+// ingest/embed the latest PUBLISHED version of every deliverable — the same
+// completeness 3GPP has.
+//
+// The folder is carried rather than dropped because it cannot be recovered later:
+// nothing in "103 101" says TR, and looking it up under etsi_ts returns a 404, not
+// a redirect. The earlier version of this function returned bare ids, and the
+// caller then resolved all of them as TS — which is why the crawl could report
+// 7 501 deliverables while the work list ended up TS-only.
 //
 // failed carries the range folders that could not be listed (a transient fetch
 // error), so the caller retries them rather than silently dropping deliverables.
-func EnumerateIDs(fetch Fetcher, typeDir string) (ids []string, failed []string) {
+func EnumerateDeliverables(fetch Fetcher, typeDir string) (ds []Deliverable, failed []string) {
 	root := deliverBase + typeDir + "/"
 	rc, err := fetch(root)
 	if err != nil {
@@ -84,9 +103,9 @@ func EnumerateIDs(fetch Fetcher, typeDir string) (ids []string, failed []string)
 				continue
 			}
 			seen[id] = true
-			ids = append(ids, id)
+			ds = append(ds, Deliverable{TypeDir: typeDir, ID: id})
 		}
 	}
-	sort.Strings(ids)
-	return ids, failed
+	sort.Slice(ds, func(i, j int) bool { return ds[i].ID < ds[j].ID })
+	return ds, failed
 }

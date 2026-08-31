@@ -88,28 +88,50 @@ func main() {
 	// Scope: --all enumerates the WHOLE /deliver corpus (the 3GPP-parity completeness:
 	// latest published version of every deliverable); --specs scopes explicitly; else
 	// the built-in LI suite.
-	specs := defaultLISpecs
+	// Every scoped deliverable carries the /deliver folder it lives in. --specs and
+	// the built-in LI suite are TS by construction; --all learns each one's folder
+	// from the crawl that found it, which is the only place that knowledge exists.
+	var deliverables []etsicat.Deliverable
 	switch {
 	case *allFlag:
-		specs = nil
 		var enumFailed []string
 		dirs := splitList(*typeDirsFlag)
+		perDir := map[string]int{}
 		for _, td := range dirs {
-			ids, f := etsicat.EnumerateIDs(fetch, td)
-			specs = append(specs, ids...)
+			ds, f := etsicat.EnumerateDeliverables(fetch, td)
+			deliverables = append(deliverables, ds...)
+			perDir[td] = len(ds)
 			enumFailed = append(enumFailed, f...)
 		}
-		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v (%d range-fetch failures)\n",
-			len(specs), dirs, len(enumFailed))
-		if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v %v (%d range-fetch failures)\n",
+			len(deliverables), dirs, perDir, len(enumFailed))
+		if len(deliverables) == 0 {
 			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
 			os.Exit(1)
 		}
-	case len(splitList(*specsFlag)) > 0:
-		specs = splitList(*specsFlag)
+	default:
+		specs := defaultLISpecs
+		if len(splitList(*specsFlag)) > 0 {
+			specs = splitList(*specsFlag)
+		}
+		for _, id := range specs {
+			deliverables = append(deliverables, etsicat.Deliverable{TypeDir: model.EtsiTypeTS, ID: id})
+		}
 	}
 
-	site, failed := etsicat.BuildSite(fetch, specs)
+	// id -> folder, so the work list can name the right tree and the right file
+	// prefix. Without it every emitted URL was an etsi_ts one, and a TR's etsi_ts
+	// URL is a 404 rather than a redirect.
+	typeOf := make(map[string]string, len(deliverables))
+	for _, d := range deliverables {
+		typeOf[d.ID] = d.TypeDir
+	}
+	specs := make([]string, 0, len(deliverables))
+	for _, d := range deliverables {
+		specs = append(specs, d.ID)
+	}
+
+	site, failed := etsicat.BuildSiteIn(fetch, deliverables)
 	for _, id := range failed {
 		fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
 	}
@@ -129,13 +151,36 @@ func main() {
 
 	if *emitWL || *report == "worklist" {
 		for _, id := range changed {
-			fmt.Printf("%s\t%s\t%s\n", id, model.EtsiDeliverURL(id, site[id]), site[id])
+			td := typeOf[id]
+			if td == "" {
+				td = model.EtsiTypeTS
+			}
+			// Fourth column: the document type ("TS"/"TR"/"EN"). scripts/etsi-corpus.sh
+			// puts it in the provenance header so the corpus can call a TR a TR
+			// instead of filing every deliverable as "ETSI TS". A reader of an older
+			// three-column list still parses (the field is simply empty) and the
+			// parser defaults to TS, which is what those lists all were.
+			fmt.Printf("%s\t%s\t%s\t%s\n", id, model.EtsiDeliverURLIn(td, id, site[id]), site[id], docTypeOf(td))
 		}
 		return
 	}
 	// matrix: JSON array of changed ids (the CI fans out one shard per id/group).
 	b, _ := json.Marshal(changed)
 	fmt.Printf("matrix=%s\n", string(b))
+}
+
+// docTypeOf renders a /deliver folder as the document type the corpus labels a
+// deliverable with: etsi_ts -> "TS". Unknown folders fall back to TS, which is what
+// the pipeline assumed unconditionally before the type was carried at all.
+func docTypeOf(typeDir string) string {
+	switch typeDir {
+	case model.EtsiTypeTR:
+		return "TR"
+	case model.EtsiTypeEN:
+		return "EN"
+	default:
+		return "TS"
+	}
 }
 
 // splitList parses a comma/space-separated flag into a trimmed, empty-dropped slice.
