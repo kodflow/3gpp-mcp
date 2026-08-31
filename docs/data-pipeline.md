@@ -28,18 +28,24 @@ The corpus is pushed by `scripts/local/publish-corpus.sh` to
 `ghcr.io/<owner>/3gpp-corpus`, a **private** package, as one layer holding
 `/3gpp.duckdb`.
 
-```
-GitHub Release `latest` (the only one) — PUBLIC, carries no clause text
-├── mcp-3gpp_linux_amd64.tar.zst   (+ .sha256)   ← Release workflow, on push to main
-├── mcp-3gpp_darwin_arm64.tar.zst  (+ .sha256)   ← Release workflow
+```text
+GitHub Release `latest` — PUBLIC, carries no clause text
 └── corpus-index.json                            ← the delta anchor:
                                                     spec|release → highest indexed
                                                     version. A version list, no text.
+    (the binary archives it used to carry came from release.yml, which is deleted;
+     build one with `make build-bin`, or pull the image, which needs no install)
 
+ghcr.io/<owner>/3gpp-mcp:latest    — PRIVATE, THE PRODUCT: server + both corpora
+                                     + models. Built by `make image` on the machine
+                                     that holds the corpus.
 ghcr.io/<owner>/3gpp-corpus:latest — PRIVATE, one layer = /3gpp.duckdb
 ghcr.io/<owner>/etsi-corpus:latest — PRIVATE, one layer = /etsi.duckdb
+                                     (the corpus packages remain for the binary's
+                                      bootstrap path; the image needs neither)
 
-Client:  mcp-3gpp bootstrap → GHCR manifest → layer (Range-resumable,
+Client:  docker run -i --rm ghcr.io/<owner>/3gpp-mcp:latest   ← nothing to fetch
+    or:  mcp-3gpp bootstrap → GHCR manifest → layer (Range-resumable,
                               digest-verified) → /3gpp.duckdb → serve (offline)
                               needs read:packages; see docs/install.md
 ```

@@ -347,6 +347,14 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// Sparse (learned-lexical) arm: same gating as the dense arm (any non-"lexical"
 	// mode), independent toggle. Best-effort — embed/score failure just omits the
 	// list (degrade, never block). Fuses into the same RRF as BM25 + dense.
+	// The budget is re-checked HERE, not only where wantSparse was decided. That
+	// decision now happens before the combined embed and the whole dense retrieval,
+	// so the budget can expire in between — and the sparse implementations ignore
+	// the context, so entering the arm would run inference past the deadline the
+	// budget exists to hold. Skipping is free: RRF already fuses whatever arrived.
+	if wantSparse && bctx.Err() != nil {
+		wantSparse = false
+	}
 	if wantSparse {
 		svecs, err := []model.SparseVec{preSparse}, error(nil)
 		if preSparse == nil {

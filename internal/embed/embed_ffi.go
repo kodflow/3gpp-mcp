@@ -25,6 +25,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"log"
 	"unsafe"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -143,6 +144,15 @@ func (e ffiEmbedder) EmbedBoth(ctx context.Context, text string) (dense []float3
 		(*C.uint)(unsafe.Pointer(&ids[0])), (*C.float)(unsafe.Pointer(&weights[0])), C.int(sparseCap)))
 	C.free(unsafe.Pointer(ct))
 	if n < 0 {
+		// -3 is the EXPECTED fallback (dense-only model, or a text that would window
+		// differently between the two heads) and is silent by design. -1 and -2 are
+		// not: a null or short buffer and invalid UTF-8 are defects in this wrapper,
+		// and folding all three into one silent "false" would turn a bug into a
+		// permanent, invisible slowdown — every query taking the two-pass path with
+		// nothing anywhere saying why.
+		if n != -3 {
+			log.Printf("embed: embed_core_embed_both rc=%d (falling back to two passes) — this is a defect, not the dense-only path", n)
+		}
 		return nil, nil, false
 	}
 	w := n
