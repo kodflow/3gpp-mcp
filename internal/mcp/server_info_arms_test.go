@@ -121,3 +121,52 @@ func TestServerInfoReportsEveryArm(t *testing.T) {
 		t.Errorf("etsi.attached = %v with no ETSI store, want false", etsiInfo["attached"])
 	}
 }
+
+// TestDocTypeDefaults pins two things the ETSI half made matter.
+//
+// spec_type=en used to fall through to the pass-through branch and reach the store
+// as the lowercase "en". The filter is an exact string comparison against the
+// stored "EN", so asking for European Norms returned silence — indistinguishable
+// from "there are none", on a corpus that holds 1 542 of them.
+//
+// And the unset default cannot be the literal "TS" on the ETSI half. The TS-first
+// doctrine says "norm before study report", which in 3GPP is TS before TR; in ETSI
+// the normative output is TS *and* EN, so the same string hides the majority of the
+// catalogue for a distinction that does not exist there.
+func TestDocTypeDefaults(t *testing.T) {
+	for in, want := range map[string]string{
+		"":    "TS",
+		"ts":  "TS",
+		"TS":  "TS",
+		"tr":  "TR",
+		"en":  "EN",
+		"EN":  "EN",
+		"any": "",
+		"all": "",
+		"es":  "ES", // an unknown type is uppercased, not passed through verbatim
+	} {
+		if got := docTypeDefault(in); got != want {
+			t.Errorf("docTypeDefault(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	for in, want := range map[string][]string{
+		"":    {"TS", "EN"}, // unset = the normative types
+		"ts":  {"TS"},       // explicit TS means TS
+		"tr":  {"TR"},
+		"en":  {"EN"},
+		"any": {""}, // no filter
+	} {
+		got := etsiDocTypes(in)
+		if len(got) != len(want) {
+			t.Errorf("etsiDocTypes(%q) = %v, want %v", in, got, want)
+			continue
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("etsiDocTypes(%q) = %v, want %v", in, got, want)
+				break
+			}
+		}
+	}
+}

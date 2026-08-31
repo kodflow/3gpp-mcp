@@ -63,7 +63,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("query", mcp.Required(), mcp.Description("free-text query")),
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
-		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, EN, or any. Omitted = the NORMATIVE types: TS on the 3GPP half (TS-first doctrine), TS+EN on the ETSI half, where a European Norm is a standard and filtering it out would hide most of the catalogue.")),
 		mcp.WithString("spec_id", mcp.Description("e.g. 33.128")),
 		mcp.WithNumber("top_k", mcp.Description("max results per page (default 10)")),
 		mcp.WithString("cursor", mcp.Description("opaque pagination cursor from a previous call's next_cursor")),
@@ -120,7 +120,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
 		mcp.WithString("working_group", mcp.Description("e.g. SA3")),
-		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, EN, or any. Omitted = the NORMATIVE types: TS on the 3GPP half (TS-first doctrine), TS+EN on the ETSI half, where a European Norm is a standard and filtering it out would hide most of the catalogue.")),
 	), h.listSpecs)
 
 	s.AddTool(mcp.NewTool("search_api",
@@ -589,13 +589,22 @@ func docTypeDefault(specType string) string {
 	case "":
 		return "TS" // TS-first default
 	case "any", "all", "*":
-		return "" // explicit opt-in to TS+TR
+		return "" // explicit opt-in to every type
 	case "tr":
 		return "TR"
 	case "ts":
 		return "TS"
+	case "en":
+		// ETSI European Norms. Without this case the value fell through to the
+		// pass-through below and reached the store as the lowercase "en", which
+		// matches nothing: the filter is an exact string comparison against the
+		// stored "EN". Asking for ENs returned silence.
+		return "EN"
 	default:
-		return specType // pass through (store filters exact-match; unknown ⇒ empty result, which is honest)
+		// Pass through, UPPERCASED. The store compares exactly, so a caller who
+		// spelled a real type in lower case would otherwise get an empty result
+		// that is indistinguishable from "no such specs".
+		return strings.ToUpper(strings.TrimSpace(specType))
 	}
 }
 
@@ -698,10 +707,14 @@ func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	// release space ("ETSI"), so the 3GPP release filter never applies to them —
 	// pass series/WG/doc_type through but clear the release so they always surface.
 	if h.etsi != nil {
-		if es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
-			Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
-			DocType: docTypeDefault(r.GetString("spec_type", "")),
-		}); eerr == nil {
+		for _, dt := range etsiDocTypes(r.GetString("spec_type", "")) {
+			es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
+				Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
+				DocType: dt,
+			})
+			if eerr != nil {
+				continue
+			}
 			for _, sp := range es {
 				rows = append(rows, specRow{Spec: sp, HasAPI: false})
 			}
@@ -835,4 +848,35 @@ func (h *handlers) storeFor(specID string) store.Reader {
 		return h.etsi
 	}
 	return h.st
+}
+
+// etsiDocTypes is the ETSI half's answer to spec_type, and it deliberately differs
+// from the 3GPP half's.
+//
+// The TS-first default exists because in 3GPP a TS is the norm and a TR is a study
+// report, so browsing a catalogue should not be dominated by reports. Applied
+// verbatim to the ETSI half it stops meaning that: ETSI's normative output is TS
+// *and* EN — a European Norm is a standard, often the harmonised one that carries
+// legal presumption of conformity — and 1 542 of the 5 117 deliverables in this
+// corpus are ENs. Filtering on the literal string "TS" would therefore hide the
+// majority of the ETSI catalogue by default, for a distinction that does not exist
+// there.
+//
+// So an unset spec_type means "the normative types" here, and the caller who wants
+// reports asks for them, exactly as on the 3GPP side. An explicit value is honoured
+// as given, and "any" clears the filter for both halves alike.
+//
+// It returns a LIST because store.SpecFilter.DocType is one exact-match string; two
+// small catalogue queries are cheaper than widening the filter shape for this.
+func etsiDocTypes(specType string) []string {
+	switch dt := docTypeDefault(specType); dt {
+	case "TS":
+		// Only when the caller said nothing: an explicit spec_type=TS must mean TS.
+		if strings.TrimSpace(specType) == "" {
+			return []string{"TS", "EN"}
+		}
+		return []string{"TS"}
+	default:
+		return []string{dt} // "" (any) clears the filter, everything else is exact
+	}
 }
