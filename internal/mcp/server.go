@@ -893,9 +893,20 @@ func etsiDocTypes(specType string) []string {
 func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
 	topK int, mode string, rerank bool) ([]model.SearchHit, error) {
 	f.Release = ""
+
+	// A spec_id PINS the document, so the type default must not second-guess it.
+	// Without this, search_spec(spec_id="ETSI TR 103 101") with no spec_type takes
+	// the normative default {TS, EN}, neither matches a TR, and the query returns
+	// NOTHING for a document the caller named explicitly — a filter answering a
+	// question the caller had already answered.
+	types := etsiDocTypes(specType)
+	if f.SpecID != "" && strings.TrimSpace(specType) == "" {
+		types = []string{""}
+	}
+
 	var lists [][]model.SearchHit
 	var firstErr error
-	for _, dt := range etsiDocTypes(specType) {
+	for _, dt := range types {
 		ef := f
 		ef.DocType = dt
 		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode, Rerank: rerank})
