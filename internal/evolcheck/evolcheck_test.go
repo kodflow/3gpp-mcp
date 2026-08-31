@@ -1,6 +1,10 @@
-package main
+package evolcheck
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/kodflow/3gpp-mcp/internal/model"
+)
 
 // TestNamesTermIsTokenNotSubstring locks the property the whole citation check
 // rests on: an edge is credited only when the cited clause names its target as a
@@ -36,8 +40,8 @@ func TestNamesTermIsTokenNotSubstring(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := namesTerm(tc.body, tc.term); got != tc.want {
-				t.Errorf("namesTerm(%q, %q) = %v, want %v", tc.body, tc.term, got, tc.want)
+			if got := NamesTerm(tc.body, tc.term); got != tc.want {
+				t.Errorf("NamesTerm(%q, %q) = %v, want %v", tc.body, tc.term, got, tc.want)
 			}
 		})
 	}
@@ -47,21 +51,21 @@ func TestNamesTermIsTokenNotSubstring(t *testing.T) {
 // from-term, and it is the TO-term that gets checked. An empty term must not be
 // reported as a failure, or every such edge would warn forever.
 func TestNamesTermEmptyTermIsVacuouslyTrue(t *testing.T) {
-	if !namesTerm("anything at all", "") {
+	if !NamesTerm("anything at all", "") {
 		t.Error("an empty term must not count as unnamed")
 	}
-	if !namesTerm("anything at all", "   ") {
+	if !NamesTerm("anything at all", "   ") {
 		t.Error("a whitespace-only term must not count as unnamed")
 	}
 }
 
-// TestOrNewRendersTheNewIn5GEdges keeps the log line readable: an edge with no
+// TestDescribeRendersTheNewIn5GEdges keeps the log line readable: an edge with no
 // predecessor prints as "(new in 5G) -> DCCF", not as " -> DCCF".
-func TestOrNewRendersTheNewIn5GEdges(t *testing.T) {
-	if got := orNew(""); got != "(new in 5G)" {
-		t.Errorf("orNew(%q) = %q", "", got)
+func TestDescribeRendersTheNewIn5GEdges(t *testing.T) {
+	if got, want := Describe(model.Evolution{FromTerm: "", ToTerm: "DCCF"}), "(new in 5G) -> DCCF"; got != want {
+		t.Errorf("Describe = %q, want %q", got, want)
 	}
-	if got := orNew("MME"); got != "MME" {
-		t.Errorf("orNew(%q) = %q", "MME", got)
+	if got, want := Describe(model.Evolution{FromTerm: "MME", ToTerm: "AMF"}), "MME -> AMF"; got != want {
+		t.Errorf("Describe = %q, want %q", got, want)
 	}
 }

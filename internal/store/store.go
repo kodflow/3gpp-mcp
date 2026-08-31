@@ -314,11 +314,40 @@ func (s *Store) ReplaceChanges(ctx context.Context, specID string, changes []mod
 // uniqueness constraint, so a --resume run would otherwise APPEND a duplicate
 // curated edge set. The seed is small + deterministic; the truncate-then-load
 // keeps the table in a known canonical state.
+// ONE TRANSACTION, because the two halves used to be two. The DELETE committed on
+// its own and the INSERTs followed in a second transaction, so any failure between
+// them — a constraint, a full disk, a killed process — left the corpus with ZERO
+// edges and no error visible to whoever reads it later. trace_evolution would then
+// answer "nothing" about a graph that had been correct minutes earlier, which is
+// worse than answering with the old seed. Wrapping both makes the replacement
+// atomic: either the new seed is there or the old one still is.
 func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
 		return fmt.Errorf("clear evolutions: %w", err)
 	}
-	return s.InsertEvolutions(evos)
+	if len(evos) > 0 {
+		stmt, perr := tx.PrepareContext(ctx,
+			`INSERT INTO evolutions
+			 (from_term, to_term, evolution_type, justification_spec, justification_clause, confidence)
+			 VALUES (?, ?, ?, ?, ?, ?)`)
+		if perr != nil {
+			return perr
+		}
+		defer func() { _ = stmt.Close() }()
+		for _, e := range evos {
+			if _, err := stmt.ExecContext(ctx, e.FromTerm, e.ToTerm, e.EvolutionType,
+				e.JustificationSpec, e.JustificationClause, e.Confidence); err != nil {
+				return fmt.Errorf("insert %s->%s: %w", e.FromTerm, e.ToTerm, err)
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current
