@@ -19,6 +19,14 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 	}{
 		{"empty keeps the built-in LI suite", "", nil, nil},
 		{"all widens to the whole deliver archive", "all", []string{"--all"}, []string{"ETSI_ALL=1"}},
+		{
+			// The ETSI analogue of keeping every 3GPP release: --all plus every
+			// published version, which multiplies the work list several-fold.
+			"all-versions widens further, to every published version",
+			"all-versions",
+			[]string{"--all", "--all-versions"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"},
+		},
 		{"whitespace around all still means all", "  all  ", []string{"--all"}, []string{"ETSI_ALL=1"}},
 		{
 			"an explicit list scopes explicitly",
@@ -53,7 +61,7 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 // the environment. If the two translations of the scope ever disagreed, the work
 // list the pipeline validates would not be the work list the builder fetches.
 func TestEtsiScopeArgsAndEnvAgree(t *testing.T) {
-	for _, scope := range []string{"", "all", "103 280"} {
+	for _, scope := range []string{"", "all", "all-versions", "103 280"} {
 		gotArgs, gotEnv := etsiScopeArgs(scope), etsiScopeEnv(scope)
 		if (len(gotArgs) == 0) != (len(gotEnv) == 0) {
 			t.Errorf("scope %q: args=%v but env=%v — one widens and the other does not", scope, gotArgs, gotEnv)

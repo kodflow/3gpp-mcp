@@ -132,6 +132,16 @@ func stepCorpusETSI() *Step {
 // time; only the path from the operator to them was missing.
 const ScopeAll = "all"
 
+// ScopeAllVersions is ScopeAll plus every PUBLISHED VERSION of each deliverable
+// rather than only the latest.
+//
+// It is what makes the ETSI half comparable to the 3GPP one, which already keeps
+// every release of every spec so a reader can see what changed. TS 103 221-1
+// alone has 23 published versions, so this multiplies the work list several-fold
+// — the download, the conversion and the GPU pass with it. A separate value
+// rather than the default, because that cost is a decision.
+const ScopeAllVersions = "all-versions"
+
 // etsiScopeArgs turns the scope knob into cmd/discover-etsi flags.
 //
 // The value is trimmed ONCE and the trimmed value is what travels. Trimming only
@@ -145,6 +155,8 @@ func etsiScopeArgs(scope string) []string {
 		return nil // the built-in LI suite
 	case ScopeAll:
 		return []string{"--all"}
+	case ScopeAllVersions:
+		return []string{"--all", "--all-versions"}
 	default:
 		return []string{"--specs", scope}
 	}
@@ -160,6 +172,8 @@ func etsiScopeEnv(scope string) []string {
 		return nil
 	case ScopeAll:
 		return []string{"ETSI_ALL=1"}
+	case ScopeAllVersions:
+		return []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
 	default:
 		return []string{"ETSI_SPECS=" + scope}
 	}

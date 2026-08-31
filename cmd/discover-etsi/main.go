@@ -49,6 +49,7 @@ func main() {
 	allFlag := flag.Bool("all", false, "enumerate the WHOLE ETSI /deliver corpus (etsi_ts+etsi_tr+etsi_en) — the latest PUBLISHED version of EVERY deliverable, not just the LI suite. Tens of thousands of specs; pair with --report worklist + a chunked CI matrix.")
 	typeDirsFlag := flag.String("type-dirs", strings.Join(etsicat.DeliverTypeDirs, ","), "with --all: which /deliver document-type folders to crawl (comma/space-separated)")
 	withRepub := flag.Bool("include-3gpp-republications", false, "with --all: also index ETSI's republications of 3GPP specs (121 000-138 999, 141 000-155 999). Off by default: the 3GPP half of this corpus already holds those, in EVERY release, while ETSI publishes one version of each")
+	allVersions := flag.Bool("all-versions", false, "emit EVERY published version of each deliverable, not just the latest — the ETSI analogue of keeping every 3GPP release, so the corpus can show how a deliverable changed. Multiplies the work list several-fold (TS 103 221-1 alone has 23 published versions)")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request HTTP timeout")
 	flag.Parse()
 
@@ -201,6 +202,45 @@ func main() {
 	specs := make([]string, 0, len(deliverables))
 	for _, d := range deliverables {
 		specs = append(specs, d.ID)
+	}
+
+	// --all-versions: every published version of every deliverable, which is what
+	// makes the ETSI half comparable to the 3GPP one. The persisted index is a
+	// LATEST-version delta anchor and cannot represent a version SET, so this mode
+	// deliberately does not diff: it emits the whole history and lets the builder's
+	// per-file resume decide what is already converted. Saying that here is better
+	// than silently diffing a set against a scalar.
+	if *allVersions {
+		history, hfailed := etsicat.BuildHistory(fetch, deliverables)
+		for _, id := range hfailed {
+			fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
+		}
+		total := 0
+		for _, vs := range history {
+			total += len(vs)
+		}
+		fmt.Fprintf(os.Stderr, "discover-etsi: %d deliverable(s), %d published version(s) in total (--all-versions; the index is not consulted)\n",
+			len(history), total)
+		if total == 0 {
+			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL resolved 0 versions — crawl/version-resolution broken")
+			os.Exit(1)
+		}
+		type line struct{ id, url, ver, dt string }
+		out := make([]line, 0, total)
+		for d, vs := range history {
+			for _, v := range vs {
+				out = append(out, line{d.ID, model.EtsiDeliverURLIn(d.TypeDir, d.ID, v), v, docTypeOf(d.TypeDir)})
+			}
+		}
+		// Sort by ID only, and STABLY: BuildHistory already returns each
+		// deliverable's versions oldest-first by rank, and comparing the version
+		// strings would undo that — "1.23.1" sorts before "1.3.1" lexically, which
+		// is the wrong order for a history and the wrong order to fetch it in.
+		sort.SliceStable(out, func(i, j int) bool { return out[i].id < out[j].id })
+		for _, l := range out {
+			fmt.Printf("%s\t%s\t%s\t%s\n", l.id, l.url, l.ver, l.dt)
+		}
+		return
 	}
 
 	site, failed := etsicat.BuildSiteIn(fetch, deliverables)
