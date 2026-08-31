@@ -1,69 +1,111 @@
-# 3gpp-data — the corpus-data base image (split-data-image plan)
+# The image — built on the machine that has the corpus
 
-## Why
+## Where it comes from
 
-The `:full` mcp image used to re-create its ~14 GB data layer at every build (the
-bake produces non-reproducible bytes), so a 3-line code change cost a ~75 min
-build, a ~15 GB push and a ~15 GB pull. Splitting **data** from **code** at the
-OCI-layer boundary makes the registry's content-addressing do the work: the data
-layer is pushed/pulled only when the corpus actually changes.
-
-## How — `FROM` inheritance (NOT `COPY`)
-
-The first cut used `COPY --link --from=3gpp-data`. The gate caught that this does
-**not** share the source blob: `COPY` (even `--link`) re-tars the files into a
-fresh content-addressed layer (a different 14 GB blob per arch). Only **`FROM`
-inheritance** lists the base's layers verbatim in the child manifest. So:
-
-- `3gpp-data` is **debian-based** (a `FROM scratch` image cannot be a usable
-  base), built **multi-arch** — each platform carries its **own** data layer.
-- `full = FROM ${DATA_IMAGE}`: full's manifest **references** that arch's exact
-  3gpp-data data blob by digest. A code-only rebuild re-creates only the small
-  top layers (apt libs, user, binary, ORT); the data layer is inherited and the
-  registry/pull dedupe it.
-
-Trade-off (user-approved): the data image's registry footprint doubles (one
-~14 GB blob per arch) vs the old scratch single-blob — the price of guaranteed
-per-arch sharing.
-
-## The chain
-
-```text
-corpus-matrix (lexical publish)          corpus-embed-kaggle (vectors)
-            └────────────┬───────────────────────┘
-                         ▼
-        corpus-data-image.yml  →  ghcr.io/kodflow/3gpp-data:{latest,YYYY-MM-DD}
-        (ONE bake, amd64; debian multi-arch — per-arch data layer)
-                         ▼  (workflow_run)
-        corpus-image.yml       →  ghcr.io/kodflow/3gpp-mcp:{latest,full,light}
-        (code-only: ~10 min, ~150 MB — full = FROM 3gpp-data@digest)
+```
+make image          # cross-build, compose, push  ghcr.io/kodflow/3gpp-mcp:latest
+make image-local    # same, stopping at .local/image/image.tar
+make image-toolchain# fetch the Linux cross-toolchain, once
 ```
 
-## Invariants (enforced fail-loud in CI)
+`scripts/local/build-image.sh` does all of it. There is no build workflow any
+more: the two that used to bake this image moved ~14 GB per run, which is exactly
+the resource this project does not have. The corpus is built here (ADR 0003), so
+the image is built here too.
 
-- `3gpp-data` is **multi-arch** (debian base, RUN-free → no QEMU): the bake's
-  verify step asserts both `linux/amd64` and `linux/arm64` exist and each carries
-  a >1 GiB data layer.
-- `corpus-image.yml`'s `gate` asserts each mcp platform's manifest references
-  **that arch's** exact 3gpp-data data blob (FROM-inheritance proof) and that it
-  is the only >1 GiB layer.
-- The bake carries every hardening of the #125 chain: identity overlay,
-  models-release restore (no HuggingFace on the hot path), DUCK guard,
-  embedding_model stamp, compaction on the emptiest disk.
-- The package is PRIVATE (verbatim 3GPP text) — born private via the PAT push;
-  every publish workflow self-heals + asserts it, like 3gpp-corpus / 3gpp-mcp /
-  3gpp-vec.
+## No container runtime is involved
 
-## Pulling from the labs
+An OCI image is a base manifest, a list of layer tarballs and a config blob, and
+`crane` composes all three. Nothing needs `docker build`:
 
-The labs pulls the single private `3gpp-mcp` image with a **dedicated read-only
-token** — see [labs-pull.md](labs-pull.md) for the token, the Docker/Kubernetes
-recipes, and both rotation procedures (image + token).
+| A Dockerfile would | Here |
+|---|---|
+| `RUN apt-get install libstdc++6 libgomp1` | the two `.so` files travel in a layer |
+| `RUN groupadd/useradd mcp` | `/etc/passwd` is read out of the base and re-shipped with one line appended |
+| `RUN mcp-3gpp prefetch-extensions` | the same `fts`/`vss` files are downloaded from the DuckDB extension repository |
+| `COPY --from=builder` | the cross-compiled binary is staged and packed |
 
-## Local helpers
+## The Linux artefacts are cross-compiled from Windows
 
-- `make image-light` — local light build (now `--target light`).
-- `make inspect-layers` — per-platform layers of the published `:latest` with
-  the `3gpp-data` blob highlighted (requires `crane` + GHCR login).
+`cmd/server` needs cgo for DuckDB, and this machine has no Linux toolchain and no
+WSL distribution. `zig cc` supplies one. Three details each produce a **broken
+image rather than an error**, so each has a guard:
 
-Plan : `.claude/plans/split-data-image.md` (v2, durci par review externe).
+1. **DuckDB's prebuilt `linux-amd64` archive is compiled against GNU libstdc++**,
+   and zig ships LLVM's libc++. Linking against zig's C++ runtime fails with
+   hundreds of undefined `std::__cxx11` symbols — the two do not share an ABI.
+   The link uses **Debian bookworm's own** `libstdc++.so.6` / `libgomp.so.1`,
+   the exact pair the runtime image carries, and those files are then shipped in
+   the image. Pinning them to the runtime base is not cosmetic: building against
+   a newer libstdc++ than the image has is how you get `version 'GLIBCXX_3.4.xx'
+   not found` at startup.
+
+2. **`cc-rs` passes `--target=x86_64-unknown-linux-gnu`** of its own accord,
+   which zig rejects (`UnknownOperatingSystem`). `scripts/local/zigcc` drops any
+   target the caller supplies and substitutes the configured one.
+
+3. **Without an explicit `-soname`**, lld records the *absolute build path* as
+   the Rust cdylib's `NEEDED` entry. The binary links here and the container dies
+   looking for `C:/Users/.../libembed_core.so`.
+   `scripts/local/elfneeded --require-sonames` asserts every `NEEDED` entry is a
+   bare SONAME, and is what caught it.
+
+`tar` is not used at all. GNU tar here treats a `C:` path as a remote rmt host,
+the toolchain's is busybox's (no `--force-local`), and `crane export` on Windows
+writes member names with **backslashes** — a layer packed that way would carry
+`usr\local\bin\mcp-3gpp` as one member name, and the image would pull, start and
+report `docker-entrypoint.sh: not found`. `scripts/local/imgtar` uses
+`archive/tar` and always writes POSIX names.
+
+## One image, not two
+
+The old split (`3gpp-data` inherited by `3gpp-mcp` via `FROM`) existed because
+"the bake produces non-reproducible bytes": each build re-created the ~14 GB data
+layer with a fresh digest, so a three-line code change cost a 15 GB push.
+
+`imgtar` stamps a **fixed timestamp** on every entry instead of the file's own,
+so an unchanged corpus packs to byte-identical bytes, the same digest, and the
+registry already has that blob — nothing is uploaded. (Measured: packing the same
+tree twice, with the files `touch`ed in between, gives one sha256.) A single
+image is then simpler and costs nothing, because the layer order runs from most
+stable to least:
+
+```
+10-runtime     /etc/passwd, /etc/group, libstdc++, libgomp
+20-duckdb-ext  the fts + vss extensions, prefetched
+30-ort         ONNX Runtime (the only arch-specific piece)
+40-models      bge-m3-sparse + the reranker
+50-corpus      3gpp.duckdb + etsi.duckdb          ← the big one, and the last
+60-bin         mcp-3gpp, the entrypoint, libembed_core.so
+```
+
+A code-only rebuild moves layer 60. A corpus rebuild moves 50 and 60.
+
+## What is in it, and why each piece has to be
+
+- **The corpus, in place.** `serve` reads it read-only; there is no `VOLUME`, so
+  a `docker run --rm` does not copy 11 GB into a fresh volume.
+- **`bge-m3-sparse`, not `bge-m3`.** Only ONE registry entry is active at serve
+  time (`SparseCapable()` reads `ActiveModel()`), so a dense-only image drops the
+  learned-lexical arm even with a corpus full of sparse postings — silently,
+  because `search.Engine` just leaves `e.sp` nil. The dual-head export serves
+  both and stamps the same dense identity; that claim is measured, and
+  `internal/embed/registry_dual_head_test.go` locks it.
+- **The reranker**, so `search_spec(rerank: true)` works.
+- **The DuckDB `fts` and `vss` extensions**, for the version the *Linux* binary
+  links (read from the `go.mod` pin, currently 1.5.3 — not this machine's 1.4.3,
+  which is what `duckdb_use_lib` gives the Windows build). Without them a
+  no-egress container degrades BM25 to `LIKE` and HNSW to an exact scan, and says
+  nothing.
+
+## The guards that run before a push
+
+- **The corpus contract**: `validate --require-fts --require-hnsw
+  --require-embed-complete`. Baking a corpus that fails its own contract produces
+  an image that serves lexically while claiming semantic capability.
+- **Dense identity**: the baked registry's `EmbedIdentity` must equal the
+  corpus's `embedding_model`. A mismatch is not a label problem — it is the serve
+  guard about to disable vector search in the image being published.
+- **Sparse identity**, when the corpus has a sparse layer: the registry must
+  declare a sparse head, and it must be the one the postings were built with.
+  Scoring a query against another model's vocabulary is wrong in silence.

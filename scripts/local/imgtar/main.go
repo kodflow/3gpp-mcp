@@ -36,7 +36,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// epoch is the fixed modification time stamped on every packed entry. 2000-01-01
+// rather than the Unix epoch because some tools treat a zero timestamp as "unset"
+// and substitute the current time, which would silently reintroduce the very
+// non-determinism this exists to remove.
+var epoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -123,8 +130,19 @@ func pack(args []string) {
 			}
 			hdr.Uid, hdr.Gid = *uid, *gid
 			hdr.Uname, hdr.Gname = "", ""
-			hdr.ModTime = hdr.ModTime.UTC().Truncate(0)
-			hdr.AccessTime, hdr.ChangeTime = hdr.ModTime, hdr.ModTime
+			// A FIXED timestamp, not the file's own. This is what makes an
+			// unchanged corpus produce a byte-identical layer, and therefore the
+			// same digest, and therefore NO upload: the registry already has that
+			// blob. Keeping the on-disk mtime would defeat it — the build copies
+			// the corpus into a staging tree, and cp stamps "now" on the copy, so
+			// an 11 GB layer that has not changed would get a fresh digest and be
+			// pushed again on every build.
+			//
+			// Splitting data from code into two images was the CI-era answer to
+			// the same problem ("the bake produces non-reproducible bytes"). One
+			// deterministic packer removes the need for the split.
+			hdr.ModTime = epoch
+			hdr.AccessTime, hdr.ChangeTime = epoch, epoch
 			// Windows has no execute bit, so it is set from the path: the two
 			// entries under /usr/local/bin are the entrypoint and the server, and
 			// a non-executable entrypoint is an image that pulls and cannot run.
