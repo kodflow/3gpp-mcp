@@ -74,6 +74,7 @@ func Pipeline() []*Step {
 		stepBuildRust(),
 		stepBuildEmbedder(),
 		stepBuildSparse(),
+		stepBuildServe(),
 		stepSeed(),
 		stepDiscover(),
 		stepFetch(),
