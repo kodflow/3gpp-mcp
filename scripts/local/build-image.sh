@@ -232,10 +232,21 @@ if [ "$WITH_CORPUS" = 1 ]; then
   VALIDATE="$ROOT/.local/bin/validate.exe"
   [ -x "$VALIDATE" ] || VALIDATE="$ROOT/.local/bin/validate"
   if [ -x "$VALIDATE" ]; then
-    say "checking the corpus contract before baking it"
-    "$VALIDATE" --db data/3gpp.duckdb --report text \
-      --require-fts --require-hnsw --require-embed-complete \
-      --embed-floor "${EMBED_FLOOR:-Rel-99}" \
+    # The flags come from scripts/data-contract.sh, never from a copy here. That
+    # script is the single source of the completeness contract precisely so the
+    # two gates that enforce it cannot drift; hardcoding a third opinion in the
+    # thing that actually publishes would defeat the arrangement.
+    #
+    # DATA_CONTRACT picks the level (dense | dense+sparse | dense+sparse+etsi).
+    # DATA_ETSI_DB points --require-etsi at the local layout rather than the
+    # image's absolute path.
+    CONTRACT_FLAGS="$(DATA_ETSI_DB="$ROOT/data/etsi.duckdb" \
+                      DATA_EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}" \
+                      bash scripts/data-contract.sh)" \
+      || die "scripts/data-contract.sh refused DATA_CONTRACT=${DATA_CONTRACT:-dense}"
+    say "corpus contract (${DATA_CONTRACT:-dense}): $CONTRACT_FLAGS"
+    # shellcheck disable=SC2086 # intentional word-split: the contract is a flag list
+    "$VALIDATE" --db data/3gpp.duckdb --report text $CONTRACT_FLAGS \
       || die "the corpus does not satisfy its own contract — refusing to bake it"
   else
     say "WARNING: validate is not built; baking WITHOUT the contract check"
