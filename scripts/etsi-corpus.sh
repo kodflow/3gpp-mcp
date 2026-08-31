@@ -83,10 +83,20 @@ i=0
 ok=0
 fail=0
 # IFS=tab so the id's internal space ("103 221-1") survives; never `for x in $var` (zsh).
-while IFS=$'\t' read -r id url version; do
+#
+# doctype is the fourth column discover-etsi emits ("TS"/"TR"/"EN"). It MUST be read
+# per line rather than defaulted once: read leaves an absent trailing field EMPTY,
+# but a variable set in a previous iteration would otherwise survive into the next
+# one and label a TS as a TR. A three-column work list from an older binary leaves
+# it empty on every line, which the default below turns back into TS.
+while IFS=$'\t' read -r id url version doctype; do
 	[ -n "$id" ] || continue
 	i=$((i + 1))
-	safe="${id// /_}_v${version}"
+	# A TS and a TR can share a number (103 101 is a TR; the TS tree 404s on it),
+	# so the document type is part of the filename or the two would overwrite
+	# each other in the same bucket.
+	doctype="${doctype:-TS}"
+	safe="${doctype}_${id// /_}_v${version}"
 	target="$BUCKET/${safe}.html"
 	printf '[etsi] (%d/%d) %s v%s\n' "$i" "$n_total" "$id" "$version"
 	if [ -s "$target" ]; then
@@ -111,7 +121,7 @@ while IFS=$'\t' read -r id url version; do
 	if convert_pdf "$pdf" "$tmp_html" "$id v$version"; then
 		# Prepend the provenance header htmlparse keys on, then the converted body.
 		{
-			printf '<!-- ETSI-SPEC: %s | %s -->\n' "$id" "$version"
+			printf '<!-- ETSI-SPEC: %s | %s | %s -->\n' "$id" "$version" "$doctype"
 			cat "$tmp_html"
 		} >"$target"
 		echo "  ✓ converted ($(wc -c <"$target" | tr -dc '0-9') bytes)"
