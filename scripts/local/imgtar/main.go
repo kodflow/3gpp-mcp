@@ -143,11 +143,26 @@ func pack(args []string) {
 			// deterministic packer removes the need for the split.
 			hdr.ModTime = epoch
 			hdr.AccessTime, hdr.ChangeTime = epoch, epoch
-			// Windows has no execute bit, so it is set from the path: the two
-			// entries under /usr/local/bin are the entrypoint and the server, and
-			// a non-executable entrypoint is an image that pulls and cannot run.
-			if fi.Mode().IsRegular() && (strings.Contains(name, "bin/") || strings.HasSuffix(name, ".sh")) {
+			// MODES ARE ASSIGNED, NOT INHERITED. Windows has no POSIX permission
+			// bits, so FileInfoHeader hands back 0666 for every regular file and
+			// 0777 for every directory — a corpus and a set of model weights that
+			// the whole world may rewrite, which is not what the Dockerfile these
+			// layers replace ever produced.
+			//
+			// The execute bit therefore comes from the path rather than the
+			// filesystem: everything under a bin/ directory, plus any .sh, is a
+			// program. A non-executable entrypoint is an image that pulls and
+			// cannot start, so this is not cosmetic. Shared libraries stay 0644 —
+			// the loader does not need +x to map them.
+			switch {
+			case fi.Mode()&os.ModeSymlink != 0:
+				// a symlink's own mode is meaningless; the target's applies
+			case fi.IsDir():
 				hdr.Mode = 0o755
+			case strings.Contains(name, "bin/") || strings.HasSuffix(name, ".sh"):
+				hdr.Mode = 0o755
+			default:
+				hdr.Mode = 0o644
 			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
