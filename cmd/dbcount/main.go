@@ -76,5 +76,23 @@ func run(ctx context.Context, path string) error {
 	}
 	fmt.Printf("clauses_with_vectors=%d\n", vec)
 	fmt.Printf("embedding_model=%s\n", s.GetMeta(ctx, "embedding_model"))
+
+	// The sparse layer, for the same reason: the bake has to decide which model
+	// to bake, and that decision depends on whether this corpus carries sparse
+	// postings at all. Asking the DB is the only way to know — an image baked
+	// with a dense-only active model over a corpus that HAS a sparse layer serves
+	// it with one retrieval arm silently missing, because SparseCapable() reads
+	// the active registry entry and search.Engine then just drops the arm.
+	//
+	// A corpus predating the sparse pass has no clause_sparse table at all, which
+	// is 0, not an error: the counter must work on both shapes or the guard that
+	// consumes it becomes conditional on corpus age.
+	var sparse int64
+	if err := s.QueryRowContext(ctx,
+		`SELECT count(*) FROM clause_sparse`).Scan(&sparse); err != nil {
+		sparse = 0
+	}
+	fmt.Printf("clauses_with_sparse=%d\n", sparse)
+	fmt.Printf("sparse_model=%s\n", s.GetMeta(ctx, "sparse_model"))
 	return nil
 }
