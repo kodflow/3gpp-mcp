@@ -195,6 +195,15 @@ fn main() -> Result<()> {
         const BATCH: usize = 2_000;
         let mut batch: Vec<(u64, Vec<(u32, f32)>)> = Vec::with_capacity(BATCH);
 
+        // The secondary index on term_id is dropped for the load and rebuilt after.
+        // DuckDB maintains it row by row, so inserting ~265 million postings into a
+        // growing ART index makes the import slower the further it goes — the shape
+        // seen on the real run, brisk for hours then CPU-bound with the file barely
+        // moving. Rebuilding afterwards is NOT optional: SearchSparse scores by
+        // term_id, and leaving it off turns every sparse query into a full scan of a
+        // 265-million-row table, with nothing to say so.
+        store.drop_sparse_term_index()?;
+
         for line in BufReader::new(f).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -223,6 +232,8 @@ fn main() -> Result<()> {
             store.set_sparse_many(&batch)?;
             total += batch.len();
         }
+        eprintln!("embed-io: rebuilding the term_id index over {total} clause(s)…");
+        store.create_sparse_term_index()?;
         if !args.sparse_model.is_empty() {
             store.set_meta("sparse_model", &args.sparse_model)?;
         }
