@@ -18,8 +18,10 @@ package etsicat
 import (
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 
@@ -182,20 +184,65 @@ func ResolveLatest(fetch Fetcher, id string) (version string, ok bool, err error
 	return v.String(), true, nil
 }
 
+// BuildSiteWorkers bounds how many deliverables BuildSite resolves at once.
+//
+// One at a time is fine for the fourteen-spec LI suite and hopeless for the whole
+// archive: --all enumerates ~7 500 deliverables, each needing its own directory
+// GET, so a sequential resolve is one round-trip deep, 7 500 times — an hour or
+// more of pure latency, which is why the --all flag existed but was never usable.
+// The work is entirely network-bound, so a small pool collapses that to minutes.
+// Small on purpose: this is someone else's CDN, and cmd/discover-etsi already had
+// to disable HTTP/2 because ETSI's edge falls over under a heavy crawl.
+const BuildSiteWorkers = 12
+
 // BuildSite resolves the latest published version of every id, returning the live
 // "site" map (id -> version) plus the ids that errored (for the caller to retry/report).
 // Ids with no published version are simply omitted (cite-or-silent).
+//
+// Resolution is concurrent (BuildSiteWorkers at a time) but the RESULT is not
+// order-dependent: site is a map, and failed is sorted before it is returned, so
+// two runs over the same archive produce byte-identical output. Fetcher is called
+// from several goroutines, so an implementation must be safe for concurrent use —
+// the http.Client-backed one in cmd/discover-etsi is.
 func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []string) {
 	site = make(map[string]string, len(ids))
-	for _, id := range ids {
-		v, ok, err := ResolveLatest(fetch, id)
-		switch {
-		case err != nil:
-			failed = append(failed, id)
-		case ok:
-			site[id] = v
-		}
+	if len(ids) == 0 {
+		return site, nil
 	}
+
+	workers := BuildSiteWorkers
+	if len(ids) < workers {
+		workers = len(ids)
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan string)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				v, ok, err := ResolveLatest(fetch, id)
+				mu.Lock()
+				switch {
+				case err != nil:
+					failed = append(failed, id)
+				case ok:
+					site[id] = v
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, id := range ids {
+		jobs <- id
+	}
+	close(jobs)
+	wg.Wait()
+
+	sort.Strings(failed)
 	return site, failed
 }
 

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // The ETSI half of the corpus.
@@ -47,10 +48,7 @@ func stepDiscoverETSI() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			args := []string{"--emit-worklist"}
-			if s := c.Cfg("etsi_scope"); s != "" {
-				args = append(args, "--specs", s)
-			}
+			args := append([]string{"--emit-worklist"}, etsiScopeArgs(c.Cfg("etsi_scope"))...)
 			out, err := c.Output(Cmd{Name: c.bin("discover-etsi"), Args: args})
 			if err != nil {
 				return err
@@ -115,12 +113,48 @@ func stepCorpusETSI() *Step {
 				"ETSI_CONVERT=" + c.dataPath("sources", "convert-etsi"),
 				"ETSI_ORIGIN=" + c.dataPath("sources", "etsi-origin"),
 			}
-			if s := c.Cfg("etsi_scope"); s != "" {
-				env = append(env, "ETSI_SPECS="+s)
-			}
+			env = append(env, etsiScopeEnv(c.Cfg("etsi_scope"))...)
 			c.Log.Printf("building the ETSI corpus (PDF text layer, never OCR)")
 			return c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-corpus.sh"}, Env: env, Echo: true})
 		},
+	}
+}
+
+// ScopeAll is the etsi_scope value that widens the ETSI half from the built-in
+// Lawful-Interception suite to the WHOLE /deliver archive (etsi_ts + etsi_tr +
+// etsi_en) — thousands of deliverables rather than fourteen.
+//
+// It is a value of the knob rather than a second knob because the knob already
+// existed and was DEAD: both steps read c.Cfg("etsi_scope"), and nothing ever put
+// an "etsi_scope" key into Ctx.Config, so the ETSI corpus was pinned to the
+// fourteen built-in LI specs with no reachable way to widen it. cmd/discover-etsi
+// has carried --all, and scripts/etsi-corpus.sh has carried ETSI_ALL, the whole
+// time; only the path from the operator to them was missing.
+const ScopeAll = "all"
+
+// etsiScopeArgs turns the scope knob into cmd/discover-etsi flags.
+func etsiScopeArgs(scope string) []string {
+	switch strings.TrimSpace(scope) {
+	case "":
+		return nil // the built-in LI suite
+	case ScopeAll:
+		return []string{"--all"}
+	default:
+		return []string{"--specs", scope}
+	}
+}
+
+// etsiScopeEnv turns the same knob into the environment scripts/etsi-corpus.sh
+// reads. The script passes these straight through to the same binary, so the two
+// helpers must agree — which is why they sit next to each other.
+func etsiScopeEnv(scope string) []string {
+	switch strings.TrimSpace(scope) {
+	case "":
+		return nil
+	case ScopeAll:
+		return []string{"ETSI_ALL=1"}
+	default:
+		return []string{"ETSI_SPECS=" + scope}
 	}
 }
 
