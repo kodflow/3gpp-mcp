@@ -906,6 +906,37 @@ impl Store {
     /// with NO terms still gets its DELETE, so re-importing genuinely clears a
     /// previous posting set rather than leaving a stale one behind. That is what
     /// makes the import idempotent and the work list converge.
+    /// drop_sparse_term_index / create_sparse_term_index bracket a bulk import.
+    ///
+    /// `clause_sparse` carries a secondary index on term_id (the one the sparse arm
+    /// scores through), and DuckDB maintains it row by row. Importing the 3GPP layer
+    /// inserts ~265 million rows — 2.2 million clauses at ~120 postings each — and
+    /// every one of them updates an ART index that is itself growing, so the import
+    /// gets slower the further it goes. That is the shape observed on the real run:
+    /// brisk for the first hours, then hours more with the file barely growing while
+    /// the process stayed CPU-bound.
+    ///
+    /// Dropping the index for the load and rebuilding it once afterwards is the
+    /// standard remedy, and it is safe here because the import owns the table for
+    /// the duration: nothing reads clause_sparse until the corpus is served.
+    /// Rebuilding is NOT optional — `SearchSparse` scores by term_id, and leaving it
+    /// off would turn every sparse query into a full scan of a 265-million-row table
+    /// without any error to say so.
+    pub fn drop_sparse_term_index(&self) -> Result<()> {
+        self.conn
+            .execute_batch("DROP INDEX IF EXISTS clause_sparse_term;")
+            .context("drop clause_sparse_term")?;
+        Ok(())
+    }
+
+    /// create_sparse_term_index rebuilds what drop_sparse_term_index removed.
+    pub fn create_sparse_term_index(&self) -> Result<()> {
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS clause_sparse_term ON clause_sparse (term_id);")
+            .context("create clause_sparse_term")?;
+        Ok(())
+    }
+
     pub fn set_sparse_many(&self, batch: &[(u64, Vec<(u32, f32)>)]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
