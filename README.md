@@ -4,6 +4,32 @@
 
 Le serveur retourne des **fragments de spécification cités** (`spec_id`, `release`, `version`, `clause`, `url`) — jamais des résumés. Claude raisonne, l'index sert.
 
+## Utilisation : une seule image, tout dedans
+
+```jsonc
+// .mcp.json (Claude Code)
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/kodflow/3gpp-mcp:latest"]
+    }
+  }
+}
+```
+
+Rien d'autre à installer, rien à télécharger au premier lancement, aucun accès
+réseau nécessaire à l'exécution. L'image porte le corpus 3GPP **et** ETSI, le
+modèle d'embedding **bi-tête** (dense + lexical appris), le reranker
+cross-encoder, et les extensions DuckDB `fts`/`vss` — donc BM25, HNSW, sparse et
+reranking fonctionnent hors ligne. Le paquet est **privé** (texte de spec
+verbatim, cf. [`DATA_NOTICE.md`](./DATA_NOTICE.md)) : `docker login ghcr.io`
+avec un token portant `read:packages` avant le premier `pull`.
+
+L'image se construit **sur la machine qui a le corpus** — `make image` — et non
+sur un runner : voir [`docs/automation/data-image.md`](./docs/automation/data-image.md).
+
 ---
 
 ## TL;DR architectural
