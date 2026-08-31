@@ -949,7 +949,12 @@ func (t corpusTarget) indexDeps() []string {
 		// build-go because the index is now built by cmd/freeze-hnsw.
 		return []string{"embed", "enrich", "paragraphs", "compact", "build-go"}
 	}
-	return []string{"embed" + t.Suffix, "build-go"}
+	// compact, for the ETSI index too. COPY FROM DATABASE does not carry custom
+	// indexes and the bin therefore resets hnsw_state to "building", so an ETSI
+	// index frozen BEFORE compaction would be thrown away by it while schema_meta
+	// still claimed the graph was frozen — the same ordering constraint the 3GPP
+	// side already encodes, and the reason compact sits before both freezes.
+	return []string{"embed" + t.Suffix, "compact", "build-go"}
 }
 
 // refreshOverlays reports whether the operator asked for the external overlays
@@ -1206,11 +1211,15 @@ func stepCompact() *Step {
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
-		Deps:  []string{"build-rust", "paragraphs"},
+		// embed-etsi joins the dependencies because this step now compacts the ETSI
+		// corpus too: compacting it before its vectors are written would rewrite a
+		// file that is about to grow again, which is the one thing a compaction
+		// must not do.
+		Deps:  []string{"build-rust", "paragraphs", "embed-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			return []string{c.dataPath("3gpp.duckdb"), c.dataPath("etsi.duckdb")}, nil
 		},
 		Validate: func(c *Ctx) error {
 			// The copy is only believable if the corpus still answers. compact
@@ -1243,6 +1252,31 @@ func stepCompact() *Step {
 			// The original is kept as <db>.pre-compact by the bin; the pipeline does
 			// not delete it. A corpus is not something to drop on the strength of a
 			// copy verified seconds ago — `validate` and `smoke` still have to run.
+
+			// THE ETSI HALF, for the same reason and with the same bin. It used to
+			// be left alone because it was fourteen deliverables in 47 MB, where
+			// dead space is not worth a rewrite. Widening the crawl to the whole
+			// /deliver archive makes it thousands, and every writer that touched it
+			// — the ingest, then the embed — leaves free blocks DuckDB only reuses
+			// internally. The image carries this file, so its dead space is bytes
+			// every puller downloads.
+			//
+			// compact.rs already reads the corpus SHAPE (clauses_is_view) and
+			// rebuilds the FTS index that shape needs, so the ETSI corpus, whose
+			// `clauses` is a real table rather than a view, takes the other branch
+			// and gets fts_main_clauses back. Nothing here is 3GPP-specific.
+			etsi := c.dataPath("etsi.duckdb")
+			if !fileNonEmpty(etsi) {
+				return nil
+			}
+			beforeE, _ := os.Stat(etsi)
+			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{"--db", etsi}, Echo: true}); err != nil {
+				return err
+			}
+			if afterE, serr := os.Stat(etsi); serr == nil && beforeE != nil {
+				c.Log.Printf("ETSI corpus %.2f GiB -> %.2f GiB",
+					float64(beforeE.Size())/(1<<30), float64(afterE.Size())/(1<<30))
+			}
 			return nil
 		},
 	}
