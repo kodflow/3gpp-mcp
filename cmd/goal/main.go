@@ -150,6 +150,22 @@ func run() error {
 		if runErr != nil {
 			return runErr
 		}
+		// A RUN THAT CONTAINS A FAILURE MUST NOT EXIT 0.
+		//
+		// An Optional step that fails is logged and the run continues, which is the
+		// right behaviour — the other steps are still worth doing. But Execute then
+		// returns no error, so `goal run` exited 0 with "failed 1 sparse" printed
+		// three lines above, and every caller that checks the exit code believed the
+		// pipeline had succeeded: `make build`, a chained script, anything.
+		//
+		// Optional does not even mean what the swallow implies any more. runStep
+		// already turns ErrDeclined — "this machine cannot do this, and that is
+		// fine" — into a success, so the branch that continues is reached ONLY by a
+		// step that ran and genuinely broke. Continuing past it is defensible;
+		// claiming the run succeeded is not.
+		if len(res.Failed) > 0 {
+			return fmt.Errorf("%d step(s) failed: %s", len(res.Failed), strings.Join(res.Failed, " "))
+		}
 		return nil
 
 	case "status":
