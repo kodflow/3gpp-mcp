@@ -238,6 +238,25 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 	default:
 		semantic = true
 	}
+	// THE SPARSE ARM, with its own reason. It was missing here entirely: a client
+	// asking what this server can do was told about lexical, semantic and the
+	// reranker, and learned nothing about the third retrieval arm — which
+	// search.Engine drops in silence when the model or the postings are absent.
+	// "Ask rather than assume" is the whole point of this tool, and a capability it
+	// cannot report is one the caller has to guess at.
+	st := h.eng.State()
+	sparseReason := ""
+	switch {
+	case !st.SparseEnabled && !h.eng.EmbedderEnabled():
+		sparseReason = "embedder_disabled"
+	case !st.SparseEnabled && h.st.GetMeta(ctx, "sparse_model") == "":
+		sparseReason = "no_sparse_postings_in_db"
+	case !st.SparseEnabled:
+		sparseReason = "model_has_no_sparse_head (bake data/models/bge-m3-sparse as the ACTIVE model)"
+	case !st.SparseOn:
+		sparseReason = "turned_off_at_runtime"
+	}
+
 	baseline := h.baseline
 	if baseline == "" {
 		baseline = "latest"
@@ -250,10 +269,30 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 		"semantic":               semantic,
 		"reason":                 reason,
 		"hnsw":                   vss,
+		"sparse":                 st.SparseEnabled && st.SparseOn,
+		"sparse_reason":          sparseReason,
+		"sparse_model":           h.st.GetMeta(ctx, "sparse_model"),
 		"reranker":               h.eng.RerankerEnabled(),
 		"embedding_model_db":     dbModel,
 		"embedding_model_client": clientModel,
 		"embed_floor":            h.st.GetMeta(ctx, "embed_floor"),
+	}
+	// The ETSI half is SERVED ALONGSIDE, never merged, and was invisible here too.
+	// Its embedding identity is reported because it is computed per store: an ETSI
+	// corpus at a stale identity answers lexically while the 3GPP one does not, and
+	// this is the only place a client can see that has happened.
+	if h.etsi != nil {
+		etsiModel := h.etsi.GetMeta(ctx, "embedding_model")
+		info["etsi"] = map[string]any{
+			"attached":           true,
+			"fts":                h.etsi.FTSAvailable(),
+			"hnsw":               h.etsi.VSSAvailable(),
+			"sparse":             h.etsi.SparseAvailable(),
+			"embedding_model":    etsiModel,
+			"embedding_model_ok": etsiModel != "" && etsiModel == clientModel,
+		}
+	} else {
+		info["etsi"] = map[string]any{"attached": false}
 	}
 	b, _ := json.MarshalIndent(info, "", "  ")
 	return mcp.NewToolResultText(string(b)), nil
