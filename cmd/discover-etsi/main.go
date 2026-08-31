@@ -48,6 +48,7 @@ func main() {
 	report := flag.String("report", "matrix", "matrix (JSON array of changed ids, for the CI matrix) | worklist")
 	allFlag := flag.Bool("all", false, "enumerate the WHOLE ETSI /deliver corpus (etsi_ts+etsi_tr+etsi_en) — the latest PUBLISHED version of EVERY deliverable, not just the LI suite. Tens of thousands of specs; pair with --report worklist + a chunked CI matrix.")
 	typeDirsFlag := flag.String("type-dirs", strings.Join(etsicat.DeliverTypeDirs, ","), "with --all: which /deliver document-type folders to crawl (comma/space-separated)")
+	withRepub := flag.Bool("include-3gpp-republications", false, "with --all: also index ETSI's republications of 3GPP specs (121 000-138 999, 141 000-155 999). Off by default: the 3GPP half of this corpus already holds those, in EVERY release, while ETSI publishes one version of each")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request HTTP timeout")
 	flag.Parse()
 
@@ -108,6 +109,26 @@ func main() {
 		if len(deliverables) == 0 {
 			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
 			os.Exit(1)
+		}
+		// ETSI's republications of 3GPP specs are dropped unless asked for, and the
+		// count is printed either way: a scope decision that changes a third of the
+		// corpus must be visible in the log, not inferred from a total.
+		kept := deliverables[:0]
+		repub := 0
+		for _, d := range deliverables {
+			if !*withRepub && etsicat.ThreeGPPRepublication(d.ID) {
+				repub++
+				continue
+			}
+			kept = append(kept, d)
+		}
+		deliverables = kept
+		if *withRepub {
+			fmt.Fprintln(os.Stderr, "discover-etsi: including ETSI's republications of 3GPP specs (--include-3gpp-republications)")
+		} else {
+			fmt.Fprintf(os.Stderr, "discover-etsi: %d ETSI-own deliverable(s); skipped %d republication(s) of 3GPP specs, "+
+				"which the 3GPP corpus already holds in every release (pass --include-3gpp-republications to index them anyway)\n",
+				len(deliverables), repub)
 		}
 	default:
 		specs := defaultLISpecs

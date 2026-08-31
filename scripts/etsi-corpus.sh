@@ -74,6 +74,10 @@ disc_args=(--emit-worklist)
 # ETSI_ALL=1 → enumerate the WHOLE /deliver corpus (etsi_ts+tr+en), not just the LI
 # suite (3GPP-parity completeness). Mutually exclusive with ETSI_SPECS in practice.
 [ -n "${ETSI_ALL:-}" ] && disc_args+=(--all)
+# ETSI_INCLUDE_3GPP=1 → also take ETSI's republications of 3GPP specs. Off by
+# default because the 3GPP half of this corpus already holds those in EVERY
+# release, while the ETSI archive publishes one version of each.
+[ -n "${ETSI_INCLUDE_3GPP:-}" ] && disc_args+=(--include-3gpp-republications)
 [ -n "${ETSI_TYPE_DIRS:-}" ] && disc_args+=(--type-dirs "$ETSI_TYPE_DIRS")
 "$DISCOVER_ETSI_BIN" "${disc_args[@]}" >"$wl" || { echo "::error::discover-etsi failed"; exit 1; }
 n_total=$(wc -l <"$wl" | tr -dc '0-9'); n_total=${n_total:-0}
