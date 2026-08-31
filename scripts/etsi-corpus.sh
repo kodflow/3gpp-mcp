@@ -78,6 +78,10 @@ disc_args=(--emit-worklist)
 # default because the 3GPP half of this corpus already holds those in EVERY
 # release, while the ETSI archive publishes one version of each.
 [ -n "${ETSI_INCLUDE_3GPP:-}" ] && disc_args+=(--include-3gpp-republications)
+# ETSI_ALL_VERSIONS=1 → every PUBLISHED version of each deliverable, not just the
+# latest: the ETSI analogue of keeping every 3GPP release. Multiplies the work
+# list several-fold (TS 103 221-1 alone has 23 published versions).
+[ -n "${ETSI_ALL_VERSIONS:-}" ] && disc_args+=(--all-versions)
 [ -n "${ETSI_TYPE_DIRS:-}" ] && disc_args+=(--type-dirs "$ETSI_TYPE_DIRS")
 "$DISCOVER_ETSI_BIN" "${disc_args[@]}" >"$wl" || { echo "::error::discover-etsi failed"; exit 1; }
 n_total=$(wc -l <"$wl" | tr -dc '0-9'); n_total=${n_total:-0}

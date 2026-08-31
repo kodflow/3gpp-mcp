@@ -311,3 +311,95 @@ func newer(a, b string) bool {
 	}
 	return ae > be
 }
+
+// AllPublished returns EVERY published version (milestone 60) in a deliverable's
+// directory, oldest first, deduplicated.
+//
+// LatestPublished answers "what should we serve"; this answers "what is there".
+// The distinction is the difference between a corpus that can show how a
+// deliverable changed and one that can only show where it ended up: TS 103 221-1
+// alone carries 23 published versions, and the 3GPP half of this corpus already
+// keeps every release of every spec for exactly that reason.
+//
+// Oldest first because that is the order a reader follows a history in, and
+// because the ingest attributes each file independently — nothing depends on the
+// order, so it may as well be the useful one.
+func AllPublished(links []string) []Version {
+	seen := map[int]bool{}
+	var out []Version
+	for _, l := range links {
+		v, ok := ParseVersionDir(l)
+		if !ok || v.Milestone != PublishedMilestone || seen[v.rank()] {
+			continue
+		}
+		seen[v.rank()] = true
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].rank() < out[j].rank() })
+	return out
+}
+
+// ResolveAllIn lists every published version of one deliverable. Same contract as
+// ResolveLatestIn: a fetch/parse error is returned so the caller can retry, and a
+// directory with no published version yields an empty slice rather than an error.
+func ResolveAllIn(fetch Fetcher, typeDir, id string) ([]string, error) {
+	dir := model.EtsiDeliverURLIn(typeDir, id, "")
+	if dir == "" {
+		return nil, nil
+	}
+	body, err := fetch(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	links, err := ExtractLinks(body)
+	if err != nil {
+		return nil, err
+	}
+	vs := AllPublished(links)
+	out := make([]string, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, v.String())
+	}
+	return out, nil
+}
+
+// BuildHistory resolves EVERY published version of every deliverable, concurrently.
+// The map is keyed by the whole deliverable for the same reason BuildSiteIn's is.
+func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]string, failed []string) {
+	history = make(map[Deliverable][]string, len(ds))
+	if len(ds) == 0 {
+		return history, nil
+	}
+	workers := BuildSiteWorkers
+	if len(ds) < workers {
+		workers = len(ds)
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan Deliverable)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				vs, err := ResolveAllIn(fetch, d.TypeDir, d.ID)
+				mu.Lock()
+				switch {
+				case err != nil:
+					failed = append(failed, d.ID)
+				case len(vs) > 0:
+					history[d] = vs
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, d := range ds {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+	sort.Strings(failed)
+	return history, failed
+}
