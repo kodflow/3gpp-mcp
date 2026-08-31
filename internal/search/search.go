@@ -285,6 +285,30 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	wantLex := r.Mode != "semantic" && !e.offLexical.Load()
 	wantVec := r.Mode != "lexical" && !e.offVector.Load()
 
+	// Whether the sparse arm runs is decided HERE, before the dense arm, so the two
+	// can share one forward pass when both are wanted. Its own gating is unchanged.
+	wantSparse := r.Mode != "lexical" && !e.offSparse.Load() && e.sp != nil && e.st.SparseAvailable() && bctx.Err() == nil
+
+	// ONE PASS FOR TWO HEADS. BGE-M3 emits the dense embedding and the learned
+	// lexical weights from the same encoder, which ONNX Runtime computes whether
+	// one output is read or two — so calling Embed and then EmbedSparse ran the
+	// transformer twice over the same query string for nothing. Measured: ~166 ms
+	// for the pair against a BM25 arm costing ~10 ms.
+	//
+	// The result is precomputed rather than the calls being merged inline, because
+	// the two arms are structurally independent (each degrades on its own) and
+	// should stay that way. A nil pair simply means the combined path was
+	// unavailable and each arm embeds as before.
+	var preDense []float32
+	var preSparse model.SparseVec
+	if wantVec && wantSparse && e.emb.Enabled() && bctx.Err() == nil {
+		if dual, ok := e.emb.(embed.DualEmbedder); ok {
+			if d, s, ok := dual.EmbedBoth(bctx, r.Text); ok {
+				preDense, preSparse = d, s
+			}
+		}
+	}
+
 	var lists [][]model.SearchHit
 	if wantLex {
 		lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
@@ -294,7 +318,11 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		lists = append(lists, lex)
 	}
 	if wantVec && e.emb.Enabled() && bctx.Err() == nil {
-		if vecs, err := e.emb.Embed(bctx, []string{r.Text}); err == nil && len(vecs) == 1 {
+		vecs, err := [][]float32{preDense}, error(nil)
+		if preDense == nil {
+			vecs, err = e.emb.Embed(bctx, []string{r.Text})
+		}
+		if err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
 			switch {
@@ -319,9 +347,12 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// Sparse (learned-lexical) arm: same gating as the dense arm (any non-"lexical"
 	// mode), independent toggle. Best-effort — embed/score failure just omits the
 	// list (degrade, never block). Fuses into the same RRF as BM25 + dense.
-	wantSparse := r.Mode != "lexical" && !e.offSparse.Load() && e.sp != nil && e.st.SparseAvailable() && bctx.Err() == nil
 	if wantSparse {
-		if svecs, err := e.sp.EmbedSparse(bctx, []string{r.Text}); err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
+		svecs, err := []model.SparseVec{preSparse}, error(nil)
+		if preSparse == nil {
+			svecs, err = e.sp.EmbedSparse(bctx, []string{r.Text})
+		}
+		if err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
 			if shits, serr := e.st.SearchSparse(bctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
 				lists = append(lists, shits)
 			}

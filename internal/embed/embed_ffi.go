@@ -18,6 +18,7 @@ int embed_core_embed(const char* text, float* out, int out_len);
 const char* embed_core_backend(void);
 int embed_core_has_sparse(void);
 int embed_core_embed_sparse(const char* text, unsigned int* out_ids, float* out_weights, int cap);
+int embed_core_embed_both(const char* text, float* out_dense, int dense_len, unsigned int* out_ids, float* out_weights, int sparse_cap);
 */
 import "C"
 
@@ -115,4 +116,42 @@ func (ffiEmbedder) EmbedSparse(_ context.Context, texts []string) ([]model.Spars
 		out[i] = sv
 	}
 	return out, nil
+}
+
+// EmbedBoth returns the dense vector AND the sparse postings for one text from a
+// SINGLE forward pass of the model.
+//
+// A hybrid query used to run the transformer twice over the same string — once
+// for each head — and ONNX Runtime computes the shared encoder either way, so the
+// second pass bought nothing. Measured on the development machine: ~166 ms for
+// the pair, against a BM25 arm that costs ~10 ms, which makes the redundant pass
+// roughly half the latency of every non-lexical search.
+//
+// ok is false when there is no combined path — a dense-only model, or a text long
+// enough that the dense and sparse windows would differ — and the caller then uses
+// Embed and EmbedSparse as before. That is a fallback, NOT an error: the answer is
+// identical either way, only slower.
+func (e ffiEmbedder) EmbedBoth(ctx context.Context, text string) (dense []float32, sparse model.SparseVec, ok bool) {
+	const sparseCap = 16384 // a query's distinct terms are far below this
+	d := make([]float32, int(C.embed_core_dim()))
+	ids := make([]uint32, sparseCap)
+	weights := make([]float32, sparseCap)
+
+	ct := C.CString(text)
+	n := int(C.embed_core_embed_both(ct,
+		(*C.float)(unsafe.Pointer(&d[0])), C.int(len(d)),
+		(*C.uint)(unsafe.Pointer(&ids[0])), (*C.float)(unsafe.Pointer(&weights[0])), C.int(sparseCap)))
+	C.free(unsafe.Pointer(ct))
+	if n < 0 {
+		return nil, nil, false
+	}
+	w := n
+	if w > sparseCap {
+		w = sparseCap
+	}
+	sv := make(model.SparseVec, w)
+	for j := 0; j < w; j++ {
+		sv[ids[j]] = weights[j]
+	}
+	return d, sv, true
 }
