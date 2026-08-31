@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -1236,4 +1237,104 @@ func stepCompact() *Step {
 			return nil
 		},
 	}
+}
+
+// -------------------------------------------------- serveur sémantique
+
+// stepBuildServe builds the server binary that can actually answer semantically,
+// and stages the DLLs it needs beside it.
+//
+// WHY THIS IS A SEPARATE STEP. build-go compiles cmd/server with GOTAGS alone —
+// no `onnx`, no `embed_ffi` — so the binary it produces has the noop embedder
+// (internal/embed/embed_noop.go) and can only answer lexically. That is the right
+// default for the portable build and the tests, and it meant `make build` shipped
+// a corpus full of vectors next to a server that could not use them. `.mcp.json`
+// pointed at that binary, so the MCP server advertised semantic search and served
+// BM25.
+//
+// `onnx` alone is not enough either: it gets the reranker, not the query embedder.
+// The embedder comes from the rust/embed-core cdylib built `--features ort`, which
+// `embed_ffi` links through cgo — the two tags are a pair, not alternatives.
+//
+// The DLLs are COPIED beside the binary rather than left on a PATH. Windows
+// resolves a DLL from the executable's own directory first, and an MCP server is
+// launched by a client that inherits none of this shell's environment: a PATH
+// export here would work in every test and fail the moment a real client started it.
+func stepBuildServe() *Step {
+	return &Step{
+		Name:      "build-serve",
+		Version:   1,
+		Doc:       "build the semantic server (onnx + embed_ffi) and stage its DLLs",
+		Deps:      []string{"toolchain", "build-go"},
+		Impl:      []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
+		Toolchain: true,
+		// A box with no ONNX Runtime still completes every other step; it just gets
+		// the lexical server. Failing the whole pipeline over the optional half of
+		// the search stack would be the wrong trade.
+		Optional: true,
+		Outputs:  func(c *Ctx) []string { return []string{c.bin("server-full")} },
+		Run: func(c *Ctx) error {
+			target := filepath.Join(c.Local, "cargo-target-embedcore")
+			c.Log.Printf("cargo build embed-core cdylib (--features ort)")
+			if err := c.Run(Cmd{
+				Name: "cargo",
+				Args: []string{"build", "--release",
+					"--manifest-path", "rust/embed-core/Cargo.toml", "--features", "ort"},
+				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
+				Echo: true,
+			}); err != nil {
+				return err
+			}
+			tags := os.Getenv("GOTAGS")
+			if tags != "" {
+				tags += ","
+			}
+			tags += "onnx,embed_ffi"
+			c.Log.Printf("go build cmd/server -tags %s", tags)
+			if err := c.Run(Cmd{Name: "go", Args: []string{
+				"build", "-tags", tags, "-o", c.bin("server-full"), "./cmd/server",
+			}, Env: []string{"CGO_LDFLAGS=-L" + filepath.Join(target, "release")}}); err != nil {
+				return err
+			}
+			// Stage every DLL the binary dlopens, beside the binary. Best-effort per
+			// file: a missing CUDA provider is a CPU box, not a broken build.
+			staged := 0
+			for _, src := range serveDLLs(c, target) {
+				b, err := os.ReadFile(src)
+				if err != nil {
+					continue
+				}
+				if err := WriteAtomic(filepath.Join(c.Local, "bin", filepath.Base(src)), b); err != nil {
+					return err
+				}
+				staged++
+			}
+			c.Log.Printf("staged %d runtime DLL(s) beside server-full", staged)
+			return nil
+		},
+	}
+}
+
+// serveDLLs lists what server-full dlopens at runtime: the embed-core cdylib and
+// the ONNX Runtime it shares with the Go reranker (ONE onnxruntime in the process
+// — two would clash on symbols, which is the whole reason embed-core is built
+// load-dynamic).
+func serveDLLs(c *Ctx, cargoTarget string) []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	out := []string{filepath.Join(cargoTarget, "release", "embed_core.dll")}
+	ort := os.Getenv("ORT_DYLIB_PATH")
+	if ort == "" {
+		return out
+	}
+	dir := filepath.Dir(ort)
+	for _, n := range []string{
+		"onnxruntime.dll",
+		"onnxruntime_providers_shared.dll",
+		"onnxruntime_providers_cuda.dll",
+	} {
+		out = append(out, filepath.Join(dir, n))
+	}
+	return out
 }
