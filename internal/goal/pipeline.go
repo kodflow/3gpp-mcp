@@ -86,7 +86,7 @@ func Pipeline() []*Step {
 		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
 		// does not carry custom indexes), so both sit between the conversion and the
 		// freeze rather than after it.
-		stepSparse(),
+		stepSparse(corpus3GPP()),
 		stepCompact(),
 		stepIndex(corpus3GPP()),
 		stepValidate(),
@@ -97,6 +97,7 @@ func Pipeline() []*Step {
 		stepDiscoverETSI(),
 		stepCorpusETSI(),
 		stepEmbed(corpusETSI()),
+		stepSparse(corpusETSI()),
 		stepIndex(corpusETSI()),
 		stepSmoke(),
 	}
