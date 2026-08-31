@@ -2,12 +2,16 @@
   "mcpServers": {
     "3gpp": {
       "type": "stdio",
-      "command": ".local/bin/server.exe",
+      "command": ".local/bin/server-full.exe",
       "args": [
         "serve",
         "--db", "data/3gpp.duckdb",
         "--etsi-db", "data/etsi.duckdb"
-      ]
+      ],
+      "env": {
+        "EMBED_MODEL_DIR": "data/models/bge-m3",
+        "ORT_DYLIB_PATH": ".local/bin/onnxruntime.dll"
+      }
     }
   }
 }
