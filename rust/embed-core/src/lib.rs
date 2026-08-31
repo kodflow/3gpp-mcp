@@ -291,7 +291,7 @@ pub extern "C" fn embed_core_embed_both(
 /// backend_embed_both routes the combined path. Only the real dual-head ONNX model
 /// has one; every other backend returns None and the caller falls back.
 #[allow(clippy::type_complexity)]
-fn backend_embed_both(text: &str) -> Option<([f32; 1024], Vec<(u32, f32)>)> {
+fn backend_embed_both(text: &str) -> Option<([f32; DENSE_DIM], Vec<(u32, f32)>)> {
     #[cfg(feature = "ort")]
     {
         ort_backend::embed_both_one(text)

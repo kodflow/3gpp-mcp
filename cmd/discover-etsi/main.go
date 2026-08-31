@@ -95,17 +95,22 @@ func main() {
 	var deliverables []etsicat.Deliverable
 	switch {
 	case *allFlag:
-		var enumFailed []string
+		// Failures are keyed by "<typeDir>/<rangeFolder>", not by the folder name
+		// alone: the same 100-range exists under etsi_ts, etsi_tr and etsi_en, and
+		// collapsing them would make a failure in one look like a failure in all.
+		failedFirst := map[string]bool{}
 		dirs := splitList(*typeDirsFlag)
 		perDir := map[string]int{}
 		for _, td := range dirs {
 			ds, f := etsicat.EnumerateDeliverables(fetch, td)
 			deliverables = append(deliverables, ds...)
 			perDir[td] = len(ds)
-			enumFailed = append(enumFailed, f...)
+			for _, r := range f {
+				failedFirst[td+"/"+r] = true
+			}
 		}
 		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v %v (%d range-fetch failures)\n",
-			len(deliverables), dirs, perDir, len(enumFailed))
+			len(deliverables), dirs, perDir, len(failedFirst))
 		if len(deliverables) == 0 {
 			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
 			os.Exit(1)
@@ -121,19 +126,34 @@ func main() {
 		// The failures are retried once (they are transient by nature: the ETSI CDN
 		// intermittently drops connections under a crawl, which is also why HTTP/2
 		// is disabled above), and what still fails is fatal.
-		if len(enumFailed) > 0 {
-			fmt.Fprintf(os.Stderr, "discover-etsi: retrying %d range folder(s) that failed to list\n", len(enumFailed))
-			var stillFailed []string
+		if len(failedFirst) > 0 {
+			fmt.Fprintf(os.Stderr, "discover-etsi: retrying %d range folder(s) that failed to list\n", len(failedFirst))
+			failedSecond := map[string]bool{}
 			for _, td := range dirs {
 				ds, f := etsicat.EnumerateDeliverables(fetch, td)
 				// Re-enumerating a whole type dir is cheap next to the version
-				// resolution that follows, and BuildSiteIn is keyed per
-				// deliverable, so re-adding what already resolved costs nothing.
+				// resolution that follows, and the deliverables are deduped by
+				// (folder, id), so re-adding what already resolved costs nothing.
 				deliverables = append(deliverables, ds...)
-				stillFailed = append(stillFailed, f...)
+				for _, r := range f {
+					failedSecond[td+"/"+r] = true
+				}
 			}
+			// FAIL ONLY ON WHAT FAILED BOTH TIMES. These errors are transient by
+			// nature, so the two attempts rarely fail on the same folder: taking
+			// the union would abort a run where folder A failed first, succeeded on
+			// retry, and folder B did the reverse — even though between the two
+			// attempts every folder was enumerated. The intersection is what is
+			// actually missing.
+			var stillFailed []string
+			for key := range failedFirst {
+				if failedSecond[key] {
+					stillFailed = append(stillFailed, key)
+				}
+			}
+			sort.Strings(stillFailed)
 			if len(stillFailed) > 0 {
-				fmt.Fprintf(os.Stderr, "discover-etsi: FATAL %d range folder(s) still unlistable after a retry: %v\n",
+				fmt.Fprintf(os.Stderr, "discover-etsi: FATAL %d range folder(s) unlistable in BOTH attempts: %v\n",
 					len(stillFailed), stillFailed)
 				fmt.Fprintln(os.Stderr, "discover-etsi: every deliverable in them would be silently missing from the corpus")
 				os.Exit(1)
