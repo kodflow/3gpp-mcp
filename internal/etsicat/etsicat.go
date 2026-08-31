@@ -217,27 +217,41 @@ type Deliverable struct {
 }
 
 // BuildSite resolves the latest published version of every TS id. The TS-only form,
-// for the built-in LI suite and --specs.
+// for the built-in LI suite and --specs; its result is keyed by id because within
+// one document type an id IS the identity.
 func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []string) {
 	ds := make([]Deliverable, 0, len(ids))
 	for _, id := range ids {
 		ds = append(ds, Deliverable{TypeDir: model.EtsiTypeTS, ID: id})
 	}
-	return BuildSiteIn(fetch, ds)
+	typed, failed := BuildSiteIn(fetch, ds)
+	site = make(map[string]string, len(typed))
+	for d, v := range typed {
+		site[d.ID] = v
+	}
+	return site, failed
 }
 
 // BuildSiteIn resolves the latest published version of every deliverable, returning
-// the live "site" map (id -> version) plus the ids that errored (for the caller to
-// retry/report). Deliverables with no published version are simply omitted
-// (cite-or-silent).
+// the live "site" map (deliverable -> version) plus the ids that errored (for the
+// caller to retry/report). Deliverables with no published version are simply
+// omitted (cite-or-silent).
+//
+// THE KEY IS THE WHOLE DELIVERABLE, not its number. Archive identity is (folder,
+// id), and the same number can exist as a TS and as a TR — /deliver/etsi_ts/…/
+// 103101/ is a 404 while the etsi_tr one is TR 103 101, but nothing stops ETSI
+// from filling both. Keyed by id alone, two concurrent workers would race to
+// overwrite each other, and a later lookup could pair one document's version with
+// another's folder and URL. There are no such collisions in the archive today;
+// keying on the identity rather than on that fact is what keeps it from mattering.
 //
 // Resolution is concurrent (BuildSiteWorkers at a time) but the RESULT is not
 // order-dependent: site is a map, and failed is sorted before it is returned, so
 // two runs over the same archive produce byte-identical output. Fetcher is called
 // from several goroutines, so an implementation must be safe for concurrent use —
 // the http.Client-backed one in cmd/discover-etsi is.
-func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[string]string, failed []string) {
-	site = make(map[string]string, len(ds))
+func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, failed []string) {
+	site = make(map[Deliverable]string, len(ds))
 	if len(ds) == 0 {
 		return site, nil
 	}
@@ -262,7 +276,7 @@ func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[string]string, faile
 				case err != nil:
 					failed = append(failed, d.ID)
 				case ok:
-					site[d.ID] = v
+					site[d] = v
 				}
 				mu.Unlock()
 			}

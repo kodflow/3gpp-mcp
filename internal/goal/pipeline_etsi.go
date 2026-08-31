@@ -133,8 +133,14 @@ func stepCorpusETSI() *Step {
 const ScopeAll = "all"
 
 // etsiScopeArgs turns the scope knob into cmd/discover-etsi flags.
+//
+// The value is trimmed ONCE and the trimmed value is what travels. Trimming only
+// for the dispatch and then forwarding the original passed " 103 280 " through to
+// --specs, where the leading space becomes part of the first id and resolves
+// nothing.
 func etsiScopeArgs(scope string) []string {
-	switch strings.TrimSpace(scope) {
+	scope = strings.TrimSpace(scope)
+	switch scope {
 	case "":
 		return nil // the built-in LI suite
 	case ScopeAll:
@@ -148,7 +154,8 @@ func etsiScopeArgs(scope string) []string {
 // reads. The script passes these straight through to the same binary, so the two
 // helpers must agree — which is why they sit next to each other.
 func etsiScopeEnv(scope string) []string {
-	switch strings.TrimSpace(scope) {
+	scope = strings.TrimSpace(scope)
+	switch scope {
 	case "":
 		return nil
 	case ScopeAll:

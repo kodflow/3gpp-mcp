@@ -110,6 +110,37 @@ func main() {
 			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
 			os.Exit(1)
 		}
+		// AN INCOMPLETE ENUMERATION IS NOT A SMALLER CORPUS, IT IS A WRONG ONE.
+		//
+		// A range folder that could not be listed omits EVERY deliverable in it —
+		// a hundred at a time — and the run would otherwise carry on and emit a
+		// perfectly well-formed work list. The corpus built from it would be
+		// missing whole number ranges, with nothing in the result to say so; the
+		// only trace was a count in a log line nobody reads on a green run.
+		//
+		// The failures are retried once (they are transient by nature: the ETSI CDN
+		// intermittently drops connections under a crawl, which is also why HTTP/2
+		// is disabled above), and what still fails is fatal.
+		if len(enumFailed) > 0 {
+			fmt.Fprintf(os.Stderr, "discover-etsi: retrying %d range folder(s) that failed to list\n", len(enumFailed))
+			var stillFailed []string
+			for _, td := range dirs {
+				ds, f := etsicat.EnumerateDeliverables(fetch, td)
+				// Re-enumerating a whole type dir is cheap next to the version
+				// resolution that follows, and BuildSiteIn is keyed per
+				// deliverable, so re-adding what already resolved costs nothing.
+				deliverables = append(deliverables, ds...)
+				stillFailed = append(stillFailed, f...)
+			}
+			if len(stillFailed) > 0 {
+				fmt.Fprintf(os.Stderr, "discover-etsi: FATAL %d range folder(s) still unlistable after a retry: %v\n",
+					len(stillFailed), stillFailed)
+				fmt.Fprintln(os.Stderr, "discover-etsi: every deliverable in them would be silently missing from the corpus")
+				os.Exit(1)
+			}
+			deliverables = dedupeDeliverables(deliverables)
+			fmt.Fprintf(os.Stderr, "discover-etsi: retry recovered every folder; %d deliverable(s)\n", len(deliverables))
+		}
 		// ETSI's republications of 3GPP specs are dropped unless asked for, and the
 		// count is printed either way: a scope decision that changes a third of the
 		// corpus must be visible in the log, not inferred from a total.
@@ -166,8 +197,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The persisted index is keyed by id, so the diff is taken over an id-keyed
+	// projection of the site. Two deliverables sharing a number would collapse into
+	// one there, so the collapse is DETECTED rather than allowed: a caller reading
+	// a work list has no way to notice a document that quietly went missing.
+	// (Measured on the live archive: zero such collisions today.)
+	byID := make(map[string]string, len(site))
+	for d, v := range site {
+		if prev, dup := byID[d.ID]; dup {
+			fmt.Fprintf(os.Stderr,
+				"discover-etsi: FATAL %q exists in more than one /deliver folder (%s here, versions %q and %q) — "+
+					"the id-keyed index cannot represent both, and one document would silently vanish from the corpus\n",
+				d.ID, d.TypeDir, prev, v)
+			os.Exit(1)
+		}
+		byID[d.ID] = v
+	}
+
 	index := loadIndex(*indexPath)
-	changed := etsicat.Diff(site, index)
+	changed := etsicat.Diff(byID, index)
 	sort.Strings(changed)
 
 	if *emitWL || *report == "worklist" {
@@ -181,7 +229,7 @@ func main() {
 			// instead of filing every deliverable as "ETSI TS". A reader of an older
 			// three-column list still parses (the field is simply empty) and the
 			// parser defaults to TS, which is what those lists all were.
-			fmt.Printf("%s\t%s\t%s\t%s\n", id, model.EtsiDeliverURLIn(td, id, site[id]), site[id], docTypeOf(td))
+			fmt.Printf("%s\t%s\t%s\t%s\n", id, model.EtsiDeliverURLIn(td, id, byID[id]), byID[id], docTypeOf(td))
 		}
 		return
 	}
@@ -232,4 +280,20 @@ func loadIndex(path string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// dedupeDeliverables collapses repeats after a retry re-enumerates a whole type
+// directory. Identity is (folder, id), never the id alone: the same number can
+// exist as a TS and as a TR, and collapsing on the number would drop one of them.
+func dedupeDeliverables(in []etsicat.Deliverable) []etsicat.Deliverable {
+	seen := make(map[etsicat.Deliverable]bool, len(in))
+	out := in[:0]
+	for _, d := range in {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
 }

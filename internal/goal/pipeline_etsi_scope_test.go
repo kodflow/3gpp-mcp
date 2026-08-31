@@ -26,6 +26,15 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 			[]string{"--specs", "103 221-1,103 280"},
 			[]string{"ETSI_SPECS=103 221-1,103 280"},
 		},
+		{
+			// The trim must reach the VALUE, not just the dispatch: a leading
+			// space forwarded to --specs becomes part of the first id and
+			// resolves nothing.
+			"whitespace around an explicit list is trimmed off the value too",
+			"  103 280  ",
+			[]string{"--specs", "103 280"},
+			[]string{"ETSI_SPECS=103 280"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

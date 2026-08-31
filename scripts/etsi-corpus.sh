@@ -102,6 +102,17 @@ while IFS=$'\t' read -r id url version doctype; do
 	doctype="${doctype:-TS}"
 	safe="${doctype}_${id// /_}_v${version}"
 	target="$BUCKET/${safe}.html"
+	# MIGRATE, do not duplicate. Every file converted before the type prefix
+	# existed is named without one, so the resume check below would miss it, the
+	# PDF would be downloaded and converted again under the new name, AND the old
+	# file would still be sitting in the bucket for the ingest to read — one
+	# deliverable, twice, from two files that disagree about nothing. Renaming is
+	# exact rather than a guess: the untyped scheme only ever produced TS.
+	legacy="$BUCKET/${id// /_}_v${version}.html"
+	if [ "$doctype" = "TS" ] && [ ! -e "$target" ] && [ -s "$legacy" ]; then
+		mv "$legacy" "$target"
+		echo "  ↻ migrated the untyped cache entry"
+	fi
 	printf '[etsi] (%d/%d) %s v%s\n' "$i" "$n_total" "$id" "$version"
 	if [ -s "$target" ]; then
 		echo "  ✓ already converted (resume)"
