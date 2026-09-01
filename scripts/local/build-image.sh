@@ -147,7 +147,8 @@ IMGTAR="$ROOT/.local/bin/imgtar.exe"
 "$CRANE" export "$BASE" "$STAGE/base.tar" --platform linux/amd64
 "$IMGTAR" cat --in "$STAGE/base.tar" etc/passwd > "$STAGE/passwd"
 "$IMGTAR" cat --in "$STAGE/base.tar" etc/group  > "$STAGE/group"
-rm -f "$STAGE/base.tar"
+# base.tar is NOT deleted here any more: step 7b reads the libraries the base
+# carries, and re-exporting it would be a second multi-hundred-MB pull.
 [ -s "$STAGE/passwd" ] && [ -s "$STAGE/group" ] || die "could not read /etc/passwd from $BASE"
 grep -q '^mcp:' "$STAGE/passwd" || echo 'mcp:x:10001:10001::/home/mcp:/usr/sbin/nologin' >> "$STAGE/passwd"
 grep -q '^mcp:' "$STAGE/group"  || echo 'mcp:x:10001:' >> "$STAGE/group"
@@ -300,6 +301,32 @@ layer() { # layer <name> <uid> <path…>
   [ "$present" = 1 ] || return 0
   "$IMGTAR" pack --root "$ROOTFS" --out "$LAYERS/$name.tar" --uid "$uid" --gid "$uid" "$@"
 }
+
+# ---- 7b. will the container's loader find everything? ------------------------
+#
+# The last unproven property of this image, and the one with no local substitute:
+# there is no container runtime and no WSL distribution on this machine, so the
+# image cannot be started before it is published. crane validate proves the
+# manifest and blobs are well formed; server-full.exe proves THIS corpus answers;
+# neither can notice an ELF whose DT_NEEDED names a library that exists here and
+# in no layer of the image. That container pulls, starts, and dies immediately
+# with "cannot open shared object file".
+#
+# --require-sonames above is the sibling check and not a substitute: it proves the
+# entry is a name rather than a Windows build path, and it only ever looked at the
+# server binary. A well-formed SONAME for a library nobody shipped fails exactly
+# the same way, and the cdylib and the ONNX Runtime objects travel here too.
+#
+# The search path given is the one the image config actually sets
+# (LD_LIBRARY_PATH=/usr/local/lib), so a library staged somewhere the loader does
+# not look is reported missing rather than counted present.
+say "loader resolution (every ELF we ship, against the overlay + $BASE)"
+go run ./scripts/local/elfneeded --resolve \
+  --rootfs "$ROOTFS" \
+  --base-tar "$STAGE/base.tar" \
+  --ld-library-path usr/local/lib \
+  || die "an ELF in the image needs a library the image does not carry"
+rm -f "$STAGE/base.tar"
 
 say "packing layers"
 layer 10-runtime    0     etc/passwd etc/group usr/lib/x86_64-linux-gnu
