@@ -285,10 +285,31 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 				`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
 			etsiModel := etsi.GetMeta(ctx, "embedding_model")
 			mainModel := db.GetMeta(ctx, "embedding_model")
-			ok := withText > 0 && vectors == withText && etsiModel != "" && etsiModel == mainModel
+			// AND THE INDEX, asked the way the server asks it.
+			//
+			// Vectors plus a matching identity are not enough to make the ETSI half
+			// answer semantically: internal/mcp calls LoadVSS per store, and LoadVSS
+			// refuses an index whose schema_meta.embedding_count disagrees with the
+			// vectors actually present. Measured on the 2026-09-01 corpus: 510 384
+			// vectors, identity equal to the 3GPP one, and embedding_count still
+			// reading 1042 from the era when the ETSI half held fourteen
+			// deliverables — because `index-etsi` had been recorded VALID in 1.3s,
+			// hnsw_state already saying "frozen" about the index of the small
+			// corpus. Every condition this gate checked was true, and the shipped
+			// image would have exact-scanned or fallen back to BM25 on half its
+			// content, silently. That is the same class of hole require-hnsw was
+			// widened to close, on the store no gate was asking about.
+			vssErr := etsi.LoadVSS(ctx)
+			serveUsable := vssErr == nil && etsi.VSSAvailable()
+			ok := withText > 0 && vectors == withText && etsiModel != "" && etsiModel == mainModel && serveUsable
+			why := "serve_usable=true"
+			if !serveUsable {
+				why = fmt.Sprintf("the server would REFUSE the ETSI index: %v", vssErr)
+			}
 			res.add("require-etsi", ok,
-				"clauses_with_text=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q)",
-				withText, vectors, withText-vectors, etsiModel, mainModel)
+				"clauses_with_text=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q) hnsw_state=%q %s",
+				withText, vectors, withText-vectors, etsiModel, mainModel,
+				etsi.GetMeta(ctx, "hnsw_state"), why)
 			_ = etsi.Close()
 		}
 	}
