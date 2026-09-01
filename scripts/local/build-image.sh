@@ -379,12 +379,39 @@ if [ "$PUSH" = 0 ]; then
   exit 0
 fi
 
+# RETRY THE PUSH. This moves ~25 GB (two DuckDB corpora plus 6.4 GB of models),
+# over a link this build does not control, in one shot — and a single transient
+# error would otherwise throw all of it away and leave :latest pointing at the
+# previous image with no sign that anything was attempted.
+#
+# Retrying is cheap and safe, and that is a property of two earlier decisions
+# rather than an assumption: the registry dedupes by digest, and imgtar stamps a
+# FIXED timestamp on every member, so re-packing the same tree yields the same
+# sha256 (verified: two packs with the files touched between them gave one
+# digest). A second attempt therefore re-checks the blobs already stored and
+# uploads only what is missing.
+push_retry() {
+  local attempt=1 max="${IMAGE_PUSH_ATTEMPTS:-4}" delay=20
+  while :; do
+    if "$@"; then return 0; fi
+    if [ "$attempt" -ge "$max" ]; then return 1; fi
+    say "push attempt $attempt/$max failed — retrying in ${delay}s (stored blobs are skipped by digest)"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
 say "appending onto $BASE and pushing $TAG"
-"$CRANE" append --platform linux/amd64 -b "$BASE" "${LAYER_ARGS[@]}" -t "$TAG"
+push_retry "$CRANE" append --platform linux/amd64 -b "$BASE" "${LAYER_ARGS[@]}" -t "$TAG" \
+  || die "crane append failed after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — nothing was published"
 
 say "setting the image config"
 DIGEST="$("$CRANE" digest "$TAG")"
-"$CRANE" mutate "$TAG" -t "$TAG" \
+# The config mutation is a manifest write, not a blob upload, but it lands on the
+# same link — and a tag left carrying layers with no entrypoint is worse than one
+# that was never moved.
+push_retry "$CRANE" mutate "$TAG" -t "$TAG" \
   --entrypoint docker-entrypoint.sh \
   --cmd serve \
   --user 10001:10001 \
@@ -399,7 +426,8 @@ DIGEST="$("$CRANE" digest "$TAG")"
   -l org.opencontainers.image.source=https://github.com/kodflow/3gpp-mcp \
   -l org.opencontainers.image.version="$VERSION" \
   -l io.kodflow.3gpp.built=local \
-  >/dev/null
+  >/dev/null \
+  || die "crane mutate failed after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — the tag carries layers but no config"
 
 say "published $TAG"
 echo "  base   $BASE (appended, $DIGEST before config)"
