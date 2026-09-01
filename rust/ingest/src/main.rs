@@ -289,6 +289,28 @@ fn main() -> Result<()> {
             .context("--etsi requires --convert <dir>")?;
         let mut specs = 0usize;
         let mut clauses = 0usize;
+
+        // THE TABLE BEING APPENDED TO CARRIES A VECTOR INDEX, AND DUCKDB MAINTAINS
+        // IT ROW BY ROW.
+        //
+        // `ingest --etsi` IS the publish step on this side — there is no merge — so
+        // it writes straight into the file that gets served, and that file already
+        // carries clauses_hnsw plus three ART indexes from the previous run.
+        //
+        // Measured 2026-09-01 on the all-versions ingest: 174 287 new clauses took
+        // data/etsi.duckdb from 8.0 GiB to 101.8 GiB, about 560 KB of file per row,
+        // and still accelerating when it was stopped. It could not have finished on
+        // any disk here. The first ETSI ingest never showed it because the index then
+        // covered 1 042 vectors rather than 510 384.
+        //
+        // The ART indexes come back below, over settled data. The vector index does
+        // not: rebuilding it needs the embedding identity to stamp, which is
+        // freeze-hnsw's job (the `index-etsi` step), and drop_clause_indexes sets
+        // hnsw_state to "building" so nothing serves a graph that is no longer there.
+        store
+            .drop_clause_indexes()
+            .context("drop clause indexes before the ETSI bulk load")?;
+
         for f in collect_html_recursive(convert)? {
             if args.resume {
                 if let Some(m) = std::fs::read_to_string(&f)
@@ -311,6 +333,10 @@ fn main() -> Result<()> {
             }
         }
         eprintln!("ingest: ETSI → {specs} spec(s), {clauses} clause(s)");
+        eprintln!("ingest: rebuilding the clause indexes over settled data…");
+        store
+            .create_clause_indexes()
+            .context("rebuild clause indexes after the ETSI bulk load")?;
         store.set_meta("producer", "rust-writeside")?;
         store.set_meta("schema_version", "1")?;
         store.checkpoint()?;
