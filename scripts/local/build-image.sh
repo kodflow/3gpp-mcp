@@ -246,8 +246,19 @@ if [ "$WITH_CORPUS" = 1 ]; then
                       bash scripts/data-contract.sh)" \
       || die "scripts/data-contract.sh refused DATA_CONTRACT=${DATA_CONTRACT:-dense}"
     say "corpus contract (${DATA_CONTRACT:-dense}): $CONTRACT_FLAGS"
+    # THE GATE MUST RESOLVE THE SPARSE IDENTITY, OR --require-sparse CHECKS NOTHING.
+    #
+    # cmd/validate compares schema_meta.sparse_model against embed.SparseModelID(),
+    # which reads the ACTIVE registry entry — and the default one is bge-m3, which
+    # is dense-only, so it returned "" and the comparison used to be skipped. This
+    # call sat BEFORE the EMBED_MODELS_CONFIG export below, so the one check written
+    # to catch a sparse layer built by another model was inert in the only place it
+    # mattered. Measured: `embedid --sparse` prints nothing by default and
+    # b13103bce7ae under EMBED_MODEL=bge-m3-sparse, while the DENSE identity stays
+    # 38067f8c6efe under both — so selecting the dual-head entry costs nothing and
+    # names the model the image actually bakes.
     # shellcheck disable=SC2086 # intentional word-split: the contract is a flag list
-    "$VALIDATE" --db data/3gpp.duckdb --report text $CONTRACT_FLAGS \
+    EMBED_MODEL=bge-m3-sparse "$VALIDATE" --db data/3gpp.duckdb --report text $CONTRACT_FLAGS \
       || die "the corpus does not satisfy its own contract — refusing to bake it"
   else
     say "WARNING: validate is not built; baking WITHOUT the contract check"

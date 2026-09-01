@@ -248,10 +248,33 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	// sparse-enabled bake; off by default (dense-only DBs pass).
 	if cfg.requireSparse {
 		_ = db.LoadSparse(ctx)
-		want := embed.SparseModelID() // "" when this build has no sparse head
+		want := embed.SparseModelID() // "" when the ACTIVE registry model has no sparse head
 		got := db.GetMeta(ctx, "sparse_model")
-		ok := db.SparseAvailable() && (want == "" || got == want)
-		res.add("require-sparse", ok, "sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
+		switch {
+		case want == "":
+			// A GATE THAT CANNOT COMPARE MUST NOT REPORT GREEN.
+			//
+			// `want == "" ||` used to make the identity comparison optional, and the
+			// default registry entry is bge-m3, which is DENSE-ONLY — so
+			// SparseModelID() returned "" and --require-sparse collapsed to
+			// "clause_sparse has at least one row". Measured: `embedid --sparse` prints
+			// nothing under the default registry and b13103bce7ae under
+			// EMBED_MODEL=bge-m3-sparse. build-image.sh called this before it exported
+			// the baked registry, so the one check written to catch a STALE sparse
+			// layer — postings scored against another model's vocabulary, which fails
+			// silently at serve time — was inert in the only place it mattered.
+			//
+			// Selecting the dual-head entry does not move the dense identity
+			// (38067f8c6efe under both), so pointing the gate at it costs nothing.
+			res.add("require-sparse", false,
+				"sparse_available=%v sparse_model=%q but THIS BUILD resolves no sparse identity "+
+					"(the active registry model has no sparse head) — the layer cannot be checked; "+
+					"set EMBED_MODEL=bge-m3-sparse or EMBED_MODELS_CONFIG to the baked registry",
+				db.SparseAvailable(), got)
+		default:
+			res.add("require-sparse", db.SparseAvailable() && got == want,
+				"sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
+		}
 	}
 
 	// require-etsi — the OTHER half of the corpus, which the image serves beside

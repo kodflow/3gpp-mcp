@@ -104,9 +104,15 @@ func checkData(args []string) error {
 	sparseOK, sparseModel, wantSparse := true, "", ""
 	if *requireSparse {
 		_ = st.LoadSparse(ctx)
-		wantSparse = embed.SparseModelID() // "" when this build has no sparse head
+		// "" when the ACTIVE registry model has no sparse head — which the default
+		// entry (bge-m3, dense-only) does not. Treating that as "skip the identity
+		// comparison" left --require-sparse meaning nothing more than "clause_sparse
+		// is non-empty", so a layer scored against another model's vocabulary passed.
+		// A gate that cannot compare must fail, not pass; see cmd/validate for the
+		// measurement.
+		wantSparse = embed.SparseModelID()
 		sparseModel = st.GetMeta(ctx, "sparse_model")
-		sparseOK = st.SparseAvailable() && (wantSparse == "" || sparseModel == wantSparse)
+		sparseOK = wantSparse != "" && st.SparseAvailable() && sparseModel == wantSparse
 	}
 
 	// Report the full picture first (so a failing build log shows every signal at
@@ -128,6 +134,12 @@ func checkData(args []string) error {
 			"the embed campaign has not converged; do not promote this data layer", nullAtFloor, *embedFloor)
 	}
 	if *requireSparse && !sparseOK {
+		if wantSparse == "" {
+			return fmt.Errorf("--require-sparse was asked of a build that resolves NO sparse identity "+
+				"(the active registry model has no sparse head): sparse_available=%v sparse_model=%q. "+
+				"The layer cannot be checked — set EMBED_MODEL=bge-m3-sparse or point "+
+				"EMBED_MODELS_CONFIG at the baked registry", st.SparseAvailable(), sparseModel)
+		}
 		return fmt.Errorf("sparse incomplete/stale: sparse_available=%v sparse_model=%q expected=%q — "+
 			"run the sparse campaign to convergence before promoting", st.SparseAvailable(), sparseModel, wantSparse)
 	}
