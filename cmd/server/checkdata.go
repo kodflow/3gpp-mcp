@@ -153,9 +153,18 @@ func checkData(args []string) error {
 			`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
 		etsiModel := etsi.GetMeta(ctx, "embedding_model")
 		mainModel := st.GetMeta(ctx, "embedding_model")
+		// The index, asked the way the server asks it. LoadVSS is what
+		// internal/mcp calls per store, and it refuses an index whose
+		// schema_meta.embedding_count disagrees with the vectors present — the
+		// state a widened ETSI crawl leaves behind when `index-etsi` was recorded
+		// VALID against the old, small corpus. Vectors and a matching identity are
+		// both true in that state; the half is still served lexically.
+		vssErr := etsi.LoadVSS(ctx)
+		serveUsable := vssErr == nil && etsi.VSSAvailable()
+		etsiHNSW := etsi.GetMeta(ctx, "hnsw_state")
 		_ = etsi.Close()
-		fmt.Printf("check-data: etsi=%s clauses_with_text=%d vectors=%d embedding_model=%q\n",
-			*requireETSI, withText, vectors, etsiModel)
+		fmt.Printf("check-data: etsi=%s clauses_with_text=%d vectors=%d embedding_model=%q hnsw_state=%q serve_usable=%v\n",
+			*requireETSI, withText, vectors, etsiModel, etsiHNSW, serveUsable)
 		switch {
 		case withText == 0:
 			return fmt.Errorf("the ETSI corpus %s holds no clause with any text", *requireETSI)
@@ -173,6 +182,10 @@ func checkData(args []string) error {
 			return fmt.Errorf("the ETSI corpus was embedded with %q but the 3GPP one with %q — "+
 				"the serve-time coherence guard would disable vector search on the ETSI half and answer it lexically, silently",
 				etsiModel, mainModel)
+		case !serveUsable:
+			return fmt.Errorf("the ETSI corpus carries %d vector(s) the server cannot use (hnsw_state=%q): %v — "+
+				"rebuild the ETSI index (goal run -only compact,index-etsi) before promoting",
+				vectors, etsiHNSW, vssErr)
 		}
 	}
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
