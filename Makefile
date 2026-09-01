@@ -9,7 +9,7 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-bin plan steps status publish build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+.PHONY: all build build-bin plan steps status publish prove build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build EVERYTHING (the corpus pipeline)
 
@@ -77,6 +77,9 @@ image-local: ## Same, assembled into .local/image/image.tar without pushing
 
 image-toolchain: ## Fetch the Linux cross-toolchain the image build needs (zig + Debian libstdc++)
 	./scripts/local/fetch-linux-toolchain.sh
+
+prove: ## Drive server-full over real JSON-RPC and assert every retrieval arm is live on BOTH halves
+	./scripts/local/prove-serving.sh
 
 build-bin: ## Build the server binary alone into bin/ (no corpus)
 	@mkdir -p $(BUILD_DIR)
