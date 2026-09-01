@@ -83,5 +83,44 @@ else
 	pass "no GNU-only mktemp --suffix in $SCRIPT"
 fi
 
+# 6. A LOST RENAME MUST BE RETRIED, NOT FATAL.
+#
+#    Measured 2026-09-01 with four shards crawling into one temp directory:
+#    "mv: can't rename '…/Temp/tmp.a07236': Permission denied". A Windows file
+#    lock holds the new file for a moment; under `set -e` that one lost rename
+#    ended the shard after 183 of 2 955 deliverables, and it sat dead for an hour
+#    while the other three ran on — because a dead shard and a slow one look
+#    identical from the outside.
+#
+#    The lock is transient, so the helper retries. Proving that needs the rename
+#    to FAIL first, which a real temp directory will not do on demand: a shell
+#    function named `mv` is found before the PATH, so it can fail exactly twice
+#    and then hand over to the real one. Testing the property, not the weather.
+mv_count_file="$(command mktemp)"
+echo 0 >"$mv_count_file"
+mv() {
+	local n
+	n=$(($(cat "$mv_count_file") + 1))
+	echo "$n" >"$mv_count_file"
+	if [ "$n" -le 2 ]; then
+		echo "mv: can't rename '$1': Permission denied" >&2
+		return 1
+	fi
+	command mv "$@"
+}
+export mv_count_file
+if p6="$(tmpfile_ext pdf)" && [ -f "$p6" ]; then
+	attempts="$(cat "$mv_count_file")"
+	if [ "$attempts" -ge 3 ]; then
+		pass "a lost rename is retried ($attempts attempts) instead of ending the run"
+	else
+		fail "the rename succeeded in $attempts attempt(s) — the stub did not take effect"
+	fi
+else
+	fail "tmpfile_ext gave up after a transient rename failure — one file lock ends the whole crawl"
+fi
+unset -f mv
+rm -f "$mv_count_file"
+
 [ "$fails" -eq 0 ] || { echo "$fails failure(s)"; exit 1; }
 echo "all good"
