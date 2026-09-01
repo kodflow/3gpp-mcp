@@ -537,11 +537,14 @@ func sha256File(path string) (string, error) {
 // exact opposite of the build steps, and the reason ExcludeTests exists.
 func stepTest() *Step {
 	return &Step{
-		Name:      "test",
-		Version:   1,
-		Doc:       "run the Go unit and contract suites, and the shell tests",
-		Deps:      []string{"build-go"},
-		Impl:      []string{"cmd", "internal", "go.mod", "go.sum", "scripts"},
+		Name:    "test",
+		Version: 2,
+		Doc:     "run the Go unit and contract suites, the Rust workspace suite, and the shell tests",
+		Deps:    []string{"build-go"},
+		// `rust` joins the fingerprint because the step now runs the Rust suite:
+		// without it, editing rust/store would leave this step reporting SKIP, which
+		// is how the Rust tests came to be written and never run in the first place.
+		Impl:      []string{"cmd", "internal", "go.mod", "go.sum", "scripts", "rust"},
 		Toolchain: true,
 		Outputs:   func(c *Ctx) []string { return []string{c.statePath("test-report.txt")} },
 		Run: func(c *Ctx) error {
@@ -553,6 +556,27 @@ func stepTest() *Step {
 			if err := c.Run(Cmd{Name: "go", Args: args, Echo: true}); err != nil {
 				return err
 			}
+			// THE RUST SUITE, WHICH NOTHING RAN.
+			//
+			// This step checked Go and the shell scripts; scripts/rust-fmt_test.sh
+			// checked Rust FORMATTING. Nothing ran `cargo test`. So every test in
+			// rust/store — the ones guarding the code that REWRITES THE CORPUS, which
+			// are the highest-stakes tests here — existed and was invisible unless
+			// somebody typed the command by hand. That is exactly the failure
+			// runShellTests was written to end, one language over.
+			//
+			// The workspace is the right scope, and it is the project's OWN
+			// definition of the core: rust/Cargo.toml lists store, parse, ingest and
+			// identity, excluding embedder, embed-core and discover on purpose (heavy
+			// ort/CUDA toolchain, a cdylib, a CI-matrix tool). What is left is
+			// precisely the DuckDB write side. rust-fmt_test.sh still covers the
+			// excluded three for formatting, so nothing loses a check.
+			c.Log.Printf("cargo test --release --workspace (rust/)")
+			if err := c.Run(Cmd{Name: "cargo", Args: []string{
+				"test", "--release", "--manifest-path", "rust/Cargo.toml", "--workspace",
+			}, Echo: true}); err != nil {
+				return err
+			}
 			shells, err := runShellTests(c)
 			if err != nil {
 				return err
@@ -560,7 +584,7 @@ func stepTest() *Step {
 			// Keep the evidence on disk: the final report cites this file rather
 			// than asking the reader to take "tests passed" on trust.
 			return WriteAtomic(c.statePath("test-report.txt"),
-				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n%d shell test(s): PASS\n",
+				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\ncargo test --release --workspace : PASS\n%d shell test(s): PASS\n",
 					os.Getenv("GOTAGS"), shells)))
 		},
 	}
