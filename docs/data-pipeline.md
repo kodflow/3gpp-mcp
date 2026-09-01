@@ -69,8 +69,9 @@ tag plus a rolling `:latest`.
 
 The corpus never enters git or a Release as raw files. Models stay on
 HuggingFace (`model.onnx_data` is 2.2 GB — over the 2 GB Release-asset cap
-anyway). The corpus does not fit either — 29.2 GB in one layer against a 2 GB
-cap — which is the second, independent reason it travels as an OCI layer.
+anyway). The corpus does not fit either — 29.2 GB in one layer, 15.9 GiB once
+gzipped, against a 2 GB cap — which is the second, independent reason it travels
+as an OCI layer.
 
 ## Workflows — there is one left
 

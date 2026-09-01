@@ -54,9 +54,9 @@ It needs data it does not ship, downloaded once into a per-user cache
 
 | Artifact | Size | Source | Needed for |
 |---|---|---|---|
-| `3gpp.duckdb` (indexed corpus) | **21.2 GB** | **private GHCR package** | always |
+| `3gpp.duckdb` (indexed corpus) | **21.2 GB** (15.9 GiB gzipped in the image) | **private GHCR package** | always |
 | `etsi.duckdb` (ETSI: 5 117 TS/TR/EN deliverables, not just the LI suite) | **8.0 GB** | private GHCR package | ETSI deliverables (`--etsi`) |
-| BGE-M3 (dense + sparse heads) + reranker + ONNX Runtime | **6.4 GB** | HuggingFace + ORT release | semantic search only |
+| BGE-M3 (dense + sparse heads) + reranker + ONNX Runtime | **6.4 GB** (4.0 GiB gzipped) | HuggingFace + ORT release | semantic search only |
 
 ## Why the corpus needs a credential
 
