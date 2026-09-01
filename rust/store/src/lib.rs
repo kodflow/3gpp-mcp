@@ -889,7 +889,6 @@ impl Store {
         Ok(())
     }
 
-
     /// set_sparse_many writes MANY clauses' postings in ONE transaction.
     ///
     /// set_sparse above is correct and, at corpus scale, unusable: it opens its own
@@ -932,7 +931,9 @@ impl Store {
     /// create_sparse_term_index rebuilds what drop_sparse_term_index removed.
     pub fn create_sparse_term_index(&self) -> Result<()> {
         self.conn
-            .execute_batch("CREATE INDEX IF NOT EXISTS clause_sparse_term ON clause_sparse (term_id);")
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS clause_sparse_term ON clause_sparse (term_id);",
+            )
             .context("create clause_sparse_term")?;
         Ok(())
     }
