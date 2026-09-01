@@ -82,7 +82,7 @@ func Pipeline() []*Step {
 		stepMerge(),
 		stepEmbed(corpus3GPP()),
 		stepEnrich(),
-		stepParagraphs(),
+		stepParagraphs(corpus3GPP()),
 		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
 		// does not carry custom indexes), so both sit between the conversion and the
 		// freeze rather than after it.
@@ -97,6 +97,13 @@ func Pipeline() []*Step {
 		stepDiscoverETSI(),
 		stepCorpusETSI(),
 		stepEmbed(corpusETSI()),
+		// The ETSI half gets the content-addressed conversion too. Without it
+		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
+		// clauses, which was harmless only while ETSI held one version per
+		// deliverable; with every published version in the corpus it is the
+		// "CHECK_IMEI" failure — a result window filled by one clause seen from a
+		// dozen versions, and the deliverable that answers never in it.
+		stepParagraphs(corpusETSI()),
 		stepSparse(corpusETSI()),
 		stepIndex(corpusETSI()),
 		stepSmoke(),
