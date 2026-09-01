@@ -19,6 +19,7 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/registry"
 	"github.com/kodflow/3gpp-mcp/internal/releaseview"
+	"github.com/kodflow/3gpp-mcp/internal/rerank"
 	"github.com/kodflow/3gpp-mcp/internal/search"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subject"
@@ -273,6 +274,7 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 		"sparse_reason":          sparseReason,
 		"sparse_model":           h.st.GetMeta(ctx, "sparse_model"),
 		"reranker":               h.eng.RerankerEnabled(),
+		"reranker_reason":        rerankReason(h.eng.RerankerEnabled()),
 		"embedding_model_db":     dbModel,
 		"embedding_model_client": clientModel,
 		"embed_floor":            h.st.GetMeta(ctx, "embed_floor"),
@@ -938,4 +940,19 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 	default:
 		return search.RRF(60, lists...), nil
 	}
+}
+
+// rerankReason mirrors sparse_reason: an arm reported as false must say why.
+//
+// Every failure path in the ONNX reranker returns Disabled{} — that is correct,
+// a retrieval arm degrades rather than stopping the server — but it left
+// "reranker": false with nothing to act on. Measured on this machine: false,
+// with model.onnx and tokenizer.json both on disk and the EMBEDDER live on the
+// same ONNX runtime, which rules out the two guesses an operator would make
+// first.
+func rerankReason(enabled bool) string {
+	if enabled {
+		return ""
+	}
+	return rerank.Reason()
 }
