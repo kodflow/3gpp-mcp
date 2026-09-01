@@ -151,6 +151,22 @@ impl Store {
     /// connection, so neither catalog name has to be guessed from a file stem — "3gpp.
     /// duckdb.new" does not yield an identifier anyone should have to predict.
     pub fn copy_database_compact(src: &str, dst: &str) -> Result<()> {
+        // The step is a PARAMETER rather than only an env read so the chunking can be
+        // exercised by a test without set_var: Rust runs tests in parallel threads and
+        // the process environment is shared, so a test that set MERGE_COPY_ROW_STEP
+        // would be racing the two other compact tests rather than testing anything.
+        let step: i64 = std::env::var("MERGE_COPY_ROW_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(20_000_000);
+        Self::copy_database_compact_step(src, dst, step)
+    }
+
+    /// copy_database_compact_step is copy_database_compact with an explicit row step.
+    /// See the range-copy comment below for why the step exists at all.
+    pub fn copy_database_compact_step(src: &str, dst: &str, step: i64) -> Result<()> {
+        let step = if step > 0 { step } else { 20_000_000 };
         let conn = Connection::open_in_memory().context("scratch connection")?;
         // The source carries an HNSW index; without vss its catalog cannot even be bound.
         // Best-effort, exactly as open_rw does it.
@@ -227,13 +243,54 @@ impl Store {
                 let rows = st.query_map([], |r| r.get::<_, String>(0))?;
                 rows.filter_map(std::result::Result::ok).collect()
             };
+            // ONE STATEMENT PER TABLE IS ONE TRANSACTION, AND THAT DOES NOT SCALE.
+            //
+            // `INSERT … SELECT` over a whole table commits once, and DuckDB cannot
+            // spill at COMMIT — temp_directory buys nothing there. It held while
+            // clause_sparse was empty. With both halves of the corpus carrying a
+            // learned-lexical layer it is ~265 MILLION rows, and the copy died:
+            //
+            //   copy table clause_sparse
+            //   TransactionContext Error: Failed to commit: failed to allocate data
+            //   of size 64.0 KiB (11.1 GiB/11.1 GiB used)
+            //
+            // against the 12 GB cap above. Raising the cap only moves the wall — the
+            // transaction grows with the table, and the machine does not.
+            //
+            // So copy in ROWID RANGES. Each statement is its own transaction, so peak
+            // memory is bounded by the step rather than by the table, and the step is
+            // the same code path for a 12-row table (one iteration) and a 265-million
+            // row one. rowid is a DuckDB pseudocolumn on base tables, and
+            // duckdb_tables() lists only base tables, so every name here has one.
+            //
+            // Deletions leave rowid gaps; a range that matches nothing simply inserts
+            // nothing. Correctness does not depend on the rows being dense, only on
+            // the ranges covering [0, max].
             for t in &tables {
-                // Column order is identical — both sides were bootstrapped from the same
-                // schema.sql — so SELECT * is the right shape, not a shortcut.
-                conn.execute_batch(&format!(
-                    "INSERT INTO copy_dst.main.\"{t}\" SELECT * FROM copy_src.main.\"{t}\";"
-                ))
-                .with_context(|| format!("copy table {t}"))?;
+                // max(rowid) is NULL on an empty table, hence Option.
+                let max_rowid: Option<i64> = conn
+                    .query_row(
+                        &format!("SELECT max(rowid) FROM copy_src.main.\"{t}\""),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .with_context(|| format!("max rowid of {t}"))?;
+                let Some(max_rowid) = max_rowid else {
+                    continue; // empty table: nothing to carry
+                };
+                let mut lo: i64 = 0;
+                while lo <= max_rowid {
+                    let hi = lo.saturating_add(step);
+                    // Column order is identical — both sides were bootstrapped from the
+                    // same schema.sql — so SELECT * is the right shape, not a shortcut.
+                    conn.execute_batch(&format!(
+                        "INSERT INTO copy_dst.main.\"{t}\"
+                           SELECT * FROM copy_src.main.\"{t}\"
+                            WHERE rowid >= {lo} AND rowid < {hi};"
+                    ))
+                    .with_context(|| format!("copy table {t} rows [{lo},{hi})"))?;
+                    lo = hi;
+                }
             }
             conn.execute_batch("DETACH copy_dst; DETACH copy_src;")?;
             Ok(())
@@ -2509,6 +2566,78 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A whole-table `INSERT … SELECT` is ONE transaction, and DuckDB cannot spill at
+    /// COMMIT. That held while clause_sparse was empty; with both halves of the corpus
+    /// carrying a learned-lexical layer it is ~265 million rows and the copy died with
+    /// "Failed to commit: failed to allocate data of size 64.0 KiB (11.1 GiB/11.1 GiB
+    /// used)" against a 12 GB cap. Raising the cap only moves the wall.
+    ///
+    /// The copy therefore walks rowid ranges, one transaction each. This pins that the
+    /// ranges COVER the table: with a step far smaller than the row count the result
+    /// must still be every row, exactly once — no gap at a boundary, no row copied
+    /// twice by overlapping ranges. Run with step 1 as well, the degenerate case.
+    #[test]
+    fn the_compact_copy_walks_rowid_ranges_without_losing_or_duplicating_a_row() {
+        for step in [1_i64, 7, 1000] {
+            let dir =
+                std::env::temp_dir().join(format!("storers-chunk-{}-{step}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("src.duckdb");
+            let dst = dir.join("dst.duckdb");
+            for p in [&src, &dst] {
+                let _ = std::fs::remove_file(p);
+            }
+            let srcs = src.to_str().unwrap().to_string();
+            let dsts = dst.to_str().unwrap().to_string();
+
+            {
+                let s = Store::open_rw(&srcs).unwrap();
+                s.raw()
+                    .execute_batch(
+                        "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                         INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                           SELECT i, '23.501', 'Rel-19', 'h' || i, 't' || i
+                           FROM range(53) t(i);",
+                    )
+                    .unwrap();
+                s.checkpoint().unwrap();
+            }
+
+            Store::copy_database_compact_step(&srcs, &dsts, step).unwrap();
+
+            let d = Store::open_rw(&dsts).unwrap();
+            let n: i64 = d
+                .raw()
+                .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                n, 53,
+                "step {step}: every row must make the trip exactly once"
+            );
+            let distinct: i64 = d
+                .raw()
+                .query_row("SELECT count(DISTINCT chunk_id) FROM clauses", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                distinct, 53,
+                "step {step}: overlapping ranges would duplicate rows"
+            );
+            let sum: i64 = d
+                .raw()
+                .query_row("SELECT coalesce(sum(chunk_id),0) FROM clauses", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                sum,
+                (0..53).sum::<i64>(),
+                "step {step}: a gap would change the sum"
+            );
+        }
     }
 
     // The base copy must RECLAIM, not clone.
