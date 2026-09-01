@@ -28,7 +28,15 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: elfneeded <file> [--require-sonames]")
+		fmt.Fprintln(os.Stderr, "       elfneeded --resolve --rootfs <dir> [--base-tar <tar>] [--ld-library-path <dirs>]")
 		os.Exit(2)
+	}
+	// --resolve asks the OTHER half of the question: not "is this NEEDED entry a
+	// name rather than a build path", but "is there a file of that name anywhere
+	// the container will look". See resolve.go.
+	if os.Args[1] == "--resolve" {
+		resolveMode(os.Args[2:])
+		return
 	}
 	path := os.Args[1]
 	strict := false
