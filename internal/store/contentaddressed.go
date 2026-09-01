@@ -382,7 +382,7 @@ func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.Sea
 			SELECT sc.sc, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
 			       o.is_normative, o.body_id, b.heading,
 			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
-			                          ORDER BY sc.sc DESC, o.version DESC) AS rn
+			                          ORDER BY sc.sc DESC, ` + versionRecencySQL("o.version") + `) AS rn
 			FROM scored sc
 			JOIN clause_occ o USING (body_id)
 			JOIN bodies b USING (body_id)
@@ -473,7 +473,7 @@ func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter
 			SELECT n.dist, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
 			       o.is_normative, o.body_id, b.heading,
 			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
-			                          ORDER BY n.dist ASC, o.version DESC) AS rn
+			                          ORDER BY n.dist ASC, ` + versionRecencySQL("o.version") + `) AS rn
 			FROM near n
 			JOIN clause_occ o USING (body_id)
 			JOIN bodies b USING (body_id)
