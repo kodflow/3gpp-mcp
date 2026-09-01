@@ -38,10 +38,32 @@ retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; sl
 # The extension is not cosmetic here: convert_pdf dispatches on it, and pdftotext
 # refuses a file it cannot recognise. Make the name ourselves and stay portable.
 tmpfile_ext() {
-	local t
+	local t n
 	t="$(mktemp)" || return 1
-	mv "$t" "$t.$1" || { rm -f "$t"; return 1; }
-	printf '%s\n' "$t.$1"
+	# THE RENAME IS RETRIED, BECAUSE LOSING IT ONCE KILLS THE WHOLE RUN.
+	#
+	# Measured 2026-09-01 with four shards crawling into one temp directory:
+	#
+	#   mv: can't rename '…/Temp/tmp.a07236': Permission denied
+	#
+	# A Windows file lock (indexer, scanner, the other shard's mktemp) holds the
+	# new file for a moment. The script runs under `set -e`, so that one lost
+	# rename ended the shard — after 183 of 2 955 deliverables, and it then sat
+	# dead for an hour while the other three ran on, because a dead shard and a
+	# slow one look identical from the outside.
+	#
+	# The lock is transient by nature, so a few backed-off attempts cost nothing
+	# and remove a whole class of run-ending failure. Giving up still returns 1,
+	# so a genuinely unwritable temp directory is still fatal rather than silent.
+	for n in 1 2 3 4 5; do
+		if mv "$t" "$t.$1" 2>/dev/null; then
+			printf '%s\n' "$t.$1"
+			return 0
+		fi
+		sleep "$n"
+	done
+	rm -f "$t"
+	return 1
 }
 
 # Binaries: supplied by the caller, or built here as a fallback.
