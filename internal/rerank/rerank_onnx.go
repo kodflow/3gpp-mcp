@@ -51,14 +51,26 @@ func newReranker() Reranker {
 	dir := envOr("BGE_RERANKER_DIR", "data/models/bge-reranker-v2-m3")
 	modelPath := filepath.Join(dir, "model.onnx")
 	tokPath := filepath.Join(dir, "tokenizer.json")
-	if !fileExists(onnxrt.LibPath()) || !fileExists(modelPath) || !fileExists(tokPath) {
-		return Disabled{}
+	// SAY WHICH FILE IS MISSING. All three absences used to collapse into one
+	// silent Disabled{}, so "reranker": false on a box whose model is on disk and
+	// whose embedder shares the same runtime told the operator nothing.
+	for _, m := range []struct{ what, path string }{
+		{"the ONNX runtime library", onnxrt.LibPath()},
+		{"model.onnx", modelPath},
+		{"tokenizer.json", tokPath},
+	} {
+		if !fileExists(m.path) {
+			reason = m.what + " is missing at " + m.path + " (BGE_RERANKER_DIR=" + dir + ")"
+			return Disabled{}
+		}
 	}
 	tok, err := pretrained.FromFile(tokPath)
 	if err != nil {
+		reason = "tokenizer.json would not load: " + err.Error()
 		return Disabled{}
 	}
 	if err := onnxrt.Init(); err != nil {
+		reason = "the ONNX runtime would not initialise: " + err.Error()
 		return Disabled{}
 	}
 	// Override ORT's default ENABLE_ALL with ENABLE_BASIC: the extended
@@ -68,15 +80,18 @@ func newReranker() Reranker {
 	// extended fusion, so the reranker session loads instead of degrading to off.
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
+		reason = "ORT session options: " + err.Error()
 		return Disabled{}
 	}
 	defer func() { _ = opts.Destroy() }()
 	if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableBasic); err != nil {
+		reason = "ORT optimisation level: " + err.Error()
 		return Disabled{}
 	}
 	sess, err := ort.NewDynamicAdvancedSession(modelPath,
 		[]string{"input_ids", "attention_mask"}, []string{"logits"}, opts)
 	if err != nil {
+		reason = "the cross-encoder session would not build: " + err.Error()
 		return Disabled{}
 	}
 	return &onnxReranker{tok: tok, session: sess}

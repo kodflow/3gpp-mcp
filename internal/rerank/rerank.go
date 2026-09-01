@@ -63,12 +63,35 @@ func (Lexical) Score(_ context.Context, query string, passages []string) ([]floa
 func New() Reranker {
 	switch strings.ToLower(os.Getenv("RERANKER")) {
 	case "lexical":
+		reason = ""
 		return Lexical{}
 	case "off", "none", "disabled":
+		reason = "turned off by RERANKER"
 		return Disabled{}
 	}
-	return newReranker()
+	reason = ""
+	r := newReranker()
+	if !r.Enabled() && reason == "" {
+		reason = "unavailable, and the backend did not say why"
+	}
+	return r
 }
+
+// reason records WHY the cross-encoder is off. Written by New/newReranker at
+// startup and read afterwards, so no lock: the server builds one reranker before
+// it serves anything.
+var reason string
+
+// Reason explains why Enabled() is false, and is empty when the arm is live.
+//
+// Every failure path in the ONNX backend returns Disabled{} — missing runtime,
+// missing model, a tokenizer that will not parse, a session that will not build —
+// and that is the right behaviour: a retrieval arm degrades, it does not stop the
+// server. But it left `"reranker": false` in server_info with nothing to act on,
+// on a machine where the model is on disk and the embedder using the same runtime
+// is live. The sparse arm already reports sparse_reason for exactly this;
+// reranking is the arm that had no such answer.
+func Reason() string { return reason }
 
 func tokenSet(s string) map[string]bool {
 	m := map[string]bool{}
