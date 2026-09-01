@@ -1393,6 +1393,26 @@ func stepCompact() *Step {
 
 // -------------------------------------------------- serveur sémantique
 
+// ldflagsWith puts `-L<dir>` in front of whatever CGO_LDFLAGS the caller already
+// exported, instead of replacing it.
+//
+// Ctx.Run appends Cmd.Env to os.Environ(), and a later duplicate key wins — so a
+// step that sets CGO_LDFLAGS silently discards the one the environment supplied.
+// This build needs BOTH: -L<cargo target>/release for the embed-core cdylib, and
+// the -L<.local/toolchain/duckdb> that scripts/local/toolchain-env.sh exports
+// because the Windows build links duckdb_use_lib against a supplied libduckdb
+// rather than the embedded archive. Dropping the second failed the link with
+// "ld.exe: cannot find -lduckdb" every single time, which is why this step's
+// recorded state was "never run": it is Optional and the finish chain calls it
+// with `|| echo`, so nothing ever stopped and nobody had to look.
+func ldflagsWith(dir string) string {
+	own := "-L" + dir
+	if prev := strings.TrimSpace(os.Getenv("CGO_LDFLAGS")); prev != "" {
+		return prev + " " + own
+	}
+	return own
+}
+
 // stepBuildServe builds the server binary that can actually answer semantically,
 // and stages the DLLs it needs beside it.
 //
@@ -1443,9 +1463,25 @@ func stepBuildServe() *Step {
 			}
 			tags += "onnx,embed_ffi"
 			c.Log.Printf("go build cmd/server -tags %s", tags)
+			// APPEND to CGO_LDFLAGS, do not replace it.
+			//
+			// This build needs TWO link directories, and it only ever named one.
+			// scripts/local/toolchain-env.sh exports -L<.local/toolchain/duckdb>
+			// because the Windows build links duckdb_use_lib against a supplied
+			// libduckdb rather than the embedded archive (see that file for why the
+			// static path mixes 1.5.3 headers with 1.4.3 objects). Setting
+			// CGO_LDFLAGS here dropped it, and the link failed with
+			//
+			//   ld.exe: cannot find -lduckdb: No such file or directory
+			//
+			// every time — which is why this step's recorded state was "never run".
+			// It is Optional and the chain calls it with `|| echo`, so the failure
+			// never stopped anything and never had to be looked at. The image does
+			// not need this binary; the end-to-end proof does, and the proof is the
+			// only thing that drives the corpus through the code the image ships.
 			if err := c.Run(Cmd{Name: "go", Args: []string{
 				"build", "-tags", tags, "-o", c.bin("server-full"), "./cmd/server",
-			}, Env: []string{"CGO_LDFLAGS=-L" + filepath.Join(target, "release")}}); err != nil {
+			}, Env: []string{"CGO_LDFLAGS=" + ldflagsWith(filepath.Join(target, "release"))}}); err != nil {
 				return err
 			}
 			// Stage every DLL the binary dlopens, beside the binary. Best-effort per
