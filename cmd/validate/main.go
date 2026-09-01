@@ -333,6 +333,43 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 				"clauses_with_text=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q) hnsw_state=%q %s",
 				withText, vectors, withText-vectors, etsiModel, mainModel,
 				etsi.GetMeta(ctx, "hnsw_state"), why)
+
+			// AND THE SHAPE, because a corpus that keeps every version and is not
+			// content-addressed is served from the branch that ranks VERSIONS.
+			//
+			// Store.SearchClauses sends a content-addressed corpus to
+			// searchClausesCA, which collapses to one row per (spec_id,
+			// clause_path); anything else keeps every occurrence as its own
+			// candidate. The comment on that branch records what the other side
+			// does: "the whole twelve-hit window for CHECK_IMEI was one clause
+			// repeated across twelve releases, and the spec that answers it never
+			// entered the window".
+			//
+			// The ETSI half was unconverted, and that was harmless for exactly as
+			// long as its crawl kept ONE version per deliverable — with one version
+			// there is nothing to repeat. Keeping every published version is the
+			// point of the widened crawl, and it is what turns a dormant shape
+			// mismatch into a drowned result window.
+			//
+			// So the gate asks the question that actually predicts the failure —
+			// "does this corpus hold the same clause at more than one version while
+			// being unable to collapse them?" — rather than "is it converted?". A
+			// gate that failed on the single-version corpus would fail on data that
+			// is correct, which is the worse kind: it teaches the operator to pass
+			// --skip.
+			if !etsi.ContentAddressed() {
+				var spec, path string
+				var n int64
+				_ = etsi.QueryRowContext(ctx, `
+					SELECT spec_id, clause_path, count(DISTINCT version) AS n
+					FROM clauses WHERE length(text) > 0
+					GROUP BY spec_id, clause_path
+					ORDER BY n DESC, spec_id, clause_path LIMIT 1`).Scan(&spec, &path, &n)
+				res.add("etsi-dedup", n <= 1,
+					"the ETSI corpus is NOT content-addressed and its most repeated clause is %s §%s at %d version(s) "+
+						"(>1 means search ranks versions, not clauses — run migrate-paragraphs on it)",
+					spec, path, n)
+			}
 			_ = etsi.Close()
 		}
 	}
