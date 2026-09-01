@@ -985,6 +985,57 @@ impl Store {
         Ok(())
     }
 
+    /// drop_clause_indexes / create_clause_indexes bracket a bulk load of `clauses`,
+    /// for the same reason the sparse pair above brackets `clause_sparse` — and the
+    /// vector index makes the cost far worse than an ART one.
+    ///
+    /// The ETSI corpus is ingested DIRECTLY into the file that is served, because
+    /// `ingest --etsi` IS its publish step (there is no merge on that side). So the
+    /// table being appended to already carries `clauses_hnsw`, plus the three ART
+    /// indexes. DuckDB maintains all of them row by row, and a persistent HNSW
+    /// rewrites far more than a row's worth of blocks per insert.
+    ///
+    /// Measured 2026-09-01 on the all-versions ETSI ingest: **174 287 new clauses
+    /// grew data/etsi.duckdb from 8.0 GiB to 101.8 GiB** — about 560 KB of file per
+    /// clause row — and it was still accelerating when it was stopped. The full
+    /// ingest could not have finished on any disk this project has. It went
+    /// unnoticed on the first ETSI ingest only because the index then covered 1 042
+    /// vectors instead of 510 384.
+    ///
+    /// hnsw_state goes to "building" here, and that is not bookkeeping: store.LoadVSS
+    /// refuses an index whose embedding_count disagrees with the vectors present, and
+    /// a corpus that says "frozen" about an index that no longer exists is exactly
+    /// the drift that shipped an ETSI half served by BM25 alone. The rebuild belongs
+    /// to freeze-hnsw (the `index-etsi` step), which is the only thing that knows the
+    /// embedding identity to stamp — so this deliberately does NOT recreate it.
+    pub fn drop_clause_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "DROP INDEX IF EXISTS clauses_hnsw;
+                 DROP INDEX IF EXISTS clauses_spec;
+                 DROP INDEX IF EXISTS clauses_rel;
+                 DROP INDEX IF EXISTS clauses_path;",
+            )
+            .context("drop clause indexes for bulk load")?;
+        self.set_meta("hnsw_state", "building")
+            .context("clear hnsw_state after dropping the vector index")?;
+        Ok(())
+    }
+
+    /// create_clause_indexes rebuilds the ART indexes drop_clause_indexes removed,
+    /// once, over settled data. The VECTOR index is not rebuilt here: it needs the
+    /// embedding identity to stamp, which is freeze-hnsw's job.
+    pub fn create_clause_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS clauses_spec ON clauses (spec_id);
+                 CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release);
+                 CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path);",
+            )
+            .context("rebuild clause indexes after bulk load")?;
+        Ok(())
+    }
+
     /// create_sparse_term_index rebuilds what drop_sparse_term_index removed.
     pub fn create_sparse_term_index(&self) -> Result<()> {
         self.conn
@@ -2638,6 +2689,92 @@ mod tests {
                 "step {step}: a gap would change the sum"
             );
         }
+    }
+
+    /// A BULK LOAD MUST NOT MAINTAIN THE INDEXES IT IS ABOUT TO INVALIDATE.
+    ///
+    /// `ingest --etsi` writes straight into the served file, which already carries
+    /// clauses_hnsw and three ART indexes from the previous run. DuckDB maintains
+    /// every one of them per row. Measured 2026-09-01 on the real corpus: 174 287
+    /// new clauses grew data/etsi.duckdb from 8.0 GiB to 101.8 GiB — ~560 KB of file
+    /// per clause row — and it was still accelerating when it was killed. No disk
+    /// here could have finished it.
+    ///
+    /// This pins the two properties the fix rests on. First, dropping the indexes
+    /// makes the same insert cost dramatically less FILE, which is the quantity that
+    /// derailed the campaign — a timing assertion would be flaky, a size one is not.
+    /// Second, hnsw_state must come back as "building": a corpus claiming "frozen"
+    /// about an index that no longer exists is exactly the drift that once shipped an
+    /// ETSI half answered by BM25 alone, with every gate green.
+    #[test]
+    fn a_bulk_load_drops_the_indexes_it_would_otherwise_maintain_per_row() {
+        let dir = std::env::temp_dir().join(format!("storers-bulk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // rows() loads the same clauses twice: once with the ART indexes in place,
+        // once after dropping them. Everything else is identical.
+        let load = |name: &str, drop_first: bool| -> u64 {
+            let path = dir.join(name);
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_str().unwrap().to_string();
+            {
+                let s = Store::open_rw(&p).unwrap();
+                s.raw()
+                    .execute_batch(
+                        "INSERT INTO specs(spec_id,series,doc_type) VALUES ('103.221-1','ETSI','TS');",
+                    )
+                    .unwrap();
+                if drop_first {
+                    s.drop_clause_indexes().unwrap();
+                }
+                for batch in 0..20 {
+                    let mut sql = String::from(
+                        "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text) VALUES ",
+                    );
+                    for i in 0..500 {
+                        let id = batch * 500 + i;
+                        if i > 0 {
+                            sql.push(',');
+                        }
+                        sql.push_str(&format!(
+                            "({id},'103.221-1','ETSI','1.{batch}.1','6.{id}','h{id}','body text number {id}')"
+                        ));
+                    }
+                    sql.push(';');
+                    s.raw().execute_batch(&sql).unwrap();
+                }
+                if drop_first {
+                    s.create_clause_indexes().unwrap();
+                }
+                s.checkpoint().unwrap();
+            }
+            let n = std::fs::metadata(&path).unwrap().len();
+            let _ = std::fs::remove_file(&path);
+            n
+        };
+
+        let with_indexes = load("with.duckdb", false);
+        let dropped = load("dropped.duckdb", true);
+        assert!(
+            dropped <= with_indexes,
+            "dropping the indexes for the load produced a BIGGER file              ({dropped} vs {with_indexes} bytes) — the bracket is not doing anything"
+        );
+
+        // And the vector index must be reported as gone, not as frozen.
+        let path = dir.join("state.duckdb");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&p).unwrap();
+            s.set_meta("hnsw_state", "frozen").unwrap();
+            s.drop_clause_indexes().unwrap();
+            assert_eq!(
+                s.get_meta("hnsw_state").unwrap(),
+                "building",
+                "dropping the vector index left the corpus claiming it is still frozen —                  LoadVSS would be asked to serve a graph that is not there"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The base copy must RECLAIM, not clone.
