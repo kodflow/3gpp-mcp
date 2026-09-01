@@ -545,7 +545,21 @@ func stepValidate() *Step {
 		Run: func(c *Ctx) error {
 			args := validateArgs(c)
 			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg("contract_flags"), corpus3GPP().Floor(c))
-			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Echo: true}); err != nil {
+			// SELECT THE SPARSE-CAPABLE REGISTRY ENTRY when the contract asks about
+			// the sparse layer, exactly as runSparse does to resolve the identity it
+			// stamps. cmd/validate compares schema_meta.sparse_model against
+			// embed.SparseModelID(), which reads the ACTIVE model — and the default
+			// entry (bge-m3) is dense-only, so it resolves nothing and the comparison
+			// cannot happen. Leaving that to the operator's environment is a footgun:
+			// the same flag would check the layer on one machine and refuse to on
+			// another. Selecting the dual-head entry does not move the DENSE identity
+			// (38067f8c6efe under both), so this changes what is CHECKED, never what
+			// is expected of the corpus.
+			var env []string
+			if hasFlag(strings.Fields(c.Cfg("contract_flags")), "--require-sparse") {
+				env = append(env, "EMBED_MODEL="+sparseModelName)
+			}
+			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Env: env, Echo: true}); err != nil {
 				return err
 			}
 			return validateAnchor(c)
