@@ -1019,7 +1019,7 @@ func (t corpusTarget) indexDeps() []string {
 	// index frozen BEFORE compaction would be thrown away by it while schema_meta
 	// still claimed the graph was frozen — the same ordering constraint the 3GPP
 	// side already encodes, and the reason compact sits before both freezes.
-	return []string{"embed" + t.Suffix, "compact", "build-go"}
+	return []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact", "build-go"}
 }
 
 // refreshOverlays reports whether the operator asked for the external overlays
@@ -1052,23 +1052,23 @@ func refreshOverlays() bool {
 // OLD shape: the conversion existed only as a tool someone had to remember to
 // run, which is the same failure as the overlays printing the name of a script
 // instead of running it.
-func stepParagraphs() *Step {
+func stepParagraphs(t corpusTarget) *Step {
 	return &Step{
-		Name:    "paragraphs",
+		Name:    "paragraphs" + t.Suffix,
 		Version: 1,
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
-		Deps:    []string{"embed", "enrich", "build-go"},
+		Deps:    t.paragraphsDeps(),
 		Impl:    []string{"cmd/migrate-paragraphs"},
 		Heavy:   true,
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			return []string{t.dbPath(c)}, nil
 		},
-		Outputs: func(c *Ctx) []string { return []string{c.dataPath("3gpp.duckdb")} },
+		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
 			// Prove the corpus can still produce the text it used to store,
 			// rather than trusting that the conversion said so earlier.
 			out, err := c.Output(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
-				"--db", c.dataPath("3gpp.duckdb"), "--verify",
+				"--db", t.dbPath(c), "--verify",
 			}})
 			if err != nil {
 				return fmt.Errorf("the converted corpus does not verify: %w", err)
@@ -1079,8 +1079,8 @@ func stepParagraphs() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			db := c.dataPath("3gpp.duckdb")
-			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
+			db := t.dbPath(c)
+			c.Log.Printf("converting %s to content-addressed storage (paragraphs, bodies, occurrences)", t.DB)
 			// --drop-clauses is safe to pass unconditionally, but NOT for the reason
 			// this comment used to give. It claimed the build was "a no-op
 			// re-derivation" on an already-converted corpus. It was the opposite: the
@@ -1191,14 +1191,30 @@ func stepSparse(t corpusTarget) *Step {
 	}
 }
 
-// sparseDeps mirrors indexDeps. The 3GPP arm waits for the content-addressed
-// conversion, because the work list is exported from the shape that conversion
-// produces; ETSI has no such step and waits for its own embed.
-func (t corpusTarget) sparseDeps() []string {
+// paragraphsDeps: the conversion runs AFTER the vectors exist, so they are simply
+// carried across to the bodies that own them and neither embed nor the Rust write
+// side has to change. 3GPP also waits on `enrich`, whose catalogue overlay rewrites
+// rows; ETSI has no such overlay (DynaReport describes 3GPP specs, not ETSI
+// deliverables), so it waits on its own embed alone.
+func (t corpusTarget) paragraphsDeps() []string {
 	if t.Suffix == "" {
-		return []string{"build-sparse", "build-rust", "paragraphs"}
+		return []string{"embed", "enrich", "build-go"}
 	}
-	return []string{"build-sparse", "build-rust", "embed" + t.Suffix}
+	return []string{"embed" + t.Suffix, "build-go"}
+}
+
+// sparseDeps mirrors indexDeps: the work list is exported from the shape the
+// content-addressed conversion produces, so BOTH arms wait for their own.
+//
+// ETSI used to wait on its embed instead, because it had no conversion. That was
+// only ever true while the ETSI half held ONE version per deliverable. With every
+// published version in it, an unconverted ETSI corpus takes the branch in
+// Store.SearchClauses that ranks VERSIONS rather than clauses — the twelve-hit
+// window that was one clause repeated across twelve releases, with the spec that
+// answers the question never in it. The conversion is what makes searchClausesCA
+// the path taken, so it is a dependency, not a nicety.
+func (t corpusTarget) sparseDeps() []string {
+	return []string{"build-sparse", "build-rust", "paragraphs" + t.Suffix}
 }
 
 // sparseFiles are the work list and postings ledger for a corpus. The 3GPP pair
@@ -1308,7 +1324,7 @@ func stepCompact() *Step {
 		// corpus too: compacting it before its vectors are written would rewrite a
 		// file that is about to grow again, which is the one thing a compaction
 		// must not do.
-		Deps:  []string{"build-rust", "paragraphs", "sparse-etsi"},
+		Deps:  []string{"build-rust", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
 		Inputs: func(c *Ctx) ([]string, error) {
