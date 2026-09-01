@@ -60,6 +60,38 @@ done
 say() { printf '\n\033[1m[image] %s\033[0m\n' "$*"; }
 die() { printf '\033[31m[image] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# field <key> <text> — the value of the "<key>=…" line, or empty.
+#
+# THIS WAS THREE sed CALLS, AND MSYS REWROTE THEIR SCRIPTS BEFORE sed SAW THEM.
+#
+# Git Bash rewrites an argument shaped like NAME=/posix/path into a Windows path
+# on its way to a native .exe. `s/^embedding_model=//p` matches that shape — the
+# `=` is followed by what looks like a path — so w64devkit's sed.exe received a
+# mangled script and answered "sed: unmatched '/'". Measured here: `s/a=/b/` and
+# `s/^a/b/` both work, `s/^a=/b/p` does not, and MSYS2_ARG_CONV_EXCL='*' makes it
+# work again. It only bites when a native sed is first on PATH, which is exactly
+# what scripts/local/toolchain-env.sh arranges — so the guard block passed when it
+# was driven standalone and failed when the pipeline ran it.
+#
+# The damage was not the message. DB_ID came back EMPTY, and the guard below
+# refuses an empty identity by design, because an absent identity is not a
+# matching one. So the build died claiming the corpus states no embedding_model —
+# on a corpus stamped 38067f8c6efe, after every data gate had passed. A guard that
+# cannot read its input reports the very failure it exists to prevent.
+#
+# Shell built-ins pass no arguments through MSYS, so there is nothing left to
+# mangle and nothing left to depend on which sed happens to be first on PATH.
+# Same reasoning that replaced tar with imgtar here.
+field() {
+  local k="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      "$k="*) printf '%s\n' "${line#"$k="}"; return 0 ;;
+    esac
+  done <<<"$2"
+  return 0
+}
+
 # ---- toolchain ---------------------------------------------------------------
 
 CRANE="$ROOT/.local/bin/crane.exe"
@@ -284,9 +316,9 @@ if [ "$WITH_CORPUS" = 1 ] && [ "$WITH_MODELS" = 1 ]; then
   EMBED_ID="$(go run ./cmd/embedid)"
   SPARSE_ID="$(go run ./cmd/embedid --sparse)"
   counters="$(go run ./cmd/dbcount --db data/3gpp.duckdb)"
-  DB_ID="$(printf '%s\n' "$counters" | sed -n 's/^embedding_model=//p' | head -1)"
-  DB_SPARSE="$(printf '%s\n' "$counters" | sed -n 's/^sparse_model=//p' | head -1)"
-  SPARSE_ROWS="$(printf '%s\n' "$counters" | sed -n 's/^clauses_with_sparse=//p' | head -1)"
+  DB_ID="$(field embedding_model "$counters")"
+  DB_SPARSE="$(field sparse_model "$counters")"
+  SPARSE_ROWS="$(field clauses_with_sparse "$counters")"
   unset EMBED_MODELS_CONFIG
   echo "  dense  registry=$EMBED_ID corpus=${DB_ID:-<none>}"
   echo "  sparse registry=${SPARSE_ID:-<none>} corpus=${DB_SPARSE:-<none>} rows=${SPARSE_ROWS:-0}"
