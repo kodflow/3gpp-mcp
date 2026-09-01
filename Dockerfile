@@ -197,6 +197,12 @@ RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.d
 # ship silently — `docker build` of `full` errors out here instead of producing a
 # server that degrades to LIKE full-scan / exact-scan (or silently lacks sparse) in
 # production. (light builds its own lexical DB and never reaches this stage.)
+# Adding --require-sparse here ALSO needs a registry that declares a sparse head:
+# the check compares schema_meta.sparse_model against embed.SparseModelID(), which
+# reads the ACTIVE registry entry, and the default one (bge-m3) is dense-only.
+# Since 7916936 that is a loud error naming the fix rather than a check that
+# quietly compares nothing — pass EMBED_MODEL=bge-m3-sparse, or point
+# EMBED_MODELS_CONFIG at a registry whose active model has a sparse_output.
 ARG DATA_CONTRACT_FLAGS="--require-fts --require-hnsw"
 RUN HOME=/home/mcp mcp-3gpp check-data --db /data/mcp-3gpp/3gpp.duckdb ${DATA_CONTRACT_FLAGS}
 
