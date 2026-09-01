@@ -17,9 +17,42 @@ cd "$ROOT"
 export EMBED_MODEL=bge-m3-sparse
 export EMBED_MODEL_DIR="$ROOT/data/models/bge-m3-sparse"
 export BGE_RERANKER_DIR="$ROOT/data/models/bge-reranker-v2-m3"
+# TWO BINDINGS, TWO RUNTIMES, AND THEY ARE NOT INTERCHANGEABLE.
+#
+# ORT_DYLIB_PATH is the RUST crate's variable: it is what rust/embed-core loads,
+# and it points at the GPU 1.20.1 build the embedder was compiled against.
+# ONNXRUNTIME_SHARED_LIBRARY_PATH is the GO binding's, used by the reranker.
+#
+# Setting only the first left the cross-encoder reporting
+#
+#   "reranker_reason": "the ONNX runtime would not initialise:
+#                       Platform-specific initialization failed:
+#                       Error setting ORT API base: 2"
+#
+# — OrtGetApiBase refusing the API version yalue/onnxruntime_go asks for, because
+# 1.20.1 predates it. One file cannot satisfy both pins, and the process does not
+# need it to: measured 2026-09-01, with the two variables pointing at 1.20.1 and
+# the pinned 1.26.0 respectively, semantic=true and reranker=true came back
+# together from the same server.
+#
+# 1.26.0 is what the image stages (scripts/local/build-image.sh reads the version
+# from scripts/fetch-model.sh), so pointing the Go side at it here proves the arm
+# against the SAME runtime version the image serves — the OS differs, the ABI does
+# not.
 ORT="$ROOT/.local/toolchain/ort/onnxruntime-win-x64-gpu-1.20.1/lib"
 export ORT_DYLIB_PATH="$ORT/onnxruntime.dll"
 export PATH="$ORT:$PATH"
+if [ -z "${ONNXRUNTIME_SHARED_LIBRARY_PATH:-}" ]; then
+  for cand in "$ROOT/data/models/onnxruntime/lib/onnxruntime.dll"               "$ROOT/data/models/onnxruntime/lib/libonnxruntime.so"; do
+    [ -f "$cand" ] && { export ONNXRUNTIME_SHARED_LIBRARY_PATH="$cand"; break; }
+  done
+fi
+if [ -z "${ONNXRUNTIME_SHARED_LIBRARY_PATH:-}" ]; then
+  echo "NOTE: no ONNX Runtime for the Go binding under data/models/onnxruntime/lib." >&2
+  echo "      The cross-encoder will report why it is off, and this proof will FAIL on it." >&2
+  echo "      Put the official build of the pinned version there (the same one the image" >&2
+  echo "      stages) — it is a different pin from the Rust crate's ORT_DYLIB_PATH." >&2
+fi
 
 OUT="$ROOT/.local/prove.out"
 ERR="$ROOT/.local/prove.stderr"
