@@ -60,7 +60,7 @@ func main() {
 
 	res := runChecks(context.Background(), checkCfg{
 		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW, requireSparse: *requireSparse,
-		requireETSI: *requireETSI,
+		requireETSI:          *requireETSI,
 		requireEmbedComplete: *requireEmbed, embedFloor: *embedFloor,
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
