@@ -87,7 +87,9 @@ func (s *Store) bodyTexts(ctx context.Context, ids []int64) (map[int64]string, e
 	return out, rows.Err()
 }
 
-// ParagraphTrace is one paragraph of a clause, and the releases carrying it.
+// ParagraphTrace is one paragraph of a clause, and the points on the spec's
+// lineage axis that carry it — releases for 3GPP, versions for ETSI. See
+// Store.LineageAxis; PresentIn is deliberately not named for either.
 //
 // This is the granularity the content-addressed corpus exists to expose. Clause
 // lineage answers "this clause runs from Rel-16 to Rel-18"; a clause that
@@ -112,7 +114,7 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	if !s.contentAddressed {
 		return nil, fmt.Errorf("this corpus is not content-addressed: paragraph lineage needs clause_occ/body_seq (ADR 0004)")
 	}
-	ordered, err := s.releasesOrdered(ctx, specID)
+	axis, ordered, err := s.LineageAxis(ctx, specID)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +128,7 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.para_id, min(s.ord), any_value(p.part), list(DISTINCT o.release)
+		SELECT p.para_id, min(s.ord), any_value(p.part), list(DISTINCT o.`+axis+`)
 		FROM clause_occ o
 		JOIN body_seq s ON s.body_id = o.body_id
 		JOIN paragraphs p USING (para_id)
@@ -218,8 +220,8 @@ func (s *Store) ClauseDelta(ctx context.Context, specID, clausePath, from, to st
 // availabilityCA is ClauseAvailability over the content-addressed tables. It
 // touches no text at all — release presence lives entirely in clause_occ — so it
 // is strictly cheaper than the version that had to scan `clauses`.
-func (s *Store) availabilityCA(ctx context.Context, specID, prefix string) ([]ClauseRel, error) {
-	q := `SELECT o.clause_path, max(b.heading), list(DISTINCT o.release)
+func (s *Store) availabilityCA(ctx context.Context, specID, prefix, axis string) ([]ClauseRel, error) {
+	q := `SELECT o.clause_path, max(b.heading), list(DISTINCT o.` + axis + `)
 	      FROM clause_occ o JOIN bodies b USING (body_id)
 	      WHERE o.spec_id = ?`
 	args := []any{specID}
