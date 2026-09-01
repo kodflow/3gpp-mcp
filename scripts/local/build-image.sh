@@ -290,12 +290,30 @@ if [ "$WITH_CORPUS" = 1 ] && [ "$WITH_MODELS" = 1 ]; then
   unset EMBED_MODELS_CONFIG
   echo "  dense  registry=$EMBED_ID corpus=${DB_ID:-<none>}"
   echo "  sparse registry=${SPARSE_ID:-<none>} corpus=${DB_SPARSE:-<none>} rows=${SPARSE_ROWS:-0}"
-  [ -n "$DB_ID" ] && [ "$DB_ID" != "$EMBED_ID" ] &&
+  # AN ABSENT IDENTITY IS NOT A MATCHING ONE.
+  #
+  # Both guards used to lead with `[ -n "$DB_…" ] &&`, so a corpus that stated no
+  # identity at all skipped the comparison and passed. That is not hypothetical
+  # for the sparse half: `embed-io --import-sparse` writes sparse_model only AFTER
+  # its import loop, so a killed import leaves millions of postings and no stamp —
+  # the state this very corpus was in on 2026-09-01. With the default
+  # DATA_CONTRACT=dense, --require-sparse is not even in the flag list, and this
+  # was the only thing left looking. The image would then bake postings whose
+  # model nobody could name, and the sparse arm scores a query against whatever
+  # vocabulary they came from, silently.
+  #
+  # Same defect cmd/server/checkdata.go was fixed for in eb0c159 ("two empty
+  # identities compare equal"), in the script that actually publishes.
+  [ -n "$DB_ID" ] ||
+    die "the corpus states no embedding_model — it has an identity to declare and does not; the serve guard would disable vector search"
+  [ "$DB_ID" = "$EMBED_ID" ] ||
     die "the baked registry is $EMBED_ID but the corpus was embedded with $DB_ID — the serve guard would disable vector search"
   if [ "${SPARSE_ROWS:-0}" -gt 0 ]; then
     [ -n "$SPARSE_ID" ] ||
       die "the corpus carries $SPARSE_ROWS sparse posting(s) but the baked registry declares no sparse head"
-    [ -n "$DB_SPARSE" ] && [ "$DB_SPARSE" != "$SPARSE_ID" ] &&
+    [ -n "$DB_SPARSE" ] ||
+      die "the corpus carries $SPARSE_ROWS sparse posting(s) and no sparse_model — an import that was killed before it stamped; re-run it"
+    [ "$DB_SPARSE" = "$SPARSE_ID" ] ||
       die "baked sparse model $SPARSE_ID but the postings were built with $DB_SPARSE"
   fi
 fi
