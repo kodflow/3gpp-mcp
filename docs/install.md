@@ -26,7 +26,7 @@ Two things to know:
   [`DATA_NOTICE.md`](../DATA_NOTICE.md)). `docker login ghcr.io` with a token
   carrying `read:packages` before pulling.
 - **No `VOLUME` is declared, deliberately.** `serve` reads the baked corpus in
-  place, read-only; a volume would make Docker copy ~11 GB into a fresh one on
+  place, read-only; a volume would make Docker copy ~36 GB into a fresh one on
   every `--rm` run.
 
 `docker run --rm ghcr.io/kodflow/3gpp-mcp:latest version` prints the build, and
@@ -54,9 +54,9 @@ It needs data it does not ship, downloaded once into a per-user cache
 
 | Artifact | Size | Source | Needed for |
 |---|---|---|---|
-| `3gpp.duckdb` (indexed corpus) | **12.36 GB** (~7.9 GB on the wire) | **private GHCR package** | always |
-| `etsi.duckdb` (ETSI LI suite) | 23 MB | private GHCR package | ETSI deliverables (`--etsi`) |
-| BGE-M3 + reranker models + ONNX Runtime | ~5 GB | HuggingFace + ORT release | semantic search only |
+| `3gpp.duckdb` (indexed corpus) | **21.2 GB** | **private GHCR package** | always |
+| `etsi.duckdb` (ETSI: 5 117 TS/TR/EN deliverables, not just the LI suite) | **8.0 GB** | private GHCR package | ETSI deliverables (`--etsi`) |
+| BGE-M3 (dense + sparse heads) + reranker + ONNX Runtime | **6.4 GB** | HuggingFace + ORT release | semantic search only |
 
 ## Why the corpus needs a credential
 
@@ -105,7 +105,8 @@ mcp-3gpp bootstrap
 mcp-3gpp bootstrap --etsi
 ```
 
-**Full semantic** (hybrid BM25 + BGE-M3 vectors + cross-encoder rerank, +~5 GB):
+**Full semantic** (hybrid BM25 + BGE-M3 dense/sparse vectors + cross-encoder
+rerank, +6.4 GB of models):
 
 ```sh
 mcp-3gpp bootstrap --semantic
@@ -157,7 +158,7 @@ otherwise identical. To pin a baseline release, add `"--release", "Rel-19"`.
 
 `serve` provisions the cache itself when it is empty, and keeps serving a cached
 corpus when no token is present or the registry is unreachable — it degrades
-rather than refusing to start. It never re-hashes 12.36 GB to decide whether an
+rather than refusing to start. It never re-hashes 21.2 GB to decide whether an
 update exists: the published layer digests are recorded beside the DB, so the
 check is one manifest request.
 

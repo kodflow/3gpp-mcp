@@ -9,8 +9,9 @@
 > describe it doing exactly that, which put the documented design in direct
 > contradiction with [`DATA_NOTICE.md`](../DATA_NOTICE.md): the DB holds verbatim
 > 3GPP/ETSI clause text, and no release asset of this public repository may carry
-> it. It also stopped fitting — GitHub caps an asset at 2 GB, the
-> content-addressed corpus is 12.36 GB.
+> it. It also stopped fitting — GitHub caps an asset at 2 GB, and the
+> content-addressed corpus is 21.2 GB (measured 2026-09-01, after the sparse
+> layer and the HNSW index).
 >
 > The sections below describe the flow that is actually in use. The reasoning
 > about volumes, deltas and clobbering carried over from the retired one; the
@@ -62,13 +63,14 @@ tag plus a rolling `:latest`.
 | Go source | small | git | ✅ |
 | 3GPP DOCX/.doc sources | ~20 GB | transient on the sync runner | ❌ |
 | Converted HTML | derived | transient on the sync runner | ❌ |
-| Indexed DB `3gpp.duckdb` | 12.36 GB (≈7.9 GB gzip) | `ghcr.io/<owner>/3gpp-corpus`, private | ❌ |
-| BGE-M3 / reranker / ONNX RT | ~2.3 GB | HuggingFace (fetched by `bootstrap --semantic`) | ❌ |
+| Indexed DB `3gpp.duckdb` | 21.2 GB | `ghcr.io/<owner>/3gpp-mcp`, private | ❌ |
+| Indexed DB `etsi.duckdb` | 8.0 GB | same image, same layer | ❌ |
+| BGE-M3 (dense+sparse) / reranker / ONNX RT | 6.4 GB | baked into the image | ❌ |
 
 The corpus never enters git or a Release as raw files. Models stay on
 HuggingFace (`model.onnx_data` is 2.2 GB — over the 2 GB Release-asset cap
-anyway). The corpus does not fit either: 7.9 GB compressed against a 2 GB cap,
-which is the second, independent reason it travels as an OCI layer.
+anyway). The corpus does not fit either — 29.2 GB in one layer against a 2 GB
+cap — which is the second, independent reason it travels as an OCI layer.
 
 ## Workflows — there is one left
 
@@ -139,7 +141,7 @@ The DB has no version number — the **digests of its layer are its identity**.
 2. Compare to the sidecar next to the cached DB.
    - differs / no cache → pull the layer, verify it against the digest, atomic
      swap;
-   - same → use cache, **no download** (the ~7.9 GB moves only when it changed);
+   - same → use cache, **no download** (the corpus layer moves only when it changed);
    - offline / fetch error / credential gone → keep the cached DB
      (degrade-don't-block).
 3. Opt-out via `--no-update` / `MCP3GPP_NO_UPDATE=1` (air-gapped).
