@@ -831,9 +831,17 @@ func (h *handlers) traceClause(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	if lErr != nil {
 		return mcp.NewToolResultErrorFromErr("trace_clause failed", lErr), nil
 	}
-	return jsonResult(map[string]any{
-		"spec_id": specID, "clause": clause, "paragraphs": traces,
-	})
+	// SAY what present_in is listing. A 3GPP spec is traced across releases; an
+	// ETSI deliverable has no releases (parse_etsi_meta stamps the constant
+	// "ETSI") and is traced across its published versions. Returning the values
+	// without the axis leaves the reader to guess which, and "1.21.1" versus
+	// "Rel-18" is only obvious until an id happens to look like both.
+	resp := map[string]any{"spec_id": specID, "clause": clause, "paragraphs": traces}
+	if axis, ordered, aErr := st.LineageAxis(ctx, specID); aErr == nil {
+		resp["axis"] = axis
+		resp["axis_values"] = ordered
+	}
+	return jsonResult(resp)
 }
 
 // storeFor routes an id to the corpus that owns it. ETSI ids are served by the

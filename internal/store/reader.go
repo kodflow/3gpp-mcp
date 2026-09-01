@@ -42,6 +42,12 @@ type Reader interface {
 	VersionForRelease(ctx context.Context, specID, release string) (string, bool, error)
 	ResolveTerm(ctx context.Context, term string) ([]model.Acronym, error)
 	ClauseAvailability(ctx context.Context, specID, prefix string) ([]ClauseRel, []string, error)
+	// LineageAxis names the column a spec actually evolves along — "release" for
+	// a 3GPP spec republished per release, "version" for an ETSI deliverable,
+	// whose release column is the constant "ETSI". Callers must SAY which one a
+	// payload is listing: a field named for releases that carries versions is
+	// the silent kind of wrong.
+	LineageAxis(ctx context.Context, specID string) (string, []string, error)
 	ClauseLineage(ctx context.Context, specID, prefix string) (map[string]model.Lineage, error)
 
 	// Paragraph-level provenance (ADR 0004). ContentAddressed reports whether a
