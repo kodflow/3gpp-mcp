@@ -744,6 +744,57 @@ func runSmoke(c *Ctx) error {
 		id++
 	}
 
+	// ASK THE SERVER WHAT IT CAN DO, rather than only checking that it did not
+	// complain.
+	//
+	// The two stderr checks below are NEGATIVE assertions — "this string is
+	// absent" — and one of them is weaker than it reads. "semantic disabled" is
+	// printed only on the --allow-lexical-fallback path, and the coherence guard
+	// that reaches it is itself behind `if emb.Enabled()`; this step runs
+	// .local/bin/server.exe, the LEXICAL build, whose noop embedder reports false.
+	// So on the binary this step actually drives, that assertion cannot fail, and
+	// the step's own log line claimed vector search was proven.
+	//
+	// server_info is a positive, falsifiable answer about the corpus that does not
+	// depend on which build asked: fts and hnsw are properties of the DB, and
+	// internal/mcp recomputes them per store. What is deliberately NOT asserted
+	// here is `semantic`, because that IS build- and environment-dependent (it
+	// needs embed_ffi, EMBED_MODEL_DIR and ORT), and a gate that fails on a
+	// correct corpus for want of an env var is worse than no gate — it teaches the
+	// operator to skip it. `.local/resume/prove.sh` drives server-full.exe with
+	// that environment set and asserts `semantic` there.
+	if contains(names, "server_info") {
+		if err := send(map[string]any{
+			"jsonrpc": "2.0", "id": id, "method": "tools/call",
+			"params": map[string]any{"name": "server_info", "arguments": map[string]any{}},
+		}); err != nil {
+			return err
+		}
+		info, err := readOne()
+		if err != nil {
+			return fmt.Errorf("server_info failed: %w", err)
+		}
+		// server_info nests the payload as a JSON STRING inside an MCP content
+		// block, so the keys arrive with their quotes: `"fts":true`, not `fts:true`.
+		body := strings.ReplaceAll(fmt.Sprintf("%v", info), " ", "")
+		// AND COUNT THEM. The ETSI half reports its own `"fts"`/`"hnsw"` in the same
+		// payload, so a bare Contains would be satisfied by either half alone — a
+		// 3GPP corpus serving without its index would pass on the strength of the
+		// ETSI one. When both halves are attached, both must say true.
+		wantEach := 1
+		if etsiAttached {
+			wantEach = 2
+		}
+		for _, arm := range []string{`"fts":true`, `"hnsw":true`} {
+			if n := strings.Count(body, arm); n < wantEach {
+				return fmt.Errorf("server_info reports %s %d time(s), want %d (halves attached: %d) — "+
+					"a corpus carries the index and the server will not use it:\n%s",
+					arm, n, wantEach, wantEach, tailString(body, 4))
+			}
+		}
+		c.Log.Printf("server_info: fts and hnsw live on %d served corpus half/halves", wantEach)
+	}
+
 	// THE assertion. The guard prints this exact prefix when it disables vector
 	// search, and a corpus with vectors that is served lexically is a failed goal.
 	errs := stderr.String()
@@ -757,7 +808,7 @@ func runSmoke(c *Ctx) error {
 		return fmt.Errorf("the server DISABLED vector search at startup — the embed identity does not match the corpus stamp:\n%s", tailString(errs, 20))
 	}
 	c.Checkpoint("tools", strconv.Itoa(len(names)))
-	c.Log.Printf("vector search was NOT disabled at startup")
+	c.Log.Printf("the server did not disable vector search at startup (see prove.sh for the semantic proof)")
 	return nil
 }
 
