@@ -12,7 +12,7 @@
 //! is far too slow for the corpus campaign. Resumable: chunk_ids already present in --out are
 //! skipped, so a killed/bounded run continues. --limit caps NEW clauses this session. The model
 //! is loaded lazily from $EMBED_MODEL_DIR on the first embed (build --features ort,cuda for GPU).
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use serde::{Deserialize, Serialize};
@@ -29,12 +29,39 @@ struct WorkItem {
 #[derive(Serialize)]
 struct Posting {
     chunk_id: u64,
+    /// The hash of the TEXT these postings were computed from. See resume_hash.
+    h: String,
     terms: Vec<(u32, f32)>,
 }
 
 #[derive(Deserialize)]
 struct DoneId {
     chunk_id: u64,
+    /// Absent on ledgers written before this field existed. An empty hash can never
+    /// satisfy the resume test, so such a line is recomputed rather than trusted:
+    /// that costs GPU, never correctness.
+    #[serde(default)]
+    h: String,
+}
+
+/// resume_hash identifies the TEXT a posting line was computed from.
+///
+/// A chunk_id is a POSITION, not an identity: ingest assigns it sequentially
+/// (offset = max_chunk_id), so a corpus rebuilt from scratch reuses the same numbers
+/// for different clauses. Measured 2026-09-02 between two ETSI builds of the SAME
+/// 11 821 documents: chunk_id 138 was "ETSI TS 101 671 v3.15.1 clause 10" in one and
+/// "ETSI EN 300 113-1 v1.3.1 clause 4" in the other.
+///
+/// This ledger carried the id and nothing else, and both the resume here and
+/// `embed-io --import-sparse` key on it — so a ledger from another build gives each
+/// clause the learned-lexical postings of an unrelated one. Nothing downstream
+/// compares a posting to the text it came from: the sparse arm would simply retrieve
+/// the wrong clauses, confidently.
+fn resume_hash(embed_text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(embed_text.as_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
 }
 
 /// arg returns the value following `--name` on the command line, if present.
@@ -68,6 +95,7 @@ fn flush_batch(
                     &mut *w,
                     &Posting {
                         chunk_id: ids[k],
+                        h: resume_hash(&txt[k]),
                         terms,
                     },
                 )
@@ -186,14 +214,14 @@ fn main() {
     );
 
     // Resume: skip chunk_ids already written to --out by a prior (bounded/killed) run.
-    let mut done: HashSet<u64> = HashSet::new();
+    let mut done: HashMap<u64, String> = HashMap::new();
     if let Ok(f) = std::fs::File::open(&out_path) {
         for line in BufReader::new(f).lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }
             if let Ok(d) = serde_json::from_str::<DoneId>(&line) {
-                done.insert(d.chunk_id);
+                done.insert(d.chunk_id, d.h);
             }
         }
     }
@@ -238,12 +266,15 @@ fn main() {
                 continue;
             }
         };
-        if done.contains(&item.chunk_id) {
+        // Match the dense EmbedText join exactly (embedder hash::embed_text).
+        let embed_text = format!("{}\n{}", item.heading, item.text).replace('\0', " ");
+        // Resume on the id AND the text it names: see resume_hash.
+        let want = resume_hash(&embed_text);
+        if matches!(done.get(&item.chunk_id), Some(h) if !h.is_empty() && *h == want) {
             continue;
         }
-        // Match the dense EmbedText join exactly (embedder hash::embed_text).
         buf_ids.push(item.chunk_id);
-        buf_txt.push(format!("{}\n{}", item.heading, item.text).replace('\0', " "));
+        buf_txt.push(embed_text);
         if buf_ids.len() >= window {
             let before = embedded;
             flush_window(
@@ -288,4 +319,28 @@ fn main() {
         "embed-core-sparse: done — embedded={embedded}/{total} skipped={skipped} in {:.0}s",
         start.elapsed().as_secs_f64()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CROSS-RUNTIME GOLDEN. goal's sparse step re-derives this hash in Go to decide
+    /// whether a postings file was written against another build of the corpus; if the
+    /// two implementations drift, the check either archives a good file every run or
+    /// stops noticing a bad one. Both sides are pinned to this constant.
+    #[test]
+    fn resume_hash_matches_the_go_side() {
+        assert_eq!(resume_hash("6 X1\nbody"), "b76cec67248a1ec9");
+    }
+
+    /// It identifies the TEXT, so a different clause hashes differently and the same
+    /// clause hashes the same however many times it is asked.
+    #[test]
+    fn resume_hash_is_stable_and_text_derived() {
+        let a = resume_hash("h\nt");
+        assert_eq!(a, resume_hash("h\nt"));
+        assert_ne!(a, resume_hash("h\nt2"));
+        assert_eq!(a.len(), 16);
+    }
 }
