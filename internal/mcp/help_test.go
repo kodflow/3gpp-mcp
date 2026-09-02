@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -113,5 +114,46 @@ func TestHelpCountsTheCorpusItServes(t *testing.T) {
 	half, ok = corpus["etsi"].(map[string]any)
 	if !ok || half["attached"] != false {
 		t.Errorf("help etsi = %v with no ETSI store, want attached:false", corpus["etsi"])
+	}
+}
+
+// TestHelpCountersAllRun is the test whose absence let two broken counters ship.
+//
+// The inventory reports a COUNT per key, and a query that cannot run is reported
+// in place of the number as "unavailable: <error>". The original test asserted
+// `clauses` and `specs` and nothing else, so `vectors` (querying a clause_vectors
+// table that does not exist) and `axis_values` (querying specs.release, a column
+// that does not exist) shipped returning errors on the real corpus while every
+// test here stayed green.
+//
+// So assert the PROPERTY rather than individual numbers: nothing in the inventory
+// may be an "unavailable" string, on either half. A counter added later is covered
+// without anyone remembering to extend this.
+func TestHelpCountersAllRun(t *testing.T) {
+	c, ctx := federatedClient(t)
+	got := call(t, c, ctx, "help", map[string]any{})
+
+	corpus, _ := got["corpus"].(map[string]any)
+	if corpus == nil {
+		t.Fatal("help reports no corpus inventory")
+	}
+	checked := 0
+	for name, raw := range corpus {
+		inv, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for k, v := range inv {
+			str, isStr := v.(string)
+			if isStr && strings.HasPrefix(str, "unavailable:") {
+				t.Errorf("%s half: counter %q could not run: %s", name, k, str)
+			}
+			if _, isNum := v.(float64); isNum {
+				checked++
+			}
+		}
+	}
+	if checked < 4 {
+		t.Errorf("only %d counter(s) came back as numbers — the inventory is not being counted", checked)
 	}
 }
