@@ -70,9 +70,25 @@ func inventoryOf(ctx context.Context, st store.Reader) map[string]any {
 	}
 	count("specs", `SELECT count(DISTINCT spec_id) FROM clauses`)
 	count("clauses", `SELECT count(*) FROM clauses`)
-	count("vectors", `SELECT count(*) FROM clause_vectors`)
-	// The lineage axis is the column this half actually evolves along, so the
-	// recap must not hardcode "releases" for a corpus that moves by version.
-	count("axis_values", `SELECT count(DISTINCT release) FROM specs`)
+	// COUNT WHERE THE VECTORS ACTUALLY ARE. There is no clause_vectors table; on a
+	// content-addressed corpus the vectors live on `bodies`, and that is the honest
+	// number — 897 556 vectors, not 2 752 688 references to them. Store.embeddingCount
+	// picks the same table for the same reason, and schema_meta.embedding_count is
+	// written from it, so counting anything else would have the recap disagree with
+	// the figure the server refuses to serve an index against.
+	vecTable := "clauses"
+	if st.ContentAddressed() {
+		vecTable = "bodies"
+	}
+	count("vectors", `SELECT count(*) FROM `+vecTable+` WHERE embedding IS NOT NULL`)
+	// BOTH AXES, COUNTED — not one of them named. A 3GPP spec is republished per
+	// release; an ETSI deliverable has no releases at all (the column is the constant
+	// "ETSI") and moves by version. Reporting a single "axis_values" would answer 1
+	// for the ETSI half, which is the same zero-information answer trace_clause used
+	// to give before it learned to name its axis. These two numbers say which one
+	// moves without the recap having to decide.
+	count("releases", `SELECT count(DISTINCT release) FROM spec_versions`)
+	count("versions", `SELECT count(*) FROM spec_versions`)
+	count("acronyms", `SELECT count(*) FROM acronyms`)
 	return inv
 }
