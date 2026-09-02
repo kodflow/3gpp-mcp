@@ -246,6 +246,83 @@ fn is_change_history(text: &str) -> bool {
     t.contains("change history")
 }
 
+/// own_page_stamp is the cover/footer stamp an ETSI deliverable puts on ITSELF,
+/// e.g. "ETSI TS 102 221 V7.10.0". Empty for a 3GPP spec, whose id ("23.501") is
+/// not an ETSI deliverable id — so the 3GPP walk is left byte-for-byte unchanged.
+fn own_page_stamp(spec_id: &str, version: &str) -> String {
+    if !spec_id.starts_with("ETSI ") || version.is_empty() {
+        return String::new();
+    }
+    format!("{spec_id} V{version}")
+}
+
+/// is_own_page_stamp answers whether one line is this document's RUNNING PAGE
+/// FURNITURE rather than its text.
+///
+/// WHY THIS EXISTS. ETSI publishes PDFs; convert_pdf reads the text layer with
+/// `pdftotext -layout`, which faithfully keeps what is printed on the page —
+/// including the footer ETSI stamps on every single one:
+///
+/// ```text
+/// Release 16    107    ETSI TS 103 666-1 V16.0.0 (2020-10)
+/// ```
+///
+/// That footer carries the VERSION. So a clause whose wording did not change
+/// between two published versions still yields two DIFFERENT texts, and the
+/// content-addressed corpus — whose whole job is to store one body once and point
+/// every version at it — can never collapse them. Measured on the ETSI half before
+/// this filter: 33 881 clauses held 460 584 distinct bodies for 391 461 version
+/// rows, i.e. essentially one "new" body per version, and `trace_clause` answered
+/// that every version introduced a brand-new paragraph and made the previous one
+/// obsolete. On TS 102 221 clause 11.1.5.1 that was 117 bodies across 126 versions;
+/// with the furniture dropped it is 19 — which is the real revision history, and
+/// the thing the corpus exists to show. Corpus-wide the collapse is 44,2 %.
+///
+/// THE DISCRIMINATOR IS SELF-NAMING, not shape. A bibliographic reference in
+/// clause 2 names ANOTHER deliverable ("ETSI TS 102 223 V7.11.0 (2008-02): ..."),
+/// while the footer always names THE DOCUMENT IN HAND. Measured across the whole
+/// ETSI half: of 232 044 lines carrying a version-stamped ETSI id at end of line,
+/// 232 044 named their own spec_id and version and 0 named another. Requiring the
+/// trailing "(yyyy-mm)" keeps a sentence that merely ENDS with a cited version
+/// ("... as defined in ETSI TS 102 221 V7.10.0.") out of it.
+fn is_own_page_stamp(line: &str, stamp: &str) -> bool {
+    if stamp.is_empty() {
+        return false;
+    }
+    let l = line.trim_end();
+    let Some(rest) = l.strip_suffix(')') else {
+        return false;
+    };
+    let Some(open) = rest.rfind('(') else {
+        return false;
+    };
+    let date = &rest[open + 1..];
+    // "yyyy-mm" — the publication date ETSI prints beside the version.
+    if date.len() != 7
+        || !date[..4].bytes().all(|b| b.is_ascii_digit())
+        || date.as_bytes()[4] != b'-'
+        || !date[5..].bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    rest[..open].trim_end().ends_with(stamp)
+}
+
+/// strip_page_furniture drops whole furniture LINES from a text block, keeping the
+/// rest verbatim. Per line rather than per node because the salvage path dumps a
+/// whole document into one <pre>: a node-level test would either spare every footer
+/// there or discard the document.
+fn strip_page_furniture(text: &str, stamp: &str) -> String {
+    if stamp.is_empty() || !text.contains(stamp) {
+        return text.to_string();
+    }
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !is_own_page_stamp(l, stamp))
+        .collect();
+    kept.join("\n")
+}
+
 /// classify_heading splits "6.2.3 Title" → ("6.2.3","Title",informative?) (== Go).
 fn classify_heading(text: &str) -> (String, String, bool) {
     if let Some(m) = re_annex().captures(text) {
@@ -306,6 +383,8 @@ struct Walker {
     cur: Option<ParsedClause>,
     buf: String,
     id: u64,
+    /// This document's own cover/footer stamp; see is_own_page_stamp.
+    page_stamp: String,
     informative_annex: bool,
     in_change_history: bool,
     pub saw_change_history: bool,
@@ -349,7 +428,8 @@ impl Walker {
                         }
                         return;
                     }
-                    let txt = node_text(n);
+                    let txt = strip_page_furniture(&node_text(n), &self.page_stamp);
+                    let txt = txt.trim_end().to_string();
                     if !txt.is_empty() {
                         self.buf.push_str(&txt);
                         self.buf.push('\n');
@@ -500,6 +580,7 @@ pub fn parse_html_clauses(
         cur: None,
         buf: String::new(),
         id: 0,
+        page_stamp: own_page_stamp(spec_id, version),
         informative_annex: false,
         in_change_history: false,
         saw_change_history: false,
@@ -522,7 +603,11 @@ pub fn parse_html_clauses(
     // on that instead of discarding the document. This runs ONLY when the structured
     // walk found nothing, so it cannot change how a well-formed spec is parsed.
     if w.clauses.is_empty() {
-        let salvaged = salvage_numbered_text(&node_text(doc.tree.root()));
+        // The salvage path re-reads the whole document as flat text, so it has to
+        // drop the page furniture too — otherwise a document with no heading markup
+        // keeps the footers the structured walk removes.
+        let flat = strip_page_furniture(&node_text(doc.tree.root()), &w.page_stamp);
+        let salvaged = salvage_numbered_text(&flat);
         if !salvaged.is_empty() {
             return (salvaged, w.saw_change_history, true);
         }
@@ -536,6 +621,124 @@ use scraper::Html;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE DEFECT THIS LOCKS DOWN. ETSI prints its own id AND VERSION in the footer
+    /// of every page, and `pdftotext -layout` keeps it. Two versions whose wording
+    /// is identical therefore produced two different clause texts, so the
+    /// content-addressed corpus could never store the body once — measured on the
+    /// live ETSI half: 460 584 distinct bodies for 391 461 version rows across
+    /// 33 881 clauses, and `trace_clause` reporting every version as a brand-new
+    /// paragraph that obsoleted the last.
+    ///
+    /// Falsified: with the filter removed, the two versions below yield DIFFERENT
+    /// clause texts and the assertion on equality fails.
+    #[test]
+    fn the_footer_that_names_this_document_is_not_its_text() {
+        let page = |v: &str, d: &str| {
+            format!(
+                "<html><body><h1>11.1.5.1	READ RECORD</h1>                 <p>This function reads one complete record.</p>                 <p>Release 7   90    ETSI TS 102 221 V{v} ({d})</p>                 <p>The response is the record content.</p></body></html>"
+            )
+        };
+        let a = parse_html_clauses(
+            &page("7.10.0", "2008-02"),
+            "ETSI TS 102 221",
+            "ETSI",
+            "7.10.0",
+        );
+        let b = parse_html_clauses(
+            &page("7.11.0", "2008-07"),
+            "ETSI TS 102 221",
+            "ETSI",
+            "7.11.0",
+        );
+        assert_eq!(a.0.len(), 1, "one clause, got {:?}", a.0);
+        assert_eq!(
+            a.0[0].text, b.0[0].text,
+            "two versions of an UNCHANGED clause must yield the same text, or the              content-addressed store cannot collapse them"
+        );
+        assert!(
+            !a.0[0].text.contains("ETSI TS 102 221 V7.10.0"),
+            "the running footer is still in the clause text: {:?}",
+            a.0[0].text
+        );
+        assert!(
+            a.0[0].text.contains("reads one complete record")
+                && a.0[0].text.contains("response is the record content"),
+            "the real text either side of the page break must survive: {:?}",
+            a.0[0].text
+        );
+    }
+
+    /// The discriminator is SELF-naming. Clause 2 of any deliverable cites OTHER
+    /// deliverables with the same shape, and those lines are the document's text.
+    /// Dropping them would delete the normative reference list — a far worse defect
+    /// than the one being fixed.
+    #[test]
+    fn a_reference_to_another_deliverable_is_kept() {
+        let html = "<html><body><h1>2	References</h1>            <p>[1] ETSI TS 102 223 V7.11.0 (2008-02)</p>            <p>[2] ETSI TS 102 221 V6.3.0 (2004-09)</p>            <p>as defined in ETSI TS 102 221 V7.10.0.</p>            <p>Release 7   9    ETSI TS 102 221 V7.10.0 (2008-02)</p></body></html>";
+        let (cl, _, _) = parse_html_clauses(html, "ETSI TS 102 221", "ETSI", "7.10.0");
+        let t = &cl[0].text;
+        assert!(t.contains("ETSI TS 102 223 V7.11.0"), "another spec: {t:?}");
+        assert!(
+            t.contains("ETSI TS 102 221 V6.3.0"),
+            "another VERSION of this spec: {t:?}"
+        );
+        assert!(
+            t.contains("as defined in ETSI TS 102 221 V7.10.0."),
+            "prose ending in a citation: {t:?}"
+        );
+        assert!(!t.contains("Release 7"), "the footer must be gone: {t:?}");
+    }
+
+    /// The 3GPP half is already deduplicated and must not be re-ingested: a 3GPP
+    /// spec_id is not an ETSI deliverable id, so the filter is inert there and the
+    /// walk stays byte-for-byte what it was.
+    #[test]
+    fn a_3gpp_spec_is_untouched_by_the_etsi_footer_filter() {
+        assert_eq!(own_page_stamp("23.501", "18.5.0"), "");
+        let html = "<html><body><h1>6.2.1	AMF</h1>            <p>Release 18   47    ETSI TS 123 501 V18.5.0 (2024-06)</p></body></html>";
+        let (cl, _, _) = parse_html_clauses(html, "23.501", "Rel-18", "18.5.0");
+        assert!(
+            cl[0].text.contains("ETSI TS 123 501 V18.5.0"),
+            "the 3GPP walk must be unchanged: {:?}",
+            cl[0].text
+        );
+    }
+
+    /// Shape alone is not enough, and neither is the id alone: the trailing
+    /// "(yyyy-mm)" is what separates a footer from a sentence that cites a version.
+    #[test]
+    fn the_stamp_test_is_exact() {
+        let s = "ETSI TS 102 221 V7.10.0";
+        assert!(is_own_page_stamp(
+            "Release 7   90    ETSI TS 102 221 V7.10.0 (2008-02)",
+            s
+        ));
+        assert!(
+            is_own_page_stamp("ETSI TS 102 221 V7.10.0 (2008-02)  ", s),
+            "the cover page"
+        );
+        assert!(!is_own_page_stamp(
+            "see ETSI TS 102 221 V7.10.0 (2008-02) for details",
+            s
+        ));
+        assert!(
+            !is_own_page_stamp("ETSI TS 102 221 V7.10.0", s),
+            "no date: not a stamp"
+        );
+        assert!(
+            !is_own_page_stamp("ETSI TS 102 221 V7.10.0 (2008-2)", s),
+            "malformed date"
+        );
+        assert!(
+            !is_own_page_stamp("ETSI TS 102 221 V7.11.0 (2008-07)", s),
+            "another version"
+        );
+        assert!(
+            !is_own_page_stamp("anything at all", ""),
+            "3GPP: no stamp, no drops"
+        );
+    }
 
     #[test]
     fn version_code_decode_matches_go() {
