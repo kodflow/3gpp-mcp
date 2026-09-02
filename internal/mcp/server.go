@@ -138,14 +138,19 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	), h.searchAPI)
 
 	s.AddTool(mcp.NewTool("trace_clause",
-		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which releases carry each "+
-			"statement, when it was introduced, and whether it is gone from the newest release. "+
+		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which points of the spec's "+
+			"history carry each statement, when it was introduced, and whether it is gone from the newest one. "+
+			"The answer names the AXIS it used: a 3GPP spec evolves along RELEASE, an ETSI deliverable along "+
+			"VERSION (it has no releases — TS 102 221 has 126 published versions). "+
 			"With from_release and to_release, the paragraphs the clause gained and lost between them. "+
 			"Clause-level lineage cannot see this: a clause that changed one sentence looks entirely new to it."),
-		mcp.WithString("spec_id", mcp.Required(), mcp.Description("e.g. 23.501")),
+		mcp.WithString("spec_id", mcp.Required(), mcp.Description("e.g. 23.501, or ETSI TS 102 221")),
 		mcp.WithString("clause", mcp.Required(), mcp.Description("exact clause path, e.g. 5.4.4a")),
-		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two")),
-		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two")),
+		// The parameter names say "release" and are kept for compatibility, but the
+		// endpoints are matched against whichever of release/version the spec holds
+		// them in. An ETSI deliverable is traced between two VERSIONS here.
+		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
+		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
 	), h.traceClause)
 
 	s.AddTool(mcp.NewTool("help",
