@@ -563,9 +563,34 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// FEDERATE, like search_spec and list_specs already do. resolve_term read the
+	// 3GPP store alone, so it answered only from TS 21.905's 1 300 terms — which do
+	// not include UICC, ADF or AID, on a corpus that holds the deliverables those
+	// terms are defined in. The ETSI half has no vocabulary spec: each deliverable
+	// carries its own Abbreviations clause, and ingest-glossary mines them.
+	//
+	// 3GPP first: it is the canonical vocabulary for a term both halves define, and
+	// the ETSI rows carry source_series "etsi" so a caller can tell them apart
+	// without this having to say so twice.
 	a, err := h.st.ResolveTerm(ctx, term)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("resolve_term failed", err), nil
+	}
+	if h.etsi != nil {
+		seen := make(map[[3]string]bool, len(a))
+		for _, x := range a {
+			seen[[3]string{x.Term, x.Expansion, x.Domain}] = true
+		}
+		e, eErr := h.etsi.ResolveTerm(ctx, term)
+		if eErr != nil {
+			return mcp.NewToolResultErrorFromErr("resolve_term failed on the ETSI half", eErr), nil
+		}
+		for _, x := range e {
+			if k := ([3]string{x.Term, x.Expansion, x.Domain}); !seen[k] {
+				seen[k] = true
+				a = append(a, x)
+			}
+		}
 	}
 	resp := map[string]any{"term": term, "count": len(a), "matches": a}
 	// Domain subjects may enrich the term (e.g. the LI subject attaches an ASN.1

@@ -29,3 +29,7 @@ path = "src/bin/ingest_catalog.rs"
 [[bin]]
 name = "ingest-li"
 path = "src/bin/ingest_li.rs"
+
+[[bin]]
+name = "ingest-glossary"
+path = "src/bin/ingest_glossary.rs"
