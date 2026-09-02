@@ -860,6 +860,46 @@ impl Store {
         Ok(())
     }
 
+    /// check_ledger_ids_unambiguous refuses a ledger that holds MORE THAN ONE content
+    /// hash for the same chunk_id.
+    ///
+    /// The ledger is append-only and the apply below joins it to the corpus on chunk_id
+    /// alone, so two rows for one id make the UPDATE pick one of them arbitrarily —
+    /// and a chunk_id is a POSITION in one build, not an identity: it is assigned
+    /// sequentially at ingest (offset = max_chunk_id), so a corpus rebuilt from scratch
+    /// reuses the same numbers for different clauses.
+    ///
+    /// Measured 2026-09-02 between two ETSI builds of the SAME 11 821 documents:
+    /// chunk_id 138 was "ETSI TS 101 671 v3.15.1 §10" in one and
+    /// "ETSI EN 300 113-1 v1.3.1 §4" in the other. Importing across that would have
+    /// given 1 262 127 clauses a vector computed from an unrelated clause, with every
+    /// gate green — null_at_floor 0, clauses_with_text equal to vectors, the identities
+    /// agreeing, the HNSW index building. Only the answers would have been wrong.
+    ///
+    /// Refusing is the right answer rather than "keep the last one": the ledger has no
+    /// dependable row order once read back, and guessing which of two vectors belongs to
+    /// a clause is exactly the decision that must not be made silently. The remedy is to
+    /// archive the ledger and re-derive — its (hash, vec) pairs are still reusable
+    /// through --resume-from, which costs no GPU.
+    fn check_ledger_ids_unambiguous(&self) -> Result<()> {
+        let (ids, worst): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT coalesce(count(*), 0), coalesce(max(n), 0) FROM (
+                   SELECT chunk_id, count(DISTINCT embedding_hash) AS n
+                     FROM _ledger GROUP BY chunk_id HAVING n > 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("check that the ledger names each chunk_id once")?;
+        if ids > 0 {
+            anyhow::bail!(
+                "the ledger holds {ids} chunk_id(s) with more than one content hash (worst: {worst}). chunk_ids are positional, so this ledger describes more than one build of the corpus and the import would attach vectors at random. Archive it and re-run the embed step: pass the archive as --resume-from so its vectors are reused without GPU."
+            );
+        }
+        Ok(())
+    }
+
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
         let p = path.replace('\\', "/").replace('\'', "''");
         self.conn
@@ -890,6 +930,7 @@ impl Store {
         // The cast to the FIXED width happens only here: staging is FLOAT[] (variable),
         // the column is FLOAT[1024], and the filter above has already guaranteed every
         // surviving row is exactly that wide.
+        self.check_ledger_ids_unambiguous()?;
         let to_bodies = self.clauses_is_view()?;
         if to_bodies {
             self.check_body_ledger_agreement()?;

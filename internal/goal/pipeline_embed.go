@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 )
 
 // ---------------------------------------------------------------- embedder
@@ -165,6 +167,93 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 // measured corpus that is a 2.74x reduction — 833 924 distinct texts for
 // 2 282 337 embeddable clauses, with 79.8% of clauses duplicated verbatim across
 // releases.
+// ledgerDescribesAnotherBuild answers whether the resume ledger was written against
+// a DIFFERENT build of this corpus.
+//
+// A chunk_id is a POSITION, not an identity: ingest assigns it sequentially
+// (offset = max_chunk_id), so rebuilding a corpus from scratch — a different file
+// order, or one document yielding a different number of clauses — reuses the same
+// numbers for different clauses. The embedder resumes on chunk_id and
+// embed-io --import joins the ledger to the corpus on chunk_id, so a ledger from
+// another build attaches vectors computed from unrelated text.
+//
+// Measured 2026-09-02 between two ETSI builds of the SAME 11 821 documents:
+// chunk_id 138 was "ETSI TS 101 671 v3.15.1 §10" in one and
+// "ETSI EN 300 113-1 v1.3.1 §4" in the other; 1 262 127 clauses were about to be
+// skipped on that basis. Every gate passes that corpus — null_at_floor 0,
+// clauses_with_text equal to vectors, identities agreeing, HNSW built. Only the
+// answers are wrong.
+//
+// The check is cheap and needs no database: the work list already holds
+// (chunk_id, heading, text) for every clause that wants a vector, so a sample of the
+// ledger's OLDEST entries — the ones an incremental run never rewrites — can be
+// re-hashed and compared. A handful of disagreements is normal (a document really
+// was revised); a large share means the numbering itself moved.
+func ledgerDescribesAnotherBuild(ledger, worklist, identity string) (moved bool, disagree, checked int) {
+	want := map[uint64]string{}
+	f, err := os.Open(ledger)
+	if err != nil {
+		return false, 0, 0
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	for sc.Scan() && len(want) < ledgerSampleSize {
+		var rec struct {
+			ChunkID uint64 `json:"chunk_id"`
+			Hash    string `json:"hash"`
+		}
+		if json.Unmarshal(sc.Bytes(), &rec) == nil && rec.Hash != "" {
+			want[rec.ChunkID] = rec.Hash
+		}
+	}
+	if len(want) == 0 {
+		return false, 0, 0
+	}
+
+	w, err := os.Open(worklist)
+	if err != nil {
+		return false, 0, 0
+	}
+	defer func() { _ = w.Close() }()
+	ws := bufio.NewScanner(w)
+	ws.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	for ws.Scan() {
+		var it struct {
+			ChunkID uint64 `json:"chunk_id"`
+			Heading string `json:"heading"`
+			Text    string `json:"text"`
+		}
+		if json.Unmarshal(ws.Bytes(), &it) != nil {
+			continue
+		}
+		h, ok := want[it.ChunkID]
+		if !ok {
+			continue
+		}
+		checked++
+		if embed.ClauseHash(it.Heading, it.Text, identity) != h {
+			disagree++
+		}
+	}
+	// Require a real sample before drawing a conclusion: on a corpus where almost
+	// everything is already embedded, the work list is short and may overlap the
+	// sample barely at all.
+	if checked < ledgerSampleMin {
+		return false, disagree, checked
+	}
+	return disagree*100 >= checked*ledgerMovedPercent, disagree, checked
+}
+
+const (
+	// Enough of the ledger's head to be representative without reading a 25 GB file.
+	ledgerSampleSize = 5000
+	// Below this many actual comparisons the sample says nothing.
+	ledgerSampleMin = 200
+	// A revised document moves a few hashes; a renumbered corpus moves most of them.
+	ledgerMovedPercent = 25
+)
+
 func runEmbed(c *Ctx, t corpusTarget) error {
 	db := t.dbPath(c)
 	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
@@ -230,6 +319,27 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	// instead of 2 752 688, straight through the view's own join. `merge` still restores
 	// (it deletes and re-inserts rows of `clauses`, which really does need the table);
 	// `embed` no longer has any reason to.
+	// A LEDGER FROM ANOTHER BUILD IS WORSE THAN NO LEDGER. Its (hash, vec) pairs stay
+	// valuable — they cost GPU time and the identity has not changed — but its
+	// chunk_ids no longer name the same clauses, and both the resume and the import
+	// key on chunk_id. So archive it and hand it back as a CACHE: --resume-from
+	// contributes vectors by content hash, while the fresh ledger carries only ids
+	// this build assigned. Nothing is recomputed that does not have to be.
+	var resumeFrom string
+	if fileNonEmpty(ledger) {
+		if moved, bad, n := ledgerDescribesAnotherBuild(ledger, worklist, id); moved {
+			archive := fmt.Sprintf("%s.%s.otherbuild.bak", ledger, time.Now().UTC().Format("20060102T150405Z"))
+			c.Log.Printf("the resume ledger describes ANOTHER build of this corpus "+
+				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s and "+
+				"reusing it only as a vector cache",
+				bad, n, filepath.Base(archive))
+			if err := os.Rename(ledger, archive); err != nil {
+				return err
+			}
+			resumeFrom = archive
+		}
+	}
+
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
@@ -238,14 +348,19 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	}
 
 	c.Log.Printf("running the GPU pass — only DISTINCT texts reach the model")
-	if err := c.Run(Cmd{Name: c.rbin("embedder"), Args: []string{
+	embedArgs := []string{
 		"--in", worklist, "--out", ledger,
 		"--model-dir", c.Cfg("model_dir"),
 		"--embed-identity", id,
 		"--require-cuda",
 		"--vram-fraction", "0.8",
 		"--max-batch", "512",
-	}, Env: gpuEnv(c), Echo: true}); err != nil {
+	}
+	if resumeFrom != "" {
+		embedArgs = append(embedArgs, "--resume-from", resumeFrom)
+	}
+	if err := c.Run(Cmd{Name: c.rbin("embedder"), Args: embedArgs,
+		Env: gpuEnv(c), Echo: true}); err != nil {
 		// The ledger is append-only and flushed per batch, so a failure here is
 		// resumable: report where we got to rather than losing the position.
 		c.Checkpoint("ledger_lines", strconv.Itoa(countLines(ledger)))
