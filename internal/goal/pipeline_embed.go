@@ -2,6 +2,8 @@ package goal
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -189,7 +191,7 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 // ledger's OLDEST entries — the ones an incremental run never rewrites — can be
 // re-hashed and compared. A handful of disagreements is normal (a document really
 // was revised); a large share means the numbering itself moved.
-func ledgerDescribesAnotherBuild(ledger, worklist, identity string) (moved bool, disagree, checked int) {
+func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, text string) string) (moved bool, disagree, checked int) {
 	want := map[uint64]string{}
 	f, err := os.Open(ledger)
 	if err != nil {
@@ -199,12 +201,19 @@ func ledgerDescribesAnotherBuild(ledger, worklist, identity string) (moved bool,
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for sc.Scan() && len(want) < ledgerSampleSize {
+		// The dense ledger names the field "hash", the sparse one "h" — they carry
+		// the same thing (the identity of the TEXT the line was computed from) and
+		// this check asks the same question of both.
 		var rec struct {
 			ChunkID uint64 `json:"chunk_id"`
 			Hash    string `json:"hash"`
+			H       string `json:"h"`
 		}
-		if json.Unmarshal(sc.Bytes(), &rec) == nil && rec.Hash != "" {
-			want[rec.ChunkID] = rec.Hash
+		if json.Unmarshal(sc.Bytes(), &rec) != nil {
+			continue
+		}
+		if h := firstNonEmpty(rec.Hash, rec.H); h != "" {
+			want[rec.ChunkID] = h
 		}
 	}
 	if len(want) == 0 {
@@ -232,7 +241,7 @@ func ledgerDescribesAnotherBuild(ledger, worklist, identity string) (moved bool,
 			continue
 		}
 		checked++
-		if embed.ClauseHash(it.Heading, it.Text, identity) != h {
+		if hashOf(it.Heading, it.Text) != h {
 			disagree++
 		}
 	}
@@ -253,6 +262,25 @@ const (
 	// A revised document moves a few hashes; a renumbered corpus moves most of them.
 	ledgerMovedPercent = 25
 )
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// sparseResumeHash mirrors rust/embed-core's resume_hash byte for byte: the sha256
+// of the text the sparse arm embeds (heading, newline, text, NULs replaced), first
+// 16 hex characters. Kept here rather than reusing embed.ClauseHash because the
+// sparse ledger does not fold a model identity in — its identity lives in
+// schema_meta.sparse_model and is checked by --require-sparse.
+func sparseResumeHash(heading, text string) string {
+	sum := sha256.Sum256([]byte(strings.ReplaceAll(heading+"\n"+text, "\x00", " ")))
+	return hex.EncodeToString(sum[:])[:16]
+}
 
 func runEmbed(c *Ctx, t corpusTarget) error {
 	db := t.dbPath(c)
@@ -327,7 +355,8 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	// this build assigned. Nothing is recomputed that does not have to be.
 	var resumeFrom string
 	if fileNonEmpty(ledger) {
-		if moved, bad, n := ledgerDescribesAnotherBuild(ledger, worklist, id); moved {
+		hashOf := func(heading, text string) string { return embed.ClauseHash(heading, text, id) }
+		if moved, bad, n := ledgerDescribesAnotherBuild(ledger, worklist, hashOf); moved {
 			archive := fmt.Sprintf("%s.%s.otherbuild.bak", ledger, time.Now().UTC().Format("20060102T150405Z"))
 			c.Log.Printf("the resume ledger describes ANOTHER build of this corpus "+
 				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s and "+
@@ -1397,6 +1426,22 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	c.Checkpoint("sparse_worklist", strconv.Itoa(todo))
 	if todo == 0 {
 		return fmt.Errorf("%w: every clause already carries a sparse posting", ErrDeclined)
+	}
+	// SAME HAZARD AS THE DENSE LEDGER, and worse until now: a posting line carried a
+	// chunk_id and nothing else. chunk_ids are positional, so a rebuilt corpus reuses
+	// them for different clauses and the sparse arm would retrieve the wrong ones,
+	// confidently. Unlike the dense ledger there is nothing to salvage — the postings
+	// carry no reusable per-text cache — so the archive is kept only as evidence.
+	if fileNonEmpty(out) {
+		if moved, bad, n := ledgerDescribesAnotherBuild(out, work, sparseResumeHash); moved {
+			archive := fmt.Sprintf("%s.%s.otherbuild.bak", out, time.Now().UTC().Format("20060102T150405Z"))
+			c.Log.Printf("the sparse postings file describes ANOTHER build of this corpus "+
+				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s",
+				bad, n, filepath.Base(archive))
+			if err := os.Rename(out, archive); err != nil {
+				return err
+			}
+		}
 	}
 	c.Log.Printf("%d clause(s) to embed (postings file already holds %d)", todo, countLines(out))
 
