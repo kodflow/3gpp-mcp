@@ -632,11 +632,17 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// ROUTE THE SOURCE SPEC. This handler read h.st unconditionally while get_spec
+	// and trace_clause went through storeFor, so asking an ETSI deliverable for its
+	// references hit the 3GPP store, found no such spec, and answered count 0 —
+	// silently, on clause 2, which IS the normative reference list. The two halves
+	// are federated and never merged, so the routing has to be explicit everywhere.
+	src := h.storeFor(specID)
 	release, version := "", ""
-	if rel, v, ok, _ := h.st.LatestVersion(ctx, specID); ok {
+	if rel, v, ok, _ := src.LatestVersion(ctx, specID); ok {
 		release, version = rel, v
 	}
-	clauses, err := h.st.GetClauses(ctx, specID, version, r.GetString("clause", ""))
+	clauses, err := src.GetClauses(ctx, specID, version, r.GetString("clause", ""))
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("find_cross_references failed", err), nil
 	}
@@ -675,10 +681,32 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 			}
 			etsiSeen[id] = true
 			etsiRefs = append(etsiRefs, id)
-			// Version is unknown from a bare mention, so cite the deliver folder
-			// pointer (EtsiDeliverURL with empty version). SpecID keeps the "ETSI TS"
-			// prefix so the citation is unambiguous against 3GPP ids.
-			etsiCites = append(etsiCites, model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")})
+			// RESOLVE THE MENTION AGAINST THE ATTACHED HALF WHEN THERE IS ONE.
+			//
+			// A bare "TS 103 280" in prose names no version and no document type, so
+			// this used to cite the etsi_ts deliver FOLDER and stop. That was right
+			// when the ETSI half held 14 deliverables; it now holds 11 822 versions of
+			// 5 142 deliverables, so the corpus usually knows the exact one — and a
+			// versioned PDF is a citation a reader can open at the right text.
+			//
+			// The type is tried in normative order and the first that resolves wins:
+			// nothing in "103 101" says TR, and the trees are disjoint (etsi_ts/103101
+			// is a 404 while etsi_tr/103101 is TR 103 101). Unresolved still cites the
+			// folder — cite the pointer, never fabricate a version.
+			cite := model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")}
+			if h.etsi != nil {
+				for _, dt := range []string{"TS", "EN", "TR"} {
+					full := "ETSI " + dt + " " + id
+					if rel, v, ok, _ := h.etsi.LatestVersion(ctx, full); ok {
+						cite = model.Citation{
+							SpecID: full, Release: rel, Version: v,
+							URL: model.SpecURL(full, v), Stable: model.IsStableVersion(v),
+						}
+						break
+					}
+				}
+			}
+			etsiCites = append(etsiCites, cite)
 		}
 	}
 	return jsonResult(map[string]any{
