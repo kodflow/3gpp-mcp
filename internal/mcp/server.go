@@ -148,6 +148,13 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two")),
 	), h.traceClause)
 
+	s.AddTool(mcp.NewTool("help",
+		mcp.WithDescription("What this corpus HOLDS and how to drive it: counts per half "+
+			"(specs, clauses, vectors), the map from question to tool, and the environment "+
+			"knobs that change what you get back. Capabilities and their on/off reasons are "+
+			"server_info's job. Read-only, no arguments."),
+	), h.help)
+
 	s.AddTool(mcp.NewTool("server_info",
 		mcp.WithDescription("Report the server's retrieval capabilities and why semantic search is on/off "+
 			"(so a client knows whether to use mode=semantic). Read-only, no arguments."),
