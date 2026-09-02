@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -360,7 +361,21 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	// key on chunk_id. So archive it and hand it back as a CACHE: --resume-from
 	// contributes vectors by content hash, while the fresh ledger carries only ids
 	// this build assigned. Nothing is recomputed that does not have to be.
+	// AN ARCHIVED LEDGER KEEPS ITS VALUE AS A CACHE beyond the run that archived it.
+	// Its chunk_ids are meaningless here, but its (hash, vector) pairs cost hours of
+	// GPU and the identity has not changed. Without this, a step that is re-entered —
+	// which is what happens when a first pass leaves clauses behind — pays the full
+	// GPU price a second time for vectors already sitting on disk.
+	//
+	// Only the newest archive: each costs several GB of RAM to index by hash, and the
+	// newest is the one that overlaps this corpus most.
 	var resumeFrom string
+	if archives, _ := filepath.Glob(ledger + ".*.otherbuild.bak"); len(archives) > 0 {
+		sort.Strings(archives) // the name carries a UTC timestamp, so this is chronological
+		resumeFrom = archives[len(archives)-1]
+		c.Log.Printf("reusing %s as a vector cache (its ids name another build; its vectors do not)",
+			filepath.Base(resumeFrom))
+	}
 	if fileNonEmpty(ledger) {
 		hashOf := func(heading, text string) string { return embed.ClauseHash(heading, text, id) }
 		if moved, bad, n, _ := ledgerDescribesAnotherBuild(ledger, worklist, hashOf); moved {
