@@ -511,7 +511,39 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 		}
 		changes = filtered
 	}
-	return jsonResult(map[string]any{"spec_id": specID, "count": len(changes), "changes": changes})
+	out := map[string]any{"spec_id": specID, "count": len(changes), "changes": changes}
+	// A ZERO THAT MEANS TWO DIFFERENT THINGS IS NOT AN ANSWER.
+	//
+	// The changes table holds 3GPP change requests. The ETSI half carries none, so
+	// every ETSI deliverable answered count 0 — which reads as "this deliverable
+	// never changed", on a corpus that keeps all 126 published versions of
+	// TS 102 221 precisely because it did.
+	//
+	// The gap is not an oversight in the pipeline; it is what the source allows.
+	// A 3GPP change history survives .doc conversion as an HTML TABLE. ETSI ships
+	// PDFs, and `pdftotext -layout` flattens that table into space-aligned text
+	// whose rows split across lines, drop their Date/Meeting on continuation rows,
+	// and leave the Old/New columns blank — so a parser would attach a CR summary
+	// to the wrong CR number and the wrong version transition. A change record that
+	// names the wrong transition is worse than no record: it is a citation that
+	// looks authoritative and is false.
+	//
+	// So say what is true, and name the tool that DOES answer the question from the
+	// text itself. trace_clause diffs a clause between two versions as a set
+	// operation on paragraph ids — no parsing, nothing reconstructed.
+	if len(changes) == 0 && h.etsi != nil && isETSISpecID(specID) {
+		out["note"] = "this corpus holds no change-request records for the ETSI half: ETSI publishes PDFs, " +
+			"and the change-history table does not survive text extraction well enough to cite. " +
+			"Use trace_clause with from_release/to_release (they accept two VERSIONS here) to diff a " +
+			"clause between two published versions from the text itself."
+	}
+	return jsonResult(out)
+}
+
+// isETSISpecID is storeFor's routing predicate, named so a caller can ask the
+// question without asking for the store.
+func isETSISpecID(specID string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(specID)), "ETSI")
 }
 
 func (h *handlers) listReleases(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -894,7 +926,7 @@ func (h *handlers) traceClause(ctx context.Context, r mcp.CallToolRequest) (*mcp
 // second store when one is attached; everything else is 3GPP. The two are never
 // merged, so the routing has to be explicit.
 func (h *handlers) storeFor(specID string) store.Reader {
-	if h.etsi != nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(specID)), "ETSI") {
+	if h.etsi != nil && isETSISpecID(specID) {
 		return h.etsi
 	}
 	return h.st

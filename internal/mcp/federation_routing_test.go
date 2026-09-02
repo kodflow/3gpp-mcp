@@ -136,3 +136,29 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// A ZERO THAT MEANS TWO THINGS IS NOT AN ANSWER. get_changelog on an ETSI
+// deliverable returned count 0, which reads as "this deliverable never changed"
+// — on a corpus that keeps every published version because it did. The corpus
+// genuinely holds no ETSI change requests (see the handler for why the source
+// does not allow them), so the fix is to SAY that and name the tool that answers
+// the question from the text.
+//
+// The 3GPP half must NOT gain the note: there, count 0 means what it says.
+func TestChangelogSaysWhyTheEtsiHalfHasNone(t *testing.T) {
+	c, ctx := federatedClient(t)
+
+	out := call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "ETSI TS 102 221"})
+	note, _ := out["note"].(string)
+	if note == "" {
+		t.Fatal("an empty ETSI changelog must say why, not just count 0")
+	}
+	if !contains(note, "trace_clause") {
+		t.Errorf("the note must name the tool that DOES answer it: %q", note)
+	}
+
+	out = call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "33.128"})
+	if _, ok := out["note"]; ok {
+		t.Errorf("the 3GPP half must not gain the note: %v", out["note"])
+	}
+}
