@@ -191,16 +191,17 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 // ledger's OLDEST entries — the ones an incremental run never rewrites — can be
 // re-hashed and compared. A handful of disagreements is normal (a document really
 // was revised); a large share means the numbering itself moved.
-func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, text string) string) (moved bool, disagree, checked int) {
+func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, text string) string) (moved bool, disagree, checked, hashed int) {
 	want := map[uint64]string{}
 	f, err := os.Open(ledger)
 	if err != nil {
-		return false, 0, 0
+		return false, 0, 0, 0
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	for sc.Scan() && len(want) < ledgerSampleSize {
+	lines := 0
+	for sc.Scan() && lines < ledgerSampleSize {
 		// The dense ledger names the field "hash", the sparse one "h" — they carry
 		// the same thing (the identity of the TEXT the line was computed from) and
 		// this check asks the same question of both.
@@ -212,17 +213,23 @@ func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, t
 		if json.Unmarshal(sc.Bytes(), &rec) != nil {
 			continue
 		}
+		lines++
 		if h := firstNonEmpty(rec.Hash, rec.H); h != "" {
 			want[rec.ChunkID] = h
 		}
 	}
+	// A file whose lines carry NO hash cannot be verified at all. That is not "no
+	// evidence of a problem": it is a file this build has no way to trust, and the
+	// sparse postings file was exactly that until it grew an `h` field. Report it as
+	// moved so the caller archives it rather than importing 510 384 lines whose ids
+	// may name other clauses.
 	if len(want) == 0 {
-		return false, 0, 0
+		return lines > 0, 0, 0, 0
 	}
 
 	w, err := os.Open(worklist)
 	if err != nil {
-		return false, 0, 0
+		return false, 0, 0, len(want)
 	}
 	defer func() { _ = w.Close() }()
 	ws := bufio.NewScanner(w)
@@ -249,9 +256,9 @@ func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, t
 	// everything is already embedded, the work list is short and may overlap the
 	// sample barely at all.
 	if checked < ledgerSampleMin {
-		return false, disagree, checked
+		return false, disagree, checked, len(want)
 	}
-	return disagree*100 >= checked*ledgerMovedPercent, disagree, checked
+	return disagree*100 >= checked*ledgerMovedPercent, disagree, checked, len(want)
 }
 
 const (
@@ -356,7 +363,7 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	var resumeFrom string
 	if fileNonEmpty(ledger) {
 		hashOf := func(heading, text string) string { return embed.ClauseHash(heading, text, id) }
-		if moved, bad, n := ledgerDescribesAnotherBuild(ledger, worklist, hashOf); moved {
+		if moved, bad, n, _ := ledgerDescribesAnotherBuild(ledger, worklist, hashOf); moved {
 			archive := fmt.Sprintf("%s.%s.otherbuild.bak", ledger, time.Now().UTC().Format("20060102T150405Z"))
 			c.Log.Printf("the resume ledger describes ANOTHER build of this corpus "+
 				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s and "+
@@ -1433,11 +1440,14 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	// confidently. Unlike the dense ledger there is nothing to salvage — the postings
 	// carry no reusable per-text cache — so the archive is kept only as evidence.
 	if fileNonEmpty(out) {
-		if moved, bad, n := ledgerDescribesAnotherBuild(out, work, sparseResumeHash); moved {
+		if moved, bad, n, hashed := ledgerDescribesAnotherBuild(out, work, sparseResumeHash); moved {
 			archive := fmt.Sprintf("%s.%s.otherbuild.bak", out, time.Now().UTC().Format("20060102T150405Z"))
+			why := fmt.Sprintf("%d of %d sampled chunk_ids hash differently", bad, n)
+			if hashed == 0 {
+				why = "it carries no content hash at all, so nothing in it can be verified"
+			}
 			c.Log.Printf("the sparse postings file describes ANOTHER build of this corpus "+
-				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s",
-				bad, n, filepath.Base(archive))
+				"(%s) — archiving it to %s", why, filepath.Base(archive))
 			if err := os.Rename(out, archive); err != nil {
 				return err
 			}

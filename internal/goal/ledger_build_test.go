@@ -67,7 +67,7 @@ func TestLedgerDescribesAnotherBuild(t *testing.T) {
 	for i := 1; i <= 400; i++ {
 		same = append(same, ledRow{ChunkID: uint64(i), Hash: embed.ClauseHash(fmt.Sprintf("h%d", i), fmt.Sprintf("clause text %d", i), id)})
 	}
-	if moved, bad, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "same.jsonl", same), worklist, denseHash(id)); moved || bad != 0 {
+	if moved, bad, n, _ := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "same.jsonl", same), worklist, denseHash(id)); moved || bad != 0 {
 		t.Errorf("a ledger from THIS build must not be archived: moved=%v disagree=%d checked=%d", moved, bad, n)
 	}
 
@@ -76,7 +76,7 @@ func TestLedgerDescribesAnotherBuild(t *testing.T) {
 	for i := 1; i <= 400; i++ {
 		other = append(other, ledRow{ChunkID: uint64(i), Hash: embed.ClauseHash("other", fmt.Sprintf("a different clause %d", i), id)})
 	}
-	moved, bad, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "other.jsonl", other), worklist, denseHash(id))
+	moved, bad, n, _ := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "other.jsonl", other), worklist, denseHash(id))
 	if !moved {
 		t.Errorf("a ledger from another build MUST be detected: disagree=%d checked=%d", bad, n)
 	}
@@ -91,18 +91,18 @@ func TestLedgerDescribesAnotherBuild(t *testing.T) {
 		}
 		revised = append(revised, ledRow{ChunkID: uint64(i), Hash: embed.ClauseHash(fmt.Sprintf("h%d", i), text, id)})
 	}
-	if moved, bad, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "revised.jsonl", revised), worklist, denseHash(id)); moved {
+	if moved, bad, n, _ := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "revised.jsonl", revised), worklist, denseHash(id)); moved {
 		t.Errorf("10%% revised clauses is a normal update, not a renumbering: disagree=%d checked=%d", bad, n)
 	}
 
 	// Too few comparisons to conclude: say nothing rather than archive on noise.
 	tiny := writeJSONL(t, dir, "tiny.jsonl", []any{ledRow{ChunkID: 1, Hash: "nope"}})
-	if moved, _, n := ledgerDescribesAnotherBuild(tiny, worklist, denseHash(id)); moved || n >= ledgerSampleMin {
+	if moved, _, n, _ := ledgerDescribesAnotherBuild(tiny, worklist, denseHash(id)); moved || n >= ledgerSampleMin {
 		t.Errorf("a sample of %d must not decide anything (moved=%v)", n, moved)
 	}
 
 	// A missing ledger is not a moved one.
-	if moved, _, _ := ledgerDescribesAnotherBuild(filepath.Join(dir, "nope.jsonl"), worklist, denseHash(id)); moved {
+	if moved, _, _, _ := ledgerDescribesAnotherBuild(filepath.Join(dir, "nope.jsonl"), worklist, denseHash(id)); moved {
 		t.Error("a missing ledger must not report a moved id space")
 	}
 }
@@ -132,10 +132,10 @@ func TestLedgerCheckReadsTheSparseShapeToo(t *testing.T) {
 		mine = append(mine, sparseRow{ChunkID: uint64(i), H: sparseResumeHash(fmt.Sprintf("h%d", i), fmt.Sprintf("clause text %d", i))})
 		theirs = append(theirs, sparseRow{ChunkID: uint64(i), H: sparseResumeHash("other", fmt.Sprintf("a different clause %d", i))})
 	}
-	if moved, bad, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-same.jsonl", mine), worklist, sparseResumeHash); moved {
+	if moved, bad, n, _ := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-same.jsonl", mine), worklist, sparseResumeHash); moved {
 		t.Errorf("sparse postings from THIS build must be kept: disagree=%d checked=%d", bad, n)
 	}
-	if moved, bad, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-other.jsonl", theirs), worklist, sparseResumeHash); !moved {
+	if moved, bad, n, _ := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-other.jsonl", theirs), worklist, sparseResumeHash); !moved {
 		t.Errorf("sparse postings from another build MUST be detected: disagree=%d checked=%d", bad, n)
 	}
 	// A pre-hash postings file carries no "h" at all: nothing to compare, so nothing
@@ -147,8 +147,21 @@ func TestLedgerCheckReadsTheSparseShapeToo(t *testing.T) {
 	for i := 1; i <= 400; i++ {
 		old = append(old, oldRow{ChunkID: uint64(i)})
 	}
-	if moved, _, n := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-old.jsonl", old), worklist, sparseResumeHash); moved || n != 0 {
-		t.Errorf("a hash-less postings file gives no sample: moved=%v checked=%d", moved, n)
+	// A file whose lines carry NO hash is not "probably fine": it is a file this
+	// build cannot verify at all, which is what the sparse postings file was until
+	// it grew an `h` field. It must be archived, not imported.
+	if moved, _, n, hashed := ledgerDescribesAnotherBuild(writeJSONL(t, dir, "s-old.jsonl", old), worklist, sparseResumeHash); !moved || n != 0 || hashed != 0 {
+		t.Errorf("a hash-less postings file must be refused: moved=%v checked=%d hashed=%d", moved, n, hashed)
+	}
+
+	// An EMPTY file is simply nothing to reuse, and must not be reported as moved —
+	// the caller would rename a file that does not exist.
+	empty := filepath.Join(dir, "s-empty.jsonl")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if moved, _, _, _ := ledgerDescribesAnotherBuild(empty, worklist, sparseResumeHash); moved {
+		t.Error("an empty postings file is nothing to archive")
 	}
 }
 
