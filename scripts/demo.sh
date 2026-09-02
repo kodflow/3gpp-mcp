@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # demo.sh — drive the 3gpp-mcp server over stdio (real MCP JSON-RPC) and
-# pretty-print what each of the 8 tools returns. This is the "test it yourself"
+# pretty-print what EVERY registered tool returns. This is the "test it yourself"
 # entry point. Requires a built binary (make build) and a DB (make ingest).
 #
 # Usage: scripts/demo.sh [db]      (default db: data/3gpp.duckdb)
@@ -28,6 +28,15 @@ trap 'rm -f "$OUT"' EXIT
   printf '%s\n' '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"trace_evolution","arguments":{"entity":"MME"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"find_cross_references","arguments":{"spec_id":"33.128","clause":"6.2.2"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"get_changelog","arguments":{"spec_id":"33.128"}}}'
+  # THE FOUR THIS DEMO USED TO SKIP while the Makefile called it "every tool".
+  # help and server_info are the two entry points a new client is told to call
+  # first; trace_clause is the tool that answers "what changed"; search_api is the
+  # only one that reaches the OpenAPI side. A demo that shows everything except the
+  # tools someone would reach for is not a demo of the product.
+  printf '%s\n' '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"help","arguments":{}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"server_info","arguments":{}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"trace_clause","arguments":{"spec_id":"33.128","clause":"6.2.2.2"}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"search_api","arguments":{"query":"Namf communication N1N2 message transfer","top_k":3}}}'
   sleep 4   # keep stdin open so the server flushes every response before EOF
 } | timeout 60 "$BIN" serve --db "$DB" 2>/dev/null > "$OUT"
 
@@ -35,7 +44,9 @@ python3 - "$OUT" <<'PY'
 import sys, json
 labels = {10:"tools/list", 11:"list_specs(series=33)", 12:"list_releases(33.128)",
           13:"get_spec(33.128 §6.2.2.2)", 14:"search_spec(xIRI X2)", 15:"resolve_term(AMF)",
-          16:"trace_evolution(MME)", 17:"find_cross_references(33.128 §6.2.2)", 18:"get_changelog(33.128)"}
+          16:"trace_evolution(MME)", 17:"find_cross_references(33.128 §6.2.2)", 18:"get_changelog(33.128)",
+          19:"help()", 20:"server_info()", 21:"trace_clause(33.128 §6.2.2.2)",
+          22:"search_api(Namf N1N2 transfer)"}
 def trim(o):
     if isinstance(o, dict): return {k: trim(v) for k,v in o.items()}
     if isinstance(o, list): return [trim(x) for x in o[:6]] + (["… (+%d)"%(len(o)-6)] if len(o)>6 else [])
