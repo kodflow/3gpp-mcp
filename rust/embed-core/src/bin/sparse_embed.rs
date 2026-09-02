@@ -72,6 +72,33 @@ fn arg(name: &str) -> Option<String> {
         .and_then(|i| a.get(i + 1).cloned())
 }
 
+/// write_posting emits one posting line. Shared by the freshly-embedded path and the
+/// repeat-text path so the two can never drift into writing different shapes.
+fn write_posting(
+    w: &mut BufWriter<std::fs::File>,
+    chunk_id: u64,
+    h: &str,
+    terms: Vec<(u32, f32)>,
+    embedded: &mut usize,
+    skipped: &mut usize,
+) {
+    if serde_json::to_writer(
+        &mut *w,
+        &Posting {
+            chunk_id,
+            h: h.to_string(),
+            terms,
+        },
+    )
+    .is_ok()
+    {
+        let _ = w.write_all(b"\n");
+        *embedded += 1;
+    } else {
+        *skipped += 1;
+    }
+}
+
 /// flush_batch embeds the buffered clauses in ONE forward pass and writes a posting line each.
 #[allow(clippy::too_many_arguments)]
 fn flush_batch(
@@ -82,6 +109,7 @@ fn flush_batch(
     skipped: &mut usize,
     total: usize,
     start: std::time::Instant,
+    seen: &mut HashMap<String, Vec<(u32, f32)>>,
 ) {
     if ids.is_empty() {
         return;
@@ -91,21 +119,9 @@ fn flush_batch(
     for (k, postings) in res.into_iter().enumerate() {
         match postings {
             Some(terms) => {
-                if serde_json::to_writer(
-                    &mut *w,
-                    &Posting {
-                        chunk_id: ids[k],
-                        h: resume_hash(&txt[k]),
-                        terms,
-                    },
-                )
-                .is_ok()
-                {
-                    let _ = w.write_all(b"\n");
-                    *embedded += 1;
-                } else {
-                    *skipped += 1;
-                }
+                let h = resume_hash(&txt[k]);
+                seen.insert(h.clone(), terms.clone());
+                write_posting(w, ids[k], &h, terms, embedded, skipped);
             }
             None => *skipped += 1, // backend error on this row — left for the next pass
         }
@@ -165,6 +181,7 @@ fn flush_window(
     skipped: &mut usize,
     total: usize,
     start: std::time::Instant,
+    seen: &mut HashMap<String, Vec<(u32, f32)>>,
 ) {
     if ids.is_empty() {
         return;
@@ -178,10 +195,10 @@ fn flush_window(
         bi.push(ids[i]);
         bt.push(std::mem::take(&mut txt[i]));
         if bi.len() >= batch {
-            flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start);
+            flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start, seen);
         }
     }
-    flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start);
+    flush_batch(&mut bi, &mut bt, w, embedded, skipped, total, start, seen);
     ids.clear();
     txt.clear();
 }
@@ -250,6 +267,24 @@ fn main() {
         .unwrap_or(0);
     let start = std::time::Instant::now();
 
+    // POSTINGS ALREADY COMPUTED IN THIS RUN, KEYED BY THE TEXT THEY CAME FROM.
+    //
+    // The dense embedder has always sent only DISTINCT texts to the model; this arm sent
+    // every occurrence. On the all-versions ETSI corpus that is 1 998 710 forward passes
+    // for 1 134 550 distinct texts — 43% of the GPU pass recomputing an answer it already
+    // had, because a clause that did not change between two releases is the same text
+    // twice. Measured 2026-09-02: ~102 clause/s, so those repeats cost about 2h20.
+    //
+    // The key is resume_hash — the SAME key resume already trusts to decide a posting
+    // line describes a given text. Two identical texts give identical postings (the model
+    // is deterministic), so serving a repeat from here cannot attach another clause's
+    // postings the way a chunk_id-keyed shortcut would.
+    //
+    // Bounded by the number of DISTINCT texts, not by the corpus: ~1.1M entries at ~120
+    // postings each is ~2 GB, and it is dropped when the pass ends.
+    let mut seen: HashMap<String, Vec<(u32, f32)>> = HashMap::new();
+    let mut reused = 0usize;
+
     let (mut embedded, mut skipped) = (0usize, 0usize);
     let mut fail_streak = 0usize; // consecutive batches that embedded nothing (broken-model guard)
     let mut buf_ids: Vec<u64> = Vec::with_capacity(batch);
@@ -273,6 +308,20 @@ fn main() {
         if matches!(done.get(&item.chunk_id), Some(h) if !h.is_empty() && *h == want) {
             continue;
         }
+        // Same text as one already embedded this run: write its postings, skip the GPU.
+        if let Some(terms) = seen.get(&want) {
+            let terms = terms.clone();
+            write_posting(
+                &mut w,
+                item.chunk_id,
+                &want,
+                terms,
+                &mut embedded,
+                &mut skipped,
+            );
+            reused += 1;
+            continue;
+        }
         buf_ids.push(item.chunk_id);
         buf_txt.push(embed_text);
         if buf_ids.len() >= window {
@@ -286,6 +335,7 @@ fn main() {
                 &mut skipped,
                 total,
                 start,
+                &mut seen,
             );
             // Fast-abort guard: if many consecutive batches embed NOTHING while the total is
             // still 0, the model/inference is broken (e.g. a batch-static ONNX export → every
@@ -314,9 +364,11 @@ fn main() {
         &mut skipped,
         total,
         start,
+        &mut seen,
     );
     eprintln!(
-        "embed-core-sparse: done — embedded={embedded}/{total} skipped={skipped} in {:.0}s",
+        "embed-core-sparse: done — embedded={embedded}/{total} skipped={skipped} reused={reused} ({} distinct text(s) reached the model) in {:.0}s",
+        seen.len(),
         start.elapsed().as_secs_f64()
     );
 }
@@ -332,6 +384,40 @@ mod tests {
     #[test]
     fn resume_hash_matches_the_go_side() {
         assert_eq!(resume_hash("6 X1\nbody"), "b76cec67248a1ec9");
+    }
+
+    /// A REPEAT MUST BE INDISTINGUISHABLE FROM A FRESH EMBED.
+    ///
+    /// The whole point of the `seen` cache is that a clause served from it is written
+    /// exactly as if the model had just produced it: same postings, same content hash,
+    /// its OWN chunk_id. If the two paths ever drifted, the arm would still look healthy
+    /// — every gate counts postings, none compares a repeat to its original.
+    #[test]
+    fn a_cached_repeat_writes_the_same_postings_under_its_own_id() {
+        let path = std::env::temp_dir().join("sparse_embed_repeat_test.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let terms: Vec<(u32, f32)> = vec![(7, 0.5), (11, 0.25)];
+        let h = resume_hash("h\nt");
+        let (mut embedded, mut skipped) = (0usize, 0usize);
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = BufWriter::new(f);
+            // The freshly-embedded clause, then the same TEXT met again at another id.
+            write_posting(&mut w, 42, &h, terms.clone(), &mut embedded, &mut skipped);
+            write_posting(&mut w, 99, &h, terms.clone(), &mut embedded, &mut skipped);
+        }
+        assert_eq!((embedded, skipped), (2, 0));
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per clause, repeats included");
+        let a: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let b: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(a["chunk_id"], 42);
+        assert_eq!(b["chunk_id"], 99, "the repeat carries ITS id, not the original's");
+        assert_eq!(a["h"], b["h"], "same text, same content hash");
+        assert_eq!(a["terms"], b["terms"], "same text, same postings");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// It identifies the TEXT, so a different clause hashes differently and the same
