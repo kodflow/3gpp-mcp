@@ -993,11 +993,29 @@ fn dedup_by_ids<'a>(rows: impl Iterator<Item = &'a [i64]>) -> Vec<Vec<usize>> {
 /// load_done scans the output ledger plus any extra `--resume-from` ledgers (the
 /// multi-GPU launcher passes the merged ledger so every per-GPU process skips what any
 /// shard already embedded). A missing file is ignored (fresh run).
+/// ONLY `--out` MAKES A CLAUSE DONE. `--resume-from` is a VECTOR CACHE.
+///
+/// The two were folded together, and the difference is the whole point: the
+/// pipeline imports `--out` and nothing else. A clause skipped because some OTHER
+/// ledger already holds its (id, hash) therefore never reaches the corpus at all.
+///
+/// Measured 2026-09-02, when the embed step first archived a ledger from an earlier
+/// build and handed it back as a cache: of 1 998 710 clauses, 1 268 594 were written
+/// and 730 116 were skipped because the archive happened to hold the same id with
+/// the same text. Those 730 116 would have been left without a vector — caught by
+/// the step's own NullAtFloor check, but only after a full GPU pass.
+///
+/// So an entry found only in a cache is a COPY, not a skip: it costs no GPU and it
+/// lands in `--out` where the import will find it.
 fn load_done(out: &Path, extra: &[PathBuf]) -> Result<Resume> {
     let mut r = Resume::default();
     scan_ledger(out, &mut r)?;
     for p in extra {
-        scan_ledger(p, &mut r)?;
+        let mut cache = Resume::default();
+        scan_ledger(p, &mut cache)?;
+        for (h, v) in cache.by_hash {
+            r.by_hash.entry(h).or_insert(v);
+        }
     }
     Ok(r)
 }
@@ -1094,6 +1112,51 @@ mod tests {
         assert!(
             !skip(10, "anything"),
             "an id the ledger never saw is not done"
+        );
+    }
+
+    /// ONLY --out MAKES A CLAUSE DONE. --resume-from is a vector CACHE, and the
+    /// pipeline imports --out alone: a clause skipped because another ledger held its
+    /// (id, hash) would never reach the corpus. Measured on the real run before this
+    /// was separated: 730 116 of 1 998 710 clauses were skipped that way.
+    #[test]
+    fn a_cache_ledger_supplies_vectors_but_never_marks_a_clause_done() {
+        let dir = std::env::temp_dir();
+        let out = dir.join(format!("embedder-out-{}.jsonl", std::process::id()));
+        let cache = dir.join(format!("embedder-cache-{}.jsonl", std::process::id()));
+        let full = vec![0.0f32; DENSE_DIM];
+        {
+            let mut f = std::fs::File::create(&out).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"chunk_id": 1, "hash": "h1", "vec": full})
+            )
+            .unwrap();
+            let mut g = std::fs::File::create(&cache).unwrap();
+            writeln!(
+                g,
+                "{}",
+                serde_json::json!({"chunk_id": 2, "hash": "h2", "vec": full})
+            )
+            .unwrap();
+        }
+        let r = load_done(&out, &[cache.clone()]).unwrap();
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_file(&cache).ok();
+
+        assert_eq!(
+            r.done.get(&1).map(String::as_str),
+            Some("h1"),
+            "an entry in --out is genuinely done"
+        );
+        assert!(
+            !r.done.contains_key(&2),
+            "an entry that exists only in a CACHE must not mark the clause done — its              vector is not in --out and the import would never see it"
+        );
+        assert!(
+            r.by_hash.contains_key("h2"),
+            "the cache must still supply the vector, so the copy costs no GPU"
         );
     }
 
