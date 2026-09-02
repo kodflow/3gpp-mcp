@@ -16,6 +16,7 @@
 package etsicat
 
 import (
+	"errors"
 	"io"
 	"regexp"
 	"sort"
@@ -155,6 +156,20 @@ func Diff(site, index map[string]string) []string {
 	return changed
 }
 
+// ErrNotInArchive marks a deliverable the /deliver archive does not hold: the
+// crawl enumerated its id, and its folder answers 404 in the tree it was
+// enumerated from. That is a DEFINITIVE answer, not a transient one.
+//
+// Why it needs a name. The fetcher retried every non-200 five times with backoff,
+// and the caller then reported "will retry next run" — so 90 ids enumerated from
+// the ETSI index but never published (historical ETS/I-ETS numbers; the whole
+// 100000_100099 range folder is a 404 in all three trees, checked 2026-09-02)
+// cost five requests each, every run, forever, and left the operator reading a
+// completeness report that promised work which can never complete. A corpus is
+// only "complete" if the tool can say WHICH of the two reasons a document is
+// missing for.
+var ErrNotInArchive = errors.New("not published in the ETSI /deliver archive")
+
 // Fetcher fetches a URL and returns its body. Injected so the crawl is unit-testable
 // with fixtures (no network) — the CLI passes an http.Get-backed implementation.
 type Fetcher func(url string) (io.ReadCloser, error)
@@ -224,7 +239,9 @@ func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []st
 	for _, id := range ids {
 		ds = append(ds, Deliverable{TypeDir: model.EtsiTypeTS, ID: id})
 	}
-	typed, failed := BuildSiteIn(fetch, ds)
+	typed, failed, absent := BuildSiteIn(fetch, ds)
+	failed = append(failed, absent...)
+	sort.Strings(failed)
 	site = make(map[string]string, len(typed))
 	for d, v := range typed {
 		site[d.ID] = v
@@ -250,10 +267,10 @@ func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []st
 // two runs over the same archive produce byte-identical output. Fetcher is called
 // from several goroutines, so an implementation must be safe for concurrent use —
 // the http.Client-backed one in cmd/discover-etsi is.
-func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, failed []string) {
+func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, failed, absent []string) {
 	site = make(map[Deliverable]string, len(ds))
 	if len(ds) == 0 {
-		return site, nil
+		return site, nil, nil
 	}
 
 	workers := BuildSiteWorkers
@@ -273,6 +290,8 @@ func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, 
 				v, ok, err := ResolveLatestIn(fetch, d.TypeDir, d.ID)
 				mu.Lock()
 				switch {
+				case errors.Is(err, ErrNotInArchive):
+					absent = append(absent, d.ID)
 				case err != nil:
 					failed = append(failed, d.ID)
 				case ok:
@@ -289,7 +308,8 @@ func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, 
 	wg.Wait()
 
 	sort.Strings(failed)
-	return site, failed
+	sort.Strings(absent)
+	return site, failed, absent
 }
 
 // newer reports whether ETSI version a is strictly newer than b (major/minor/edit).
@@ -366,10 +386,10 @@ func ResolveAllIn(fetch Fetcher, typeDir, id string) ([]string, error) {
 
 // BuildHistory resolves EVERY published version of every deliverable, concurrently.
 // The map is keyed by the whole deliverable for the same reason BuildSiteIn's is.
-func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]string, failed []string) {
+func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]string, failed, absent []string) {
 	history = make(map[Deliverable][]string, len(ds))
 	if len(ds) == 0 {
-		return history, nil
+		return history, nil, nil
 	}
 	workers := BuildSiteWorkers
 	if len(ds) < workers {
@@ -386,6 +406,8 @@ func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]st
 				vs, err := ResolveAllIn(fetch, d.TypeDir, d.ID)
 				mu.Lock()
 				switch {
+				case errors.Is(err, ErrNotInArchive):
+					absent = append(absent, d.ID)
 				case err != nil:
 					failed = append(failed, d.ID)
 				case len(vs) > 0:
@@ -401,5 +423,6 @@ func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]st
 	close(jobs)
 	wg.Wait()
 	sort.Strings(failed)
-	return history, failed
+	sort.Strings(absent)
+	return history, failed, absent
 }
