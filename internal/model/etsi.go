@@ -102,6 +102,47 @@ func EtsiDeliverURLIn(typeDir, id, version string) string {
 	return fmt.Sprintf("%s/%s/%s_%sv%sp.pdf", base, verFolder, filePrefix, token, verToken)
 }
 
+// reEtsiSpecID splits a CORPUS spec_id — the form the ETSI half of the store
+// holds, "ETSI TS 102 221" / "ETSI TR 103 101" / "ETSI EN 301 893" — into its
+// document type and its bare number. Distinct from reEtsiID, which recognises a
+// citation appearing inside 3GPP prose and is anchored on "1NN": ETSI EN numbers
+// are "3NN NNN", so the recogniser must keep refusing them while this parser must
+// accept them.
+var reEtsiSpecID = regexp.MustCompile(`^ETSI\s+(TS|TR|EN)\s+(\S.*)$`)
+
+// EtsiSpecURL builds the deliver-archive URL for a spec_id held in the ETSI half
+// of the corpus, e.g. ("ETSI TS 102 221","18.4.0") ->
+// https://www.etsi.org/deliver/etsi_ts/102200_102299/102221/18.04.00_60/ts_102221v180400p.pdf
+//
+// WHY THIS EXISTS. model.ArchiveURL reconstructs a 3GPP archive ZIP URL and
+// returns "" for anything that is not a 3GPP id — so every citation the ETSI half
+// produced carried an EMPTY url. The clause text was right, the version was right,
+// and there was no way to reach the document it came from: 2 994 221 clauses that
+// cite nothing a reader can open. "Cite or stay silent" (CLAUDE.md §1) is not
+// satisfied by a citation whose pointer is blank.
+//
+// Returns "" for a non-ETSI spec_id, so the caller can fall back to ArchiveURL,
+// and the deliver FOLDER when the version cannot be parsed — cite the pointer,
+// never fabricate a version.
+func EtsiSpecURL(specID, version string) string {
+	m := reEtsiSpecID.FindStringSubmatch(strings.TrimSpace(specID))
+	if m == nil {
+		return ""
+	}
+	typeDir := map[string]string{"TS": EtsiTypeTS, "TR": EtsiTypeTR, "EN": EtsiTypeEN}[m[1]]
+	return EtsiDeliverURLIn(typeDir, m[2], version)
+}
+
+// SpecURL is the one citation-URL entry point: the ETSI deliver archive for an
+// ETSI deliverable, the 3GPP archive for a 3GPP spec. Both halves are served from
+// one process, so a single call site cannot be allowed to know only one of them.
+func SpecURL(specID, version string) string {
+	if u := EtsiSpecURL(specID, version); u != "" {
+		return u
+	}
+	return ArchiveURL(specID, version)
+}
+
 // reEtsiArchiveID is the ARCHIVE-side id parser, deliberately looser than
 // reEtsiID: any 3-digit prefix, and any number of "-P" parts.
 //
