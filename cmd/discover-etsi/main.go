@@ -79,6 +79,14 @@ func main() {
 			}
 			if resp.StatusCode != http.StatusOK {
 				_ = resp.Body.Close()
+				// A 404 IS AN ANSWER. The enumeration walks the ETSI index, which
+				// lists historical ids the /deliver archive never carried — the whole
+				// 100000_100099 range folder is a 404 in all three trees. Retrying
+				// those five times with backoff, every run, buys nothing and made the
+				// summary promise work that can never complete.
+				if resp.StatusCode == http.StatusNotFound {
+					return retry.Permanent(fmt.Errorf("%w: GET %s", etsicat.ErrNotInArchive, url))
+				}
 				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 			}
 			body = resp.Body
@@ -211,9 +219,15 @@ func main() {
 	// per-file resume decide what is already converted. Saying that here is better
 	// than silently diffing a set against a scalar.
 	if *allVersions {
-		history, hfailed := etsicat.BuildHistory(fetch, deliverables)
+		history, hfailed, habsent := etsicat.BuildHistory(fetch, deliverables)
 		for _, id := range hfailed {
 			fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
+		}
+		// Absent is not failed, and saying so is the difference between a corpus
+		// that is complete and one that looks 90 documents short forever.
+		if len(habsent) > 0 {
+			fmt.Fprintf(os.Stderr, "discover-etsi: %d enumerated id(s) are NOT in the /deliver archive (404) — nothing to retry: %s\n",
+				len(habsent), strings.Join(habsent, ", "))
 		}
 		total := 0
 		for _, vs := range history {
@@ -243,9 +257,15 @@ func main() {
 		return
 	}
 
-	site, failed := etsicat.BuildSiteIn(fetch, deliverables)
+	site, failed, absent := etsicat.BuildSiteIn(fetch, deliverables)
 	for _, id := range failed {
 		fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
+	}
+	// Absent is not failed, and saying so is the difference between a corpus
+	// that is complete and one that looks 90 documents short forever.
+	if len(absent) > 0 {
+		fmt.Fprintf(os.Stderr, "discover-etsi: %d enumerated id(s) are NOT in the /deliver archive (404) — nothing to retry: %s\n",
+			len(absent), strings.Join(absent, ", "))
 	}
 	// Loud, machine-greppable resolution summary on stderr. A green-but-empty run
 	// (the absolute-href bug fixed here) MUST be visible, not silent.
