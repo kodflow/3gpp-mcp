@@ -135,7 +135,7 @@ make serve
 
 # TESTER soi-même
 make poc                      # test E2E : events LI X2→MDF2 par NE/NF (TS 33.128)
-make demo                     # interroge les 8 tools en vrai (JSON-RPC) et affiche
+make demo                     # interroge TOUS les tools en vrai (JSON-RPC) et affiche
 
 # Backend sémantique ONNX réel (optionnel, ~2.3 Go)
 make model                    # bootstrap BGE-M3 + ONNX Runtime, puis build -tags onnx
@@ -162,7 +162,7 @@ racine du repo si tu utilises le devcontainer — avec :
 }
 ```
 
-Claude Code redémarre, le serveur apparaît, les 8 tools sont disponibles.
+Claude Code redémarre, le serveur apparaît, les 13 outils sont disponibles.
 
 ## Surface MCP
 
@@ -232,7 +232,7 @@ Les 8 phases du moteur de retrieval sont implémentées et le service build/serv
 | 5 — Glossaire (21.905) | ✅ seeder câblé (best-effort) | `internal/ingest` |
 | 6 — Changelog (Change History) | ✅ | `internal/htmlparse` |
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
-| 8 — Serveur MCP + 8 tools | ✅ | `internal/mcp`, `cmd/server` |
+| 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
 
 **Deux écarts assumés avec l'archi figée (à régulariser en MR `arch-change`) :**
 
