@@ -681,7 +681,11 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		"count": len(refs), "references": refs,
 		// Source-spec citation (where the references were found) + one citation per
 		// referenced spec, each with whatever provenance is resolvable.
-		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version)},
+		// SpecURL, not ArchiveURL: find_cross_references is routed to the ETSI
+		// store for a spec_id beginning "ETSI ", and ArchiveURL answers "" for
+		// anything that is not a 3GPP id — so this citation named a deliverable
+		// with no pointer to it.
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableVersion(version)},
 		"ref_citations": refCites,
 		// ETSI cross-references (separate keys; absent-as-empty, never null).
 		"etsi_references":    etsiRefs,
