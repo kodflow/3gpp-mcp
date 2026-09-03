@@ -422,12 +422,21 @@ const discoverTTL = 6 * time.Hour
 func stepDiscover() *Step {
 	return &Step{
 		Name:    "discover",
-		Version: 1,
+		Version: 3,
 		Doc:     "diff the live 3GPP status report against the local corpus index",
 		Deps:    []string{"build-rust", "seed"},
 		Impl:    []string{"rust/discover", "scripts/lib/discover.sh"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{filepath.Join(c.Local, "corpus-index.json")}, nil
+			in := []string{filepath.Join(c.Local, "corpus-index.json")}
+			// The accepted-absent ledger decides as much of the work list as the
+			// corpus index does — a key in it is not drift. Leaving it out would
+			// mean that deleting or extending the ledger changed what discover
+			// produces without changing what discover claims to depend on, and the
+			// step would skip while its answer was stale.
+			if a := absentIndexPath(c); fileNonEmpty(a) {
+				in = append(in, a)
+			}
+			return in, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			m := map[string]string{

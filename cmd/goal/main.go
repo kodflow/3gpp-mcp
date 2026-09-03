@@ -46,7 +46,7 @@ func run() error {
 		etsiScope  = fs.String("etsi-scope", env("GOAL_ETSI_SCOPE", ""), "ETSI deliverables to index: empty = the built-in LI suite; 'all' = the whole /deliver archive (latest version of each); 'all-versions' = the whole archive with EVERY published version, the analogue of keeping every 3GPP release; else a comma-separated id list")
 		dataDir    = fs.String("data", env("GOAL_DATA", ""), "corpus/DB directory (default <repo>/data)")
 		full       = fs.Bool("full", false, "ignore the delta anchor and reindex everything")
-		repair     = fs.Bool("repair", false, "fetch only the repair set: upstream drift UNION corpus holes (proportionate, ~1k specs vs ~20k)")
+		repair     = fs.Bool("repair", false, "require the proportionate work list (upstream drift UNION corpus holes) and fail if it cannot be computed; it is the DEFAULT wherever a corpus and an index exist")
 		dry        = fs.Bool("dry-run", false, "decide but do not execute")
 		only       = fs.String("only", "", "restrict to these steps, comma separated (preconditions are still checked)")
 		forceOnly  = fs.Bool("force-only", false, "run the selected steps even when their preconditions are unmet — loudly, and the result is not reproducible")
