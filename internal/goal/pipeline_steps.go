@@ -506,6 +506,27 @@ func stepMerge() *Step {
 				return err
 			}
 
+			// A MERGE MUST NOT PUBLISH A SMALLER CORPUS THAN THE ONE IT REPLACES.
+			//
+			// merge folds shards by replacing the bucket for each (spec, release) it
+			// carries, so a shard built from an incomplete source tree replaces a full
+			// bucket with a partial one — and the loss is silent, because every later
+			// gate measures the corpus against ITSELF. This is the same shape as the
+			// paragraph migration that cut clause_occ to 5% with all gates green.
+			//
+			// It is not hypothetical on a machine that has already published. Sources
+			// are pruned once converted (purgeConvertedZips, and the archives go with
+			// them), so a box holding a finished 20 163-version corpus can be left
+			// with 1 410 converted files — 7%. Re-running the acquisition chain there
+			// rebuilds the corpus from what survived, and nothing downstream objects.
+			//
+			// The check runs BEFORE publishCorpus, which is the last moment the old
+			// corpus still exists. Refusing costs a failed step and the merge output
+			// on disk to inspect; not refusing costs the corpus.
+			if err := refuseCorpusShrink(c, db, tmp); err != nil {
+				return err
+			}
+
 			// Publish the new corpus and its anchor TOGETHER, and only after the
 			// merge succeeded. Publishing the index first would let a crash leave
 			// an anchor claiming a corpus state that was never written — the next
@@ -525,6 +546,95 @@ func stepMerge() *Step {
 			return nil
 		},
 	}
+}
+
+// corpusShrinkOverride names the escape hatch for the one legitimate case: an
+// operator who KNOWS the corpus is meant to get smaller. It has to be typed, it
+// is loud in the log, and it is not a flag, so it cannot end up in a script that
+// someone re-runs later without reading it.
+const corpusShrinkOverride = "GOAL_ALLOW_CORPUS_SHRINK"
+
+// refuseCorpusShrink compares the merge output with the corpus it is about to
+// replace and fails the step if the new one holds materially fewer spec versions.
+//
+// The tolerance is deliberately tight. merge ADDS or REPLACES buckets; the only
+// honest way to end up with fewer versions is upstream withdrawing some, which is
+// rare and tiny. A loss of more than 1% is a source tree that no longer holds the
+// corpus, not a 3GPP editorial decision.
+func refuseCorpusShrink(c *Ctx, db, tmp string) error {
+	if !fileNonEmpty(db) {
+		return nil // nothing is being replaced: a first build cannot shrink anything
+	}
+	before, err := specVersionCount(c, db)
+	if err != nil {
+		// Unable to measure is not licence to proceed: the whole point is that the
+		// loss would otherwise be invisible.
+		return fmt.Errorf("cannot read the corpus this merge would replace, so its loss cannot be ruled out: %w", err)
+	}
+	after, err := specVersionCount(c, tmp)
+	if err != nil {
+		return fmt.Errorf("cannot read the merged corpus at %s: %w", tmp, err)
+	}
+	overridden := os.Getenv(corpusShrinkOverride) != ""
+	if err := shrinkVerdict(before, after, tmp, overridden); err != nil {
+		return err
+	}
+	if overridden && after*100 < before*99 {
+		// An override that passes in silence is indistinguishable from a check that
+		// found nothing, in the log and in every later postmortem.
+		c.Log.Printf("WARNING: the merged corpus holds %d spec version(s) against %d — publishing anyway because %s is set",
+			after, before, corpusShrinkOverride)
+	}
+	c.Log.Printf("shrink check: %d -> %d spec version(s)", before, after)
+	return nil
+}
+
+// shrinkVerdict is the decision alone, separated from reading the databases so it
+// can be tested without a corpus.
+func shrinkVerdict(before, after int, tmp string, override bool) error {
+	if before == 0 || after*100 >= before*99 {
+		return nil
+	}
+	if override {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to publish: the merged corpus holds %d spec version(s) where the one it replaces holds %d (%.1f%% lost).\n"+
+			"  The shards were almost certainly built from an incomplete source tree — sources are pruned once converted,\n"+
+			"  so a machine that has already published may no longer hold what its corpus was built from.\n"+
+			"  The merge output is left at %s and the live corpus is untouched.\n"+
+			"  Re-acquire the sources first, or set %s=1 if the corpus is genuinely meant to get smaller",
+		after, before, 100*float64(before-after)/float64(before), tmp, corpusShrinkOverride)
+}
+
+// specVersionCount reads the one counter that says how much corpus there is.
+func specVersionCount(c *Ctx, db string) (int, error) {
+	out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", db}})
+	if err != nil {
+		return 0, err
+	}
+	n, err := parseSpecVersions(out)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", db, err)
+	}
+	return n, nil
+}
+
+// parseSpecVersions pulls spec_versions out of a dbcount report. Split out so the
+// parsing is testable without a database.
+func parseSpecVersions(out string) (int, error) {
+	for _, line := range strings.Split(out, "\n") {
+		v, ok := strings.CutPrefix(strings.TrimSpace(line), "spec_versions=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, fmt.Errorf("dbcount reported an unreadable spec_versions %q: %w", v, err)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("dbcount produced no spec_versions counter")
 }
 
 // publishCorpus puts the freshly merged database at its final path and DROPS THE
