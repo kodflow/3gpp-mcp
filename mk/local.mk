@@ -12,27 +12,26 @@
 #   make goal-status       what is valid right now, from persisted state alone
 #   make goal-manifest     machine-readable provenance of the local build
 
-GOAL := .local/bin/goal$(if $(filter Windows_NT,$(OS)),.exe,)
-ENV  := . scripts/local/toolchain-env.sh
+# GOAL, GOAL_ENV and goal-bin live in the top-level Makefile and are NOT redefined
+# here. They were, once, with a different default for GOTAGS and a different rule
+# for when to relink — so `make build` and `make goal` were two orchestrators
+# wearing one name, and only one of them was current. ENV is kept as an alias
+# because the recipes below still read better with it.
+ENV := $(GOAL_ENV)
 
-.PHONY: goal goal-plan goal-status goal-resume goal-manifest goal-bin \
+.PHONY: goal goal-plan goal-status goal-resume goal-manifest \
         local-toolchain local-setup local-model local-clean local-clean-all \
         corpus-verify snapshot-smoke
 
-goal-bin: ## [goal] (re)build the orchestrator
-	@set -e; $(ENV); mkdir -p .local/bin; \
-	  go build $${GOTAGS:+-tags $$GOTAGS} -o "$(GOAL)" ./cmd/goal
+# The four goal-* names are the older spelling of build/plan/status. They are
+# aliases, not copies: one implementation, two vocabularies.
+goal-plan: plan ## [goal] Differential plan: what would run and why. Changes nothing.
 
-goal-plan: goal-bin ## [goal] Differential plan: what would run and why. Changes nothing.
-	@$(ENV); "$(GOAL)" plan $(ARGS)
+goal: build ## [goal] Bring the repo to the target state (resumable)
 
-goal: goal-bin ## [goal] Bring the repo to the target state (resumable)
-	@$(ENV); "$(GOAL)" run $(ARGS)
+goal-resume: build ## [goal] Alias of `goal` — every step is resumable by construction
 
-goal-resume: goal ## [goal] Alias of `goal` — every step is resumable by construction
-
-goal-status: goal-bin ## [goal] What is valid now, read from persisted state
-	@$(ENV); "$(GOAL)" status
+goal-status: status ## [goal] What is valid now, read from persisted state
 
 goal-manifest: goal-bin ## [goal] Provenance manifest of the local build
 	@$(ENV); "$(GOAL)" manifest

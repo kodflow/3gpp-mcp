@@ -24,6 +24,24 @@
 have() { command -v "$1" >/dev/null 2>&1; }
 
 _TE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# La racine DOIT etre au format POSIX. Sous `make`, le repertoire courant est
+# herite au format Windows, donc `pwd` rend "C:/Users/..." — et chaque entree
+# ajoutee a PATH y apporte un deux-points, que bash lit comme le SEPARATEUR de
+# PATH. "C:/x/go/bin" devient les deux entrees "C" et "/x/go/bin", aucune des
+# deux n'existe, et la toolchain disparait sans un mot : `make build` echouait
+# sur "go: command not found" alors que le meme prelude, source a la main,
+# marchait. Rien n'avertit — c'est PATH qui se coupe en silence.
+case "$_TE_ROOT" in
+  [A-Za-z]:[/\\]*)
+    if have cygpath; then
+      _TE_ROOT="$(cygpath -u "$_TE_ROOT")"
+    else
+      _TE_ROOT="/$(printf '%s' "${_TE_ROOT%%:*}" | tr 'A-Z' 'a-z')$(printf '%s' "${_TE_ROOT#*:}" | tr '\\' '/')"
+    fi
+    ;;
+esac
+
 _TE_LOCAL="$_TE_ROOT/.local/toolchain"
 
 case "$(uname -s 2>/dev/null)" in
