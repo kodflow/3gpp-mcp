@@ -443,6 +443,26 @@ DIGEST="$("$CRANE" digest "$TAG")"
 # The config mutation is a manifest write, not a blob upload, but it lands on the
 # same link — and a tag left carrying layers with no entrypoint is worse than one
 # that was never moved.
+# EVERY PATH BELOW IS A PATH *INSIDE A LINUX IMAGE*, AND MSYS REWRITES THEM.
+#
+# This is the trap `field()` documents 370 lines above, hitting a second time and
+# far harder. Git Bash rewrites an argument shaped like NAME=/posix/path into a
+# Windows path on its way to a native .exe, and crane.exe is a native .exe. Every
+# one of these arguments has that shape. What was actually published on
+# 2026-09-03 was:
+#
+#   PATH=C:\Program Files\Git\usr\local\sbin;C:\Program Files\Git\usr\local\bin;…
+#   MCP3GPP_CACHE=C:/Program Files/Git/data/mcp-3gpp
+#   ORT_DYLIB_PATH=C:/Program Files/Git/data/mcp-3gpp/models/onnxruntime/lib/…
+#   WorkingDir=C:/Program Files/Git/home/mcp
+#
+# Note the ':' list separators turned into ';' — that is MSYS's PATH-list
+# conversion, and it is the signature. The entrypoint is resolved through that
+# PATH, so the container did not merely misbehave: it could not start at all. The
+# corpus was correct, every data gate was green, the local server proved every
+# retrieval arm over real JSON-RPC — and the artefact a consumer pulls was dead.
+# No producer-side check could see it, because none of them reads the config.
+MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
 push_retry "$CRANE" mutate "$TAG" -t "$TAG" \
   --entrypoint docker-entrypoint.sh \
   --cmd serve \
@@ -460,6 +480,36 @@ push_retry "$CRANE" mutate "$TAG" -t "$TAG" \
   -l io.kodflow.3gpp.built=local \
   >/dev/null \
   || die "crane mutate failed after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — the tag carries layers but no config"
+
+# READ THE CONFIG BACK. Setting it is not evidence that it landed.
+#
+# The mutation above exited 0 while writing Windows paths into a Linux image, and
+# stayed that way through a publish, a `prove` and a runbook that called it done —
+# because nothing ever looked. This is the same shape as the guard that could not
+# read its own input: an assertion that never runs is not an assertion.
+say "verifying the published config"
+CFG="$("$CRANE" config "$TAG" 2>/dev/null)" \
+  || die "cannot read back the config just written to $TAG"
+for want in \
+  '"PATH=/usr/local/sbin:' \
+  '"MCP3GPP_CACHE=/data/mcp-3gpp"' \
+  '"LD_LIBRARY_PATH=/usr/local/lib"' \
+  '"ORT_DYLIB_PATH=/data/mcp-3gpp/models/onnxruntime/lib/libonnxruntime.so"' \
+  '"EMBED_MODELS_CONFIG=/data/mcp-3gpp/models/models.yaml"' \
+  '"WorkingDir":"/home/mcp"'
+do
+  case "$CFG" in
+    *"$want"*) ;;
+    *) die "the published config does not carry ${want} — a Linux image was written with
+  host paths (MSYS argument conversion). The tag now points at an image that
+  cannot start. Re-run with MSYS2_ARG_CONV_EXCL='*' in the environment." ;;
+  esac
+done
+case "$CFG" in
+  *'C:'*|*'Program Files'*)
+    die "the published config contains a Windows path — see above; refusing to call this published" ;;
+esac
+echo "  config OK — entrypoint, workdir and all five paths are POSIX"
 
 say "published $TAG"
 echo "  base   $BASE (appended, $DIGEST before config)"
