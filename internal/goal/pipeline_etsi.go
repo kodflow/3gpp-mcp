@@ -79,7 +79,7 @@ func stepDiscoverETSI() *Step {
 func stepCorpusETSI() *Step {
 	return &Step{
 		Name:    "corpus-etsi",
-		Version: 1,
+		Version: 2,
 		Doc:     "download, extract and ingest the ETSI deliverables into data/etsi.duckdb",
 		Deps:    []string{"discover-etsi", "build-rust"},
 		Impl:    []string{"scripts/etsi-corpus.sh", "scripts/lib/convert.sh", "rust/ingest/src"},
@@ -119,6 +119,24 @@ func stepCorpusETSI() *Step {
 				"ETSI_ORIGIN=" + c.dataPath("sources", "etsi-origin"),
 			}
 			env = append(env, etsiScopeEnv(c.Cfg("etsi_scope"))...)
+
+			// THIS STEP WRITES CLAUSES, so it needs the corpus in write shape.
+			//
+			// A converted corpus (ADR 0004) serves `clauses` as a VIEW over the
+			// occurrences, and DuckDB answers an INSERT into a view with "Catalog
+			// Error: clauses is not a table". The ETSI ingest runs one transaction
+			// across every deliverable, so that first error aborted the transaction
+			// and every deliverable after it failed with "Current transaction is
+			// aborted" — a whole ETSI pass lost to one unrestored view.
+			//
+			// The 3GPP half has always called this before folding; the ETSI half was
+			// written before its corpus was ever converted, and the requirement was
+			// never carried across. It surfaced the first time corpus-etsi ran after
+			// paragraphs-etsi (2026-09-03), not because either step changed.
+			if err := ensureWriteShape(c, c.dataPath("etsi.duckdb")); err != nil {
+				return fmt.Errorf("the ETSI corpus could not be put back into write shape: %w", err)
+			}
+
 			c.Log.Printf("building the ETSI corpus (PDF text layer, never OCR)")
 			return c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-corpus.sh"}, Env: env, Echo: true})
 		},
