@@ -119,6 +119,7 @@ func stepToolchain() *Step {
 		Doc:       "verify the build toolchain and record its identity",
 		Impl:      []string{"scripts/local/toolchain-env.sh"},
 		Toolchain: true,
+		Tool:      true,
 		Outputs:   func(c *Ctx) []string { return []string{c.statePath("toolchain.json")} },
 		Validate: func(c *Ctx) error {
 			// Cheap and re-run on every plan: a toolchain that vanished (a moved
@@ -166,6 +167,7 @@ func stepBuildGo() *Step {
 		// eight binaries. The `test` step deliberately does NOT set this.
 		ExcludeTests: true,
 		Toolchain:    true,
+		Tool:         true,
 		Outputs: func(c *Ctx) []string {
 			out := make([]string, 0, len(goBins))
 			for _, b := range goBins {
@@ -216,6 +218,7 @@ func stepBuildRust() *Step {
 		Impl:         []string{"rust", "contracts", "internal/store/schema.sql"},
 		ExcludeTests: true,
 		Toolchain:    true,
+		Tool:         true,
 		Outputs: func(c *Ctx) []string {
 			var out []string
 			for _, bins := range rustBins {
@@ -307,6 +310,19 @@ func stepSeed() *Step {
 			// The snapshot is a starting point, not an authority.
 			if st, err := os.Stat(db); err == nil && st.Size() > 0 {
 				c.Log.Printf("a local corpus already exists (%d bytes) — not overwriting it with the published snapshot", st.Size())
+				// And SAY so, in the one way the state machine understands. This
+				// branch does no work and produces no artefact, but it used to
+				// record an ordinary success — so bumping seed's Version (which the
+				// move to GHCR legitimately required) republished a new identity for
+				// a step that had touched nothing, and discover, fetch, ingest,
+				// merge and every vector step behind them were scheduled to replay a
+				// finished 22 GB corpus. A decline says "nothing to do" and carries
+				// the previous provenance forward, which is the truth here.
+				if err := seedAnchor(c, db, false); err != nil {
+					return err
+				}
+				reportAnchorHoles(c, db)
+				return fmt.Errorf("%w: a local corpus is already present, seeding would add nothing", ErrDeclined)
 			} else {
 				if err := os.MkdirAll(c.Data, 0o755); err != nil {
 					return err
@@ -429,6 +445,12 @@ func stepDiscover() *Step {
 		Outputs: func(c *Ctx) []string {
 			return []string{c.statePath("series.json"), c.statePath("worklist.txt")}
 		},
+		// runDiscover writes exactly these two files, plus status-report.htm — which
+		// is its OWN HTTP cache, read by nothing downstream and already folded into
+		// this step's fingerprint as an age bucket. So for a dependant, these two
+		// files are the whole of what discover did: an unchanged delta must not
+		// replay fetch, ingest and merge.
+		OutputsComplete: true,
 		Validate: func(c *Ctx) error {
 			b, err := os.ReadFile(c.statePath("series.json"))
 			if err != nil {
