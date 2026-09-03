@@ -28,7 +28,7 @@ ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 GOAL_ENV := . scripts/local/toolchain-env.sh
 GOAL     := .local/bin/goal$(if $(filter Windows_NT,$(OS)),.exe,)
 
-.PHONY: all build build-bin goal-bin plan steps status publish prove build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+.PHONY: all build build-bin goal-bin plan steps status eta publish prove build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build EVERYTHING (the corpus pipeline)
 
@@ -104,6 +104,15 @@ build/%: goal-bin ## Run ONE pipeline step: make build/fetch, build/ingest, buil
 
 status: goal-bin ## Per-step state of the last run
 	@$(GOAL_ENV); "$(GOAL)" status
+
+# ETA answers the question `plan` leaves open: not WHAT will run, but how long
+# before each step counts as finished. Every number is measured — goal records
+# duration_sec on every step — and the ones that are NOT usable as an estimate
+# say so instead of being quietly summed: a step whose last attempt crashed, a
+# step that declined, and `fetch`, whose recorded time was taken on a full
+# source tree that no longer exists.
+eta: goal-bin ## Per-step ETA before each step counts as finished, from measured durations
+	@$(GOAL_ENV); bash scripts/local/eta-steps.sh
 
 # PUBLISH IS LOCAL. The image used to be baked by two workflows that moved ~14 GB
 # per run; they are gone. `make image` cross-compiles the Linux artefacts here
