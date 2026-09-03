@@ -288,3 +288,31 @@ func TestReleasingAnAbsentBackupIsHarmless(t *testing.T) {
 		t.Fatalf("releasing an absent backup removed the corpus itself: %v", err)
 	}
 }
+
+// TestAnInterruptedCompactionDoesNotBlockTheNextOne.
+//
+// compact writes <db>.compact, verifies it, then swaps — so a completed run
+// leaves none. A leftover means the previous attempt died between the copy and
+// the swap, and compact then refuses: "already exists — refusing to overwrite
+// it". That refusal is right about the file and wrong about the run: it leaves
+// the pipeline stuck on a corpus it can never finish compacting. It happened
+// twice on 2026-09-03, once per half, each time needing a manual delete.
+func TestAnInterruptedCompactionDoesNotBlockTheNextOne(t *testing.T) {
+	c, _ := newTestCtx(t)
+	write(t, c.dataPath("3gpp.duckdb"), "the live corpus")
+	write(t, c.dataPath("3gpp.duckdb.compact"), "a half-finished copy")
+	write(t, c.dataPath("etsi.duckdb.compact"), "a half-finished copy")
+
+	clearStaleCompactions(c)
+
+	for _, n := range []string{"3gpp.duckdb.compact", "etsi.duckdb.compact"} {
+		if _, err := os.Stat(c.dataPath(n)); !os.IsNotExist(err) {
+			t.Errorf("%s survived, so compact will refuse to swap again", n)
+		}
+	}
+	// The negative control that matters: the live corpus is what the guard
+	// exists to protect, and clearing an intermediate must never touch it.
+	if _, err := os.Stat(c.dataPath("3gpp.duckdb")); err != nil {
+		t.Fatalf("clearing the intermediate removed the live corpus: %v", err)
+	}
+}
