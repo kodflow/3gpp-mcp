@@ -1610,7 +1610,7 @@ func runSparse(c *Ctx, t corpusTarget) error {
 func stepCompact() *Step {
 	return &Step{
 		Name:    "compact",
-		Version: 3,
+		Version: 4,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
@@ -1621,9 +1621,22 @@ func stepCompact() *Step {
 		Deps:  []string{"build-rust", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb"), c.dataPath("etsi.duckdb")}, nil
-		},
+		// Not even compact may fingerprint the corpora, though it looked like the
+		// one step that safely could.
+		//
+		// It is the last step to REWRITE them, so the file it records ought to be
+		// the file it is judged against — that was the reasoning, and it was wrong
+		// by one step. `index` and `index-etsi` freeze the HNSW into those same
+		// files afterwards. So compact recorded a corpus without an index and was
+		// re-decided against a corpus with one, and planned a 30-minute rewrite on
+		// every build for ever.
+		//
+		// It is the eleventh instance of one defect, found only by sweeping the DAG
+		// instead of fixing the step in front of me. What decides compact's work is
+		// its data dependencies — paragraphs, paragraphs-etsi and sparse-etsi — and
+		// those already say, through provenance, whether anything was written that
+		// leaves dead space behind.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Validate: func(c *Ctx) error {
 			// The copy is only believable if the corpus still answers. compact
 			// itself refuses to swap on a clause-count mismatch; this re-asks

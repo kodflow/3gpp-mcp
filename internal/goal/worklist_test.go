@@ -247,9 +247,18 @@ func TestTheCorpusIsNobodysInput(t *testing.T) {
 	// validate reads the finished 3GPP corpus, which nothing touches after index;
 	// smoke reads both to prove they serve. Fingerprinting the corpus is the whole
 	// point for these — it is what makes them notice a corpus that changed.
+	// The honest exceptions, and compact is NOT one of them — that mistake cost a
+	// whole verification cycle. compact is the last step to REWRITE the corpora,
+	// which reads like safety and is wrong by one step: index and index-etsi
+	// freeze the HNSW into those same files afterwards, so compact records a
+	// corpus without an index and is judged against one with it.
+	//
+	// What is left runs at or after the LAST write to the half it fingerprints:
+	// index and index-etsi freeze on top of compact, validate reads a 3GPP corpus
+	// nothing touches after index, and smoke reads both to prove they serve. For
+	// these, fingerprinting the corpus is the whole point.
 	allowed := map[string]bool{
-		"compact": true, "index": true, "index-etsi": true,
-		"validate": true, "smoke": true,
+		"index": true, "index-etsi": true, "validate": true, "smoke": true,
 	}
 	for _, s := range Pipeline() {
 		if s.Inputs == nil || allowed[s.Name] {
