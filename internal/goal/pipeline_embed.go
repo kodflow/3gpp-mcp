@@ -779,7 +779,7 @@ func hasFlag(args []string, name string) bool {
 func stepSmoke() *Step {
 	return &Step{
 		Name:    "smoke",
-		Version: 1,
+		Version: 2,
 		Doc:     "start the real server over stdio and prove vector search stays enabled",
 		Deps:    []string{"validate"},
 		Impl:    []string{"cmd/server", "internal/mcp", "internal/search"},
@@ -990,7 +990,41 @@ func runSmoke(c *Ctx) error {
 	}
 	c.Checkpoint("tools", strconv.Itoa(len(names)))
 	c.Log.Printf("the server did not disable vector search at startup (see prove.sh for the semantic proof)")
+
+	// THIS is the moment compact's own instruction points at: "once served and
+	// verified, remove <db>.pre-compact". Until now nothing did, and the
+	// consequence was not merely wasted disk — compact REFUSES to overwrite an
+	// existing .pre-compact, so the backup left by one build blocked the next
+	// one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB, 3 169 614
+	// clauses) and then failed on the in-place swap because of a backup from the
+	// 2nd. A step that cannot run twice without someone deleting a file by hand is
+	// a step the pipeline cannot converge through.
+	//
+	// Removing it HERE, and nowhere earlier, is the point: the smoke has just
+	// started the shipped binary against this corpus and had it answer. Before
+	// that the backup is the only way back.
+	releasePreCompact(c)
 	return nil
+}
+
+// releasePreCompact drops the pre-compaction backups now that the compacted
+// corpora have been proven to serve.
+//
+// Failures are logged, never fatal: a backup that could not be deleted is a disk
+// problem, not a reason to fail a smoke that passed.
+func releasePreCompact(c *Ctx) {
+	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
+		p := c.dataPath(name + ".pre-compact")
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			c.Log.Printf("WARNING: could not remove %s (%.1f GiB): %v", p, float64(st.Size())/(1<<30), err)
+			continue
+		}
+		c.Log.Printf("released %s — %.1f GiB reclaimed, the compacted corpus has served", p, float64(st.Size())/(1<<30))
+	}
 }
 
 func toolNames(m map[string]any) []string {

@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -243,5 +244,47 @@ func TestMergeStillWatchesTheShards(t *testing.T) {
 	}
 	if !sawShard {
 		t.Error("merge no longer watches the shards, so new clauses would never replay the fold")
+	}
+}
+
+// TestTheCompactionBackupHasAnEndOfLife.
+//
+// compact writes <db>.pre-compact and prints "once served and verified, remove
+// it" — and nothing ever did. That is not just disk: compact REFUSES to
+// overwrite an existing .pre-compact, so one build's backup blocks the next.
+// On 2026-09-03 the ETSI half compacted and verified (14.7 GiB, 3 169 614
+// clauses) and then failed the in-place swap because of a backup from the 2nd.
+//
+// The release belongs to `smoke`, and nowhere earlier: until the shipped binary
+// has served the compacted corpus and answered, the backup is the only way back.
+func TestTheCompactionBackupHasAnEndOfLife(t *testing.T) {
+	c, _ := newTestCtx(t)
+	for _, n := range []string{"3gpp.duckdb.pre-compact", "etsi.duckdb.pre-compact"} {
+		write(t, c.dataPath(n), "backup")
+	}
+	// A corpus that has NOT been served keeps its backup.
+	if _, err := os.Stat(c.dataPath("3gpp.duckdb.pre-compact")); err != nil {
+		t.Fatal(err)
+	}
+
+	releasePreCompact(c)
+
+	for _, n := range []string{"3gpp.duckdb.pre-compact", "etsi.duckdb.pre-compact"} {
+		if _, err := os.Stat(c.dataPath(n)); !os.IsNotExist(err) {
+			t.Errorf("%s survived the smoke, so the next compact will refuse to swap", n)
+		}
+	}
+}
+
+// The negative control: releasing a backup that is not there must not fail, and
+// must never touch the corpus itself.
+func TestReleasingAnAbsentBackupIsHarmless(t *testing.T) {
+	c, _ := newTestCtx(t)
+	write(t, c.dataPath("3gpp.duckdb"), "the corpus")
+
+	releasePreCompact(c) // no .pre-compact anywhere
+
+	if _, err := os.Stat(c.dataPath("3gpp.duckdb")); err != nil {
+		t.Fatalf("releasing an absent backup removed the corpus itself: %v", err)
 	}
 }
