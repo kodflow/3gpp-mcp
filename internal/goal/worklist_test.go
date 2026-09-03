@@ -289,6 +289,48 @@ func TestReleasingAnAbsentBackupIsHarmless(t *testing.T) {
 	}
 }
 
+// TestNothingAPreviousCompactionLeftBehindCanBlockTheNextOne.
+//
+// compact refuses to overwrite either of its own artefacts: <db>.compact (the
+// copy, left only by a run that died between copy and swap) and <db>.pre-compact
+// (the backup, created only BY a completed swap). Each refusal is right about the
+// file and wrong about the run — it strands the pipeline on a corpus it can never
+// finish compacting. Three manual deletions on 2026-09-03.
+//
+// The release first lived in `smoke`, so that a backup would outlive the corpus
+// until the shipped binary had served it. Sound reasoning, wrong placement:
+// compact fails before smoke can run, so the release sat behind the very step it
+// had to unblock.
+func TestNothingAPreviousCompactionLeftBehindCanBlockTheNextOne(t *testing.T) {
+	c, _ := newTestCtx(t)
+	write(t, c.dataPath("3gpp.duckdb"), "the live corpus")
+	write(t, c.dataPath("etsi.duckdb"), "the live corpus")
+	for _, n := range []string{
+		"3gpp.duckdb.compact", "3gpp.duckdb.pre-compact",
+		"etsi.duckdb.compact", "etsi.duckdb.pre-compact",
+	} {
+		write(t, c.dataPath(n), "left behind")
+	}
+
+	rotateCompactionArtefacts(c)
+
+	for _, n := range []string{
+		"3gpp.duckdb.compact", "3gpp.duckdb.pre-compact",
+		"etsi.duckdb.compact", "etsi.duckdb.pre-compact",
+	} {
+		if _, err := os.Stat(c.dataPath(n)); !os.IsNotExist(err) {
+			t.Errorf("%s survived, so compact will refuse again", n)
+		}
+	}
+	// The negative control the refusals exist for: the live corpora are what must
+	// never be touched.
+	for _, n := range []string{"3gpp.duckdb", "etsi.duckdb"} {
+		if _, err := os.Stat(c.dataPath(n)); err != nil {
+			t.Fatalf("rotation removed the live corpus %s: %v", n, err)
+		}
+	}
+}
+
 // TestAnInterruptedCompactionDoesNotBlockTheNextOne.
 //
 // compact writes <db>.compact, verifies it, then swaps — so a completed run
@@ -303,7 +345,7 @@ func TestAnInterruptedCompactionDoesNotBlockTheNextOne(t *testing.T) {
 	write(t, c.dataPath("3gpp.duckdb.compact"), "a half-finished copy")
 	write(t, c.dataPath("etsi.duckdb.compact"), "a half-finished copy")
 
-	clearStaleCompactions(c)
+	rotateCompactionArtefacts(c)
 
 	for _, n := range []string{"3gpp.duckdb.compact", "etsi.duckdb.compact"} {
 		if _, err := os.Stat(c.dataPath(n)); !os.IsNotExist(err) {

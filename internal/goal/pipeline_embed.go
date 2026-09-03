@@ -1007,35 +1007,45 @@ func runSmoke(c *Ctx) error {
 	return nil
 }
 
-// clearStaleCompactions removes the <db>.compact intermediates a previous,
-// interrupted compaction left behind.
+// rotateCompactionArtefacts clears what a previous compaction left behind, so
+// that this one can run at all. It keeps ONE generation of backup, not two.
 //
-// compact writes <db>.compact, verifies it, and only then swaps it into place —
-// so on a run that completed there is none. A leftover therefore means the
-// previous attempt died between the copy and the swap, and compact refuses to
-// overwrite it: "etsi.duckdb.compact already exists — refusing to overwrite it".
-// That refusal is right about the FILE and wrong about the RUN. It leaves the
-// pipeline stuck on a corpus it will never finish compacting, and the only way
-// out is someone deleting a file by hand — which is exactly what happened twice
-// on 2026-09-03, once per half.
+// compact leaves two kinds of file and refuses to overwrite either:
 //
-// Clearing it HERE is safe in the way the refusal is trying to protect: the live
-// corpus is intact (compact never touched it), and this run is about to rebuild
-// the copy from it. What the guard defends against — losing the only good copy —
-// cannot happen when the original is still the original.
-func clearStaleCompactions(c *Ctx) {
+//	<db>.compact      the copy. A completed run renames it into place, so a
+//	                  leftover means the previous attempt died between the copy
+//	                  and the swap.
+//	<db>.pre-compact  the backup. It exists only BECAUSE a swap completed — that
+//	                  is the step that creates it.
+//
+// Both refusals are right about the FILE and wrong about the RUN: they leave the
+// pipeline stuck on a corpus it can never finish compacting, and the only way out
+// is someone deleting a file by hand. That happened three times on 2026-09-03.
+//
+// The release was first attached to `smoke`, on the reasoning that a backup
+// should outlive the corpus until the shipped binary has served it. That reasoning
+// is sound and the placement was not: compact fails BEFORE smoke can run, so the
+// release sat behind the very step it had to unblock. A deadlock, and mine.
+//
+// Rotating here is safe in exactly the way the refusals intend. The live corpus is
+// untouched — compact writes only the copy until it verifies it — and a
+// .pre-compact present at this point backs up a corpus the live one has already
+// superseded. There is no instant at which nothing good exists.
+func rotateCompactionArtefacts(c *Ctx) {
 	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
-		p := c.dataPath(name + ".compact")
-		st, err := os.Stat(p)
-		if err != nil {
-			continue
+		for _, suffix := range []string{".compact", ".pre-compact"} {
+			p := c.dataPath(name + suffix)
+			st, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if err := os.Remove(p); err != nil {
+				c.Log.Printf("WARNING: %s is in the way and could not be removed: %v", p, err)
+				continue
+			}
+			c.Log.Printf("rotated %s (%.1f GiB) — superseded by the live corpus",
+				p, float64(st.Size())/(1<<30))
 		}
-		if err := os.Remove(p); err != nil {
-			c.Log.Printf("WARNING: a stale %s is in the way and could not be removed: %v", p, err)
-			continue
-		}
-		c.Log.Printf("cleared a stale compaction intermediate: %s (%.1f GiB, from an interrupted run)",
-			p, float64(st.Size())/(1<<30))
 	}
 }
 
@@ -1569,7 +1579,7 @@ func runSparse(c *Ctx, t corpusTarget) error {
 func stepCompact() *Step {
 	return &Step{
 		Name:    "compact",
-		Version: 2,
+		Version: 3,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
@@ -1597,7 +1607,7 @@ func stepCompact() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			clearStaleCompactions(c)
+			rotateCompactionArtefacts(c)
 			before, _ := os.Stat(c.dataPath("3gpp.duckdb"))
 			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
 				"--db", c.dataPath("3gpp.duckdb"),
