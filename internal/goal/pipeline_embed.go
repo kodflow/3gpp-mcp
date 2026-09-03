@@ -1007,6 +1007,38 @@ func runSmoke(c *Ctx) error {
 	return nil
 }
 
+// clearStaleCompactions removes the <db>.compact intermediates a previous,
+// interrupted compaction left behind.
+//
+// compact writes <db>.compact, verifies it, and only then swaps it into place —
+// so on a run that completed there is none. A leftover therefore means the
+// previous attempt died between the copy and the swap, and compact refuses to
+// overwrite it: "etsi.duckdb.compact already exists — refusing to overwrite it".
+// That refusal is right about the FILE and wrong about the RUN. It leaves the
+// pipeline stuck on a corpus it will never finish compacting, and the only way
+// out is someone deleting a file by hand — which is exactly what happened twice
+// on 2026-09-03, once per half.
+//
+// Clearing it HERE is safe in the way the refusal is trying to protect: the live
+// corpus is intact (compact never touched it), and this run is about to rebuild
+// the copy from it. What the guard defends against — losing the only good copy —
+// cannot happen when the original is still the original.
+func clearStaleCompactions(c *Ctx) {
+	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
+		p := c.dataPath(name + ".compact")
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			c.Log.Printf("WARNING: a stale %s is in the way and could not be removed: %v", p, err)
+			continue
+		}
+		c.Log.Printf("cleared a stale compaction intermediate: %s (%.1f GiB, from an interrupted run)",
+			p, float64(st.Size())/(1<<30))
+	}
+}
+
 // releasePreCompact drops the pre-compaction backups now that the compacted
 // corpora have been proven to serve.
 //
@@ -1537,7 +1569,7 @@ func runSparse(c *Ctx, t corpusTarget) error {
 func stepCompact() *Step {
 	return &Step{
 		Name:    "compact",
-		Version: 1,
+		Version: 2,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
@@ -1565,6 +1597,7 @@ func stepCompact() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
+			clearStaleCompactions(c)
 			before, _ := os.Stat(c.dataPath("3gpp.duckdb"))
 			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
 				"--db", c.dataPath("3gpp.duckdb"),
