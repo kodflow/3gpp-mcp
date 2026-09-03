@@ -193,34 +193,77 @@ ingest: series 23 → 4 spec(s), 1200 clause(s) (4 file(s))`,
 	}
 }
 
-// TestNoStepFoldsItsOwnOutputIntoItsFingerprint.
+// TestNoStepFoldsItsOwnOutputIntoItsFingerprint — for EVERY step, not just the
+// one that was caught first.
 //
-// merge folds the shards into data/3gpp.duckdb, and paragraphs, sparse, compact
-// and index all rewrite that file afterwards. While the corpus was also declared
-// an INPUT of merge, merge could never see a stable fingerprint: every build
-// changed the corpus after merge had recorded it, so the next build replayed
-// merge — a 22 GB restore, a fold and a publish, an hour with paragraphs behind
-// it — on a corpus nothing had added to. Observed on 2026-09-03 with `ingest`
-// freshly DECLINED and not one shard carrying a clause.
+// A step's own product can never be a stable input to itself, and in this
+// pipeline it is worse than circular: compact, index and the paragraph conversion
+// all rewrite the corpus later in the same build. So a step that fingerprints it
+// records one set of bytes and is judged against another, and replays on every
+// build for ever. It cost `merge` a 22 GB restore and a 38-minute fold per run,
+// and it kept `embed`, `embed-etsi`, `paragraphs` and `paragraphs-etsi` planned
+// as "certain to run (heavy)" on a corpus nothing had touched — measured
+// 2026-09-03, on a pipeline whose every step was VALID.
 //
-// A step's own output can never be a stable input to itself. The shards are the
-// inputs; the corpus is the output.
+// Sweeping the whole DAG rather than one step is the point: this was found three
+// times in three places before it was looked for everywhere.
 func TestNoStepFoldsItsOwnOutputIntoItsFingerprint(t *testing.T) {
 	c, _ := newTestCtx(t)
-	step := stepMerge()
+	for _, s := range Pipeline() {
+		if s.Inputs == nil || s.Outputs == nil {
+			continue
+		}
+		ins, err := s.Inputs(c)
+		if err != nil {
+			t.Fatalf("%s: %v", s.Name, err)
+		}
+		outs := map[string]bool{}
+		for _, o := range s.Outputs(c) {
+			outs[filepath.Clean(o)] = true
+		}
+		for _, in := range ins {
+			if outs[filepath.Clean(in)] {
+				t.Errorf("step %s declares %s as both an input and an output, so its "+
+					"fingerprint can never settle and every build replays it",
+					s.Name, filepath.Base(in))
+			}
+		}
+	}
+}
 
-	ins, err := step.Inputs(c)
-	if err != nil {
-		t.Fatal(err)
+// TestTheCorpusIsNobodysInput. The corpus file is rewritten by compact, index and
+// the paragraph conversion, so ANY step that fingerprints it is judged against
+// bytes that moved after it ran — whether or not it also declares it an output.
+// That is how embed and embed-etsi stayed "certain to run" on a finished corpus.
+func TestTheCorpusIsNobodysInput(t *testing.T) {
+	c, _ := newTestCtx(t)
+	rewritten := map[string]bool{
+		filepath.Clean(c.dataPath("3gpp.duckdb")): true,
+		filepath.Clean(c.dataPath("etsi.duckdb")): true,
 	}
-	outs := map[string]bool{}
-	for _, o := range step.Outputs(c) {
-		outs[filepath.Clean(o)] = true
+	// The honest exceptions: every one of these runs at or after the last write to
+	// the half it fingerprints, so what it records is what it is judged against.
+	// compact is the last rewrite; index and index-etsi freeze on top of it;
+	// validate reads the finished 3GPP corpus, which nothing touches after index;
+	// smoke reads both to prove they serve. Fingerprinting the corpus is the whole
+	// point for these — it is what makes them notice a corpus that changed.
+	allowed := map[string]bool{
+		"compact": true, "index": true, "index-etsi": true,
+		"validate": true, "smoke": true,
 	}
-	for _, in := range ins {
-		if outs[filepath.Clean(in)] {
-			t.Errorf("merge declares %s as both an input and an output, so its fingerprint "+
-				"can never settle and every build replays the fold", in)
+	for _, s := range Pipeline() {
+		if s.Inputs == nil || allowed[s.Name] {
+			continue
+		}
+		ins, err := s.Inputs(c)
+		if err != nil {
+			t.Fatalf("%s: %v", s.Name, err)
+		}
+		for _, in := range ins {
+			if rewritten[filepath.Clean(in)] {
+				t.Errorf("step %s fingerprints %s, which later steps rewrite — it will "+
+					"replay on every build", s.Name, filepath.Base(in))
+			}
 		}
 	}
 }
