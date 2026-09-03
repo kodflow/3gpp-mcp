@@ -414,7 +414,10 @@ mod tests {
         let a: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         let b: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(a["chunk_id"], 42);
-        assert_eq!(b["chunk_id"], 99, "the repeat carries ITS id, not the original's");
+        assert_eq!(
+            b["chunk_id"], 99,
+            "the repeat carries ITS id, not the original's"
+        );
         assert_eq!(a["h"], b["h"], "same text, same content hash");
         assert_eq!(a["terms"], b["terms"], "same text, same postings");
         let _ = std::fs::remove_file(&path);
