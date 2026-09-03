@@ -66,7 +66,7 @@ func stepBuildEmbedder() *Step {
 func stepEmbed(t corpusTarget) *Step {
 	return &Step{
 		Name:    "embed" + t.Suffix,
-		Version: 1,
+		Version: 2,
 		Doc:     "vectorise the corpus on the GPU, reusing every already-seen content hash",
 		Deps:    append([]string{"build-embedder"}, t.singleProducer()...),
 		// data/3gpp.duckdb has two producers, not one: `merge` folds local shards
@@ -75,9 +75,23 @@ func stepEmbed(t corpusTarget) *Step {
 		// through Deps instead (AnyDeps rejects a one-element set on purpose).
 		AnyDeps: t.multiProducer(),
 		Impl:    []string{"rust/embedder/src", "rust/store/src/bin/embed_io.rs", "internal/embed/identity.go", "internal/embed/models.yaml"},
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{t.dbPath(c)}, nil
-		},
+		// The corpus is NOT an input, although this step reads and rewrites it.
+		//
+		// It is the step's own product, and compact, index and the paragraph
+		// conversion all rewrite it further down the same build. A step that folds
+		// it into its fingerprint therefore never sees a stable input: every build
+		// changes the corpus after the step recorded it, so the next build replays
+		// the step. Same shape as the one that made `merge` replay a 22 GB restore
+		// on every run — measured here on 2026-09-03, where a fully VALID pipeline
+		// still planned "2 certain to run (2 heavy)" on a corpus nothing had
+		// touched.
+		//
+		// What determines this step's work is declared elsewhere and precisely: its
+		// DATA dependency (merge or seed, through provenance), the embed identity
+		// and floor in Extra, and — at run time — the corpus's own answer to "does
+		// any clause still need one of these". That last question is the honest one,
+		// and the step already asks it before declining.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The embed identity is THE determinant: model family, revision,
 			// tokenizer, dimension, normalisation, precision, windowing and
@@ -1298,14 +1312,28 @@ func refreshOverlays() bool {
 func stepParagraphs(t corpusTarget) *Step {
 	return &Step{
 		Name:    "paragraphs" + t.Suffix,
-		Version: 1,
+		Version: 2,
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
 		Deps:    t.paragraphsDeps(),
 		Impl:    []string{"cmd/migrate-paragraphs"},
 		Heavy:   true,
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{t.dbPath(c)}, nil
-		},
+		// The corpus is NOT an input, although this step reads and rewrites it.
+		//
+		// It is the step's own product, and compact, index and the paragraph
+		// conversion all rewrite it further down the same build. A step that folds
+		// it into its fingerprint therefore never sees a stable input: every build
+		// changes the corpus after the step recorded it, so the next build replays
+		// the step. Same shape as the one that made `merge` replay a 22 GB restore
+		// on every run — measured here on 2026-09-03, where a fully VALID pipeline
+		// still planned "2 certain to run (2 heavy)" on a corpus nothing had
+		// touched.
+		//
+		// What determines this step's work is declared elsewhere and precisely: its
+		// DATA dependency (merge or seed, through provenance), the embed identity
+		// and floor in Extra, and — at run time — the corpus's own answer to "does
+		// any clause still need one of these". That last question is the honest one,
+		// and the step already asks it before declining.
+		Inputs:  func(c *Ctx) ([]string, error) { return nil, nil },
 		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
 			// Prove the corpus can still produce the text it used to store,
@@ -1419,13 +1447,16 @@ func stepBuildSparse() *Step {
 func stepSparse(t corpusTarget) *Step {
 	return &Step{
 		Name:    "sparse" + t.Suffix,
-		Version: 1,
+		Version: 2,
 		Doc:     "vectorise the learned-lexical (sparse) arm of " + t.DB + " on the GPU",
 		Deps:    t.sparseDeps(),
 		Impl:    []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs"},
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{t.dbPath(c)}, nil
-		},
+		// The corpus is not an input here either: compact rewrites it after this
+		// step, so fingerprinting it guarantees a replay on the next build. The
+		// sparse identity in Extra and the data dependency are what actually decide
+		// this step's work, and it asks the corpus directly — "does every clause
+		// already carry a posting" — before declining.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Extra: func(c *Ctx) (map[string]string, error) {
 			return map[string]string{"sparse_identity": sparseIdentityForPlan(c)}, nil
 		},
