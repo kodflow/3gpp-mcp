@@ -41,6 +41,11 @@ func stepDiscoverETSI() *Step {
 			return map[string]string{"etsi_scope": c.Cfg("etsi_scope")}, nil
 		},
 		Outputs: func(c *Ctx) []string { return []string{c.statePath("etsi-worklist.tsv")} },
+		// The Run below writes this file and nothing else. An ETSI catalogue that
+		// enumerates to the same deliverables must not replay corpus-etsi, which is
+		// hours of download and PDF conversion over a corpus that has since been
+		// content-addressed and compacted.
+		OutputsComplete: true,
 		Validate: func(c *Ctx) error {
 			if countLines(c.statePath("etsi-worklist.tsv")) == 0 {
 				return fmt.Errorf("the ETSI work list is empty — discover resolved nothing")

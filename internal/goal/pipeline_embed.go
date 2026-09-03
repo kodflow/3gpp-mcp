@@ -28,6 +28,7 @@ func stepBuildEmbedder() *Step {
 		Deps:      []string{"toolchain"},
 		Impl:      []string{"rust/embedder"},
 		Toolchain: true,
+		Tool:      true,
 		Optional:  true, // a machine without a GPU still completes every other step
 		Outputs:   func(c *Ctx) []string { return []string{c.rbin("embedder")} },
 		Run: func(c *Ctx) error {
@@ -1280,6 +1281,7 @@ func stepBuildSparse() *Step {
 		Deps:      []string{"toolchain"},
 		Impl:      []string{"rust/embed-core/src"},
 		Toolchain: true,
+		Tool:      true,
 		// A box without the sparse model still completes every other step: the
 		// sparse arm is additive, and refusing to build without it would make the
 		// whole pipeline hostage to one optional artefact.
@@ -1625,6 +1627,7 @@ func stepBuildServe() *Step {
 		Deps:      []string{"toolchain", "build-go"},
 		Impl:      []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
 		Toolchain: true,
+		Tool:      true,
 		// A box with no ONNX Runtime still completes every other step; it just gets
 		// the lexical server. Failing the whole pipeline over the optional half of
 		// the search stack would be the wrong trade.

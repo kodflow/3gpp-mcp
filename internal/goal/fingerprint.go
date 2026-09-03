@@ -201,10 +201,14 @@ func inputsHash(paths []string) (string, map[string]string) {
 
 // Fingerprint composes the deterministic identity of a step.
 //
-// Only determinants enter it. Dependencies contribute their OWN fingerprints,
-// which is what makes invalidation transitive: if merge changes, embed's
-// fingerprint changes because merge's did, without embed knowing anything about
-// merge's internals.
+// Only determinants enter it. DATA dependencies contribute their OWN
+// fingerprints, which is what makes invalidation transitive: if merge changes,
+// embed's fingerprint changes because merge's did, without embed knowing
+// anything about merge's internals.
+//
+// TOOL dependencies are excluded, and the exclusion is the load-bearing part —
+// see Step.Tool. They are ordered and force-built for this step, but a rebuilt
+// compiler output is not new provenance for 22 GB of corpus.
 func (r *Runner) Fingerprint(s *Step, ctx *Ctx) (string, *Record, error) {
 	rec := &Record{
 		Step:        s.Name,
@@ -229,13 +233,25 @@ func (r *Runner) Fingerprint(s *Step, ctx *Ctx) (string, *Record, error) {
 	// dirty.
 	// Alternatives fold in exactly like Deps: a seeded corpus and a merged one
 	// are different corpora, so switching producer must replay the step.
-	deps := append(append([]string(nil), s.Deps...), s.AnyDeps...)
+	//
+	// Tool dependencies are filtered out HERE rather than at the declaration site,
+	// so the graph keeps saying the true thing — ingest really does need cargo to
+	// have run — while the fingerprint keeps to what can actually change ingest's
+	// output. rec.Deps records only what was hashed, so `goal status` and
+	// explainDrift never name a determinant that had no vote.
+	deps := make([]string, 0, len(s.Deps)+len(s.AnyDeps))
+	for _, d := range append(append([]string(nil), s.Deps...), s.AnyDeps...) {
+		if dep := r.byName[d]; dep != nil && dep.Tool {
+			continue
+		}
+		deps = append(deps, d)
+	}
 	sort.Strings(deps)
 	for _, d := range deps {
 		prev, _ := r.store.Load(d)
 		fp := "missing"
 		if prev != nil && prev.Status == StatusSuccess {
-			fp = prev.Fingerprint
+			fp = publishedProvenance(prev)
 		}
 		rec.Deps[d] = fp
 		x.add("dep:"+d, fp)

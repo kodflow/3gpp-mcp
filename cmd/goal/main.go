@@ -122,6 +122,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Close the selection over the BUILD steps it needs. `--only sparse` must
+	// launch the sparse binary this checkout describes, not whatever was last
+	// linked — see Runner.WithToolDeps for the five times that cost us a run.
+	// They skip in milliseconds when nothing changed, so the plan stays honest
+	// without becoming expensive.
+	selection = runner.WithToolDeps(selection)
 
 	switch sub {
 	case "plan":
@@ -230,13 +236,24 @@ func selectSteps(r *goal.Runner, only, from string) (map[string]bool, error) {
 	return nil, nil
 }
 
+// printPlan separates what WILL run from what will merely be re-examined. The
+// two used to print identically, so a plan whose only certain work was a relink
+// announced fifteen heavy steps and a corpus rebuild.
 func printPlan(ds []goal.Decision) {
 	fmt.Println("\n\033[1mGOAL PLAN\033[0m")
 	fmt.Println()
-	heavy := 0
+	heavy, maybe, maybeHeavy := 0, 0, 0
 	for _, d := range ds {
 		mark := "\033[2mSKIP\033[0m"
-		if d.Action == goal.ActionRun {
+		switch {
+		case d.Action != goal.ActionRun:
+		case d.Conditional:
+			mark = "\033[2mRUN?\033[0m"
+			maybe++
+			if d.Step.Heavy {
+				maybeHeavy++
+			}
+		default:
 			mark = "\033[33mRUN \033[0m"
 			if d.Step.Heavy {
 				heavy++
@@ -244,7 +261,23 @@ func printPlan(ds []goal.Decision) {
 		}
 		fmt.Printf("  [%s] %-16s %s\n", mark, d.Step.Name, d.Reason)
 	}
-	fmt.Printf("\n  %d step(s), %d heavy step(s) to execute\n\n", len(ds), heavy)
+	fmt.Printf("\n  %d step(s) examined, %d certain to run (%d heavy)\n", len(ds), len(ds)-countSkips(ds)-maybe, heavy)
+	if maybe > 0 {
+		fmt.Printf("  %d more (%d heavy) marked RUN? — each is decided against real state\n"+
+			"  once its dependency has finished, and skipped if that dependency changed nothing.\n",
+			maybe, maybeHeavy)
+	}
+	fmt.Println()
+}
+
+func countSkips(ds []goal.Decision) int {
+	n := 0
+	for _, d := range ds {
+		if d.Action != goal.ActionRun {
+			n++
+		}
+	}
+	return n
 }
 
 func printSummary(res *goal.Result) {
