@@ -29,7 +29,7 @@ portant `read:packages` avant le premier `pull`.
 Chiffres **mesurés** dans les bases servies le 2026-09-04, pas des ordres de
 grandeur. Ils portent sur un digest précis, pas sur le tag mouvant :
 
-```
+```text
 ghcr.io/kodflow/3gpp-mcp@sha256:f2aa17e695871ddf33acb2e419f1250b602ac8b720cea9c329add374ce796642
 ```
 
