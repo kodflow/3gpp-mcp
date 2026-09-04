@@ -483,11 +483,25 @@ func stepEnrich() *Step {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
 			// or the corpus keeps whatever li_events it had.
-			return []string{
-				c.statePath("status-report.htm"),
-				c.dataPath("sources", "5g-apis"),
-				c.dataPath("sources", "asn"),
-			}, nil
+			//
+			// ENUMERATED FILE BY FILE, because naming the directories read as
+			// watching them and watched nothing. inputsHash records a directory as
+			// the constant string "dir" (fingerprint.go), so neither tree could
+			// ever change this step's fingerprint: acquiring the LI registry or a
+			// new 5GC API left the overlay "unchanged" — the exact opposite of what
+			// the paragraph above asks for. The only real determinant here was
+			// status-report.htm, and until runDiscover stopped renaming it over
+			// itself, that one moved on every single run. So this step was
+			// simultaneously blind to what it watched and dirty for what it did not.
+			in := []string{c.statePath("status-report.htm")}
+			for _, d := range []string{"5g-apis", "asn"} {
+				files, err := filesUnder(c.dataPath("sources", d))
+				if err != nil {
+					return nil, err
+				}
+				in = append(in, files...)
+			}
+			return in, nil
 		},
 		Heavy: true,
 		Validate: func(c *Ctx) error {

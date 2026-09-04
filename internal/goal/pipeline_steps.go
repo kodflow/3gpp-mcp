@@ -44,7 +44,31 @@ func runDiscover(c *Ctx) error {
 	if err != nil || st.Size() < 4096 {
 		return fmt.Errorf("the status report came back empty or truncated (%v bytes) — refusing to compute a delta from it", st.Size())
 	}
-	if err := os.Rename(report+".tmp", report); err != nil {
+	// PUBLISH THE REPORT THROUGH WriteAtomic, NOT os.Rename.
+	//
+	// A rename always moves the mtime, and this file is an INPUT of `enrich`,
+	// which — like every step — has its inputs identified by size and mtime. So
+	// every discover made enrich dirty; enrich WRITES the corpus; and paragraphs,
+	// sparse, compact, index, validate and smoke all replayed behind it. discover
+	// runs on a 6 h TTL, which is a clock and not a change, so this happened on a
+	// schedule rather than in response to anything.
+	//
+	// Measured on 2026-09-04: three consecutive builds each ran 11 steps and ~21
+	// minutes of corpus work on a corpus to which nothing had been added, and the
+	// only thing that had actually moved was this file's timestamp.
+	//
+	// WriteAtomic already states the rule — a file that is not changing must not
+	// be touched — and was applied to series.json and worklist.txt when it was
+	// written. The report was missed because its consumer is not the enumerator
+	// itself but a step three edges downstream.
+	body, err := os.ReadFile(report + ".tmp")
+	if err != nil {
+		return err
+	}
+	if err := WriteAtomic(report, body); err != nil {
+		return err
+	}
+	if err := os.Remove(report + ".tmp"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	c.Log.Printf("status report: %d bytes", st.Size())
