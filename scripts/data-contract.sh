@@ -33,18 +33,19 @@ dense+sparse)
 	flags="$flags --require-sparse"
 	;;
 dense+sparse+etsi)
-	# NOT SELECTABLE YET, and it says so instead of emitting a phantom flag.
+	# SELECTABLE AGAIN. Both gate binaries now declare --require-etsi, so the
+	# ratchet in ADR 0002 continues here rather than stopping with an explanation.
 	#
-	# This branch used to append --require-etsi, which NEITHER gate binary
-	# declares: cmd/validate and `mcp-3gpp check-data` both reject it as an unknown
-	# flag. Choosing this level therefore did not tighten the contract — it broke
-	# the bake, with Go's opaque "flag provided but not defined" as the only clue.
-	# Failing here, with the reason, is strictly better than failing there without.
+	# The flag takes the ETSI corpus's PATH, because that is what makes the check
+	# possible at all: it opens the second store and asserts it holds clauses, that
+	# every one of them carries a vector, and that its embedding identity equals the
+	# 3GPP corpus's. The last of those is the one that matters — internal/mcp
+	# recomputes semantic availability PER STORE, so an ETSI half at a stale
+	# identity is answered lexically while the 3GPP half is not, with no error
+	# anywhere.
 	#
-	# Restore the original line once --require-etsi exists in BOTH binaries
-	# (ETSI ingestion, Phase C); the ratchet in ADR 0002 then continues.
-	echo "data-contract: DATA_CONTRACT=dense+sparse+etsi is not implementable yet — neither cmd/validate nor 'mcp-3gpp check-data' declares --require-etsi (Phase C). Use dense or dense+sparse." >&2
-	exit 2
+	# DATA_ETSI_DB overrides the path for a layout that is not the image's.
+	flags="$flags --require-sparse --require-etsi ${DATA_ETSI_DB:-/data/mcp-3gpp/etsi.duckdb}"
 	;;
 *)
 	echo "data-contract: unknown DATA_CONTRACT=$level (want: dense | dense+sparse | dense+sparse+etsi)" >&2

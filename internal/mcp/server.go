@@ -19,6 +19,7 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 	"github.com/kodflow/3gpp-mcp/internal/registry"
 	"github.com/kodflow/3gpp-mcp/internal/releaseview"
+	"github.com/kodflow/3gpp-mcp/internal/rerank"
 	"github.com/kodflow/3gpp-mcp/internal/search"
 	"github.com/kodflow/3gpp-mcp/internal/store"
 	"github.com/kodflow/3gpp-mcp/internal/subject"
@@ -63,7 +64,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("query", mcp.Required(), mcp.Description("free-text query")),
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
-		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, EN, or any. Omitted = the NORMATIVE types: TS on the 3GPP half (TS-first doctrine), TS+EN on the ETSI half, where a European Norm is a standard and filtering it out would hide most of the catalogue.")),
 		mcp.WithString("spec_id", mcp.Description("e.g. 33.128")),
 		mcp.WithNumber("top_k", mcp.Description("max results per page (default 10)")),
 		mcp.WithString("cursor", mcp.Description("opaque pagination cursor from a previous call's next_cursor")),
@@ -120,7 +121,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("series", mcp.Description("e.g. 33")),
 		mcp.WithString("working_group", mcp.Description("e.g. SA3")),
-		mcp.WithString("spec_type", mcp.Description("TS (default), TR, or any (TS+TR). Omitted = TS per the TS-first doctrine.")),
+		mcp.WithString("spec_type", mcp.Description("TS (default), TR, EN, or any. Omitted = the NORMATIVE types: TS on the 3GPP half (TS-first doctrine), TS+EN on the ETSI half, where a European Norm is a standard and filtering it out would hide most of the catalogue.")),
 	), h.listSpecs)
 
 	s.AddTool(mcp.NewTool("search_api",
@@ -137,15 +138,27 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	), h.searchAPI)
 
 	s.AddTool(mcp.NewTool("trace_clause",
-		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which releases carry each "+
-			"statement, when it was introduced, and whether it is gone from the newest release. "+
+		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which points of the spec's "+
+			"history carry each statement, when it was introduced, and whether it is gone from the newest one. "+
+			"The answer names the AXIS it used: a 3GPP spec evolves along RELEASE, an ETSI deliverable along "+
+			"VERSION (it has no releases — TS 102 221 has 126 published versions). "+
 			"With from_release and to_release, the paragraphs the clause gained and lost between them. "+
 			"Clause-level lineage cannot see this: a clause that changed one sentence looks entirely new to it."),
-		mcp.WithString("spec_id", mcp.Required(), mcp.Description("e.g. 23.501")),
+		mcp.WithString("spec_id", mcp.Required(), mcp.Description("e.g. 23.501, or ETSI TS 102 221")),
 		mcp.WithString("clause", mcp.Required(), mcp.Description("exact clause path, e.g. 5.4.4a")),
-		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two")),
-		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two")),
+		// The parameter names say "release" and are kept for compatibility, but the
+		// endpoints are matched against whichever of release/version the spec holds
+		// them in. An ETSI deliverable is traced between two VERSIONS here.
+		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
+		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
 	), h.traceClause)
+
+	s.AddTool(mcp.NewTool("help",
+		mcp.WithDescription("What this corpus HOLDS and how to drive it: counts per half "+
+			"(specs, clauses, vectors), the map from question to tool, and the environment "+
+			"knobs that change what you get back. Capabilities and their on/off reasons are "+
+			"server_info's job. Read-only, no arguments."),
+	), h.help)
 
 	s.AddTool(mcp.NewTool("server_info",
 		mcp.WithDescription("Report the server's retrieval capabilities and why semantic search is on/off "+
@@ -238,6 +251,25 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 	default:
 		semantic = true
 	}
+	// THE SPARSE ARM, with its own reason. It was missing here entirely: a client
+	// asking what this server can do was told about lexical, semantic and the
+	// reranker, and learned nothing about the third retrieval arm — which
+	// search.Engine drops in silence when the model or the postings are absent.
+	// "Ask rather than assume" is the whole point of this tool, and a capability it
+	// cannot report is one the caller has to guess at.
+	st := h.eng.State()
+	sparseReason := ""
+	switch {
+	case !st.SparseEnabled && !h.eng.EmbedderEnabled():
+		sparseReason = "embedder_disabled"
+	case !st.SparseEnabled && h.st.GetMeta(ctx, "sparse_model") == "":
+		sparseReason = "no_sparse_postings_in_db"
+	case !st.SparseEnabled:
+		sparseReason = "model_has_no_sparse_head (bake data/models/bge-m3-sparse as the ACTIVE model)"
+	case !st.SparseOn:
+		sparseReason = "turned_off_at_runtime"
+	}
+
 	baseline := h.baseline
 	if baseline == "" {
 		baseline = "latest"
@@ -250,10 +282,31 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 		"semantic":               semantic,
 		"reason":                 reason,
 		"hnsw":                   vss,
+		"sparse":                 st.SparseEnabled && st.SparseOn,
+		"sparse_reason":          sparseReason,
+		"sparse_model":           h.st.GetMeta(ctx, "sparse_model"),
 		"reranker":               h.eng.RerankerEnabled(),
+		"reranker_reason":        rerankReason(h.eng.RerankerEnabled()),
 		"embedding_model_db":     dbModel,
 		"embedding_model_client": clientModel,
 		"embed_floor":            h.st.GetMeta(ctx, "embed_floor"),
+	}
+	// The ETSI half is SERVED ALONGSIDE, never merged, and was invisible here too.
+	// Its embedding identity is reported because it is computed per store: an ETSI
+	// corpus at a stale identity answers lexically while the 3GPP one does not, and
+	// this is the only place a client can see that has happened.
+	if h.etsi != nil {
+		etsiModel := h.etsi.GetMeta(ctx, "embedding_model")
+		info["etsi"] = map[string]any{
+			"attached":           true,
+			"fts":                h.etsi.FTSAvailable(),
+			"hnsw":               h.etsi.VSSAvailable(),
+			"sparse":             h.etsi.SparseAvailable(),
+			"embedding_model":    etsiModel,
+			"embedding_model_ok": etsiModel != "" && etsiModel == clientModel,
+		}
+	} else {
+		info["etsi"] = map[string]any{"attached": false}
 	}
 	b, _ := json.MarshalIndent(info, "", "  ")
 	return mcp.NewToolResultText(string(b)), nil
@@ -289,19 +342,15 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
-		ef := filter
-		ef.Release = ""
 		servingEng = h.etsiEng
-		hits, err = h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank})
+		hits, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
 	} else {
 		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
 		if err == nil && h.etsiEng != nil && filter.SpecID == "" && filter.Series == "" {
-			ef := filter
-			ef.Release = ""
-			if eh, eerr := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: want, Mode: mode, Rerank: rerank}); eerr == nil && len(eh) > 0 {
+			if eh, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank); eerr == nil && len(eh) > 0 {
 				hits = search.RRF(60, hits, eh)
 			}
 		}
@@ -462,7 +511,39 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 		}
 		changes = filtered
 	}
-	return jsonResult(map[string]any{"spec_id": specID, "count": len(changes), "changes": changes})
+	out := map[string]any{"spec_id": specID, "count": len(changes), "changes": changes}
+	// A ZERO THAT MEANS TWO DIFFERENT THINGS IS NOT AN ANSWER.
+	//
+	// The changes table holds 3GPP change requests. The ETSI half carries none, so
+	// every ETSI deliverable answered count 0 — which reads as "this deliverable
+	// never changed", on a corpus that keeps all 126 published versions of
+	// TS 102 221 precisely because it did.
+	//
+	// The gap is not an oversight in the pipeline; it is what the source allows.
+	// A 3GPP change history survives .doc conversion as an HTML TABLE. ETSI ships
+	// PDFs, and `pdftotext -layout` flattens that table into space-aligned text
+	// whose rows split across lines, drop their Date/Meeting on continuation rows,
+	// and leave the Old/New columns blank — so a parser would attach a CR summary
+	// to the wrong CR number and the wrong version transition. A change record that
+	// names the wrong transition is worse than no record: it is a citation that
+	// looks authoritative and is false.
+	//
+	// So say what is true, and name the tool that DOES answer the question from the
+	// text itself. trace_clause diffs a clause between two versions as a set
+	// operation on paragraph ids — no parsing, nothing reconstructed.
+	if len(changes) == 0 && h.etsi != nil && isETSISpecID(specID) {
+		out["note"] = "this corpus holds no change-request records for the ETSI half: ETSI publishes PDFs, " +
+			"and the change-history table does not survive text extraction well enough to cite. " +
+			"Use trace_clause with from_release/to_release (they accept two VERSIONS here) to diff a " +
+			"clause between two published versions from the text itself."
+	}
+	return jsonResult(out)
+}
+
+// isETSISpecID is storeFor's routing predicate, named so a caller can ask the
+// question without asking for the store.
+func isETSISpecID(specID string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(specID)), "ETSI")
 }
 
 func (h *handlers) listReleases(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -482,9 +563,34 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// FEDERATE, like search_spec and list_specs already do. resolve_term read the
+	// 3GPP store alone, so it answered only from TS 21.905's 1 300 terms — which do
+	// not include UICC, ADF or AID, on a corpus that holds the deliverables those
+	// terms are defined in. The ETSI half has no vocabulary spec: each deliverable
+	// carries its own Abbreviations clause, and ingest-glossary mines them.
+	//
+	// 3GPP first: it is the canonical vocabulary for a term both halves define, and
+	// the ETSI rows carry source_series "etsi" so a caller can tell them apart
+	// without this having to say so twice.
 	a, err := h.st.ResolveTerm(ctx, term)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("resolve_term failed", err), nil
+	}
+	if h.etsi != nil {
+		seen := make(map[[3]string]bool, len(a))
+		for _, x := range a {
+			seen[[3]string{x.Term, x.Expansion, x.Domain}] = true
+		}
+		e, eErr := h.etsi.ResolveTerm(ctx, term)
+		if eErr != nil {
+			return mcp.NewToolResultErrorFromErr("resolve_term failed on the ETSI half", eErr), nil
+		}
+		for _, x := range e {
+			if k := ([3]string{x.Term, x.Expansion, x.Domain}); !seen[k] {
+				seen[k] = true
+				a = append(a, x)
+			}
+		}
 	}
 	resp := map[string]any{"term": term, "count": len(a), "matches": a}
 	// Domain subjects may enrich the term (e.g. the LI subject attaches an ASN.1
@@ -550,13 +656,22 @@ func docTypeDefault(specType string) string {
 	case "":
 		return "TS" // TS-first default
 	case "any", "all", "*":
-		return "" // explicit opt-in to TS+TR
+		return "" // explicit opt-in to every type
 	case "tr":
 		return "TR"
 	case "ts":
 		return "TS"
+	case "en":
+		// ETSI European Norms. Without this case the value fell through to the
+		// pass-through below and reached the store as the lowercase "en", which
+		// matches nothing: the filter is an exact string comparison against the
+		// stored "EN". Asking for ENs returned silence.
+		return "EN"
 	default:
-		return specType // pass through (store filters exact-match; unknown ⇒ empty result, which is honest)
+		// Pass through, UPPERCASED. The store compares exactly, so a caller who
+		// spelled a real type in lower case would otherwise get an empty result
+		// that is indistinguishable from "no such specs".
+		return strings.ToUpper(strings.TrimSpace(specType))
 	}
 }
 
@@ -574,11 +689,17 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// ROUTE THE SOURCE SPEC. This handler read h.st unconditionally while get_spec
+	// and trace_clause went through storeFor, so asking an ETSI deliverable for its
+	// references hit the 3GPP store, found no such spec, and answered count 0 —
+	// silently, on clause 2, which IS the normative reference list. The two halves
+	// are federated and never merged, so the routing has to be explicit everywhere.
+	src := h.storeFor(specID)
 	release, version := "", ""
-	if rel, v, ok, _ := h.st.LatestVersion(ctx, specID); ok {
+	if rel, v, ok, _ := src.LatestVersion(ctx, specID); ok {
 		release, version = rel, v
 	}
-	clauses, err := h.st.GetClauses(ctx, specID, version, r.GetString("clause", ""))
+	clauses, err := src.GetClauses(ctx, specID, version, r.GetString("clause", ""))
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("find_cross_references failed", err), nil
 	}
@@ -617,10 +738,32 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 			}
 			etsiSeen[id] = true
 			etsiRefs = append(etsiRefs, id)
-			// Version is unknown from a bare mention, so cite the deliver folder
-			// pointer (EtsiDeliverURL with empty version). SpecID keeps the "ETSI TS"
-			// prefix so the citation is unambiguous against 3GPP ids.
-			etsiCites = append(etsiCites, model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")})
+			// RESOLVE THE MENTION AGAINST THE ATTACHED HALF WHEN THERE IS ONE.
+			//
+			// A bare "TS 103 280" in prose names no version and no document type, so
+			// this used to cite the etsi_ts deliver FOLDER and stop. That was right
+			// when the ETSI half held 14 deliverables; it now holds 11 822 versions of
+			// 5 142 deliverables, so the corpus usually knows the exact one — and a
+			// versioned PDF is a citation a reader can open at the right text.
+			//
+			// The type is tried in normative order and the first that resolves wins:
+			// nothing in "103 101" says TR, and the trees are disjoint (etsi_ts/103101
+			// is a 404 while etsi_tr/103101 is TR 103 101). Unresolved still cites the
+			// folder — cite the pointer, never fabricate a version.
+			cite := model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")}
+			if h.etsi != nil {
+				for _, dt := range []string{"TS", "EN", "TR"} {
+					full := "ETSI " + dt + " " + id
+					if rel, v, ok, _ := h.etsi.LatestVersion(ctx, full); ok {
+						cite = model.Citation{
+							SpecID: full, Release: rel, Version: v,
+							URL: model.SpecURL(full, v), Stable: model.IsStableVersion(v),
+						}
+						break
+					}
+				}
+			}
+			etsiCites = append(etsiCites, cite)
 		}
 	}
 	return jsonResult(map[string]any{
@@ -628,7 +771,11 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		"count": len(refs), "references": refs,
 		// Source-spec citation (where the references were found) + one citation per
 		// referenced spec, each with whatever provenance is resolvable.
-		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.ArchiveURL(specID, version), Stable: model.IsStableVersion(version)},
+		// SpecURL, not ArchiveURL: find_cross_references is routed to the ETSI
+		// store for a spec_id beginning "ETSI ", and ArchiveURL answers "" for
+		// anything that is not a 3GPP id — so this citation named a deliverable
+		// with no pointer to it.
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableVersion(version)},
 		"ref_citations": refCites,
 		// ETSI cross-references (separate keys; absent-as-empty, never null).
 		"etsi_references":    etsiRefs,
@@ -659,10 +806,14 @@ func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	// release space ("ETSI"), so the 3GPP release filter never applies to them —
 	// pass series/WG/doc_type through but clear the release so they always surface.
 	if h.etsi != nil {
-		if es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
-			Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
-			DocType: docTypeDefault(r.GetString("spec_type", "")),
-		}); eerr == nil {
+		for _, dt := range etsiDocTypes(r.GetString("spec_type", "")) {
+			es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
+				Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
+				DocType: dt,
+			})
+			if eerr != nil {
+				continue
+			}
 			for _, sp := range es {
 				rows = append(rows, specRow{Spec: sp, HasAPI: false})
 			}
@@ -783,17 +934,126 @@ func (h *handlers) traceClause(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	if lErr != nil {
 		return mcp.NewToolResultErrorFromErr("trace_clause failed", lErr), nil
 	}
-	return jsonResult(map[string]any{
-		"spec_id": specID, "clause": clause, "paragraphs": traces,
-	})
+	// SAY what present_in is listing. A 3GPP spec is traced across releases; an
+	// ETSI deliverable has no releases (parse_etsi_meta stamps the constant
+	// "ETSI") and is traced across its published versions. Returning the values
+	// without the axis leaves the reader to guess which, and "1.21.1" versus
+	// "Rel-18" is only obvious until an id happens to look like both.
+	resp := map[string]any{"spec_id": specID, "clause": clause, "paragraphs": traces}
+	if axis, ordered, aErr := st.LineageAxis(ctx, specID); aErr == nil {
+		resp["axis"] = axis
+		resp["axis_values"] = ordered
+	}
+	return jsonResult(resp)
 }
 
 // storeFor routes an id to the corpus that owns it. ETSI ids are served by the
 // second store when one is attached; everything else is 3GPP. The two are never
 // merged, so the routing has to be explicit.
 func (h *handlers) storeFor(specID string) store.Reader {
-	if h.etsi != nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(specID)), "ETSI") {
+	if h.etsi != nil && isETSISpecID(specID) {
 		return h.etsi
 	}
 	return h.st
+}
+
+// etsiDocTypes is the ETSI half's answer to spec_type, and it deliberately differs
+// from the 3GPP half's.
+//
+// The TS-first default exists because in 3GPP a TS is the norm and a TR is a study
+// report, so browsing a catalogue should not be dominated by reports. Applied
+// verbatim to the ETSI half it stops meaning that: ETSI's normative output is TS
+// *and* EN — a European Norm is a standard, often the harmonised one that carries
+// legal presumption of conformity — and 1 542 of the 5 117 deliverables in this
+// corpus are ENs. Filtering on the literal string "TS" would therefore hide the
+// majority of the ETSI catalogue by default, for a distinction that does not exist
+// there.
+//
+// So an unset spec_type means "the normative types" here, and the caller who wants
+// reports asks for them, exactly as on the 3GPP side. An explicit value is honoured
+// as given, and "any" clears the filter for both halves alike.
+//
+// It returns a LIST because store.SpecFilter.DocType is one exact-match string; two
+// small catalogue queries are cheaper than widening the filter shape for this.
+func etsiDocTypes(specType string) []string {
+	switch dt := docTypeDefault(specType); dt {
+	case "TS":
+		// Only when the caller said nothing: an explicit spec_type=TS must mean TS.
+		if strings.TrimSpace(specType) == "" {
+			return []string{"TS", "EN"}
+		}
+		return []string{"TS"}
+	default:
+		return []string{dt} // "" (any) clears the filter, everything else is exact
+	}
+}
+
+// searchETSI runs a query against the ETSI index with that half's own conventions.
+//
+// Two of them, and both were wrong before this existed. The release filter is
+// cleared: ETSI clauses live in their own "ETSI" release space, so a 3GPP baseline
+// like Rel-19 matches nothing there. And the document-type default is the
+// NORMATIVE SET rather than the literal "TS" — the same rule list_specs uses, for
+// the same reason (see etsiDocTypes). Copying the 3GPP filter wholesale meant an
+// unqualified search could never surface an ETSI EN or TR at all: 56% of that
+// corpus was reachable by id and invisible to search, with nothing saying so.
+//
+// One query per type, RRF-merged. RRF is rank-based, so merging two lists from the
+// same engine is the same operation as merging the ETSI list into the 3GPP one —
+// no score calibration is implied between them.
+func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
+	topK int, mode string, rerank bool) ([]model.SearchHit, error) {
+	f.Release = ""
+
+	// A spec_id PINS the document, so the type default must not second-guess it.
+	// Without this, search_spec(spec_id="ETSI TR 103 101") with no spec_type takes
+	// the normative default {TS, EN}, neither matches a TR, and the query returns
+	// NOTHING for a document the caller named explicitly — a filter answering a
+	// question the caller had already answered.
+	types := etsiDocTypes(specType)
+	if f.SpecID != "" && strings.TrimSpace(specType) == "" {
+		types = []string{""}
+	}
+
+	var lists [][]model.SearchHit
+	var firstErr error
+	for _, dt := range types {
+		ef := f
+		ef.DocType = dt
+		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode, Rerank: rerank})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if len(hits) > 0 {
+			lists = append(lists, hits)
+		}
+	}
+	switch {
+	case len(lists) == 0 && firstErr != nil:
+		return nil, firstErr
+	case len(lists) == 0:
+		return nil, nil
+	case len(lists) == 1:
+		return lists[0], nil
+	default:
+		return search.RRF(60, lists...), nil
+	}
+}
+
+// rerankReason mirrors sparse_reason: an arm reported as false must say why.
+//
+// Every failure path in the ONNX reranker returns Disabled{} — that is correct,
+// a retrieval arm degrades rather than stopping the server — but it left
+// "reranker": false with nothing to act on. Measured on this machine: false,
+// with model.onnx and tokenizer.json both on disk and the EMBEDDER live on the
+// same ONNX runtime, which rules out the two guesses an operator would make
+// first.
+func rerankReason(enabled bool) string {
+	if enabled {
+		return ""
+	}
+	return rerank.Reason()
 }

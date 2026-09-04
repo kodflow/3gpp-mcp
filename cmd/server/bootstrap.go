@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 )
 
 // WHERE THE CORPUS COMES FROM, AND WHY IT MOVED.
@@ -256,9 +258,32 @@ func pointModelsAtCache() {
 			_ = os.Setenv("ONNXRUNTIME_SHARED_LIBRARY_PATH", lib)
 		}
 	}
-	// EMBED_MODEL_DIR points the active embed model (default bge-m3) at the cached
-	// copy, so serve finds it without the user exporting anything (registry seam).
-	setIfPresent("EMBED_MODEL_DIR", models+"/bge-m3", "model.onnx")
+	// EMBED_MODEL_DIR points the embedder at the cached copy of the model the
+	// REGISTRY says is active — not at a hardcoded "bge-m3".
+	//
+	// The distinction is load-bearing, because the two halves of the embedder
+	// resolve the model differently: the Go side reads the registry, while the
+	// Rust cdylib (rust/embed-core, ort backend) reads EMBED_MODEL_DIR and falls
+	// back to the literal relative path "data/models/bge-m3". So on a deployment
+	// that ships the dual-head export INSTEAD of the dense-only one — which is
+	// what the image does, because only the ACTIVE registry entry decides whether
+	// the sparse arm exists at all — this used to find no bge-m3 directory, leave
+	// EMBED_MODEL_DIR unset, and let the cdylib look for a relative path that does
+	// not exist under the working directory. Semantic search would then fail at the
+	// first query, in an image whose corpus is full of vectors.
+	//
+	// Only the LAST path element of the registry's dir is used, rejoined onto the
+	// cache: the built-in registry names a repo-relative path ("data/models/…")
+	// while a baked one names an absolute container path, and what is being
+	// resolved here is "the cached copy", which lives under the cache either way.
+	//
+	// Falling back to "bge-m3" keeps every existing cache layout working: that is
+	// where a bootstrap without a registry override puts the weights.
+	active := "bge-m3"
+	if d := strings.TrimSpace(embed.ActiveModel().Dir); d != "" {
+		active = filepath.Base(d)
+	}
+	setIfPresent("EMBED_MODEL_DIR", filepath.Join(models, active), "model.onnx")
 	setIfPresent("BGE_RERANKER_DIR", models+"/bge-reranker-v2-m3", "model.onnx")
 }
 

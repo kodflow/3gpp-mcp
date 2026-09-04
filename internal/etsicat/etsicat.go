@@ -16,10 +16,13 @@
 package etsicat
 
 import (
+	"errors"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 
@@ -153,16 +156,42 @@ func Diff(site, index map[string]string) []string {
 	return changed
 }
 
+// ErrNotInArchive marks a deliverable the /deliver archive does not hold: the
+// crawl enumerated its id, and its folder answers 404 in the tree it was
+// enumerated from. That is a DEFINITIVE answer, not a transient one.
+//
+// Why it needs a name. The fetcher retried every non-200 five times with backoff,
+// and the caller then reported "will retry next run" — so 90 ids enumerated from
+// the ETSI index but never published (historical ETS/I-ETS numbers; the whole
+// 100000_100099 range folder is a 404 in all three trees, checked 2026-09-02)
+// cost five requests each, every run, forever, and left the operator reading a
+// completeness report that promised work which can never complete. A corpus is
+// only "complete" if the tool can say WHICH of the two reasons a document is
+// missing for.
+var ErrNotInArchive = errors.New("not published in the ETSI /deliver archive")
+
 // Fetcher fetches a URL and returns its body. Injected so the crawl is unit-testable
 // with fixtures (no network) — the CLI passes an http.Get-backed implementation.
 type Fetcher func(url string) (io.ReadCloser, error)
 
-// ResolveLatest fetches a spec's deliver directory and returns its latest PUBLISHED
-// version string ("1.21.1"). ok is false (no error) when the spec dir has no published
-// version (drafts only / empty) — the caller skips it. A fetch/parse error is returned
-// so the CLI can retry (the resume mechanic), never silently drop a spec.
+// ResolveLatest resolves a TS. Kept as the TS-only form for the built-in LI suite
+// and the citation path, both of which are TS by construction.
 func ResolveLatest(fetch Fetcher, id string) (version string, ok bool, err error) {
-	dir := model.EtsiDeliverURL(id, "") // version-less ⇒ the spec's directory URL
+	return ResolveLatestIn(fetch, model.EtsiTypeTS, id)
+}
+
+// ResolveLatestIn fetches a deliverable's deliver directory IN A GIVEN document-type
+// folder and returns its latest PUBLISHED version string ("1.21.1"). ok is false (no
+// error) when the directory carries no published version (drafts only / empty) — the
+// caller skips it. A fetch/parse error is returned so the CLI can retry (the resume
+// mechanic), never silently drop a deliverable.
+//
+// The folder is a parameter because the archive is three trees, not one. Resolving
+// every enumerated id under etsi_ts made each TR and EN 404, five times over (the
+// retry budget), and then land in "failed" — which is how --all could crawl the
+// whole archive, report 7 501 deliverables, and still index only the TS ones.
+func ResolveLatestIn(fetch Fetcher, typeDir, id string) (version string, ok bool, err error) {
+	dir := model.EtsiDeliverURLIn(typeDir, id, "") // version-less ⇒ the deliverable's directory URL
 	if dir == "" {
 		return "", false, nil // not an ETSI-shaped id
 	}
@@ -182,21 +211,105 @@ func ResolveLatest(fetch Fetcher, id string) (version string, ok bool, err error
 	return v.String(), true, nil
 }
 
-// BuildSite resolves the latest published version of every id, returning the live
-// "site" map (id -> version) plus the ids that errored (for the caller to retry/report).
-// Ids with no published version are simply omitted (cite-or-silent).
+// BuildSiteWorkers bounds how many deliverables BuildSite resolves at once.
+//
+// One at a time is fine for the fourteen-spec LI suite and hopeless for the whole
+// archive: --all enumerates ~7 500 deliverables, each needing its own directory
+// GET, so a sequential resolve is one round-trip deep, 7 500 times — an hour or
+// more of pure latency, which is why the --all flag existed but was never usable.
+// The work is entirely network-bound, so a small pool collapses that to minutes.
+// Small on purpose: this is someone else's CDN, and cmd/discover-etsi already had
+// to disable HTTP/2 because ETSI's edge falls over under a heavy crawl.
+const BuildSiteWorkers = 12
+
+// Deliverable is an ETSI deliverable's archive identity: its canonical number id
+// plus the /deliver document-type folder it actually lives in. The folder is not
+// derivable from the id — the number alone does not say whether 103 101 is a TS or
+// a TR — so it has to travel with it from enumeration all the way to the URL.
+type Deliverable struct {
+	TypeDir string // model.EtsiTypeTS | EtsiTypeTR | EtsiTypeEN
+	ID      string // "103 221-1"
+}
+
+// BuildSite resolves the latest published version of every TS id. The TS-only form,
+// for the built-in LI suite and --specs; its result is keyed by id because within
+// one document type an id IS the identity.
 func BuildSite(fetch Fetcher, ids []string) (site map[string]string, failed []string) {
-	site = make(map[string]string, len(ids))
+	ds := make([]Deliverable, 0, len(ids))
 	for _, id := range ids {
-		v, ok, err := ResolveLatest(fetch, id)
-		switch {
-		case err != nil:
-			failed = append(failed, id)
-		case ok:
-			site[id] = v
-		}
+		ds = append(ds, Deliverable{TypeDir: model.EtsiTypeTS, ID: id})
+	}
+	typed, failed, absent := BuildSiteIn(fetch, ds)
+	failed = append(failed, absent...)
+	sort.Strings(failed)
+	site = make(map[string]string, len(typed))
+	for d, v := range typed {
+		site[d.ID] = v
 	}
 	return site, failed
+}
+
+// BuildSiteIn resolves the latest published version of every deliverable, returning
+// the live "site" map (deliverable -> version) plus the ids that errored (for the
+// caller to retry/report). Deliverables with no published version are simply
+// omitted (cite-or-silent).
+//
+// THE KEY IS THE WHOLE DELIVERABLE, not its number. Archive identity is (folder,
+// id), and the same number can exist as a TS and as a TR — /deliver/etsi_ts/…/
+// 103101/ is a 404 while the etsi_tr one is TR 103 101, but nothing stops ETSI
+// from filling both. Keyed by id alone, two concurrent workers would race to
+// overwrite each other, and a later lookup could pair one document's version with
+// another's folder and URL. There are no such collisions in the archive today;
+// keying on the identity rather than on that fact is what keeps it from mattering.
+//
+// Resolution is concurrent (BuildSiteWorkers at a time) but the RESULT is not
+// order-dependent: site is a map, and failed is sorted before it is returned, so
+// two runs over the same archive produce byte-identical output. Fetcher is called
+// from several goroutines, so an implementation must be safe for concurrent use —
+// the http.Client-backed one in cmd/discover-etsi is.
+func BuildSiteIn(fetch Fetcher, ds []Deliverable) (site map[Deliverable]string, failed, absent []string) {
+	site = make(map[Deliverable]string, len(ds))
+	if len(ds) == 0 {
+		return site, nil, nil
+	}
+
+	workers := BuildSiteWorkers
+	if len(ds) < workers {
+		workers = len(ds)
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan Deliverable)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				v, ok, err := ResolveLatestIn(fetch, d.TypeDir, d.ID)
+				mu.Lock()
+				switch {
+				case errors.Is(err, ErrNotInArchive):
+					absent = append(absent, d.ID)
+				case err != nil:
+					failed = append(failed, d.ID)
+				case ok:
+					site[d] = v
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, d := range ds {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+
+	sort.Strings(failed)
+	sort.Strings(absent)
+	return site, failed, absent
 }
 
 // newer reports whether ETSI version a is strictly newer than b (major/minor/edit).
@@ -217,4 +330,99 @@ func newer(a, b string) bool {
 		return an > bn
 	}
 	return ae > be
+}
+
+// AllPublished returns EVERY published version (milestone 60) in a deliverable's
+// directory, oldest first, deduplicated.
+//
+// LatestPublished answers "what should we serve"; this answers "what is there".
+// The distinction is the difference between a corpus that can show how a
+// deliverable changed and one that can only show where it ended up: TS 103 221-1
+// alone carries 23 published versions, and the 3GPP half of this corpus already
+// keeps every release of every spec for exactly that reason.
+//
+// Oldest first because that is the order a reader follows a history in, and
+// because the ingest attributes each file independently — nothing depends on the
+// order, so it may as well be the useful one.
+func AllPublished(links []string) []Version {
+	seen := map[int]bool{}
+	var out []Version
+	for _, l := range links {
+		v, ok := ParseVersionDir(l)
+		if !ok || v.Milestone != PublishedMilestone || seen[v.rank()] {
+			continue
+		}
+		seen[v.rank()] = true
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].rank() < out[j].rank() })
+	return out
+}
+
+// ResolveAllIn lists every published version of one deliverable. Same contract as
+// ResolveLatestIn: a fetch/parse error is returned so the caller can retry, and a
+// directory with no published version yields an empty slice rather than an error.
+func ResolveAllIn(fetch Fetcher, typeDir, id string) ([]string, error) {
+	dir := model.EtsiDeliverURLIn(typeDir, id, "")
+	if dir == "" {
+		return nil, nil
+	}
+	body, err := fetch(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	links, err := ExtractLinks(body)
+	if err != nil {
+		return nil, err
+	}
+	vs := AllPublished(links)
+	out := make([]string, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, v.String())
+	}
+	return out, nil
+}
+
+// BuildHistory resolves EVERY published version of every deliverable, concurrently.
+// The map is keyed by the whole deliverable for the same reason BuildSiteIn's is.
+func BuildHistory(fetch Fetcher, ds []Deliverable) (history map[Deliverable][]string, failed, absent []string) {
+	history = make(map[Deliverable][]string, len(ds))
+	if len(ds) == 0 {
+		return history, nil, nil
+	}
+	workers := BuildSiteWorkers
+	if len(ds) < workers {
+		workers = len(ds)
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan Deliverable)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				vs, err := ResolveAllIn(fetch, d.TypeDir, d.ID)
+				mu.Lock()
+				switch {
+				case errors.Is(err, ErrNotInArchive):
+					absent = append(absent, d.ID)
+				case err != nil:
+					failed = append(failed, d.ID)
+				case len(vs) > 0:
+					history[d] = vs
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, d := range ds {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+	sort.Strings(failed)
+	sort.Strings(absent)
+	return history, failed, absent
 }

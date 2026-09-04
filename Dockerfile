@@ -1,5 +1,23 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
+# NOT THE BUILD PATH ANY MORE — kept as the reference specification.
+#
+# `make image` builds and pushes ghcr.io/kodflow/3gpp-mcp:latest from
+# scripts/local/build-image.sh, which composes the same image with crane on a
+# machine that has no container runtime. That script is authoritative; this file
+# is what it reproduces, and is retained because it says WHY each piece is there
+# in a way a shell script assembling tarballs cannot.
+#
+# Two things here no longer hold, and would bite anyone who ran `docker build`:
+#   - the `light` target was removed from the product (one image, everything in
+#     it), so only `full` is meaningful;
+#   - `full` is `FROM ${DATA_IMAGE}`, and 3gpp-data is no longer published — the
+#     workflow that baked it is gone. build-image.sh puts the corpus in a layer
+#     of the one image instead, which a deterministic packer makes free (see
+#     docs/automation/data-image.md).
+#
+# The header below describes the arrangement as it was under CI.
+# =============================================================================
 # 3gpp-mcp production image — TWO TARGETS (pass --target light|full):
 #
 #   light : binary + the lexical DB.zst baked from image-data/ (BM25 offline);
@@ -179,6 +197,12 @@ RUN HOME=/home/mcp mcp-3gpp prefetch-extensions && chown -R mcp:mcp /home/mcp/.d
 # ship silently — `docker build` of `full` errors out here instead of producing a
 # server that degrades to LIKE full-scan / exact-scan (or silently lacks sparse) in
 # production. (light builds its own lexical DB and never reaches this stage.)
+# Adding --require-sparse here ALSO needs a registry that declares a sparse head:
+# the check compares schema_meta.sparse_model against embed.SparseModelID(), which
+# reads the ACTIVE registry entry, and the default one (bge-m3) is dense-only.
+# Since 7916936 that is a loud error naming the fix rather than a check that
+# quietly compares nothing — pass EMBED_MODEL=bge-m3-sparse, or point
+# EMBED_MODELS_CONFIG at a registry whose active model has a sparse_output.
 ARG DATA_CONTRACT_FLAGS="--require-fts --require-hnsw"
 RUN HOME=/home/mcp mcp-3gpp check-data --db /data/mcp-3gpp/3gpp.duckdb ${DATA_CONTRACT_FLAGS}
 

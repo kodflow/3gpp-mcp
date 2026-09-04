@@ -48,6 +48,8 @@ func main() {
 	report := flag.String("report", "matrix", "matrix (JSON array of changed ids, for the CI matrix) | worklist")
 	allFlag := flag.Bool("all", false, "enumerate the WHOLE ETSI /deliver corpus (etsi_ts+etsi_tr+etsi_en) — the latest PUBLISHED version of EVERY deliverable, not just the LI suite. Tens of thousands of specs; pair with --report worklist + a chunked CI matrix.")
 	typeDirsFlag := flag.String("type-dirs", strings.Join(etsicat.DeliverTypeDirs, ","), "with --all: which /deliver document-type folders to crawl (comma/space-separated)")
+	withRepub := flag.Bool("include-3gpp-republications", false, "with --all: also index ETSI's republications of 3GPP specs (121 000-138 999, 141 000-155 999). Off by default: the 3GPP half of this corpus already holds those, in EVERY release, while ETSI publishes one version of each")
+	allVersions := flag.Bool("all-versions", false, "emit EVERY published version of each deliverable, not just the latest — the ETSI analogue of keeping every 3GPP release, so the corpus can show how a deliverable changed. Multiplies the work list several-fold (TS 103 221-1 alone has 23 published versions)")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request HTTP timeout")
 	flag.Parse()
 
@@ -77,6 +79,14 @@ func main() {
 			}
 			if resp.StatusCode != http.StatusOK {
 				_ = resp.Body.Close()
+				// A 404 IS AN ANSWER. The enumeration walks the ETSI index, which
+				// lists historical ids the /deliver archive never carried — the whole
+				// 100000_100099 range folder is a 404 in all three trees. Retrying
+				// those five times with backoff, every run, buys nothing and made the
+				// summary promise work that can never complete.
+				if resp.StatusCode == http.StatusNotFound {
+					return retry.Permanent(fmt.Errorf("%w: GET %s", etsicat.ErrNotInArchive, url))
+				}
 				return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 			}
 			body = resp.Body
@@ -88,30 +98,174 @@ func main() {
 	// Scope: --all enumerates the WHOLE /deliver corpus (the 3GPP-parity completeness:
 	// latest published version of every deliverable); --specs scopes explicitly; else
 	// the built-in LI suite.
-	specs := defaultLISpecs
+	// Every scoped deliverable carries the /deliver folder it lives in. --specs and
+	// the built-in LI suite are TS by construction; --all learns each one's folder
+	// from the crawl that found it, which is the only place that knowledge exists.
+	var deliverables []etsicat.Deliverable
 	switch {
 	case *allFlag:
-		specs = nil
-		var enumFailed []string
+		// Failures are keyed by "<typeDir>/<rangeFolder>", not by the folder name
+		// alone: the same 100-range exists under etsi_ts, etsi_tr and etsi_en, and
+		// collapsing them would make a failure in one look like a failure in all.
+		failedFirst := map[string]bool{}
 		dirs := splitList(*typeDirsFlag)
+		perDir := map[string]int{}
 		for _, td := range dirs {
-			ids, f := etsicat.EnumerateIDs(fetch, td)
-			specs = append(specs, ids...)
-			enumFailed = append(enumFailed, f...)
+			ds, f := etsicat.EnumerateDeliverables(fetch, td)
+			deliverables = append(deliverables, ds...)
+			perDir[td] = len(ds)
+			for _, r := range f {
+				failedFirst[td+"/"+r] = true
+			}
 		}
-		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v (%d range-fetch failures)\n",
-			len(specs), dirs, len(enumFailed))
-		if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "discover-etsi: enumerated %d deliverable(s) across %v %v (%d range-fetch failures)\n",
+			len(deliverables), dirs, perDir, len(failedFirst))
+		if len(deliverables) == 0 {
 			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL --all enumerated 0 deliverables — crawl broken")
 			os.Exit(1)
 		}
-	case len(splitList(*specsFlag)) > 0:
-		specs = splitList(*specsFlag)
+		// AN INCOMPLETE ENUMERATION IS NOT A SMALLER CORPUS, IT IS A WRONG ONE.
+		//
+		// A range folder that could not be listed omits EVERY deliverable in it —
+		// a hundred at a time — and the run would otherwise carry on and emit a
+		// perfectly well-formed work list. The corpus built from it would be
+		// missing whole number ranges, with nothing in the result to say so; the
+		// only trace was a count in a log line nobody reads on a green run.
+		//
+		// The failures are retried once (they are transient by nature: the ETSI CDN
+		// intermittently drops connections under a crawl, which is also why HTTP/2
+		// is disabled above), and what still fails is fatal.
+		if len(failedFirst) > 0 {
+			fmt.Fprintf(os.Stderr, "discover-etsi: retrying %d range folder(s) that failed to list\n", len(failedFirst))
+			failedSecond := map[string]bool{}
+			for _, td := range dirs {
+				ds, f := etsicat.EnumerateDeliverables(fetch, td)
+				// Re-enumerating a whole type dir is cheap next to the version
+				// resolution that follows, and the deliverables are deduped by
+				// (folder, id), so re-adding what already resolved costs nothing.
+				deliverables = append(deliverables, ds...)
+				for _, r := range f {
+					failedSecond[td+"/"+r] = true
+				}
+			}
+			// FAIL ONLY ON WHAT FAILED BOTH TIMES. These errors are transient by
+			// nature, so the two attempts rarely fail on the same folder: taking
+			// the union would abort a run where folder A failed first, succeeded on
+			// retry, and folder B did the reverse — even though between the two
+			// attempts every folder was enumerated. The intersection is what is
+			// actually missing.
+			var stillFailed []string
+			for key := range failedFirst {
+				if failedSecond[key] {
+					stillFailed = append(stillFailed, key)
+				}
+			}
+			sort.Strings(stillFailed)
+			if len(stillFailed) > 0 {
+				fmt.Fprintf(os.Stderr, "discover-etsi: FATAL %d range folder(s) unlistable in BOTH attempts: %v\n",
+					len(stillFailed), stillFailed)
+				fmt.Fprintln(os.Stderr, "discover-etsi: every deliverable in them would be silently missing from the corpus")
+				os.Exit(1)
+			}
+			deliverables = dedupeDeliverables(deliverables)
+			fmt.Fprintf(os.Stderr, "discover-etsi: retry recovered every folder; %d deliverable(s)\n", len(deliverables))
+		}
+		// ETSI's republications of 3GPP specs are dropped unless asked for, and the
+		// count is printed either way: a scope decision that changes a third of the
+		// corpus must be visible in the log, not inferred from a total.
+		kept := deliverables[:0]
+		repub := 0
+		for _, d := range deliverables {
+			if !*withRepub && etsicat.ThreeGPPRepublication(d.ID) {
+				repub++
+				continue
+			}
+			kept = append(kept, d)
+		}
+		deliverables = kept
+		if *withRepub {
+			fmt.Fprintln(os.Stderr, "discover-etsi: including ETSI's republications of 3GPP specs (--include-3gpp-republications)")
+		} else {
+			fmt.Fprintf(os.Stderr, "discover-etsi: %d ETSI-own deliverable(s); skipped %d republication(s) of 3GPP specs, "+
+				"which the 3GPP corpus already holds in every release (pass --include-3gpp-republications to index them anyway)\n",
+				len(deliverables), repub)
+		}
+	default:
+		specs := defaultLISpecs
+		if len(splitList(*specsFlag)) > 0 {
+			specs = splitList(*specsFlag)
+		}
+		for _, id := range specs {
+			deliverables = append(deliverables, etsicat.Deliverable{TypeDir: model.EtsiTypeTS, ID: id})
+		}
 	}
 
-	site, failed := etsicat.BuildSite(fetch, specs)
+	// id -> folder, so the work list can name the right tree and the right file
+	// prefix. Without it every emitted URL was an etsi_ts one, and a TR's etsi_ts
+	// URL is a 404 rather than a redirect.
+	typeOf := make(map[string]string, len(deliverables))
+	for _, d := range deliverables {
+		typeOf[d.ID] = d.TypeDir
+	}
+	specs := make([]string, 0, len(deliverables))
+	for _, d := range deliverables {
+		specs = append(specs, d.ID)
+	}
+
+	// --all-versions: every published version of every deliverable, which is what
+	// makes the ETSI half comparable to the 3GPP one. The persisted index is a
+	// LATEST-version delta anchor and cannot represent a version SET, so this mode
+	// deliberately does not diff: it emits the whole history and lets the builder's
+	// per-file resume decide what is already converted. Saying that here is better
+	// than silently diffing a set against a scalar.
+	if *allVersions {
+		history, hfailed, habsent := etsicat.BuildHistory(fetch, deliverables)
+		for _, id := range hfailed {
+			fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
+		}
+		// Absent is not failed, and saying so is the difference between a corpus
+		// that is complete and one that looks 90 documents short forever.
+		if len(habsent) > 0 {
+			fmt.Fprintf(os.Stderr, "discover-etsi: %d enumerated id(s) are NOT in the /deliver archive (404) — nothing to retry: %s\n",
+				len(habsent), strings.Join(habsent, ", "))
+		}
+		total := 0
+		for _, vs := range history {
+			total += len(vs)
+		}
+		fmt.Fprintf(os.Stderr, "discover-etsi: %d deliverable(s), %d published version(s) in total (--all-versions; the index is not consulted)\n",
+			len(history), total)
+		if total == 0 {
+			fmt.Fprintln(os.Stderr, "discover-etsi: FATAL resolved 0 versions — crawl/version-resolution broken")
+			os.Exit(1)
+		}
+		type line struct{ id, url, ver, dt string }
+		out := make([]line, 0, total)
+		for d, vs := range history {
+			for _, v := range vs {
+				out = append(out, line{d.ID, model.EtsiDeliverURLIn(d.TypeDir, d.ID, v), v, docTypeOf(d.TypeDir)})
+			}
+		}
+		// Sort by ID only, and STABLY: BuildHistory already returns each
+		// deliverable's versions oldest-first by rank, and comparing the version
+		// strings would undo that — "1.23.1" sorts before "1.3.1" lexically, which
+		// is the wrong order for a history and the wrong order to fetch it in.
+		sort.SliceStable(out, func(i, j int) bool { return out[i].id < out[j].id })
+		for _, l := range out {
+			fmt.Printf("%s\t%s\t%s\t%s\n", l.id, l.url, l.ver, l.dt)
+		}
+		return
+	}
+
+	site, failed, absent := etsicat.BuildSiteIn(fetch, deliverables)
 	for _, id := range failed {
 		fmt.Fprintf(os.Stderr, "discover-etsi: WARN could not resolve %q (will retry next run)\n", id)
+	}
+	// Absent is not failed, and saying so is the difference between a corpus
+	// that is complete and one that looks 90 documents short forever.
+	if len(absent) > 0 {
+		fmt.Fprintf(os.Stderr, "discover-etsi: %d enumerated id(s) are NOT in the /deliver archive (404) — nothing to retry: %s\n",
+			len(absent), strings.Join(absent, ", "))
 	}
 	// Loud, machine-greppable resolution summary on stderr. A green-but-empty run
 	// (the absolute-href bug fixed here) MUST be visible, not silent.
@@ -123,19 +277,59 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The persisted index is keyed by id, so the diff is taken over an id-keyed
+	// projection of the site. Two deliverables sharing a number would collapse into
+	// one there, so the collapse is DETECTED rather than allowed: a caller reading
+	// a work list has no way to notice a document that quietly went missing.
+	// (Measured on the live archive: zero such collisions today.)
+	byID := make(map[string]string, len(site))
+	for d, v := range site {
+		if prev, dup := byID[d.ID]; dup {
+			fmt.Fprintf(os.Stderr,
+				"discover-etsi: FATAL %q exists in more than one /deliver folder (%s here, versions %q and %q) — "+
+					"the id-keyed index cannot represent both, and one document would silently vanish from the corpus\n",
+				d.ID, d.TypeDir, prev, v)
+			os.Exit(1)
+		}
+		byID[d.ID] = v
+	}
+
 	index := loadIndex(*indexPath)
-	changed := etsicat.Diff(site, index)
+	changed := etsicat.Diff(byID, index)
 	sort.Strings(changed)
 
 	if *emitWL || *report == "worklist" {
 		for _, id := range changed {
-			fmt.Printf("%s\t%s\t%s\n", id, model.EtsiDeliverURL(id, site[id]), site[id])
+			td := typeOf[id]
+			if td == "" {
+				td = model.EtsiTypeTS
+			}
+			// Fourth column: the document type ("TS"/"TR"/"EN"). scripts/etsi-corpus.sh
+			// puts it in the provenance header so the corpus can call a TR a TR
+			// instead of filing every deliverable as "ETSI TS". A reader of an older
+			// three-column list still parses (the field is simply empty) and the
+			// parser defaults to TS, which is what those lists all were.
+			fmt.Printf("%s\t%s\t%s\t%s\n", id, model.EtsiDeliverURLIn(td, id, byID[id]), byID[id], docTypeOf(td))
 		}
 		return
 	}
 	// matrix: JSON array of changed ids (the CI fans out one shard per id/group).
 	b, _ := json.Marshal(changed)
 	fmt.Printf("matrix=%s\n", string(b))
+}
+
+// docTypeOf renders a /deliver folder as the document type the corpus labels a
+// deliverable with: etsi_ts -> "TS". Unknown folders fall back to TS, which is what
+// the pipeline assumed unconditionally before the type was carried at all.
+func docTypeOf(typeDir string) string {
+	switch typeDir {
+	case model.EtsiTypeTR:
+		return "TR"
+	case model.EtsiTypeEN:
+		return "EN"
+	default:
+		return "TS"
+	}
 }
 
 // splitList parses a comma/space-separated flag into a trimmed, empty-dropped slice.
@@ -166,4 +360,20 @@ func loadIndex(path string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// dedupeDeliverables collapses repeats after a retry re-enumerates a whole type
+// directory. Identity is (folder, id), never the id alone: the same number can
+// exist as a TS and as a TR, and collapsing on the number would drop one of them.
+func dedupeDeliverables(in []etsicat.Deliverable) []etsicat.Deliverable {
+	seen := make(map[etsicat.Deliverable]bool, len(in))
+	out := in[:0]
+	for _, d := range in {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
 }

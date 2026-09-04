@@ -1,6 +1,46 @@
 # Installing the 3GPP MCP server
 
-`mcp-3gpp` as released is a single self-contained binary. It exposes the 3GPP
+## The short way: pull the image
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/kodflow/3gpp-mcp:latest"]
+    }
+  }
+}
+```
+
+That is the whole installation. The image carries the 3GPP and ETSI corpora, the
+dual-head BGE-M3 (dense + learned-lexical), the cross-encoder reranker and the
+DuckDB `fts`/`vss` extensions, so every retrieval arm works with **no network at
+run time and nothing downloaded on first start**.
+
+Two things to know:
+
+- The package is **private** — it holds verbatim specification text (see
+  [`DATA_NOTICE.md`](../DATA_NOTICE.md)). `docker login ghcr.io` with a token
+  carrying `read:packages` before pulling.
+- **No `VOLUME` is declared, deliberately.** `serve` reads the baked corpus in
+  place, read-only; a volume would make Docker copy ~36 GB into a fresh one on
+  every `--rm` run.
+
+`docker run --rm ghcr.io/kodflow/3gpp-mcp:latest version` prints the build, and
+the `server_info` tool reports which retrieval arms are actually live — ask it
+rather than assuming.
+
+## The long way: the binary
+
+> **Releases are no longer published from CI** — the workflows that built them
+> are gone (they cost resources this project does not have). Build the binary
+> yourself with `make build-bin`, or use the image above, which is the supported
+> path.
+
+`mcp-3gpp` is a single self-contained binary. It exposes the 3GPP
 corpus to any MCP client (Claude Code, etc.) over stdio. There is **no service to
 run, no Python, and no Ollama/LLM to install** — the binary is a *retrieval*
 engine; your MCP client does the reasoning.
@@ -14,9 +54,9 @@ It needs data it does not ship, downloaded once into a per-user cache
 
 | Artifact | Size | Source | Needed for |
 |---|---|---|---|
-| `3gpp.duckdb` (indexed corpus) | **12.36 GB** (~7.9 GB on the wire) | **private GHCR package** | always |
-| `etsi.duckdb` (ETSI LI suite) | 23 MB | private GHCR package | ETSI deliverables (`--etsi`) |
-| BGE-M3 + reranker models + ONNX Runtime | ~5 GB | HuggingFace + ORT release | semantic search only |
+| `3gpp.duckdb` (indexed corpus) | **21.2 GB** (15.9 GiB gzipped in the image) | **private GHCR package** | always |
+| `etsi.duckdb` (ETSI: 5 117 TS/TR/EN deliverables, not just the LI suite) | **8.0 GB** | private GHCR package | ETSI deliverables (`--etsi`) |
+| BGE-M3 (dense + sparse heads) + reranker + ONNX Runtime | **6.4 GB** (4.0 GiB gzipped) | HuggingFace + ORT release | semantic search only |
 
 ## Why the corpus needs a credential
 
@@ -65,7 +105,8 @@ mcp-3gpp bootstrap
 mcp-3gpp bootstrap --etsi
 ```
 
-**Full semantic** (hybrid BM25 + BGE-M3 vectors + cross-encoder rerank, +~5 GB):
+**Full semantic** (hybrid BM25 + BGE-M3 dense/sparse vectors + cross-encoder
+rerank, +6.4 GB of models):
 
 ```sh
 mcp-3gpp bootstrap --semantic
@@ -117,7 +158,7 @@ otherwise identical. To pin a baseline release, add `"--release", "Rel-19"`.
 
 `serve` provisions the cache itself when it is empty, and keeps serving a cached
 corpus when no token is present or the registry is unreachable — it degrades
-rather than refusing to start. It never re-hashes 12.36 GB to decide whether an
+rather than refusing to start. It never re-hashes 21.2 GB to decide whether an
 update exists: the published layer digests are recorded beside the DB, so the
 check is one manifest request.
 

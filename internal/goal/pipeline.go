@@ -44,7 +44,7 @@ func exe(name string) string {
 
 // goBins are the Go commands the pipeline needs on disk. cmd/server is the
 // product; the others are the offline tools the steps call.
-var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs", "freeze-hnsw"}
+var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs", "freeze-hnsw", "seed-evolutions"}
 
 // rustBins maps a cargo manifest to the binaries built from it. The embedder is
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own
@@ -82,11 +82,11 @@ func Pipeline() []*Step {
 		stepMerge(),
 		stepEmbed(corpus3GPP()),
 		stepEnrich(),
-		stepParagraphs(),
+		stepParagraphs(corpus3GPP()),
 		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
 		// does not carry custom indexes), so both sit between the conversion and the
 		// freeze rather than after it.
-		stepSparse(),
+		stepSparse(corpus3GPP()),
 		stepCompact(),
 		stepIndex(corpus3GPP()),
 		stepValidate(),
@@ -97,6 +97,14 @@ func Pipeline() []*Step {
 		stepDiscoverETSI(),
 		stepCorpusETSI(),
 		stepEmbed(corpusETSI()),
+		// The ETSI half gets the content-addressed conversion too. Without it
+		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
+		// clauses, which was harmless only while ETSI held one version per
+		// deliverable; with every published version in the corpus it is the
+		// "CHECK_IMEI" failure — a result window filled by one clause seen from a
+		// dozen versions, and the deliverable that answers never in it.
+		stepParagraphs(corpusETSI()),
+		stepSparse(corpusETSI()),
 		stepIndex(corpusETSI()),
 		stepSmoke(),
 	}
@@ -111,6 +119,7 @@ func stepToolchain() *Step {
 		Doc:       "verify the build toolchain and record its identity",
 		Impl:      []string{"scripts/local/toolchain-env.sh"},
 		Toolchain: true,
+		Tool:      true,
 		Outputs:   func(c *Ctx) []string { return []string{c.statePath("toolchain.json")} },
 		Validate: func(c *Ctx) error {
 			// Cheap and re-run on every plan: a toolchain that vanished (a moved
@@ -158,6 +167,7 @@ func stepBuildGo() *Step {
 		// eight binaries. The `test` step deliberately does NOT set this.
 		ExcludeTests: true,
 		Toolchain:    true,
+		Tool:         true,
 		Outputs: func(c *Ctx) []string {
 			out := make([]string, 0, len(goBins))
 			for _, b := range goBins {
@@ -208,6 +218,7 @@ func stepBuildRust() *Step {
 		Impl:         []string{"rust", "contracts", "internal/store/schema.sql"},
 		ExcludeTests: true,
 		Toolchain:    true,
+		Tool:         true,
 		Outputs: func(c *Ctx) []string {
 			var out []string
 			for _, bins := range rustBins {
@@ -281,7 +292,11 @@ func stepSeed() *Step {
 			// Proof that the file is a usable DuckDB, not just bytes on disk.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the seeded DB does not open: %w", err)
+				// THE ONE THAT MATTERS MOST. The Run below downloads and REPLACES
+				// the corpus, so "cannot open" must never be allowed to mean
+				// "re-acquire 21 GB" on the strength of a stale file handle.
+				return stillOpenElsewhere("3gpp.duckdb",
+					fmt.Errorf("the seeded DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters: %q", out)
@@ -299,6 +314,19 @@ func stepSeed() *Step {
 			// The snapshot is a starting point, not an authority.
 			if st, err := os.Stat(db); err == nil && st.Size() > 0 {
 				c.Log.Printf("a local corpus already exists (%d bytes) — not overwriting it with the published snapshot", st.Size())
+				// And SAY so, in the one way the state machine understands. This
+				// branch does no work and produces no artefact, but it used to
+				// record an ordinary success — so bumping seed's Version (which the
+				// move to GHCR legitimately required) republished a new identity for
+				// a step that had touched nothing, and discover, fetch, ingest,
+				// merge and every vector step behind them were scheduled to replay a
+				// finished 22 GB corpus. A decline says "nothing to do" and carries
+				// the previous provenance forward, which is the truth here.
+				if err := seedAnchor(c, db, false); err != nil {
+					return err
+				}
+				reportAnchorHoles(c, db)
+				return fmt.Errorf("%w: a local corpus is already present, seeding would add nothing", ErrDeclined)
 			} else {
 				if err := os.MkdirAll(c.Data, 0o755); err != nil {
 					return err
@@ -398,12 +426,21 @@ const discoverTTL = 6 * time.Hour
 func stepDiscover() *Step {
 	return &Step{
 		Name:    "discover",
-		Version: 1,
+		Version: 3,
 		Doc:     "diff the live 3GPP status report against the local corpus index",
 		Deps:    []string{"build-rust", "seed"},
 		Impl:    []string{"rust/discover", "scripts/lib/discover.sh"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{filepath.Join(c.Local, "corpus-index.json")}, nil
+			in := []string{filepath.Join(c.Local, "corpus-index.json")}
+			// The accepted-absent ledger decides as much of the work list as the
+			// corpus index does — a key in it is not drift. Leaving it out would
+			// mean that deleting or extending the ledger changed what discover
+			// produces without changing what discover claims to depend on, and the
+			// step would skip while its answer was stale.
+			if a := absentIndexPath(c); fileNonEmpty(a) {
+				in = append(in, a)
+			}
+			return in, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			m := map[string]string{
@@ -421,6 +458,12 @@ func stepDiscover() *Step {
 		Outputs: func(c *Ctx) []string {
 			return []string{c.statePath("series.json"), c.statePath("worklist.txt")}
 		},
+		// runDiscover writes exactly these two files, plus status-report.htm — which
+		// is its OWN HTTP cache, read by nothing downstream and already folded into
+		// this step's fingerprint as an age bucket. So for a dependant, these two
+		// files are the whole of what discover did: an unchanged delta must not
+		// replay fetch, ingest and merge.
+		OutputsComplete: true,
 		Validate: func(c *Ctx) error {
 			b, err := os.ReadFile(c.statePath("series.json"))
 			if err != nil {
@@ -529,11 +572,14 @@ func sha256File(path string) (string, error) {
 // exact opposite of the build steps, and the reason ExcludeTests exists.
 func stepTest() *Step {
 	return &Step{
-		Name:      "test",
-		Version:   1,
-		Doc:       "run the Go unit and contract suites, and the shell tests",
-		Deps:      []string{"build-go"},
-		Impl:      []string{"cmd", "internal", "go.mod", "go.sum", "scripts"},
+		Name:    "test",
+		Version: 2,
+		Doc:     "run the Go unit and contract suites, the Rust workspace suite, and the shell tests",
+		Deps:    []string{"build-go"},
+		// `rust` joins the fingerprint because the step now runs the Rust suite:
+		// without it, editing rust/store would leave this step reporting SKIP, which
+		// is how the Rust tests came to be written and never run in the first place.
+		Impl:      []string{"cmd", "internal", "go.mod", "go.sum", "scripts", "rust"},
 		Toolchain: true,
 		Outputs:   func(c *Ctx) []string { return []string{c.statePath("test-report.txt")} },
 		Run: func(c *Ctx) error {
@@ -545,6 +591,27 @@ func stepTest() *Step {
 			if err := c.Run(Cmd{Name: "go", Args: args, Echo: true}); err != nil {
 				return err
 			}
+			// THE RUST SUITE, WHICH NOTHING RAN.
+			//
+			// This step checked Go and the shell scripts; scripts/rust-fmt_test.sh
+			// checked Rust FORMATTING. Nothing ran `cargo test`. So every test in
+			// rust/store — the ones guarding the code that REWRITES THE CORPUS, which
+			// are the highest-stakes tests here — existed and was invisible unless
+			// somebody typed the command by hand. That is exactly the failure
+			// runShellTests was written to end, one language over.
+			//
+			// The workspace is the right scope, and it is the project's OWN
+			// definition of the core: rust/Cargo.toml lists store, parse, ingest and
+			// identity, excluding embedder, embed-core and discover on purpose (heavy
+			// ort/CUDA toolchain, a cdylib, a CI-matrix tool). What is left is
+			// precisely the DuckDB write side. rust-fmt_test.sh still covers the
+			// excluded three for formatting, so nothing loses a check.
+			c.Log.Printf("cargo test --release --workspace (rust/)")
+			if err := c.Run(Cmd{Name: "cargo", Args: []string{
+				"test", "--release", "--manifest-path", "rust/Cargo.toml", "--workspace",
+			}, Echo: true}); err != nil {
+				return err
+			}
 			shells, err := runShellTests(c)
 			if err != nil {
 				return err
@@ -552,7 +619,7 @@ func stepTest() *Step {
 			// Keep the evidence on disk: the final report cites this file rather
 			// than asking the reader to take "tests passed" on trust.
 			return WriteAtomic(c.statePath("test-report.txt"),
-				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\n%d shell test(s): PASS\n",
+				[]byte(fmt.Sprintf("go test -count=1 -tags %q ./...  : PASS\ncargo test --release --workspace : PASS\n%d shell test(s): PASS\n",
 					os.Getenv("GOTAGS"), shells)))
 		},
 	}

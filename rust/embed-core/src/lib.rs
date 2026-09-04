@@ -232,3 +232,73 @@ mod tests {
         assert_eq!(embed_core_embed(txt.as_ptr(), out.as_mut_ptr(), 10), -1);
     }
 }
+
+/// embed_core_embed_both fills the dense vector AND the sparse postings from ONE
+/// forward pass. Returns the sparse posting COUNT (which may exceed `sparse_cap`;
+/// only the first `sparse_cap` are written, highest weight first), or a negative
+/// code:
+///
+///   -1 null pointer / negative capacity / dense_len < the model dimension
+///   -2 `text` is not valid UTF-8
+///   -3 no combined path available — the caller must fall back to the two separate
+///      calls, which is NOT an error: it happens for a dense-only model and for a
+///      text long enough that the dense and sparse windows would differ.
+///
+/// A hybrid query used to run the transformer twice over the same text for the two
+/// heads, which ONNX Runtime computes together anyway. Measured here at ~166 ms
+/// for the pair, so the redundant pass was about half the latency of every
+/// non-lexical search.
+///
+/// # Safety
+/// `text` is a NUL-terminated C string; `out_dense` points to ≥ `dense_len`
+/// writable floats and `out_ids`/`out_weights` to ≥ `sparse_cap` writable slots.
+#[no_mangle]
+pub extern "C" fn embed_core_embed_both(
+    text: *const c_char,
+    out_dense: *mut f32,
+    dense_len: c_int,
+    out_ids: *mut u32,
+    out_weights: *mut f32,
+    sparse_cap: c_int,
+) -> c_int {
+    if text.is_null() || out_dense.is_null() || out_ids.is_null() || out_weights.is_null() {
+        return -1;
+    }
+    if dense_len < embed_core_dim() || sparse_cap < 0 {
+        return -1;
+    }
+    let s = match unsafe { CStr::from_ptr(text) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let Some((dense, postings)) = backend_embed_both(s) else {
+        return -3;
+    };
+    for (i, v) in dense.iter().enumerate() {
+        unsafe { *out_dense.add(i) = *v };
+    }
+    let n = postings.len();
+    let w = (sparse_cap as usize).min(n);
+    for (i, (id, weight)) in postings.into_iter().take(w).enumerate() {
+        unsafe {
+            *out_ids.add(i) = id;
+            *out_weights.add(i) = weight;
+        }
+    }
+    n as c_int
+}
+
+/// backend_embed_both routes the combined path. Only the real dual-head ONNX model
+/// has one; every other backend returns None and the caller falls back.
+#[allow(clippy::type_complexity)]
+fn backend_embed_both(text: &str) -> Option<([f32; DENSE_DIM], Vec<(u32, f32)>)> {
+    #[cfg(feature = "ort")]
+    {
+        ort_backend::embed_both_one(text)
+    }
+    #[cfg(not(feature = "ort"))]
+    {
+        let _ = text;
+        None
+    }
+}

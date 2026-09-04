@@ -151,6 +151,22 @@ impl Store {
     /// connection, so neither catalog name has to be guessed from a file stem — "3gpp.
     /// duckdb.new" does not yield an identifier anyone should have to predict.
     pub fn copy_database_compact(src: &str, dst: &str) -> Result<()> {
+        // The step is a PARAMETER rather than only an env read so the chunking can be
+        // exercised by a test without set_var: Rust runs tests in parallel threads and
+        // the process environment is shared, so a test that set MERGE_COPY_ROW_STEP
+        // would be racing the two other compact tests rather than testing anything.
+        let step: i64 = std::env::var("MERGE_COPY_ROW_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(20_000_000);
+        Self::copy_database_compact_step(src, dst, step)
+    }
+
+    /// copy_database_compact_step is copy_database_compact with an explicit row step.
+    /// See the range-copy comment below for why the step exists at all.
+    pub fn copy_database_compact_step(src: &str, dst: &str, step: i64) -> Result<()> {
+        let step = if step > 0 { step } else { 20_000_000 };
         let conn = Connection::open_in_memory().context("scratch connection")?;
         // The source carries an HNSW index; without vss its catalog cannot even be bound.
         // Best-effort, exactly as open_rw does it.
@@ -227,13 +243,54 @@ impl Store {
                 let rows = st.query_map([], |r| r.get::<_, String>(0))?;
                 rows.filter_map(std::result::Result::ok).collect()
             };
+            // ONE STATEMENT PER TABLE IS ONE TRANSACTION, AND THAT DOES NOT SCALE.
+            //
+            // `INSERT … SELECT` over a whole table commits once, and DuckDB cannot
+            // spill at COMMIT — temp_directory buys nothing there. It held while
+            // clause_sparse was empty. With both halves of the corpus carrying a
+            // learned-lexical layer it is ~265 MILLION rows, and the copy died:
+            //
+            //   copy table clause_sparse
+            //   TransactionContext Error: Failed to commit: failed to allocate data
+            //   of size 64.0 KiB (11.1 GiB/11.1 GiB used)
+            //
+            // against the 12 GB cap above. Raising the cap only moves the wall — the
+            // transaction grows with the table, and the machine does not.
+            //
+            // So copy in ROWID RANGES. Each statement is its own transaction, so peak
+            // memory is bounded by the step rather than by the table, and the step is
+            // the same code path for a 12-row table (one iteration) and a 265-million
+            // row one. rowid is a DuckDB pseudocolumn on base tables, and
+            // duckdb_tables() lists only base tables, so every name here has one.
+            //
+            // Deletions leave rowid gaps; a range that matches nothing simply inserts
+            // nothing. Correctness does not depend on the rows being dense, only on
+            // the ranges covering [0, max].
             for t in &tables {
-                // Column order is identical — both sides were bootstrapped from the same
-                // schema.sql — so SELECT * is the right shape, not a shortcut.
-                conn.execute_batch(&format!(
-                    "INSERT INTO copy_dst.main.\"{t}\" SELECT * FROM copy_src.main.\"{t}\";"
-                ))
-                .with_context(|| format!("copy table {t}"))?;
+                // max(rowid) is NULL on an empty table, hence Option.
+                let max_rowid: Option<i64> = conn
+                    .query_row(
+                        &format!("SELECT max(rowid) FROM copy_src.main.\"{t}\""),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .with_context(|| format!("max rowid of {t}"))?;
+                let Some(max_rowid) = max_rowid else {
+                    continue; // empty table: nothing to carry
+                };
+                let mut lo: i64 = 0;
+                while lo <= max_rowid {
+                    let hi = lo.saturating_add(step);
+                    // Column order is identical — both sides were bootstrapped from the
+                    // same schema.sql — so SELECT * is the right shape, not a shortcut.
+                    conn.execute_batch(&format!(
+                        "INSERT INTO copy_dst.main.\"{t}\"
+                           SELECT * FROM copy_src.main.\"{t}\"
+                            WHERE rowid >= {lo} AND rowid < {hi};"
+                    ))
+                    .with_context(|| format!("copy table {t} rows [{lo},{hi})"))?;
+                    lo = hi;
+                }
             }
             conn.execute_batch("DETACH copy_dst; DETACH copy_src;")?;
             Ok(())
@@ -803,6 +860,46 @@ impl Store {
         Ok(())
     }
 
+    /// check_ledger_ids_unambiguous refuses a ledger that holds MORE THAN ONE content
+    /// hash for the same chunk_id.
+    ///
+    /// The ledger is append-only and the apply below joins it to the corpus on chunk_id
+    /// alone, so two rows for one id make the UPDATE pick one of them arbitrarily —
+    /// and a chunk_id is a POSITION in one build, not an identity: it is assigned
+    /// sequentially at ingest (offset = max_chunk_id), so a corpus rebuilt from scratch
+    /// reuses the same numbers for different clauses.
+    ///
+    /// Measured 2026-09-02 between two ETSI builds of the SAME 11 821 documents:
+    /// chunk_id 138 was "ETSI TS 101 671 v3.15.1 §10" in one and
+    /// "ETSI EN 300 113-1 v1.3.1 §4" in the other. Importing across that would have
+    /// given 1 262 127 clauses a vector computed from an unrelated clause, with every
+    /// gate green — null_at_floor 0, clauses_with_text equal to vectors, the identities
+    /// agreeing, the HNSW index building. Only the answers would have been wrong.
+    ///
+    /// Refusing is the right answer rather than "keep the last one": the ledger has no
+    /// dependable row order once read back, and guessing which of two vectors belongs to
+    /// a clause is exactly the decision that must not be made silently. The remedy is to
+    /// archive the ledger and re-derive — its (hash, vec) pairs are still reusable
+    /// through --resume-from, which costs no GPU.
+    fn check_ledger_ids_unambiguous(&self) -> Result<()> {
+        let (ids, worst): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT coalesce(count(*), 0), coalesce(max(n), 0) FROM (
+                   SELECT chunk_id, count(DISTINCT embedding_hash) AS n
+                     FROM _ledger GROUP BY chunk_id HAVING n > 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .context("check that the ledger names each chunk_id once")?;
+        if ids > 0 {
+            anyhow::bail!(
+                "the ledger holds {ids} chunk_id(s) with more than one content hash (worst: {worst}). chunk_ids are positional, so this ledger describes more than one build of the corpus and the import would attach vectors at random. Archive it and re-run the embed step: pass the archive as --resume-from so its vectors are reused without GPU."
+            );
+        }
+        Ok(())
+    }
+
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
         let p = path.replace('\\', "/").replace('\'', "''");
         self.conn
@@ -833,6 +930,7 @@ impl Store {
         // The cast to the FIXED width happens only here: staging is FLOAT[] (variable),
         // the column is FLOAT[1024], and the filter above has already guaranteed every
         // surviving row is exactly that wide.
+        self.check_ledger_ids_unambiguous()?;
         let to_bodies = self.clauses_is_view()?;
         if to_bodies {
             self.check_body_ledger_agreement()?;
@@ -886,6 +984,140 @@ impl Store {
         }
         sql.push_str("COMMIT;");
         self.conn.execute_batch(&sql).context("set_sparse")?;
+        Ok(())
+    }
+
+    /// set_sparse_many writes MANY clauses' postings in ONE transaction.
+    ///
+    /// set_sparse above is correct and, at corpus scale, unusable: it opens its own
+    /// BEGIN/COMMIT per clause and formats one INSERT statement per term. Importing
+    /// the 3GPP sparse layer that way is 2.2 million transactions and ~110 million
+    /// individually-parsed statements, and it was measured at over seven hours —
+    /// with no progress output, so it looks like a hang for most of them.
+    ///
+    /// This batches both dimensions: one transaction per call, one DELETE naming
+    /// every chunk_id in the batch, and ONE multi-row INSERT for all their terms.
+    /// The per-statement parse cost collapses from 110 million to a few thousand.
+    ///
+    /// Semantics are unchanged, including the part that is easy to lose: a clause
+    /// with NO terms still gets its DELETE, so re-importing genuinely clears a
+    /// previous posting set rather than leaving a stale one behind. That is what
+    /// makes the import idempotent and the work list converge.
+    /// drop_sparse_term_index / create_sparse_term_index bracket a bulk import.
+    ///
+    /// `clause_sparse` carries a secondary index on term_id (the one the sparse arm
+    /// scores through), and DuckDB maintains it row by row. Importing the 3GPP layer
+    /// inserts ~265 million rows — 2.2 million clauses at ~120 postings each — and
+    /// every one of them updates an ART index that is itself growing, so the import
+    /// gets slower the further it goes. That is the shape observed on the real run:
+    /// brisk for the first hours, then hours more with the file barely growing while
+    /// the process stayed CPU-bound.
+    ///
+    /// Dropping the index for the load and rebuilding it once afterwards is the
+    /// standard remedy, and it is safe here because the import owns the table for
+    /// the duration: nothing reads clause_sparse until the corpus is served.
+    /// Rebuilding is NOT optional — `SearchSparse` scores by term_id, and leaving it
+    /// off would turn every sparse query into a full scan of a 265-million-row table
+    /// without any error to say so.
+    pub fn drop_sparse_term_index(&self) -> Result<()> {
+        self.conn
+            .execute_batch("DROP INDEX IF EXISTS clause_sparse_term;")
+            .context("drop clause_sparse_term")?;
+        Ok(())
+    }
+
+    /// drop_clause_indexes / create_clause_indexes bracket a bulk load of `clauses`,
+    /// for the same reason the sparse pair above brackets `clause_sparse` — and the
+    /// vector index makes the cost far worse than an ART one.
+    ///
+    /// The ETSI corpus is ingested DIRECTLY into the file that is served, because
+    /// `ingest --etsi` IS its publish step (there is no merge on that side). So the
+    /// table being appended to already carries `clauses_hnsw`, plus the three ART
+    /// indexes. DuckDB maintains all of them row by row, and a persistent HNSW
+    /// rewrites far more than a row's worth of blocks per insert.
+    ///
+    /// Measured 2026-09-01 on the all-versions ETSI ingest: **174 287 new clauses
+    /// grew data/etsi.duckdb from 8.0 GiB to 101.8 GiB** — about 560 KB of file per
+    /// clause row — and it was still accelerating when it was stopped. The full
+    /// ingest could not have finished on any disk this project has. It went
+    /// unnoticed on the first ETSI ingest only because the index then covered 1 042
+    /// vectors instead of 510 384.
+    ///
+    /// hnsw_state goes to "building" here, and that is not bookkeeping: store.LoadVSS
+    /// refuses an index whose embedding_count disagrees with the vectors present, and
+    /// a corpus that says "frozen" about an index that no longer exists is exactly
+    /// the drift that shipped an ETSI half served by BM25 alone. The rebuild belongs
+    /// to freeze-hnsw (the `index-etsi` step), which is the only thing that knows the
+    /// embedding identity to stamp — so this deliberately does NOT recreate it.
+    pub fn drop_clause_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "DROP INDEX IF EXISTS clauses_hnsw;
+                 DROP INDEX IF EXISTS clauses_spec;
+                 DROP INDEX IF EXISTS clauses_rel;
+                 DROP INDEX IF EXISTS clauses_path;",
+            )
+            .context("drop clause indexes for bulk load")?;
+        self.set_meta("hnsw_state", "building")
+            .context("clear hnsw_state after dropping the vector index")?;
+        Ok(())
+    }
+
+    /// create_clause_indexes rebuilds the ART indexes drop_clause_indexes removed,
+    /// once, over settled data. The VECTOR index is not rebuilt here: it needs the
+    /// embedding identity to stamp, which is freeze-hnsw's job.
+    pub fn create_clause_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS clauses_spec ON clauses (spec_id);
+                 CREATE INDEX IF NOT EXISTS clauses_rel  ON clauses (release);
+                 CREATE INDEX IF NOT EXISTS clauses_path ON clauses (spec_id, clause_path);",
+            )
+            .context("rebuild clause indexes after bulk load")?;
+        Ok(())
+    }
+
+    /// create_sparse_term_index rebuilds what drop_sparse_term_index removed.
+    pub fn create_sparse_term_index(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS clause_sparse_term ON clause_sparse (term_id);",
+            )
+            .context("create clause_sparse_term")?;
+        Ok(())
+    }
+
+    pub fn set_sparse_many(&self, batch: &[(u64, Vec<(u32, f32)>)]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::with_capacity(64 * 1024);
+        sql.push_str("BEGIN; DELETE FROM clause_sparse WHERE chunk_id IN (");
+        for (i, (chunk_id, _)) in batch.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&chunk_id.to_string());
+        }
+        sql.push_str(");");
+
+        let mut rows = 0usize;
+        for (chunk_id, terms) in batch {
+            for (term_id, weight) in terms {
+                if rows == 0 {
+                    sql.push_str("INSERT INTO clause_sparse(chunk_id, term_id, weight) VALUES ");
+                } else {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({chunk_id},{term_id},{weight})"));
+                rows += 1;
+            }
+        }
+        if rows > 0 {
+            sql.push(';');
+        }
+        sql.push_str("COMMIT;");
+        self.conn.execute_batch(&sql).context("set_sparse_many")?;
         Ok(())
     }
 
@@ -2425,6 +2657,164 @@ mod tests {
             "a catalogued-but-textless version must still be re-ingested — it is a hole"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A whole-table `INSERT … SELECT` is ONE transaction, and DuckDB cannot spill at
+    /// COMMIT. That held while clause_sparse was empty; with both halves of the corpus
+    /// carrying a learned-lexical layer it is ~265 million rows and the copy died with
+    /// "Failed to commit: failed to allocate data of size 64.0 KiB (11.1 GiB/11.1 GiB
+    /// used)" against a 12 GB cap. Raising the cap only moves the wall.
+    ///
+    /// The copy therefore walks rowid ranges, one transaction each. This pins that the
+    /// ranges COVER the table: with a step far smaller than the row count the result
+    /// must still be every row, exactly once — no gap at a boundary, no row copied
+    /// twice by overlapping ranges. Run with step 1 as well, the degenerate case.
+    #[test]
+    fn the_compact_copy_walks_rowid_ranges_without_losing_or_duplicating_a_row() {
+        for step in [1_i64, 7, 1000] {
+            let dir =
+                std::env::temp_dir().join(format!("storers-chunk-{}-{step}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("src.duckdb");
+            let dst = dir.join("dst.duckdb");
+            for p in [&src, &dst] {
+                let _ = std::fs::remove_file(p);
+            }
+            let srcs = src.to_str().unwrap().to_string();
+            let dsts = dst.to_str().unwrap().to_string();
+
+            {
+                let s = Store::open_rw(&srcs).unwrap();
+                s.raw()
+                    .execute_batch(
+                        "INSERT INTO specs(spec_id,series,doc_type) VALUES ('23.501','23','TS');
+                         INSERT INTO clauses(chunk_id,spec_id,release,heading,text)
+                           SELECT i, '23.501', 'Rel-19', 'h' || i, 't' || i
+                           FROM range(53) t(i);",
+                    )
+                    .unwrap();
+                s.checkpoint().unwrap();
+            }
+
+            Store::copy_database_compact_step(&srcs, &dsts, step).unwrap();
+
+            let d = Store::open_rw(&dsts).unwrap();
+            let n: i64 = d
+                .raw()
+                .query_row("SELECT count(*) FROM clauses", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                n, 53,
+                "step {step}: every row must make the trip exactly once"
+            );
+            let distinct: i64 = d
+                .raw()
+                .query_row("SELECT count(DISTINCT chunk_id) FROM clauses", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                distinct, 53,
+                "step {step}: overlapping ranges would duplicate rows"
+            );
+            let sum: i64 = d
+                .raw()
+                .query_row("SELECT coalesce(sum(chunk_id),0) FROM clauses", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                sum,
+                (0..53).sum::<i64>(),
+                "step {step}: a gap would change the sum"
+            );
+        }
+    }
+
+    /// A BULK LOAD MUST NOT MAINTAIN THE INDEXES IT IS ABOUT TO INVALIDATE.
+    ///
+    /// `ingest --etsi` writes straight into the served file, which already carries
+    /// clauses_hnsw and three ART indexes from the previous run. DuckDB maintains
+    /// every one of them per row. Measured 2026-09-01 on the real corpus: 174 287
+    /// new clauses grew data/etsi.duckdb from 8.0 GiB to 101.8 GiB — ~560 KB of file
+    /// per clause row — and it was still accelerating when it was killed. No disk
+    /// here could have finished it.
+    ///
+    /// This pins the two properties the fix rests on. First, dropping the indexes
+    /// makes the same insert cost dramatically less FILE, which is the quantity that
+    /// derailed the campaign — a timing assertion would be flaky, a size one is not.
+    /// Second, hnsw_state must come back as "building": a corpus claiming "frozen"
+    /// about an index that no longer exists is exactly the drift that once shipped an
+    /// ETSI half answered by BM25 alone, with every gate green.
+    #[test]
+    fn a_bulk_load_drops_the_indexes_it_would_otherwise_maintain_per_row() {
+        let dir = std::env::temp_dir().join(format!("storers-bulk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // rows() loads the same clauses twice: once with the ART indexes in place,
+        // once after dropping them. Everything else is identical.
+        let load = |name: &str, drop_first: bool| -> u64 {
+            let path = dir.join(name);
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_str().unwrap().to_string();
+            {
+                let s = Store::open_rw(&p).unwrap();
+                s.raw()
+                    .execute_batch(
+                        "INSERT INTO specs(spec_id,series,doc_type) VALUES ('103.221-1','ETSI','TS');",
+                    )
+                    .unwrap();
+                if drop_first {
+                    s.drop_clause_indexes().unwrap();
+                }
+                for batch in 0..20 {
+                    let mut sql = String::from(
+                        "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text) VALUES ",
+                    );
+                    for i in 0..500 {
+                        let id = batch * 500 + i;
+                        if i > 0 {
+                            sql.push(',');
+                        }
+                        sql.push_str(&format!(
+                            "({id},'103.221-1','ETSI','1.{batch}.1','6.{id}','h{id}','body text number {id}')"
+                        ));
+                    }
+                    sql.push(';');
+                    s.raw().execute_batch(&sql).unwrap();
+                }
+                if drop_first {
+                    s.create_clause_indexes().unwrap();
+                }
+                s.checkpoint().unwrap();
+            }
+            let n = std::fs::metadata(&path).unwrap().len();
+            let _ = std::fs::remove_file(&path);
+            n
+        };
+
+        let with_indexes = load("with.duckdb", false);
+        let dropped = load("dropped.duckdb", true);
+        assert!(
+            dropped <= with_indexes,
+            "dropping the indexes for the load produced a BIGGER file              ({dropped} vs {with_indexes} bytes) — the bracket is not doing anything"
+        );
+
+        // And the vector index must be reported as gone, not as frozen.
+        let path = dir.join("state.duckdb");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap().to_string();
+        {
+            let s = Store::open_rw(&p).unwrap();
+            s.set_meta("hnsw_state", "frozen").unwrap();
+            s.drop_clause_indexes().unwrap();
+            assert_eq!(
+                s.get_meta("hnsw_state").unwrap(),
+                "building",
+                "dropping the vector index left the corpus claiming it is still frozen —                  LoadVSS would be asked to serve a graph that is not there"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

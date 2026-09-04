@@ -60,6 +60,14 @@ func runDiscover(c *Ctx) error {
 	default:
 		c.Log.Printf("no local corpus-index.json — this pass is a FULL discover")
 	}
+	// What upstream has PROVEN it cannot serve is not drift, and must not be
+	// re-requested for ever. A full rebuild ignores the ledger on purpose: it is
+	// the one pass whose job is to re-establish the facts rather than trust them.
+	absent := absentIndexPath(c)
+	if c.Cfg("full") != "1" && fileNonEmpty(absent) {
+		args = append(args, "--absent-index", absent)
+		c.Log.Printf("accepted-absent ledger: %s", absent)
+	}
 	if s := c.Cfg("scope"); s != "" {
 		args = append(args, "--series", s)
 	}
@@ -78,25 +86,48 @@ func runDiscover(c *Ctx) error {
 	// Two work-lists, and they are NOT the same set.
 	//
 	// `--emit-worklist` applies no version comparison at all: it emits every spec
-	// of every selected series, 20 225 entries against the 986 that actually moved.
-	// That 20x over-fetch is wasteful, and it is also the only reason the anchor's
-	// over-claims currently get repaired — it re-acquires them by accident.
+	// of every selected series — 20 225 entries against the 201 that actually
+	// moved, measured on this corpus on 2026-09-03.
 	//
 	// `--repair-plan` is the proportionate set, drift UNION corpus-holes, and it is
 	// only safe BECAUSE it takes the holes as an explicit input. Asking for the
 	// precise set without supplying them would freeze every over-claimed spec as a
 	// permanent gap, so the holes are computed here rather than left to the caller.
+	//
+	// The proportionate set is the DEFAULT, and the wholesale one is reserved for
+	// the case where it is also the honest answer: a full build, or a machine with
+	// no corpus yet, where every spec really is missing. Wholesale used to be the
+	// default because it repaired the anchor's over-claims BY ACCIDENT — it
+	// re-acquired them along with everything else. `--repair-plan` covers exactly
+	// the same keys deliberately, via --holes, so the accident is no longer worth
+	// its cost. That cost is not merely "wasteful": `fetch` purges each archive
+	// once its HTML exists (purgeConvertedZips), so on a machine whose converted
+	// tree has been reclaimed — 1 410 files here for 20 163 versions — a wholesale
+	// list is not a re-listing of work already done, it is ~30 h of re-download to
+	// reproduce a corpus that is already complete. That is what made `make build`
+	// unrunnable here, and it is the whole of the difference.
 	wlArgs := []string{"--status-file", report, "--floor", c.Cfg("floor")}
 	if s := c.Cfg("scope"); s != "" {
 		wlArgs = append(wlArgs, "--series", s)
 	}
-	if c.Cfg("repair") == "1" {
+	proportionate := proportionateWorklist(c.Cfg("full"), fileNonEmpty(idx), fileNonEmpty(c.dataPath("3gpp.duckdb")))
+	if c.Cfg("repair") == "1" && !proportionate {
+		return fmt.Errorf("-repair asks for the proportionate work list, which needs both %s and a corpus at %s",
+			idx, c.dataPath("3gpp.duckdb"))
+	}
+	if proportionate {
 		holes, err := repairKeys(c)
 		if err != nil {
-			return fmt.Errorf("repair mode needs the corpus holes and could not get them: %w", err)
+			return fmt.Errorf("the proportionate work list needs the corpus holes and could not get them: %w", err)
 		}
 		wlArgs = append(wlArgs, "--repair-plan", "--holes", holes, "--index", idx)
+		// The same ledger the delta consults. Both calls must see it, or the delta
+		// stops flagging a series while the work list keeps asking for its specs.
+		if fileNonEmpty(absent) {
+			wlArgs = append(wlArgs, "--absent-index", absent)
+		}
 	} else {
+		c.Log.Printf("no corpus to compare against — the work list is every spec at/above the floor")
 		wlArgs = append(wlArgs, "--emit-worklist")
 	}
 	wl, err := c.Output(Cmd{Name: c.rbin("discover"), Args: wlArgs})
@@ -137,6 +168,18 @@ func runDiscover(c *Ctx) error {
 	c.Log.Printf("worklist: %d (spec, release) pairs", strings.Count(wl, "\n")+1)
 	c.Checkpoint("series", strconv.Itoa(len(names)))
 	return nil
+}
+
+// proportionateWorklist reports whether the fetch work list should be the
+// precise set — upstream drift UNION corpus holes — rather than every spec at or
+// above the floor.
+//
+// The precise set is computable only against a corpus: the holes come from the
+// published DB and the drift from the index. Where neither exists, "everything"
+// is not a fallback, it is the truthful answer — so a first build on a bare
+// machine still acquires the whole of 3GPP.
+func proportionateWorklist(full string, indexPresent, corpusPresent bool) bool {
+	return full != "1" && indexPresent && corpusPresent
 }
 
 func parseSeries(s string) []string {
@@ -204,7 +247,7 @@ func fileNonEmpty(p string) bool {
 func stepFetch() *Step {
 	return &Step{
 		Name:    "fetch",
-		Version: 1,
+		Version: 3,
 		Doc:     "download and convert the delta specs to HTML (LibreOffice)",
 		Deps:    []string{"discover"},
 		Impl:    []string{"scripts/corpus.sh", "scripts/lib/convert.sh", "scripts/lib/retry.sh", "scripts/lib/soffice-guard.sh"},
@@ -230,33 +273,66 @@ func stepFetch() *Step {
 		Heavy: true,
 		Run: func(c *Ctx) error {
 			series := seriesOf(c)
-			if len(series) == 0 {
-				c.Log.Printf("delta is empty — nothing to download or convert")
-				return nil
+			wl := c.statePath("worklist.txt")
+			n := countLines(wl)
+
+			// An empty work list is the ordinary state of a finished corpus, and it
+			// must DECLINE rather than succeed. A success here republishes a fresh
+			// provenance, and ingest, merge, embed and index all fold that — so
+			// "3GPP published nothing today" used to schedule the whole write side
+			// to reproduce bytes nobody had touched. Declining reports the previous
+			// provenance instead, and the corpus stays skipped end to end.
+			if n == 0 || len(series) == 0 {
+				return fmt.Errorf("%w: the work list is empty — no spec is missing or behind upstream", ErrDeclined)
 			}
+
 			if _, err := c.Output(Cmd{Name: "soffice", Args: []string{"--version"}}); err != nil {
 				return fmt.Errorf("LibreOffice (soffice) is required to convert 3GPP .doc/.docx to HTML and is not on PATH: %w", err)
 			}
 			// corpus.sh is already incremental and flock-guarded; it is the
 			// per-resource checkpoint for this step (one file at a time, skipping
 			// whatever is already downloaded and converted).
-			args := []string{"scripts/corpus.sh", "--set", c.Cfg("floor"), "--jobs", c.Cfg("jobs")}
-			if c.Cfg("repair") == "1" {
-				// discover already wrote the exact set (drift ∪ corpus holes). Hand it
-				// over verbatim instead of letting corpus.sh re-enumerate the series,
-				// which is what turns 1 000 specs back into 20 225.
-				wl := c.statePath("worklist.txt")
-				n := countLines(wl)
-				c.Log.Printf("repair mode: fetching %d specs from the repair plan (not %d series wholesale)", n, len(series))
-				args = append(args, "--worklist", wl)
-			} else {
-				c.Log.Printf("converting %d series: %s", len(series), strings.Join(series, " "))
-				args = append(args, "--series", strings.Join(series, " "))
+			//
+			// discover wrote the exact set it wants acquired. Hand it over verbatim
+			// rather than letting corpus.sh re-enumerate the series, which is what
+			// turns 201 specs back into 20 225 — and, on a machine whose converted
+			// tree has been reclaimed, 10 minutes back into ~30 hours. The series
+			// list still exists, but it addresses INGEST (which walks the converted
+			// tree by series); it was never a statement about what to download.
+			c.Log.Printf("fetching %d spec(s) from the work list, across %d series", n, len(series))
+			before := countFiles(c.dataPath("sources", "convert"), ".html")
+			args := []string{
+				"scripts/corpus.sh", "--set", c.Cfg("floor"), "--jobs", c.Cfg("jobs"),
+				"--worklist", wl,
 			}
 			if err := c.Run(Cmd{Name: "bash", Args: args, Echo: true}); err != nil {
 				return err
 			}
-			return purgeConvertedZips(c)
+			if err := recordAbsent(c, wl); err != nil {
+				// A ledger that could not be written is not a reason to fail an
+				// acquisition that succeeded; it only means the next discover asks
+				// for these again.
+				c.Log.Printf("WARNING: could not record what upstream refused: %v", err)
+			}
+			if err := purgeConvertedZips(c); err != nil {
+				return err
+			}
+
+			// A work list is a REQUEST, not an acquisition. Upstream answers most of
+			// this one with nothing at all: on 2026-09-03, 201 requested versions
+			// produced 177 FAILDL, 4 fallbacks to a version already held, and not one
+			// new file. Judging the step by "did it run" rather than "did it acquire"
+			// is what put ingest, merge, embed, sparse, compact and index behind an
+			// empty result — hours of work to re-derive an unchanged corpus.
+			//
+			// The converted tree is the honest measure, because it is what ingest
+			// actually reads. This catches every reason nothing arrived, not just the
+			// one the ledger knows about.
+			if after := countFiles(c.dataPath("sources", "convert"), ".html"); after == before {
+				return fmt.Errorf("%w: upstream served none of the %d requested version(s) — the converted tree is unchanged at %d file(s)",
+					ErrDeclined, n, after)
+			}
+			return nil
 		},
 		Outputs: func(c *Ctx) []string { return nil },
 		Validate: func(c *Ctx) error {
@@ -325,10 +401,34 @@ func countFiles(dir, ext string) int {
 
 // ------------------------------------------------------------------- ingest
 
+// ingestTallyRe reads the per-series line the Rust ingest prints for every
+// series it walks: "ingest: series 43 → 0 spec(s), 0 clause(s) (0 file(s))".
+var ingestTallyRe = regexp.MustCompile(`\x{2192}\s*(\d+) spec\(s\), (\d+) clause\(s\)`)
+
+// ingestedNothing reports whether a completed pass added no spec and no clause
+// to any shard.
+//
+// It answers false when there is no tally to read at all. A pass whose output
+// cannot be parsed must be treated as work done: wrongly declining would carry
+// a stale provenance forward and leave real clauses out of the corpus, which is
+// far worse than a merge that turns out to be a no-op.
+func ingestedNothing(logText string) bool {
+	m := ingestTallyRe.FindAllStringSubmatch(logText, -1)
+	if len(m) == 0 {
+		return false
+	}
+	for _, g := range m {
+		if g[1] != "0" || g[2] != "0" {
+			return false
+		}
+	}
+	return true
+}
+
 func stepIngest() *Step {
 	return &Step{
 		Name:    "ingest",
-		Version: 1,
+		Version: 2,
 		Doc:     "parse the converted HTML into per-series DuckDB shards",
 		Deps:    []string{"fetch", "build-rust"},
 		Impl:    []string{"rust/parse", "rust/ingest", "rust/store/src", "internal/store/schema.sql"},
@@ -400,6 +500,21 @@ func stepIngest() *Step {
 				c.Checkpoint("last_series", s)
 				c.Checkpoint("done", fmt.Sprintf("%d/%d", i+1, len(series)))
 			}
+
+			// Having parsed every series is not the same as having added anything.
+			// `--resume --corpus` skips whatever the corpus already holds, so a pass
+			// over a converted tree that is entirely already-held ends with every
+			// shard empty — and used to publish a fresh provenance anyway, which
+			// sends merge over 22 GB and enrich behind it to reproduce a corpus
+			// nobody changed. Measured on 2026-09-03: 19 series, every one of them
+			// "0 spec(s), 0 clause(s)", followed by a full merge.
+			//
+			// The binary's own per-series tally is the evidence; nothing else knows
+			// what --resume decided to skip.
+			if b, err := os.ReadFile(c.Log.Path()); err == nil && ingestedNothing(string(b)) {
+				return fmt.Errorf("%w: the corpus already held every converted spec in %d series — no shard gained a clause",
+					ErrDeclined, len(series))
+			}
 			return nil
 		},
 	}
@@ -410,7 +525,7 @@ func stepIngest() *Step {
 func stepMerge() *Step {
 	return &Step{
 		Name:    "merge",
-		Version: 1,
+		Version: 2,
 		Doc:     "fold the shards into the corpus DB and rewrite the delta anchor",
 		// build-go is a dependency because the fold is preceded by a restore, and
 		// that restore is a Go binary. cmd/migrate-paragraphs is in Impl for the
@@ -428,7 +543,21 @@ func stepMerge() *Step {
 					}
 				}
 			}
-			in = append(in, c.dataPath("3gpp.duckdb"))
+			// The corpus itself is NOT an input, although merge folds into it.
+			//
+			// It is this step's OUTPUT, and paragraphs, sparse, compact and index all
+			// rewrite it afterwards. Folding it into the fingerprint therefore meant
+			// merge could never see a stable input: every build changed the corpus
+			// after merge recorded it, so the next build replayed merge — a 22 GB
+			// restore, a fold and a publish, about an hour with paragraphs behind it,
+			// on a corpus nothing had added to. Measured on 2026-09-03, where merge
+			// re-ran with `ingest` freshly DECLINED and no shard carrying a clause.
+			//
+			// The shards above ARE the inputs: they are what there is to fold. If
+			// there is nothing new in them, ingest declines, its provenance carries,
+			// and merge skips — which is the whole design. A corpus swapped from
+			// underneath (a fresh `seed`) still replays merge, because seed sits
+			// upstream of it and its provenance propagates down the chain.
 			return in, nil
 		},
 		Heavy: true,
@@ -438,7 +567,8 @@ func stepMerge() *Step {
 		Validate: func(c *Ctx) error {
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the merged DB does not open: %w", err)
+				return stillOpenElsewhere("3gpp.duckdb",
+					fmt.Errorf("the merged DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters")
@@ -506,6 +636,27 @@ func stepMerge() *Step {
 				return err
 			}
 
+			// A MERGE MUST NOT PUBLISH A SMALLER CORPUS THAN THE ONE IT REPLACES.
+			//
+			// merge folds shards by replacing the bucket for each (spec, release) it
+			// carries, so a shard built from an incomplete source tree replaces a full
+			// bucket with a partial one — and the loss is silent, because every later
+			// gate measures the corpus against ITSELF. This is the same shape as the
+			// paragraph migration that cut clause_occ to 5% with all gates green.
+			//
+			// It is not hypothetical on a machine that has already published. Sources
+			// are pruned once converted (purgeConvertedZips, and the archives go with
+			// them), so a box holding a finished 20 163-version corpus can be left
+			// with 1 410 converted files — 7%. Re-running the acquisition chain there
+			// rebuilds the corpus from what survived, and nothing downstream objects.
+			//
+			// The check runs BEFORE publishCorpus, which is the last moment the old
+			// corpus still exists. Refusing costs a failed step and the merge output
+			// on disk to inspect; not refusing costs the corpus.
+			if err := refuseCorpusShrink(c, db, tmp); err != nil {
+				return err
+			}
+
 			// Publish the new corpus and its anchor TOGETHER, and only after the
 			// merge succeeded. Publishing the index first would let a crash leave
 			// an anchor claiming a corpus state that was never written — the next
@@ -525,6 +676,95 @@ func stepMerge() *Step {
 			return nil
 		},
 	}
+}
+
+// corpusShrinkOverride names the escape hatch for the one legitimate case: an
+// operator who KNOWS the corpus is meant to get smaller. It has to be typed, it
+// is loud in the log, and it is not a flag, so it cannot end up in a script that
+// someone re-runs later without reading it.
+const corpusShrinkOverride = "GOAL_ALLOW_CORPUS_SHRINK"
+
+// refuseCorpusShrink compares the merge output with the corpus it is about to
+// replace and fails the step if the new one holds materially fewer spec versions.
+//
+// The tolerance is deliberately tight. merge ADDS or REPLACES buckets; the only
+// honest way to end up with fewer versions is upstream withdrawing some, which is
+// rare and tiny. A loss of more than 1% is a source tree that no longer holds the
+// corpus, not a 3GPP editorial decision.
+func refuseCorpusShrink(c *Ctx, db, tmp string) error {
+	if !fileNonEmpty(db) {
+		return nil // nothing is being replaced: a first build cannot shrink anything
+	}
+	before, err := specVersionCount(c, db)
+	if err != nil {
+		// Unable to measure is not licence to proceed: the whole point is that the
+		// loss would otherwise be invisible.
+		return fmt.Errorf("cannot read the corpus this merge would replace, so its loss cannot be ruled out: %w", err)
+	}
+	after, err := specVersionCount(c, tmp)
+	if err != nil {
+		return fmt.Errorf("cannot read the merged corpus at %s: %w", tmp, err)
+	}
+	overridden := os.Getenv(corpusShrinkOverride) != ""
+	if err := shrinkVerdict(before, after, tmp, overridden); err != nil {
+		return err
+	}
+	if overridden && after*100 < before*99 {
+		// An override that passes in silence is indistinguishable from a check that
+		// found nothing, in the log and in every later postmortem.
+		c.Log.Printf("WARNING: the merged corpus holds %d spec version(s) against %d — publishing anyway because %s is set",
+			after, before, corpusShrinkOverride)
+	}
+	c.Log.Printf("shrink check: %d -> %d spec version(s)", before, after)
+	return nil
+}
+
+// shrinkVerdict is the decision alone, separated from reading the databases so it
+// can be tested without a corpus.
+func shrinkVerdict(before, after int, tmp string, override bool) error {
+	if before == 0 || after*100 >= before*99 {
+		return nil
+	}
+	if override {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to publish: the merged corpus holds %d spec version(s) where the one it replaces holds %d (%.1f%% lost).\n"+
+			"  The shards were almost certainly built from an incomplete source tree — sources are pruned once converted,\n"+
+			"  so a machine that has already published may no longer hold what its corpus was built from.\n"+
+			"  The merge output is left at %s and the live corpus is untouched.\n"+
+			"  Re-acquire the sources first, or set %s=1 if the corpus is genuinely meant to get smaller",
+		after, before, 100*float64(before-after)/float64(before), tmp, corpusShrinkOverride)
+}
+
+// specVersionCount reads the one counter that says how much corpus there is.
+func specVersionCount(c *Ctx, db string) (int, error) {
+	out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", db}})
+	if err != nil {
+		return 0, err
+	}
+	n, err := parseSpecVersions(out)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", db, err)
+	}
+	return n, nil
+}
+
+// parseSpecVersions pulls spec_versions out of a dbcount report. Split out so the
+// parsing is testable without a database.
+func parseSpecVersions(out string) (int, error) {
+	for _, line := range strings.Split(out, "\n") {
+		v, ok := strings.CutPrefix(strings.TrimSpace(line), "spec_versions=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, fmt.Errorf("dbcount reported an unreadable spec_versions %q: %w", v, err)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("dbcount produced no spec_versions counter")
 }
 
 // publishCorpus puts the freshly merged database at its final path and DROPS THE

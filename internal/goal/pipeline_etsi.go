@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // The ETSI half of the corpus.
@@ -40,6 +41,11 @@ func stepDiscoverETSI() *Step {
 			return map[string]string{"etsi_scope": c.Cfg("etsi_scope")}, nil
 		},
 		Outputs: func(c *Ctx) []string { return []string{c.statePath("etsi-worklist.tsv")} },
+		// The Run below writes this file and nothing else. An ETSI catalogue that
+		// enumerates to the same deliverables must not replay corpus-etsi, which is
+		// hours of download and PDF conversion over a corpus that has since been
+		// content-addressed and compacted.
+		OutputsComplete: true,
 		Validate: func(c *Ctx) error {
 			if countLines(c.statePath("etsi-worklist.tsv")) == 0 {
 				return fmt.Errorf("the ETSI work list is empty — discover resolved nothing")
@@ -47,10 +53,7 @@ func stepDiscoverETSI() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			args := []string{"--emit-worklist"}
-			if s := c.Cfg("etsi_scope"); s != "" {
-				args = append(args, "--specs", s)
-			}
+			args := append([]string{"--emit-worklist"}, etsiScopeArgs(c.Cfg("etsi_scope"))...)
 			out, err := c.Output(Cmd{Name: c.bin("discover-etsi"), Args: args})
 			if err != nil {
 				return err
@@ -76,7 +79,7 @@ func stepDiscoverETSI() *Step {
 func stepCorpusETSI() *Step {
 	return &Step{
 		Name:    "corpus-etsi",
-		Version: 1,
+		Version: 2,
 		Doc:     "download, extract and ingest the ETSI deliverables into data/etsi.duckdb",
 		Deps:    []string{"discover-etsi", "build-rust"},
 		Impl:    []string{"scripts/etsi-corpus.sh", "scripts/lib/convert.sh", "rust/ingest/src"},
@@ -91,7 +94,8 @@ func stepCorpusETSI() *Step {
 			// and it would serve as an empty corpus without complaining.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("etsi.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the ETSI DB does not open: %w", err)
+				return stillOpenElsewhere("etsi.duckdb",
+					fmt.Errorf("the ETSI DB does not open: %w", err))
 			}
 			n := countFiles(c.dataPath("sources", "convert-etsi"), ".html")
 			if n == 0 {
@@ -115,12 +119,87 @@ func stepCorpusETSI() *Step {
 				"ETSI_CONVERT=" + c.dataPath("sources", "convert-etsi"),
 				"ETSI_ORIGIN=" + c.dataPath("sources", "etsi-origin"),
 			}
-			if s := c.Cfg("etsi_scope"); s != "" {
-				env = append(env, "ETSI_SPECS="+s)
+			env = append(env, etsiScopeEnv(c.Cfg("etsi_scope"))...)
+
+			// THIS STEP WRITES CLAUSES, so it needs the corpus in write shape.
+			//
+			// A converted corpus (ADR 0004) serves `clauses` as a VIEW over the
+			// occurrences, and DuckDB answers an INSERT into a view with "Catalog
+			// Error: clauses is not a table". The ETSI ingest runs one transaction
+			// across every deliverable, so that first error aborted the transaction
+			// and every deliverable after it failed with "Current transaction is
+			// aborted" — a whole ETSI pass lost to one unrestored view.
+			//
+			// The 3GPP half has always called this before folding; the ETSI half was
+			// written before its corpus was ever converted, and the requirement was
+			// never carried across. It surfaced the first time corpus-etsi ran after
+			// paragraphs-etsi (2026-09-03), not because either step changed.
+			if err := ensureWriteShape(c, c.dataPath("etsi.duckdb")); err != nil {
+				return fmt.Errorf("the ETSI corpus could not be put back into write shape: %w", err)
 			}
+
 			c.Log.Printf("building the ETSI corpus (PDF text layer, never OCR)")
 			return c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-corpus.sh"}, Env: env, Echo: true})
 		},
+	}
+}
+
+// ScopeAll is the etsi_scope value that widens the ETSI half from the built-in
+// Lawful-Interception suite to the WHOLE /deliver archive (etsi_ts + etsi_tr +
+// etsi_en) — thousands of deliverables rather than fourteen.
+//
+// It is a value of the knob rather than a second knob because the knob already
+// existed and was DEAD: both steps read c.Cfg("etsi_scope"), and nothing ever put
+// an "etsi_scope" key into Ctx.Config, so the ETSI corpus was pinned to the
+// fourteen built-in LI specs with no reachable way to widen it. cmd/discover-etsi
+// has carried --all, and scripts/etsi-corpus.sh has carried ETSI_ALL, the whole
+// time; only the path from the operator to them was missing.
+const ScopeAll = "all"
+
+// ScopeAllVersions is ScopeAll plus every PUBLISHED VERSION of each deliverable
+// rather than only the latest.
+//
+// It is what makes the ETSI half comparable to the 3GPP one, which already keeps
+// every release of every spec so a reader can see what changed. TS 103 221-1
+// alone has 23 published versions, so this multiplies the work list several-fold
+// — the download, the conversion and the GPU pass with it. A separate value
+// rather than the default, because that cost is a decision.
+const ScopeAllVersions = "all-versions"
+
+// etsiScopeArgs turns the scope knob into cmd/discover-etsi flags.
+//
+// The value is trimmed ONCE and the trimmed value is what travels. Trimming only
+// for the dispatch and then forwarding the original passed " 103 280 " through to
+// --specs, where the leading space becomes part of the first id and resolves
+// nothing.
+func etsiScopeArgs(scope string) []string {
+	scope = strings.TrimSpace(scope)
+	switch scope {
+	case "":
+		return nil // the built-in LI suite
+	case ScopeAll:
+		return []string{"--all"}
+	case ScopeAllVersions:
+		return []string{"--all", "--all-versions"}
+	default:
+		return []string{"--specs", scope}
+	}
+}
+
+// etsiScopeEnv turns the same knob into the environment scripts/etsi-corpus.sh
+// reads. The script passes these straight through to the same binary, so the two
+// helpers must agree — which is why they sit next to each other.
+func etsiScopeEnv(scope string) []string {
+	scope = strings.TrimSpace(scope)
+	switch scope {
+	case "":
+		return nil
+	case ScopeAll:
+		return []string{"ETSI_ALL=1"}
+	case ScopeAllVersions:
+		return []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
+	default:
+		return []string{"ETSI_SPECS=" + scope}
 	}
 }
 

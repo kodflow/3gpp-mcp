@@ -100,3 +100,23 @@ func sqrt32(x float32) float32 {
 	}
 	return z
 }
+
+// DualEmbedder produces BOTH heads of a dual-head model from ONE forward pass.
+//
+// BGE-M3 emits the dense sentence embedding and the learned-lexical weights from
+// the same encoder, and ONNX Runtime computes that encoder whether one output is
+// read or two. A hybrid query that called Embed and then EmbedSparse therefore ran
+// the transformer twice over the same string for nothing — measured at ~166 ms for
+// the pair against a BM25 arm costing ~10 ms, so the redundant pass was about half
+// the latency of every non-lexical search.
+//
+// ok is false when there is no combined path (a dense-only model, or a text long
+// enough that the dense and sparse windows would diverge). That is a FALLBACK, not
+// an error: the caller uses Embed and EmbedSparse and gets an identical answer,
+// only slower. Equivalence is asserted bit-for-bit by
+// internal/embed's EmbedBoth test, because a combined path that returns
+// almost-the-same vectors would be a silent quality regression rather than a
+// speed-up.
+type DualEmbedder interface {
+	EmbedBoth(ctx context.Context, text string) (dense []float32, sparse model.SparseVec, ok bool)
+}

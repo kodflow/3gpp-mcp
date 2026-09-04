@@ -45,15 +45,43 @@ models:
     inputs: [input_ids, attention_mask]
     output: sentence_embedding
 
-  - name: bge-m3-sparse     # dual-head export: dense sentence_embedding + the learned
-    family: bge-m3          # lexical sparse_weights head. Validated live on Kaggle
-    dir: data/models/bge-m3-sparse  # (both outputs present; sparse byte-exact vs
-    precision: fp32         # FlagEmbedding, maxdiff 0.0000). Published as Kaggle Dataset
-    dim: 1024               # extazy937/bge-m3-sparse-onnx. Bake at `dir` so serve can
-    normalization: l2       # sparse-embed the QUERY (the sparse arm's serve side); the
-    revision: 5617a9f       # corpus sparse pass fills clause_sparse.
+  # THE MODEL AN IMAGE SHOULD BAKE. Dual-head: the same dense sentence_embedding
+  # as bge-m3 above, PLUS the learned-lexical sparse_weights head — so one 2.2 GB
+  # model serves BOTH arms. It has to be one model: SparseCapable() reads the
+  # ACTIVE registry entry, so a build whose active model is dense-only drops the
+  # sparse arm no matter what else is on disk, and the corpus's sparse postings
+  # become bytes nothing can query.
+  #
+  # windowing/max_tokens are declared to match bge-m3, and that is a CLAIM about
+  # interchangeability, so it was measured rather than assumed. Re-embedding 20
+  # clauses of TS 23.501 whose vectors are already in the corpus:
+  #
+  #   bge-m3        vs stored   cos min 0.999995  avg 0.999999   (harness control)
+  #   bge-m3-sparse vs stored   cos min 0.999995  avg 0.999999
+  #   bge-m3        vs bge-m3-sparse            cos min 1.000000
+  #
+  # The two dense heads are the same tensor; 0.999995 is the float32 round-trip
+  # through DuckDB, not a difference between the models. The tokenizers are
+  # byte-identical (sha256 21106b6d…), so tokenizer_dir defaults to `dir`.
+  # Both therefore stamp EmbedIdentity 38067f8c6efe, which is what the corpus
+  # carries.
+  #
+  # Of the two lines, only `windowing` actually carries the identity here:
+  # DefaultMaxTokens is 2048, so declaring max_tokens is documentation while
+  # omitting windowing silently means "truncate" and yields fd18ca72f577 — which
+  # is the value this entry stamped before, and what the serve guard would have
+  # compared against the corpus before disabling VSS. Both are declared anyway,
+  # because an entry that relies on a default matching by luck is how this drifts.
+  - name: bge-m3-sparse
+    family: bge-m3
+    dir: data/models/bge-m3-sparse
+    precision: fp32
+    dim: 1024
+    normalization: l2
+    windowing: mean_pool
+    max_tokens: 2048
+    revision: 5617a9f
     tokenizer_revision: 5617a9f
-    tokenizer_dir: data/models/bge-m3
     inputs: [input_ids, attention_mask]
     output: sentence_embedding
     sparse_output: sparse_weights   # <- the head that makes SparseModelID non-empty

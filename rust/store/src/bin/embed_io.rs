@@ -183,6 +183,27 @@ fn main() -> Result<()> {
         let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
         let mut total = 0usize;
         let mut skipped = 0usize;
+
+        // BATCHED, and it is not an optimisation detail. One transaction per clause
+        // is 2.2 million transactions and ~110 million individually-parsed INSERT
+        // statements for the 3GPP layer — measured at over SEVEN HOURS, during which
+        // the step prints nothing at all and looks exactly like a hang.
+        //
+        // 2 000 clauses per transaction keeps the generated SQL to a few MB while
+        // collapsing the per-statement cost; the progress line every batch means the
+        // step can no longer be mistaken for a stall.
+        const BATCH: usize = 2_000;
+        let mut batch: Vec<(u64, Vec<(u32, f32)>)> = Vec::with_capacity(BATCH);
+
+        // The secondary index on term_id is dropped for the load and rebuilt after.
+        // DuckDB maintains it row by row, so inserting ~265 million postings into a
+        // growing ART index makes the import slower the further it goes — the shape
+        // seen on the real run, brisk for hours then CPU-bound with the file barely
+        // moving. Rebuilding afterwards is NOT optional: SearchSparse scores by
+        // term_id, and leaving it off turns every sparse query into a full scan of a
+        // 265-million-row table, with nothing to say so.
+        store.drop_sparse_term_index()?;
+
         for line in BufReader::new(f).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -198,10 +219,21 @@ fn main() -> Result<()> {
                 }
             };
             // An empty-postings clause (heading-only/void text) still counts as "done" so the
-            // worklist converges — write the (empty) posting set, which set_sparse handles.
-            store.set_sparse(r.chunk_id, &r.terms)?;
-            total += 1;
+            // worklist converges — the DELETE is issued for it either way.
+            batch.push((r.chunk_id, r.terms));
+            if batch.len() >= BATCH {
+                store.set_sparse_many(&batch)?;
+                total += batch.len();
+                batch.clear();
+                eprintln!("embed-io: sparse import {total} clause(s)");
+            }
         }
+        if !batch.is_empty() {
+            store.set_sparse_many(&batch)?;
+            total += batch.len();
+        }
+        eprintln!("embed-io: rebuilding the term_id index over {total} clause(s)…");
+        store.create_sparse_term_index()?;
         if !args.sparse_model.is_empty() {
             store.set_meta("sparse_model", &args.sparse_model)?;
         }

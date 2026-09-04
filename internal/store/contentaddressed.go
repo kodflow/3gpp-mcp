@@ -87,7 +87,9 @@ func (s *Store) bodyTexts(ctx context.Context, ids []int64) (map[int64]string, e
 	return out, rows.Err()
 }
 
-// ParagraphTrace is one paragraph of a clause, and the releases carrying it.
+// ParagraphTrace is one paragraph of a clause, and the points on the spec's
+// lineage axis that carry it — releases for 3GPP, versions for ETSI. See
+// Store.LineageAxis; PresentIn is deliberately not named for either.
 //
 // This is the granularity the content-addressed corpus exists to expose. Clause
 // lineage answers "this clause runs from Rel-16 to Rel-18"; a clause that
@@ -112,7 +114,7 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	if !s.contentAddressed {
 		return nil, fmt.Errorf("this corpus is not content-addressed: paragraph lineage needs clause_occ/body_seq (ADR 0004)")
 	}
-	ordered, err := s.releasesOrdered(ctx, specID)
+	axis, ordered, err := s.LineageAxis(ctx, specID)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +128,7 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.para_id, min(s.ord), any_value(p.part), list(DISTINCT o.release)
+		SELECT p.para_id, min(s.ord), any_value(p.part), list(DISTINCT o.`+axis+`)
 		FROM clause_occ o
 		JOIN body_seq s ON s.body_id = o.body_id
 		JOIN paragraphs p USING (para_id)
@@ -165,8 +167,56 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	return out, rows.Err()
 }
 
-// ClauseDelta reports the paragraphs a clause gained and lost between two
-// releases, and how many it kept.
+// deltaAxis names the column the two endpoints of a delta actually live in, by
+// asking which one HOLDS them both for this spec.
+//
+// A 3GPP spec is republished per release and is traced by release; an ETSI
+// deliverable has no releases at all — parse_etsi_meta stamps the constant "ETSI"
+// on every one — and is traced by version. Hard-coding `release` therefore made
+// the ETSI half answer every delta with added=null, removed=null, kept=0. Not an
+// error: an EMPTY DIFF, which reads as "this clause did not change between those
+// two points" on a corpus kept at every version precisely to show that it did.
+//
+// Asking which column holds the endpoints is better than asking which column
+// varies (LineageAxis): a caller who names two versions of a multi-release 3GPP
+// spec gets the answer they asked for instead of an empty one.
+//
+// And when NEITHER column holds them, that is now an error naming what the spec
+// does have. An empty result meant both "nothing changed" and "your endpoints
+// matched nothing", and the two are not distinguishable by the caller.
+func (s *Store) deltaAxis(ctx context.Context, specID, from, to string) (string, error) {
+	for _, col := range []string{"release", "version"} {
+		var n int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT count(DISTINCT `+col+`) FROM spec_versions WHERE spec_id = ? AND `+col+` IN (?, ?)`,
+			specID, from, to).Scan(&n); err != nil {
+			return "", err
+		}
+		if n == 2 || (n == 1 && from == to) {
+			return col, nil
+		}
+	}
+	rels, _ := s.orderedValues(ctx, specID, "release", releaseRecencySQL("release"))
+	vers, _ := s.orderedValues(ctx, specID, "version", versionOrderSQL("version", "ASC"))
+	return "", fmt.Errorf("%s holds neither %q nor %q as a release or a version: releases %v, versions %v",
+		specID, from, to, rels, summarise3(vers))
+}
+
+// summarise3 keeps an error message readable when a spec carries 126 versions.
+func summarise3(v []string) string {
+	switch {
+	case len(v) == 0:
+		return "(none)"
+	case len(v) <= 6:
+		return fmt.Sprintf("%v", v)
+	}
+	return fmt.Sprintf("[%s … %s] (%d in all)", v[0], v[len(v)-1], len(v))
+}
+
+// ClauseDelta reports the paragraphs a clause gained and lost between two points
+// of its history, and how many it kept. The two points are releases for a 3GPP
+// spec and versions for an ETSI deliverable; deltaAxis decides from the endpoints
+// themselves rather than from a per-corpus flag.
 //
 // It is a set operation on para_id, not a text diff: the corpus already knows
 // which paragraphs are the same because storing them once is what makes them
@@ -176,16 +226,20 @@ func (s *Store) ClauseDelta(ctx context.Context, specID, clausePath, from, to st
 	if !s.contentAddressed {
 		return nil, nil, 0, fmt.Errorf("this corpus is not content-addressed: clause deltas need clause_occ/body_seq (ADR 0004)")
 	}
+	axis, aErr := s.deltaAxis(ctx, specID, from, to)
+	if aErr != nil {
+		return nil, nil, 0, aErr
+	}
 	rows, qErr := s.db.QueryContext(ctx, `
 		WITH side AS (
-			SELECT o.release, s.ord, p.para_id, p.part
+			SELECT o.`+axis+` AS axis, s.ord, p.para_id, p.part
 			FROM clause_occ o
 			JOIN body_seq s ON s.body_id = o.body_id
 			JOIN paragraphs p USING (para_id)
-			WHERE o.spec_id = ? AND o.clause_path = ? AND o.release IN (?, ?)
+			WHERE o.spec_id = ? AND o.clause_path = ? AND o.`+axis+` IN (?, ?)
 		),
-		a AS (SELECT DISTINCT para_id, part, ord FROM side WHERE release = ?),
-		b AS (SELECT DISTINCT para_id, part, ord FROM side WHERE release = ?)
+		a AS (SELECT DISTINCT para_id, part, ord FROM side WHERE axis = ?),
+		b AS (SELECT DISTINCT para_id, part, ord FROM side WHERE axis = ?)
 		SELECT CASE WHEN a.para_id IS NULL THEN 'added'
 		            WHEN b.para_id IS NULL THEN 'removed'
 		            ELSE 'kept' END,
@@ -218,8 +272,8 @@ func (s *Store) ClauseDelta(ctx context.Context, specID, clausePath, from, to st
 // availabilityCA is ClauseAvailability over the content-addressed tables. It
 // touches no text at all — release presence lives entirely in clause_occ — so it
 // is strictly cheaper than the version that had to scan `clauses`.
-func (s *Store) availabilityCA(ctx context.Context, specID, prefix string) ([]ClauseRel, error) {
-	q := `SELECT o.clause_path, max(b.heading), list(DISTINCT o.release)
+func (s *Store) availabilityCA(ctx context.Context, specID, prefix, axis string) ([]ClauseRel, error) {
+	q := `SELECT o.clause_path, max(b.heading), list(DISTINCT o.` + axis + `)
 	      FROM clause_occ o JOIN bodies b USING (body_id)
 	      WHERE o.spec_id = ?`
 	args := []any{specID}
@@ -382,7 +436,7 @@ func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.Sea
 			SELECT sc.sc, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
 			       o.is_normative, o.body_id, b.heading,
 			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
-			                          ORDER BY sc.sc DESC, o.version DESC) AS rn
+			                          ORDER BY sc.sc DESC, ` + versionRecencySQL("o.version") + `) AS rn
 			FROM scored sc
 			JOIN clause_occ o USING (body_id)
 			JOIN bodies b USING (body_id)
@@ -473,7 +527,7 @@ func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter
 			SELECT n.dist, o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
 			       o.is_normative, o.body_id, b.heading,
 			       row_number() OVER (PARTITION BY o.spec_id, o.clause_path
-			                          ORDER BY n.dist ASC, o.version DESC) AS rn
+			                          ORDER BY n.dist ASC, ` + versionRecencySQL("o.version") + `) AS rn
 			FROM near n
 			JOIN clause_occ o USING (body_id)
 			JOIN bodies b USING (body_id)

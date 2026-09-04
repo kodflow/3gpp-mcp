@@ -42,6 +42,7 @@ func main() {
 		requireFTS    = flag.Bool("require-fts", false, "fail if the BM25 FTS index is absent")
 		requireHNSW   = flag.Bool("require-hnsw", false, "fail if the DB is vectorized but its HNSW index is not frozen")
 		requireSparse = flag.Bool("require-sparse", false, "fail unless the sparse (clause_sparse) postings are populated (sparse-enabled bakes only)")
+		requireETSI   = flag.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, carries vectors, and was embedded with the SAME identity as --db (an ETSI half at a stale identity is served lexically, silently)")
 		requireEmbed  = flag.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence; floor-aware, unlike --pending-zero)")
 		embedFloor    = flag.String("embed-floor", "", "release floor for --require-embed-complete (e.g. Rel-99); empty = all releases. Below-floor/legacy clauses are intentionally NULL and never counted.")
 		embeddingDim  = flag.Int("embedding-dim", 0, "if >0, fail unless schema_meta embedding_dim == this")
@@ -59,6 +60,7 @@ func main() {
 
 	res := runChecks(context.Background(), checkCfg{
 		db: *dbPath, pendingZero: *pendingZero, requireFTS: *requireFTS, requireHNSW: *requireHNSW, requireSparse: *requireSparse,
+		requireETSI:          *requireETSI,
 		requireEmbedComplete: *requireEmbed, embedFloor: *embedFloor,
 		embeddingDim: *embeddingDim, minClauses: *minClauses, expectedReleases: splitCSV(*expRels),
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
@@ -87,6 +89,7 @@ type checkCfg struct {
 	db                                         string
 	pendingZero, requireFTS, requireHNSW       bool
 	requireSparse                              bool
+	requireETSI                                string
 	requireEmbedComplete                       bool
 	embedFloor                                 string
 	embeddingDim, minClauses                   int
@@ -245,10 +248,130 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	// sparse-enabled bake; off by default (dense-only DBs pass).
 	if cfg.requireSparse {
 		_ = db.LoadSparse(ctx)
-		want := embed.SparseModelID() // "" when this build has no sparse head
+		want := embed.SparseModelID() // "" when the ACTIVE registry model has no sparse head
 		got := db.GetMeta(ctx, "sparse_model")
-		ok := db.SparseAvailable() && (want == "" || got == want)
-		res.add("require-sparse", ok, "sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
+		switch {
+		case want == "":
+			// A GATE THAT CANNOT COMPARE MUST NOT REPORT GREEN.
+			//
+			// `want == "" ||` used to make the identity comparison optional, and the
+			// default registry entry is bge-m3, which is DENSE-ONLY — so
+			// SparseModelID() returned "" and --require-sparse collapsed to
+			// "clause_sparse has at least one row". Measured: `embedid --sparse` prints
+			// nothing under the default registry and b13103bce7ae under
+			// EMBED_MODEL=bge-m3-sparse. build-image.sh called this before it exported
+			// the baked registry, so the one check written to catch a STALE sparse
+			// layer — postings scored against another model's vocabulary, which fails
+			// silently at serve time — was inert in the only place it mattered.
+			//
+			// Selecting the dual-head entry does not move the dense identity
+			// (38067f8c6efe under both), so pointing the gate at it costs nothing.
+			res.add("require-sparse", false,
+				"sparse_available=%v sparse_model=%q but THIS BUILD resolves no sparse identity "+
+					"(the active registry model has no sparse head) — the layer cannot be checked; "+
+					"set EMBED_MODEL=bge-m3-sparse or EMBED_MODELS_CONFIG to the baked registry",
+				db.SparseAvailable(), got)
+		default:
+			res.add("require-sparse", db.SparseAvailable() && got == want,
+				"sparse_available=%v sparse_model=%q expected=%q", db.SparseAvailable(), got, want)
+		}
+	}
+
+	// require-etsi — the OTHER half of the corpus, which the image serves beside
+	// this one and which no gate could previously talk about.
+	//
+	// The check that matters is the LAST one: both corpora must carry the same
+	// embedding identity. internal/mcp recomputes semantic availability per store
+	// and the serve-time coherence guard disables VSS when a store's model differs
+	// from the client's, so re-embedding 3GPP while ETSI keeps an older identity
+	// drops the ETSI arm to lexical — with no error, on a corpus that looks
+	// complete from every other angle. That is the failure this flag exists for;
+	// the existence and clause-count checks are there so it cannot be satisfied by
+	// an empty file that trivially "agrees".
+	if cfg.requireETSI != "" {
+		etsi, err := store.OpenReadOnly(cfg.requireETSI)
+		if err != nil {
+			res.add("require-etsi", false, "cannot open %s: %v", cfg.requireETSI, err)
+		} else {
+			// CONVERGENCE MEANS "no clause WITH TEXT lacks a vector", not
+			// "vectors == clauses". A quarter of the ETSI corpus is headings whose
+			// body is empty — PDF text extraction reads numbered figure captions
+			// and sequence-diagram steps as clauses — and the embedder rightly
+			// produces nothing for them. Measured: 354 of 1 396 clauses empty, all
+			// 354 with a NULL embedding, and ZERO clauses that have text and no
+			// vector. Comparing against the total would therefore have failed every
+			// build on a corpus that had in fact converged, which is a worse gate
+			// than none: it teaches the operator to pass --skip.
+			var withText, vectors int64
+			_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE length(text) > 0`).Scan(&withText)
+			_ = etsi.QueryRowContext(ctx,
+				`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
+			etsiModel := etsi.GetMeta(ctx, "embedding_model")
+			mainModel := db.GetMeta(ctx, "embedding_model")
+			// AND THE INDEX, asked the way the server asks it.
+			//
+			// Vectors plus a matching identity are not enough to make the ETSI half
+			// answer semantically: internal/mcp calls LoadVSS per store, and LoadVSS
+			// refuses an index whose schema_meta.embedding_count disagrees with the
+			// vectors actually present. Measured on the 2026-09-01 corpus: 510 384
+			// vectors, identity equal to the 3GPP one, and embedding_count still
+			// reading 1042 from the era when the ETSI half held fourteen
+			// deliverables — because `index-etsi` had been recorded VALID in 1.3s,
+			// hnsw_state already saying "frozen" about the index of the small
+			// corpus. Every condition this gate checked was true, and the shipped
+			// image would have exact-scanned or fallen back to BM25 on half its
+			// content, silently. That is the same class of hole require-hnsw was
+			// widened to close, on the store no gate was asking about.
+			vssErr := etsi.LoadVSS(ctx)
+			serveUsable := vssErr == nil && etsi.VSSAvailable()
+			ok := withText > 0 && vectors == withText && etsiModel != "" && etsiModel == mainModel && serveUsable
+			why := "serve_usable=true"
+			if !serveUsable {
+				why = fmt.Sprintf("the server would REFUSE the ETSI index: %v", vssErr)
+			}
+			res.add("require-etsi", ok,
+				"clauses_with_text=%d vectors=%d (missing=%d) embedding_model=%q (3gpp=%q) hnsw_state=%q %s",
+				withText, vectors, withText-vectors, etsiModel, mainModel,
+				etsi.GetMeta(ctx, "hnsw_state"), why)
+
+			// AND THE SHAPE, because a corpus that keeps every version and is not
+			// content-addressed is served from the branch that ranks VERSIONS.
+			//
+			// Store.SearchClauses sends a content-addressed corpus to
+			// searchClausesCA, which collapses to one row per (spec_id,
+			// clause_path); anything else keeps every occurrence as its own
+			// candidate. The comment on that branch records what the other side
+			// does: "the whole twelve-hit window for CHECK_IMEI was one clause
+			// repeated across twelve releases, and the spec that answers it never
+			// entered the window".
+			//
+			// The ETSI half was unconverted, and that was harmless for exactly as
+			// long as its crawl kept ONE version per deliverable — with one version
+			// there is nothing to repeat. Keeping every published version is the
+			// point of the widened crawl, and it is what turns a dormant shape
+			// mismatch into a drowned result window.
+			//
+			// So the gate asks the question that actually predicts the failure —
+			// "does this corpus hold the same clause at more than one version while
+			// being unable to collapse them?" — rather than "is it converted?". A
+			// gate that failed on the single-version corpus would fail on data that
+			// is correct, which is the worse kind: it teaches the operator to pass
+			// --skip.
+			if !etsi.ContentAddressed() {
+				var spec, path string
+				var n int64
+				_ = etsi.QueryRowContext(ctx, `
+					SELECT spec_id, clause_path, count(DISTINCT version) AS n
+					FROM clauses WHERE length(text) > 0
+					GROUP BY spec_id, clause_path
+					ORDER BY n DESC, spec_id, clause_path LIMIT 1`).Scan(&spec, &path, &n)
+				res.add("etsi-dedup", n <= 1,
+					"the ETSI corpus is NOT content-addressed and its most repeated clause is %s §%s at %d version(s) "+
+						"(>1 means search ranks versions, not clauses — run migrate-paragraphs on it)",
+					spec, path, n)
+			}
+			_ = etsi.Close()
+		}
 	}
 
 	// catalog coverage: specs that have indexed clauses but no catalog title/WG

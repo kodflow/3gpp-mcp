@@ -4,6 +4,78 @@
 
 Le serveur retourne des **fragments de spécification cités** (`spec_id`, `release`, `version`, `clause`, `url`) — jamais des résumés. Claude raisonne, l'index sert.
 
+## Utilisation : une seule image, tout dedans
+
+```jsonc
+// .mcp.json (Claude Code)
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/kodflow/3gpp-mcp:latest"]
+    }
+  }
+}
+```
+
+Rien d'autre à installer, rien a telecharger au premier lancement, aucun accès
+réseau nécessaire à l'exécution. Le paquet est **privé** (texte de spec verbatim,
+cf. [`DATA_NOTICE.md`](./DATA_NOTICE.md)) : `docker login ghcr.io` avec un token
+portant `read:packages` avant le premier `pull`.
+
+### Ce que l'image contient
+
+Chiffres **mesurés** sur l'image publiée le 2026-09-02
+(`sha256:7ca6e0f937269bef97e2c9ffe473e448b45dca796299c166a686da34d5400961`),
+pas des ordres de grandeur. Pour les relire sur VOTRE copie, appelez l'outil
+`help` : il compte dans la base servie au lieu de répéter ce tableau.
+
+| | 3GPP | ETSI |
+|---|---|---|
+| Clauses | 2 752 688 | 2 994 221 ingérées, **3 168 508** après content-addressing |
+| Vecteurs denses | 821 146 | **2 002 313** |
+| Postings sparse | ~194 M | oui (modèle `b13103bce7ae`) |
+| Index HNSW | gelé | gelé, 1 062 164 embeddings |
+| BM25 / FTS | oui | oui |
+| Taille sur disque | 21,2 GiB | 16,0 GiB |
+| Axe d'évolution | **release** (Rel-99 → dernière) | **version** (toutes les versions de chaque deliverable) |
+
+Plus : le modèle d'embedding **bi-tête** BGE-M3 (dense + lexical appris,
+identité `38067f8c6efe`), le reranker cross-encoder, ONNX Runtime et les
+extensions DuckDB `fts`/`vss`. Total 48 GiB de couches, ~25 GiB au pull.
+
+Les deux moitiés sont **fédérées, jamais fusionnées** : un `spec_id` commençant
+par `ETSI ` part sur la base ETSI, le reste sur la base 3GPP, et une recherche
+fédérée interroge les deux. C'est ce qui permet de garder deux axes d'évolution
+distincts sans que l'un écrase l'autre.
+
+### Les quatre armes de recherche
+
+| Arme | Ce qu'elle fait | Quand elle sert |
+|---|---|---|
+| BM25 / FTS | correspondance lexicale exacte | noms d'IE, de NF, références de clause |
+| HNSW dense | proximité sémantique | question formulée autrement que la spec |
+| Sparse (lexical appris) | termes pondérés par le modèle | vocabulaire technique rare |
+| Cross-encoder | réordonne les candidats | précision sur le haut du classement |
+
+`search_spec` les combine (RRF) par défaut. `server_info` dit lesquelles sont
+**actives à cet instant** et, quand l'une est éteinte, **pourquoi** — à lire
+avant de conclure qu'une arme manque.
+
+### Vérifier que tout répond
+
+```bash
+docker run -i --rm ghcr.io/kodflow/3gpp-mcp:latest   # puis, en JSON-RPC : help, puis server_info
+```
+
+Le dépôt embarque la preuve utilisée en interne : `scripts/local/prove-serving.sh`
+démarre le vrai serveur sur stdio et vérifie les sept armes sur les deux moitiés
+en JSON-RPC réel. Elle sort `PROVE OK` ou échoue.
+
+L'image se construit **sur la machine qui a le corpus** — `make image` — et non
+sur un runner : voir [`docs/automation/data-image.md`](./docs/automation/data-image.md).
+
 ---
 
 ## TL;DR architectural
@@ -63,7 +135,7 @@ make serve
 
 # TESTER soi-même
 make poc                      # test E2E : events LI X2→MDF2 par NE/NF (TS 33.128)
-make demo                     # interroge les 8 tools en vrai (JSON-RPC) et affiche
+make demo                     # interroge TOUS les tools en vrai (JSON-RPC) et affiche
 
 # Backend sémantique ONNX réel (optionnel, ~2.3 Go)
 make model                    # bootstrap BGE-M3 + ONNX Runtime, puis build -tags onnx
@@ -90,22 +162,62 @@ racine du repo si tu utilises le devcontainer — avec :
 }
 ```
 
-Claude Code redémarre, le serveur apparaît, les 8 tools sont disponibles.
+Claude Code redémarre, le serveur apparaît, les 13 outils sont disponibles.
 
 ## Surface MCP
 
-| Tool | Rôle |
-|---|---|
-| `search_spec` | Retrieval hybride (BM25 + vecteurs + RRF) avec citations |
-| `get_spec` | Fetch d'une spec ou d'une clause précise |
-| `get_changelog` | CRs entre deux releases (depuis Change History Annex) |
-| `list_releases` | Versions, freeze dates |
-| `resolve_term` | Glossaire 3GPP (seed TS 21.905) |
-| `trace_evolution` | Évolutions NE↔NF (V2, via KuzuDB) |
-| `find_cross_references` | Specs/clauses référencées |
-| `list_specs` | Catalogue filtré par release/série/WG |
+13 outils. En cas de doute sur lequel appeler, `help` rend la carte complète
+depuis le serveur lui-même.
 
-Chaque réponse contient un bloc `citations: [{spec_id, release, version, clause, url}]`. Pas de citation possible = pas de réponse.
+| Tool | À appeler quand |
+|---|---|
+| `help` | **récap** : ce que le corpus contient (compté réellement), la carte question → outil, les réglages |
+| `server_info` | quelles armes sont actives, et **pourquoi** l'une est éteinte |
+| `search_spec` | question en texte libre sur le corps des clauses — l'entrée principale |
+| `get_spec` | vous savez déjà la spec et la clause, vous voulez le texte |
+| `search_api` | vous cherchez une operation ou un schema OpenAPI 5GC, pas de la prose |
+| `trace_clause` | comment le TEXTE d'une clause a évolué, **paragraphe par paragraphe** |
+| `trace_evolution` | comment un élément 4G se projette sur ses NF 5GC |
+| `get_changelog` | les CRs entre deux releases d'une spec |
+| `list_releases` | quelles releases/versions d'une spec sont dans le corpus |
+| `list_specs` | parcourir le catalogue par release, série ou WG |
+| `find_cross_references` | quelles specs une spec ou une clause référence |
+| `resolve_term` | développer un acronyme, trouver où un terme est défini |
+| `li_events` | définitions d'événements d'interception légale (TS 33.128) |
+
+Chaque réponse contient un bloc `citations: [{spec_id, release, version, clause, url}]`.
+Pas de citation possible = pas de réponse.
+
+### Suivre une évolution entre versions
+
+`trace_clause` est l'outil qui répond à « qu'est-ce qui a changé ». Il travaille
+au **paragraphe**, pas à la clause : une clause dont une seule phrase a bougé
+paraît entièrement neuve à un suivi clause-à-clause.
+
+```jsonc
+{"spec_id": "23.501", "clause": "5.4.4a",
+ "from_release": "Rel-17", "to_release": "Rel-18"}
+```
+
+La réponse nomme l'**axe** qu'elle a suivi (`release` côté 3GPP, `version` côté
+ETSI) et liste `axis_values`. Un champ nommé pour des releases qui porterait des
+versions serait le genre d'erreur silencieuse que ce projet traque.
+
+### Réglages
+
+Variables lues au démarrage du serveur ; `help` en rend la liste à jour.
+
+| Variable | Effet |
+|---|---|
+| `RT_DB` | chemin de la base 3GPP servie (défaut `data/3gpp.duckdb`) |
+| `RT_DB_FULL` | chemin de la base ETSI attachée ; non défini = 3GPP seul |
+| `EMBEDDER=off` | coupe l'embedder de requête : sémantique et sparse s'éteignent, BM25 reste |
+| `RERANKER=off` | coupe le cross-encoder |
+| `RERANK_WINDOW` | nombre de candidats rescorés (défaut 12) |
+| `SEARCH_BUDGET` | budget par recherche avant résultats partiels (défaut 20s) |
+| `EMBED_QUERY_CACHE` | entrées du cache d'embeddings de requête (défaut 512) |
+| `ORT_EP` | execution provider ONNX (`cpu`, `cuda`) |
+| `MCP3GPP_ALLOW_LEXICAL_FALLBACK` | `true` autorise un démarrage lexical si les vecteurs sont inutilisables ; **par défaut le serveur refuse de démarrer**, pour qu'un service silencieusement dégradé ne soit jamais servi |
 
 ## État d'implémentation (V1)
 
@@ -120,7 +232,7 @@ Les 8 phases du moteur de retrieval sont implémentées et le service build/serv
 | 5 — Glossaire (21.905) | ✅ seeder câblé (best-effort) | `internal/ingest` |
 | 6 — Changelog (Change History) | ✅ | `internal/htmlparse` |
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
-| 8 — Serveur MCP + 8 tools | ✅ | `internal/mcp`, `cmd/server` |
+| 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
 
 **Deux écarts assumés avec l'archi figée (à régulariser en MR `arch-change`) :**
 
