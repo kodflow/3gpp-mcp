@@ -39,6 +39,8 @@ toolchain ─┬─ build-go ── test
                                                                 └─ enrich ┴─ index
                                                                              │
                                                               validate ── smoke
+                                                                             │
+                                                            index-etsi ── publish
 ```
 
 | Step | Does | Cost |
@@ -58,6 +60,14 @@ toolchain ─┬─ build-go ── test
 | `index` | build and freeze the HNSW cosine index | RAM-bound |
 | `validate` | the data-completeness contract | seconds |
 | `smoke` | start the real server, call real tools, assert vector search stays on | seconds |
+| `publish` | compose the OCI image and push it — declines without a registry credential | ~25 min |
+
+`publish` is a STEP, not a separate entry point. The image was the only output of
+this repository with no determinants: nothing could say whether what consumers
+pull was the corpus the machine had built, and twice in two days it went out
+stale or unbootable while every local gate was green. It now depends on `smoke`
+**and** `index-etsi` — both halves frozen and proved — and `make plan` states
+whether the published image is behind the corpus before anything runs.
 
 ---
 

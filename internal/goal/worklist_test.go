@@ -259,8 +259,13 @@ func TestTheCorpusIsNobodysInput(t *testing.T) {
 	// index and index-etsi freeze on top of compact, validate reads a 3GPP corpus
 	// nothing touches after index, and smoke reads both to prove they serve. For
 	// these, fingerprinting the corpus is the whole point.
+	// publish is the last step in the graph: it depends on smoke AND index-etsi,
+	// so both halves are frozen before it reads them, and nothing rewrites either
+	// corpus afterwards. Fingerprinting them is the entire point of the step —
+	// it is what makes a published image notice a corpus that moved.
 	allowed := map[string]bool{
 		"index": true, "index-etsi": true, "validate": true, "smoke": true,
+		"publish": true,
 	}
 	for _, s := range Pipeline() {
 		if s.Inputs == nil || allowed[s.Name] {
