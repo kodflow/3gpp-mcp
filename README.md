@@ -26,10 +26,16 @@ portant `read:packages` avant le premier `pull`.
 
 ### Ce que l'image contient
 
-Chiffres **mesurés** dans les bases servies le 2026-09-04, sur l'image publiée
-(`sha256:f2aa17e695871ddf33acb2e419f1250b602ac8b720cea9c329add374ce796642`), pas des ordres de grandeur. Pour les
-relire sur VOTRE copie, appelez l'outil `help` : il compte dans la base servie au
-lieu de répéter ce tableau.
+Chiffres **mesurés** dans les bases servies le 2026-09-04, pas des ordres de
+grandeur. Ils portent sur un digest précis, pas sur le tag mouvant :
+
+```
+ghcr.io/kodflow/3gpp-mcp@sha256:f2aa17e695871ddf33acb2e419f1250b602ac8b720cea9c329add374ce796642
+```
+
+`:latest` pointe sur ce digest à cette date ; épinglez le digest si vous voulez
+que ces chiffres restent vrais. Pour les relire sur VOTRE copie, appelez l'outil
+`help` : il compte dans la base servie au lieu de répéter ce tableau.
 
 | | 3GPP | ETSI |
 |---|---|---|
@@ -149,16 +155,19 @@ make prove                    # JSON-RPC réel contre le vrai binaire → `PROVE
 make publish
 ```
 
-> `make build` est **l'orchestrateur du corpus**, pas un `go build` : chaque étape
-> déclare ses sources, et une étape qui n'a rien à faire **décline** au lieu de
-> reprogrammer tout l'aval. Sur un corpus déjà complet, un build converge vers
-> « rien à faire » — un `fetch` qui ne reçoit aucune nouvelle version décline, et
-> ingest, merge, embed et index sautent derrière lui. Les binaires seuls se
-> bâtissent avec `make build/build-go`.
->
-> Lire un plan : `[SKIP]` prouvé · `[RUN ]` va tourner, pour la raison affichée
-> · `[RUN?]` sera re-décidé contre l'état réel quand sa dépendance aura fini, et
-> sauté si celle-ci n'a rien changé.
+`make build` est **l'orchestrateur du corpus**, pas un `go build` : chaque étape
+déclare ses sources, et une étape qui n'a rien à faire **décline** au lieu de
+reprogrammer tout l'aval. Sur un corpus déjà complet, un build converge vers
+« rien à faire » — un `fetch` qui ne reçoit aucune nouvelle version décline, et
+ingest, merge, embed et index sautent derrière lui.
+
+Pour les binaires seuls, sans toucher au corpus : `make build-bin` bâtit le
+serveur dans `bin/`, `make goal-bin` l'orchestrateur, et `make build/build-go`
+tous les binaires de lecture (serveur + outils hors-ligne).
+
+**Lire un plan** : `[SKIP]` prouvé · `[RUN ]` va tourner, pour la raison
+affichée · `[RUN?]` sera re-décidé contre l'état réel quand sa dépendance aura
+fini, et sauté si celle-ci n'a rien changé.
 
 > **Comment c'est indexé et les relations entre éléments** : voir
 > [`docs/INDEXING.md`](./docs/INDEXING.md) (tables, index FTS/HNSW/b-tree,
