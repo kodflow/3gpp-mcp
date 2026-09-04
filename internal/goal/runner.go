@@ -248,6 +248,13 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	}
 	if s.Validate != nil {
 		if err := s.Validate(r.ctx); err != nil {
+			// A verdict of "no" and the ABSENCE of a verdict are not the same
+			// answer, and only one of them is allowed to schedule work. An
+			// undecidable validation stops the plan rather than invalidating the
+			// step: see ErrUndecidable for the 21 GB this distinction protects.
+			if Undecidable(err) {
+				return Decision{}, fmt.Errorf("cannot decide whether %s is still valid: %w", s.Name, err)
+			}
 			d.Reason = "validation failed: " + firstLine(err.Error())
 			return d, nil
 		}

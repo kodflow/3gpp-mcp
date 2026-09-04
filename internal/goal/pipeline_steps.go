@@ -567,7 +567,8 @@ func stepMerge() *Step {
 		Validate: func(c *Ctx) error {
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the merged DB does not open: %w", err)
+				return stillOpenElsewhere("3gpp.duckdb",
+					fmt.Errorf("the merged DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters")

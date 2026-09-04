@@ -292,7 +292,11 @@ func stepSeed() *Step {
 			// Proof that the file is a usable DuckDB, not just bytes on disk.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the seeded DB does not open: %w", err)
+				// THE ONE THAT MATTERS MOST. The Run below downloads and REPLACES
+				// the corpus, so "cannot open" must never be allowed to mean
+				// "re-acquire 21 GB" on the strength of a stale file handle.
+				return stillOpenElsewhere("3gpp.duckdb",
+					fmt.Errorf("the seeded DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters: %q", out)

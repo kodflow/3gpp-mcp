@@ -94,7 +94,8 @@ func stepCorpusETSI() *Step {
 			// and it would serve as an empty corpus without complaining.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("etsi.duckdb")}})
 			if err != nil {
-				return fmt.Errorf("the ETSI DB does not open: %w", err)
+				return stillOpenElsewhere("etsi.duckdb",
+					fmt.Errorf("the ETSI DB does not open: %w", err))
 			}
 			n := countFiles(c.dataPath("sources", "convert-etsi"), ".html")
 			if n == 0 {

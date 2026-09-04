@@ -28,23 +28,75 @@ var Version = "dev"
 
 func main() {
 	db := flag.String("db", "", "DuckDB path to count (required)")
+	blocks := flag.Bool("blocks", false,
+		"print only the physical block accounting, skipping the coverage counts")
 	flag.Parse()
 	if *db == "" {
 		fmt.Fprintln(os.Stderr, "dbcount: --db is required")
 		os.Exit(2)
 	}
-	if err := run(context.Background(), *db); err != nil {
+	if err := run(context.Background(), *db, *blocks); err != nil {
 		fmt.Fprintln(os.Stderr, "dbcount:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, path string) error {
+// reportBlocks prints DuckDB's own accounting of the file: how many blocks it
+// holds, how many carry data, and how many are free.
+//
+// THE FREE ONES ARE THE ONLY REASON TO COMPACT. DuckDB never returns them to the
+// filesystem — a CHECKPOINT re-offers them for reuse INSIDE the file, which is a
+// different thing — so `COPY FROM DATABASE` is the only operation that shrinks
+// the corpus, and it is worth exactly the free blocks it drops. Nothing in the
+// file size says how many those are: a corpus that has never freed a block and
+// one that is four fifths dead space are the same number of bytes on disk right
+// up until the rewrite.
+//
+// That is why this lives here rather than in the compactor, and the reason is
+// provenance, not taste. `ingest` names the whole of `rust/store/src` in its
+// Impl, so adding a flag to rust/store/src/bin/compact.rs schedules a heavy
+// re-ingest of the corpus — measured on 2026-09-04, `make plan` went from
+// "0 certain to run" to a re-ingest and the merge, embed, paragraphs and sparse
+// chain behind it. A read-only query has no business costing that, and dbcount
+// is already the bin `compact` runs to validate itself.
+//
+// The row is picked by largest total_blocks: pragma_database_size() reports one
+// row per attached database, and only the corpus itself has blocks worth counting.
+func reportBlocks(ctx context.Context, s *store.Store) error {
+	var blockSize, total, used, free int64
+	if err := s.QueryRowContext(ctx,
+		`SELECT block_size, total_blocks, used_blocks, free_blocks
+		   FROM pragma_database_size()
+		  WHERE total_blocks IS NOT NULL
+		  ORDER BY total_blocks DESC
+		  LIMIT 1`).Scan(&blockSize, &total, &used, &free); err != nil {
+		return fmt.Errorf("read pragma_database_size: %w", err)
+	}
+	fmt.Printf("block_size=%d\n", blockSize)
+	fmt.Printf("total_blocks=%d\n", total)
+	fmt.Printf("used_blocks=%d\n", used)
+	fmt.Printf("free_blocks=%d\n", free)
+	fmt.Printf("reclaimable_bytes=%d\n", free*blockSize)
+	return nil
+}
+func run(ctx context.Context, path string, blocksOnly bool) error {
 	s, err := store.OpenReadOnly(path) // dbcount only reads row counts
 	if err != nil {
 		return err
 	}
 	defer func() { _ = s.Close() }()
+
+	// The block accounting comes first and always: it is one pragma, it costs
+	// nothing, and the counts below are the expensive part. --blocks stops here,
+	// which is what lets `compact` ask "is there anything to reclaim?" of a corpus
+	// whose coverage it does not need — and of the ETSI half, which has no
+	// spec_versions table to count at all.
+	if err := reportBlocks(ctx, s); err != nil {
+		return err
+	}
+	if blocksOnly {
+		return nil
+	}
 
 	sv, err := s.CountSpecVersions(ctx)
 	if err != nil {

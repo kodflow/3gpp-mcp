@@ -1,8 +1,10 @@
 package goal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -408,5 +410,100 @@ func TestAnInterruptedCompactionDoesNotBlockTheNextOne(t *testing.T) {
 	// exists to protect, and clearing an intermediate must never touch it.
 	if _, err := os.Stat(c.dataPath("3gpp.duckdb")); err != nil {
 		t.Fatalf("clearing the intermediate removed the live corpus: %v", err)
+	}
+}
+
+// blocks renders what `dbcount --blocks` prints, so a case below reads as the
+// four numbers that decide it rather than as a transcript to be squinted at.
+func blocks(blockSize, total, used, free int64) string {
+	return fmt.Sprintf(`block_size=%d
+total_blocks=%d
+used_blocks=%d
+free_blocks=%d
+reclaimable_bytes=%d
+`, blockSize, total, used, free, free*blockSize)
+}
+
+// A compaction is worth exactly the dead space it removes, and until 2026-09-04
+// this step never asked how much that was. It rewrote 21 GiB and 18 GiB of corpus
+// on every build that reached it, because the step in front of it had written
+// something — which is true, and says nothing at all about free blocks. Measured
+// that day: thirty minutes to take data/3gpp.duckdb from 18.2 GiB to 18.2 GiB.
+//
+// These are the numbers dbcount reported for the two finished corpora on the
+// machine that had just built them: two free blocks each.
+func TestAFinishedCorpusIsNotRewrittenForNothing(t *testing.T) {
+	measured := map[string]string{
+		"3GPP, after embed, sparse and index": blocks(262144, 87830, 87828, 2),
+		"ETSI, the same":                      blocks(262144, 75179, 75177, 2),
+	}
+	for name, out := range measured {
+		t.Run(name, func(t *testing.T) {
+			skip, why := nothingToReclaim(out)
+			if !skip {
+				t.Fatal("a corpus with 2 free blocks was sent through a 30-minute rewrite")
+			}
+			if !strings.Contains(why, "free") {
+				t.Errorf("the decline does not report what was measured, so nobody can check it: %q", why)
+			}
+		})
+	}
+}
+
+// THE NEGATIVE CONTROLS, and they matter more than the case above. Declining a
+// corpus that really does carry dead space carries the previous provenance
+// forward, skips index behind it, and publishes an image whose corpus layer is
+// mostly free blocks — with every gate green, which is how this repository has
+// shipped its worst artefacts.
+//
+// The unreadable transcripts are controls too: not knowing must never read as
+// nothing-to-do, for the same reason ingestedNothing refuses to conclude anything
+// from a transcript with no tally in it.
+func TestACorpusWithRealDeadSpaceIsNeverDeclined(t *testing.T) {
+	cases := map[string]string{
+		"the 2026-08-30 corpus, 79.5 percent free, 43.6 GB": blocks(262144, 229166, 46947, 182219),
+		"under the fraction but over 1 GiB":                 blocks(262144, 200000, 194000, 6000),
+		"under 1 GiB but a tenth of the file":               blocks(262144, 1000, 900, 100),
+		"a corpus that reports no blocks at all":            blocks(262144, 0, 0, 0),
+		"a bin that predates --blocks says nothing":         "",
+		"a coverage-only transcript carries no accounting":  "spec_versions=20163 clauses_with_vectors=2752688",
+		"free_blocks alone proves nothing":                  "free_blocks=2",
+		"a truncated pipe lost the block size":              "total_blocks=87830 free_blocks=2",
+		"a value that is not a number is not a zero":        "block_size=262144 total_blocks=87830 free_blocks=two",
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			if skip, _ := nothingToReclaim(out); skip {
+				t.Error("real or unproven dead space was reported as nothing to reclaim")
+			}
+		})
+	}
+}
+
+// TestCompactStillRunsBeforeTheIndex guards the invariant the decline is easiest
+// to break: compact must come BEFORE index, never after.
+//
+// COPY FROM DATABASE does not carry custom indexes, so the bin clears hnsw_state
+// to "building", which serve treats as unusable. A compaction that ran after the
+// index would leave a corpus the server refuses, so index declares compact as a
+// dependency and not the other way round. Now that compact can decline, that same
+// edge is what makes the decline safe: a declined compaction republishes its
+// previous provenance, so index folds an unchanged value and stays skipped.
+func TestCompactStillRunsBeforeTheIndex(t *testing.T) {
+	steps := map[string]*Step{}
+	for _, s := range Pipeline() {
+		steps[s.Name] = s
+	}
+	for _, name := range []string{"index", "index-etsi"} {
+		s, ok := steps[name]
+		if !ok {
+			t.Fatalf("%s is not in the pipeline any more", name)
+		}
+		if !slices.Contains(s.Deps, "compact") {
+			t.Errorf("%s no longer depends on compact: a compaction after the index leaves the frozen index behind and the server refuses to serve it (deps: %v)", name, s.Deps)
+		}
+	}
+	if slices.Contains(steps["compact"].Deps, "index") {
+		t.Error("compact depends on index — the invariant is inverted")
 	}
 }
