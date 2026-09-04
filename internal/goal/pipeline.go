@@ -107,6 +107,12 @@ func Pipeline() []*Step {
 		stepSparse(corpusETSI()),
 		stepIndex(corpusETSI()),
 		stepSmoke(),
+		// The image is the LAST step, and it is a step rather than a separate
+		// entry point because it was the only output of this repository with no
+		// determinants: nothing could say whether what consumers pull was the
+		// corpus this machine had built. See pipeline_publish.go for the two
+		// failures that cost.
+		stepPublish(),
 	}
 }
 

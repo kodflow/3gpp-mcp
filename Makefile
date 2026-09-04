@@ -114,12 +114,27 @@ status: goal-bin ## Per-step state of the last run
 eta: goal-bin ## Per-step ETA before each step counts as finished, from measured durations
 	@$(GOAL_ENV); bash scripts/local/eta-steps.sh
 
-# PUBLISH IS LOCAL. The image used to be baked by two workflows that moved ~14 GB
-# per run; they are gone. `make image` cross-compiles the Linux artefacts here
-# (zig — no Docker, no WSL) and composes the OCI image with crane.
-publish: image ## Build the image from the corpus `make build` produced and push it to GHCR
+# PUBLISH IS LOCAL, and it is now a PIPELINE STEP. The image used to be baked by
+# two workflows that moved ~14 GB per run; they are gone, and the local script
+# that replaced them (`zig` — no Docker, no WSL) then spent its life OUTSIDE the
+# graph: no fingerprint, no declared inputs, no record of what it had pushed.
+# Nothing could answer "is the image on ghcr.io the corpus this machine built?".
+# Twice in two days the answer was no while every local gate was green — see
+# internal/goal/pipeline_publish.go for both.
+#
+# So `publish` is the last step of the pipeline, and this target is `make build`
+# under another name: bring everything up to date, then ship it. On a corpus
+# nothing has touched it does nothing at all.
+#
+# `-only publish` is deliberately NOT used here. --only skips dependency
+# checking, which is precisely how a corpus that never passed its gates would
+# get published.
+publish: build ## Bring everything up to date, then push the image (does nothing when it already matches)
 
-image: ## Build the full image locally and push it to GHCR (:latest)
+# image / image-local are the RAW script: no change detection, no gate ordering,
+# and nothing records what they pushed. They are for debugging the image build
+# itself — `make publish` is the supported path.
+image: ## Run build-image.sh directly, no change detection (for debugging the image build)
 	@test -s data/3gpp.duckdb || { echo "no corpus at data/3gpp.duckdb — run: make build"; exit 1; }
 	./scripts/local/build-image.sh
 
