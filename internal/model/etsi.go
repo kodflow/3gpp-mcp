@@ -40,27 +40,6 @@ func NormalizeEtsiID(raw string) (id string, ok bool) {
 	return id, true
 }
 
-// etsiNumberToken turns a canonical id into the deliver-archive number token:
-// "103 221-1" -> "10322101" (base digits + 2-digit zero-padded part), "103 280" ->
-// "103280" (no part). Returns (token, base6, ok); base6 ("103221") drives the
-// 100-range folder.
-func etsiNumberToken(id string) (token, base6 string, ok bool) {
-	m := reEtsiID.FindStringSubmatch(id)
-	if m == nil {
-		return "", "", false
-	}
-	base6 = m[1] + m[2] // "103" + "221" = "103221"
-	token = base6
-	if m[3] != "" {
-		p, err := strconv.Atoi(m[3])
-		if err != nil {
-			return "", "", false
-		}
-		token += fmt.Sprintf("%02d", p)
-	}
-	return token, base6, true
-}
-
 // EtsiDeliverURL builds the deterministic ETSI deliver-archive URL for a published
 // TS, e.g. ("103 221-1","1.21.1") ->
 // https://www.etsi.org/deliver/etsi_ts/103200_103299/10322101/01.21.01_60/ts_10322101v012101p.pdf
@@ -70,7 +49,39 @@ func etsiNumberToken(id string) (token, base6 string, ok bool) {
 // cite-the-pointer, never fabricate a version (mirrors the 3GPP unindexed fallback
 // in internal/mcp/server.go). Returns "" only if the id itself is not ETSI-shaped.
 func EtsiDeliverURL(id, version string) string {
-	token, base6, ok := etsiNumberToken(id)
+	return EtsiDeliverURLIn(EtsiTypeTS, id, version)
+}
+
+// The three /deliver document-type folders this project crawls. The folder is not
+// cosmetic: it selects the tree AND the file-name prefix, and the same number does
+// not exist in two of them — /deliver/etsi_ts/103100_103199/103101/ is a 404 while
+// /deliver/etsi_tr/103100_103199/103101/ is TR 103 101. Building a TR's URL under
+// etsi_ts, which is what a single hardcoded folder did, therefore does not return
+// the wrong document: it returns nothing, after five retries.
+const (
+	EtsiTypeTS = "etsi_ts"
+	EtsiTypeTR = "etsi_tr"
+	EtsiTypeEN = "etsi_en"
+)
+
+// EtsiDeliverURLIn builds the deterministic ETSI deliver-archive URL for a
+// published deliverable in a given document-type folder:
+//
+//	("etsi_ts","103 221-1","1.21.1") -> …/etsi_ts/103200_103299/10322101/01.21.01_60/ts_10322101v012101p.pdf
+//	("etsi_tr","103 101","1.1.1")    -> …/etsi_tr/103100_103199/103101/01.01.01_60/tr_103101v010101p.pdf
+//	("etsi_en","301 893","2.2.1")    -> …/etsi_en/301800_301899/301893/02.02.01_60/en_301893v020201p.pdf
+//
+// An unknown typeDir yields "" rather than a plausible-looking URL into a tree
+// that does not exist.
+func EtsiDeliverURLIn(typeDir, id, version string) string {
+	switch typeDir {
+	case EtsiTypeTS, EtsiTypeTR, EtsiTypeEN:
+	default:
+		return ""
+	}
+	filePrefix := strings.TrimPrefix(typeDir, "etsi_") // ts | tr | en
+
+	token, base6, ok := etsiArchiveToken(id)
 	if !ok {
 		return ""
 	}
@@ -80,7 +91,7 @@ func EtsiDeliverURL(id, version string) string {
 	}
 	floor = (floor / 100) * 100
 	rangeFolder := fmt.Sprintf("%06d_%06d", floor, floor+99)
-	base := "https://www.etsi.org/deliver/etsi_ts/" + rangeFolder + "/" + token
+	base := "https://www.etsi.org/deliver/" + typeDir + "/" + rangeFolder + "/" + token
 
 	maj, mnr, ed, vok := parseEtsiVersion(version)
 	if !vok {
@@ -88,7 +99,83 @@ func EtsiDeliverURL(id, version string) string {
 	}
 	verFolder := fmt.Sprintf("%02d.%02d.%02d_60", maj, mnr, ed)
 	verToken := fmt.Sprintf("%02d%02d%02d", maj, mnr, ed)
-	return fmt.Sprintf("%s/%s/ts_%sv%sp.pdf", base, verFolder, token, verToken)
+	return fmt.Sprintf("%s/%s/%s_%sv%sp.pdf", base, verFolder, filePrefix, token, verToken)
+}
+
+// reEtsiSpecID splits a CORPUS spec_id — the form the ETSI half of the store
+// holds, "ETSI TS 102 221" / "ETSI TR 103 101" / "ETSI EN 301 893" — into its
+// document type and its bare number. Distinct from reEtsiID, which recognises a
+// citation appearing inside 3GPP prose and is anchored on "1NN": ETSI EN numbers
+// are "3NN NNN", so the recogniser must keep refusing them while this parser must
+// accept them.
+var reEtsiSpecID = regexp.MustCompile(`^ETSI\s+(TS|TR|EN)\s+(\S.*)$`)
+
+// EtsiSpecURL builds the deliver-archive URL for a spec_id held in the ETSI half
+// of the corpus, e.g. ("ETSI TS 102 221","18.4.0") ->
+// https://www.etsi.org/deliver/etsi_ts/102200_102299/102221/18.04.00_60/ts_102221v180400p.pdf
+//
+// WHY THIS EXISTS. model.ArchiveURL reconstructs a 3GPP archive ZIP URL and
+// returns "" for anything that is not a 3GPP id — so every citation the ETSI half
+// produced carried an EMPTY url. The clause text was right, the version was right,
+// and there was no way to reach the document it came from: 2 994 221 clauses that
+// cite nothing a reader can open. "Cite or stay silent" (CLAUDE.md §1) is not
+// satisfied by a citation whose pointer is blank.
+//
+// Returns "" for a non-ETSI spec_id, so the caller can fall back to ArchiveURL,
+// and the deliver FOLDER when the version cannot be parsed — cite the pointer,
+// never fabricate a version.
+func EtsiSpecURL(specID, version string) string {
+	m := reEtsiSpecID.FindStringSubmatch(strings.TrimSpace(specID))
+	if m == nil {
+		return ""
+	}
+	typeDir := map[string]string{"TS": EtsiTypeTS, "TR": EtsiTypeTR, "EN": EtsiTypeEN}[m[1]]
+	return EtsiDeliverURLIn(typeDir, m[2], version)
+}
+
+// SpecURL is the one citation-URL entry point: the ETSI deliver archive for an
+// ETSI deliverable, the 3GPP archive for a 3GPP spec. Both halves are served from
+// one process, so a single call site cannot be allowed to know only one of them.
+func SpecURL(specID, version string) string {
+	if u := EtsiSpecURL(specID, version); u != "" {
+		return u
+	}
+	return ArchiveURL(specID, version)
+}
+
+// reEtsiArchiveID is the ARCHIVE-side id parser, deliberately looser than
+// reEtsiID: any 3-digit prefix, and any number of "-P" parts.
+//
+// reEtsiID is a RECOGNISER — it decides whether a string appearing in 3GPP clause
+// text is an ETSI citation — so it is anchored on "1NN" to keep it from claiming
+// arbitrary number pairs out of running prose. That constraint is right there and
+// wrong here: ETSI ENs are numbered 3NN NNN (EN 301 893, EN 300 328), so every
+// single EN in the /deliver archive parsed as "not ETSI-shaped" and got an EMPTY
+// url in the work list. Two parsers because there are genuinely two jobs; they are
+// next to each other so the difference stays visible.
+var reEtsiArchiveID = regexp.MustCompile(`^(?:ETSI\s+)?(?:T[SR]|EN\s+)?\s*(\d{3})\s*(\d{3})((?:-\d+)*)$`)
+
+// etsiArchiveToken turns an archive id into its deliver number token, the inverse
+// of etsicat.TokenToID: "103 221-1" -> "10322101", "301 893" -> "301893",
+// "103 192-6" -> "10319206". Multi-part ids chain their 2-digit parts.
+func etsiArchiveToken(id string) (token, base6 string, ok bool) {
+	m := reEtsiArchiveID.FindStringSubmatch(strings.TrimSpace(id))
+	if m == nil {
+		return "", "", false
+	}
+	base6 = m[1] + m[2]
+	token = base6
+	for _, part := range strings.Split(strings.TrimPrefix(m[3], "-"), "-") {
+		if part == "" {
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || p < 0 || p > 99 {
+			return "", "", false
+		}
+		token += fmt.Sprintf("%02d", p)
+	}
+	return token, base6, true
 }
 
 // ParseEtsiVersion splits an ETSI version "V1.21.1" / "1.21.1" into its three numeric

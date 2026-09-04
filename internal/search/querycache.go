@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
+	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
 // defaultQueryCacheSize is the entry cap when EMBED_QUERY_CACHE is unset. 512 short
@@ -115,4 +116,37 @@ func (c *cachingEmbedder) put(key string, vec []float32) {
 		c.order.Remove(back)
 		delete(c.items, back.Value.(*cacheEntry).key)
 	}
+}
+
+// EmbedBoth keeps the LRU in front of the combined path, so a hybrid query never
+// costs more than ONE forward pass whichever way it goes:
+//
+//	cache HIT  → the dense vector is free; only the sparse head runs (as before)
+//	cache MISS → one combined pass, and the dense half populates the cache
+//
+// Without this the decorator would hide EmbedBoth from the engine and a repeated
+// query would pay the model for a vector it already had — the combined path is a
+// speed-up on a miss and must not become a regression on a hit.
+//
+// ok is false when the base embedder has no combined path at all; the caller then
+// falls back to Embed + EmbedSparse.
+func (c *cachingEmbedder) EmbedBoth(ctx context.Context, text string) ([]float32, model.SparseVec, bool) {
+	dual, isDual := c.Embedder.(embed.DualEmbedder)
+	sp, isSparse := c.Embedder.(embed.SparseEmbedder)
+	if !isDual || !isSparse {
+		return nil, nil, false
+	}
+	if v, hit := c.get(text); hit {
+		svecs, err := sp.EmbedSparse(ctx, []string{text})
+		if err != nil || len(svecs) != 1 {
+			return nil, nil, false
+		}
+		return v, svecs[0], true
+	}
+	dense, sparse, ok := dual.EmbedBoth(ctx, text)
+	if !ok {
+		return nil, nil, false
+	}
+	c.put(text, dense)
+	return dense, sparse, true
 }

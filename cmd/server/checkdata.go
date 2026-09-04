@@ -39,6 +39,7 @@ func checkData(args []string) error {
 	requireEmbed := fs.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence)")
 	embedFloor := fs.String("embed-floor", "", "release floor for --require-embed-complete; empty = all releases")
 	requireSparse := fs.Bool("require-sparse", false, "fail unless clause_sparse is populated and sparse_model matches this build's sparse identity")
+	requireETSI := fs.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, every one of them carries a vector, and its embedding identity equals --db's")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -103,9 +104,15 @@ func checkData(args []string) error {
 	sparseOK, sparseModel, wantSparse := true, "", ""
 	if *requireSparse {
 		_ = st.LoadSparse(ctx)
-		wantSparse = embed.SparseModelID() // "" when this build has no sparse head
+		// "" when the ACTIVE registry model has no sparse head — which the default
+		// entry (bge-m3, dense-only) does not. Treating that as "skip the identity
+		// comparison" left --require-sparse meaning nothing more than "clause_sparse
+		// is non-empty", so a layer scored against another model's vocabulary passed.
+		// A gate that cannot compare must fail, not pass; see cmd/validate for the
+		// measurement.
+		wantSparse = embed.SparseModelID()
 		sparseModel = st.GetMeta(ctx, "sparse_model")
-		sparseOK = st.SparseAvailable() && (wantSparse == "" || sparseModel == wantSparse)
+		sparseOK = wantSparse != "" && st.SparseAvailable() && sparseModel == wantSparse
 	}
 
 	// Report the full picture first (so a failing build log shows every signal at
@@ -127,8 +134,71 @@ func checkData(args []string) error {
 			"the embed campaign has not converged; do not promote this data layer", nullAtFloor, *embedFloor)
 	}
 	if *requireSparse && !sparseOK {
+		if wantSparse == "" {
+			return fmt.Errorf("--require-sparse was asked of a build that resolves NO sparse identity "+
+				"(the active registry model has no sparse head): sparse_available=%v sparse_model=%q. "+
+				"The layer cannot be checked — set EMBED_MODEL=bge-m3-sparse or point "+
+				"EMBED_MODELS_CONFIG at the baked registry", st.SparseAvailable(), sparseModel)
+		}
 		return fmt.Errorf("sparse incomplete/stale: sparse_available=%v sparse_model=%q expected=%q — "+
 			"run the sparse campaign to convergence before promoting", st.SparseAvailable(), sparseModel, wantSparse)
+	}
+	// The OTHER half of the corpus. The image serves both stores side by side and
+	// internal/mcp recomputes semantic availability PER STORE, so an ETSI corpus at
+	// a stale embedding identity is answered lexically while the 3GPP one is not —
+	// no error, no log line, and a data layer that passes every other check here.
+	// Convergence is asserted too: ETSI has no release floor, so a clause without a
+	// vector is an interrupted pass, not a deliberate omission.
+	if *requireETSI != "" {
+		etsi, eerr := store.OpenReadOnly(*requireETSI)
+		if eerr != nil {
+			return fmt.Errorf("open the ETSI corpus %s: %w", *requireETSI, eerr)
+		}
+		// Convergence is counted over clauses WITH TEXT. A quarter of the ETSI
+		// corpus is headings with an empty body — PDF extraction reads numbered
+		// figure captions and sequence-diagram steps as clauses — and the embedder
+		// rightly produces nothing for them. Measured: 354 of 1 396 empty, all with
+		// a NULL embedding, and zero clauses that have text and no vector.
+		var withText, vectors int64
+		_ = etsi.QueryRowContext(ctx, `SELECT count(*) FROM clauses WHERE length(text) > 0`).Scan(&withText)
+		_ = etsi.QueryRowContext(ctx,
+			`SELECT count(*) FROM clauses WHERE length(text) > 0 AND embedding IS NOT NULL`).Scan(&vectors)
+		etsiModel := etsi.GetMeta(ctx, "embedding_model")
+		mainModel := st.GetMeta(ctx, "embedding_model")
+		// The index, asked the way the server asks it. LoadVSS is what
+		// internal/mcp calls per store, and it refuses an index whose
+		// schema_meta.embedding_count disagrees with the vectors present — the
+		// state a widened ETSI crawl leaves behind when `index-etsi` was recorded
+		// VALID against the old, small corpus. Vectors and a matching identity are
+		// both true in that state; the half is still served lexically.
+		vssErr := etsi.LoadVSS(ctx)
+		serveUsable := vssErr == nil && etsi.VSSAvailable()
+		etsiHNSW := etsi.GetMeta(ctx, "hnsw_state")
+		_ = etsi.Close()
+		fmt.Printf("check-data: etsi=%s clauses_with_text=%d vectors=%d embedding_model=%q hnsw_state=%q serve_usable=%v\n",
+			*requireETSI, withText, vectors, etsiModel, etsiHNSW, serveUsable)
+		switch {
+		case withText == 0:
+			return fmt.Errorf("the ETSI corpus %s holds no clause with any text", *requireETSI)
+		case vectors != withText:
+			return fmt.Errorf("the ETSI corpus is %d clause(s) short of a vector — the embed pass has not converged",
+				withText-vectors)
+		case etsiModel == "":
+			// An UNSTAMPED corpus must not pass by matching another unstamped one.
+			// Two empty strings compare equal, so a pair of corpora that both lost
+			// their embedding_model would satisfy the identity check below while
+			// having no identity at all — the one thing this flag exists to compare.
+			// cmd/validate already rejects it; this restores the parity.
+			return fmt.Errorf("the ETSI corpus carries no embedding_model — it has an identity to state and does not state it")
+		case etsiModel != mainModel:
+			return fmt.Errorf("the ETSI corpus was embedded with %q but the 3GPP one with %q — "+
+				"the serve-time coherence guard would disable vector search on the ETSI half and answer it lexically, silently",
+				etsiModel, mainModel)
+		case !serveUsable:
+			return fmt.Errorf("the ETSI corpus carries %d vector(s) the server cannot use (hnsw_state=%q): %v — "+
+				"rebuild the ETSI index (goal run -only compact,index-etsi) before promoting",
+				vectors, etsiHNSW, vssErr)
+		}
 	}
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil

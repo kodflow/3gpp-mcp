@@ -97,9 +97,10 @@ type Step struct {
 	// interpretation of an input). Bumping it forces exactly one replay.
 	Version int
 
-	// Deps are the names of steps that must be materialised first. Their
-	// fingerprints fold into this step's fingerprint, which is what makes
-	// invalidation transitive without any extra bookkeeping.
+	// Deps are the names of steps that must be materialised first. A DATA
+	// dependency's fingerprint folds into this step's fingerprint, which is what
+	// makes invalidation transitive without any extra bookkeeping. A Tool
+	// dependency does not — see Tool for why that separation is load-bearing.
 	Deps []string
 
 	// AnyDeps are ALTERNATIVE producers of the same artefact: at least one must
@@ -155,6 +156,25 @@ type Step struct {
 	// Outputs are the paths that must exist for a success record to be trusted.
 	Outputs func(ctx *Ctx) []string
 
+	// OutputsComplete asserts that the declared Outputs are this step's ENTIRE
+	// observable effect. It licenses one inference and only one: if every output
+	// comes back identical to the last successful run, the step changed nothing,
+	// so nothing downstream needs replaying.
+	//
+	// It is opt-in because the assertion is false for most of this pipeline, and
+	// silently so. `embed` declares its ledger and then writes vectors into the
+	// DuckDB; `fetch` declares nothing at all and fills data/sources. Inferring
+	// "unchanged" from their declarations would skip an index over data that did
+	// move — the exact shape of every bug this repository has spent weeks on, and
+	// the reason TestInvalidationIsTransitiveAndMinimal is written the way it is.
+	//
+	// Set it only on a step you have READ and whose writes you can enumerate. It is
+	// worth setting on the enumerators: discover rewrites its work list on every
+	// run, so its mtime always moved, so an unchanged 3GPP delta still replayed
+	// fetch — and an unchanged ETSI catalogue still replayed hours of PDF
+	// conversion over a corpus that had since been converted and compacted.
+	OutputsComplete bool
+
 	// Validate is a CHEAP check that the outputs are real, not merely present —
 	// a DuckDB that opens, a JSONL whose last line parses, a non-empty index. It
 	// runs on every plan, including for steps that would otherwise be skipped,
@@ -176,6 +196,27 @@ type Step struct {
 	// re-download the corpus or re-run the GPU.
 	Toolchain bool
 
+	// Tool marks a step that PRODUCES BINARIES rather than data. Depending on one
+	// is an availability constraint — "the executable I am about to launch must be
+	// current" — not a provenance one, so a Tool dependency orders this step and
+	// is force-built for it, but contributes NOTHING to its fingerprint.
+	//
+	// That distinction is the difference between a pipeline you can re-run and one
+	// nobody dares re-run. Every data step already names, in its own Impl, the
+	// sources of the tool it invokes: `ingest` names rust/parse and rust/ingest,
+	// `validate` names cmd/validate, `index` names cmd/freeze-hnsw. Folding
+	// build-go's fingerprint in on top of that re-counts the ENTIRE Go tree at
+	// maximum coarseness, so editing any file under cmd/ or internal/ invalidated
+	// seed, and through it discover, fetch, ingest, merge, embed and the rest —
+	// a 22 GB corpus and hours of GPU replayed for a one-line edit that could not
+	// reach them. It also contradicted this package's own stated contract, which
+	// promises in as many words that "a change to cmd/server never invalidates
+	// the embeddings".
+	//
+	// This is the same reasoning that already keeps Toolchain off the data steps,
+	// applied to the edge instead of the compiler.
+	Tool bool
+
 	// Optional marks a step whose failure does not fail the goal. It must be an
 	// explicit, reviewed property — never an inline "|| true" that hides a real
 	// failure. A failed optional step is still recorded as failed and reported.
@@ -188,12 +229,23 @@ type Step struct {
 // Record is what a step persists. It is the only thing a fresh agent, with no
 // memory of any previous session, reads to decide what is already valid.
 type Record struct {
-	Step        string            `json:"step"`
-	StepVersion int               `json:"step_version"`
-	Status      Status            `json:"status"`
-	StartedAt   time.Time         `json:"started_at"`
-	FinishedAt  time.Time         `json:"finished_at,omitempty"`
-	Fingerprint string            `json:"fingerprint"`
+	Step        string    `json:"step"`
+	StepVersion int       `json:"step_version"`
+	Status      Status    `json:"status"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at,omitempty"`
+	Fingerprint string    `json:"fingerprint"`
+	// Provenance is what DEPENDANTS fold in, and it is deliberately not always
+	// the fingerprint. The fingerprint answers "under what configuration did this
+	// step last succeed?", which is the right question for replaying the step
+	// itself. Dependants are asking a different one: "did the artefact I stand on
+	// change?". A run that declined, or that ran and left every declared output
+	// byte-identical, changed nothing — so it must publish what it published
+	// before, or the whole downstream is replayed to reproduce identical bytes.
+	//
+	// Empty means "same as Fingerprint", which is what every record written before
+	// this field existed says — so introducing it invalidated nothing.
+	Provenance  string            `json:"provenance,omitempty"`
 	Deps        map[string]string `json:"dependencies,omitempty"`
 	Inputs      map[string]string `json:"inputs,omitempty"`
 	Outputs     map[string]string `json:"outputs,omitempty"`
@@ -223,6 +275,17 @@ type Decision struct {
 	Reason      string
 	Fingerprint string
 	Previous    *Record
+	// Conditional marks a RUN that is a PREDICTION, not a verdict: the only thing
+	// against this step is that a dependency is scheduled to re-run, and whether
+	// that dependency actually changes anything is unknowable until it has. Plan
+	// cannot resolve it; Execute does, by re-deciding each step against real state
+	// once its dependencies have finished.
+	//
+	// Printing these as plain RUN is how `make plan` came to announce "15 heavy
+	// steps" — a full corpus rebuild — for a run that would do none of them. A plan
+	// nobody believes is a plan nobody reads, and the habit it teaches is to reach
+	// for --only, which is the trap two other fixes here exist to close.
+	Conditional bool
 }
 
 // Ctx carries the paths and resolved configuration a step needs. It is passed to

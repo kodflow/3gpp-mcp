@@ -1,5 +1,15 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
+# NO LONGER BUILT — kept as the reference specification of the data layer.
+#
+# The image 3gpp-data existed to be inherited (`FROM`) by 3gpp-mcp, so that a
+# code-only rebuild in CI did not re-push a fresh ~14 GB blob. The workflow that
+# baked it is gone, and so is the reason: scripts/local/build-image.sh packs the
+# corpus with a fixed timestamp, so an unchanged corpus produces a byte-identical
+# layer that the registry already has. One image, nothing re-uploaded.
+#
+# See docs/automation/data-image.md.
+# =============================================================================
 # 3gpp-data — the corpus-data base image: the fused corpus DuckDB (lexical +
 # fp16 vectors, identity-overlaid + compacted) and the BGE-M3 fp16 embedder,
 # baked by .github/workflows/corpus-data-image.yml.

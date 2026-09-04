@@ -35,7 +35,7 @@ mod hash;
 mod model;
 mod window;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -226,7 +226,9 @@ struct Pending {
 /// text was already embedded under another chunk_id, instead of re-embedding it).
 #[derive(Default)]
 struct Resume {
-    done: HashSet<u64>,
+    /// chunk_id -> the CONTENT HASH the ledger holds a vector for. Not a set of ids:
+    /// see the skip in the work-list loop for why an id alone is not enough.
+    done: std::collections::HashMap<u64, String>,
     by_hash: std::collections::HashMap<String, Vec<f32>>,
 }
 
@@ -297,6 +299,9 @@ fn main() -> Result<()> {
     let mut hashes: Vec<String> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let mut to_copy: Vec<(u64, String)> = Vec::new();
+    // Counted, and reported loudly below: a ledger entry whose id matches but whose
+    // hash does not is the signature of a REBUILT corpus reusing the same numbers.
+    let mut stale_ids: usize = 0;
     {
         let f =
             File::open(&args.r#in).with_context(|| format!("open work-list {:?}", args.r#in))?;
@@ -306,10 +311,39 @@ fn main() -> Result<()> {
                 continue;
             }
             let it: WorkItem = serde_json::from_str(&line).context("parse work-list line")?;
-            if resume.done.contains(&it.chunk_id) || it.text.trim().is_empty() {
+            if it.text.trim().is_empty() {
                 continue;
             }
             let h = hash::clause_hash(&it.heading, &it.text, &args.embed_identity);
+            // RESUMING ON THE ID ALONE ATTACHES A VECTOR TO THE WRONG TEXT.
+            //
+            // chunk_ids are assigned sequentially at ingest (offset = max_chunk_id), so
+            // they describe a POSITION in one build, not an identity. A corpus rebuilt
+            // from scratch — a different file order, or one file yielding a different
+            // number of clauses — reuses the same numbers for different clauses.
+            //
+            // Measured 2026-09-02 between two ETSI builds of the SAME 11 821 documents:
+            //
+            //     chunk_id 138      old: ETSI TS 101 671 v3.15.1 §10
+            //                       new: ETSI EN 300 113-1 v1.3.1 §4
+            //     chunk_id 2500000  old: ETSI TS 102 241 v17.1.0 §6
+            //                       new: ETSI TS 102 384 v6.5.0 §27.22.4.8.2.1
+            //
+            // 1 262 127 clauses were about to be skipped on that basis, and
+            // embed-io --import joins the ledger to the corpus on chunk_id alone — so
+            // each would have received a vector computed from an unrelated clause. Every
+            // gate passes that corpus: null_at_floor is 0, clauses_with_text equals
+            // vectors, the identities agree, the HNSW index builds. Only the answers are
+            // wrong.
+            //
+            // So skip only when the ledger's entry for this id was computed from THIS
+            // text. A ledger line with no hash (a truncated write, or an id-only line)
+            // cannot be verified and is not trusted: that costs GPU, never correctness.
+            match resume.done.get(&it.chunk_id) {
+                Some(d) if *d == h => continue,
+                Some(_) => stale_ids += 1,
+                None => {}
+            }
             // Multi-GPU: this process only owns its shard of the work-list. Sharding by the
             // text-derived hash keeps every copy of a clause in the SAME shard, so the dedup
             // is never split across GPUs.
@@ -338,6 +372,11 @@ fn main() -> Result<()> {
         .open(&args.out)
         .with_context(|| format!("open output {:?}", args.out))?;
     let mut w = BufWriter::new(out);
+    if stale_ids > 0 {
+        eprintln!(
+            "embedder: {stale_ids} ledger entr(ies) matched a chunk_id but NOT its text: this corpus was rebuilt and the ids no longer mean the same clause; they are being re-derived, not reused"
+        );
+    }
     if !to_copy.is_empty() {
         for (chunk_id, h) in &to_copy {
             let vec = resume.by_hash.get(h).expect("hash present").clone();
@@ -954,11 +993,29 @@ fn dedup_by_ids<'a>(rows: impl Iterator<Item = &'a [i64]>) -> Vec<Vec<usize>> {
 /// load_done scans the output ledger plus any extra `--resume-from` ledgers (the
 /// multi-GPU launcher passes the merged ledger so every per-GPU process skips what any
 /// shard already embedded). A missing file is ignored (fresh run).
+/// ONLY `--out` MAKES A CLAUSE DONE. `--resume-from` is a VECTOR CACHE.
+///
+/// The two were folded together, and the difference is the whole point: the
+/// pipeline imports `--out` and nothing else. A clause skipped because some OTHER
+/// ledger already holds its (id, hash) therefore never reaches the corpus at all.
+///
+/// Measured 2026-09-02, when the embed step first archived a ledger from an earlier
+/// build and handed it back as a cache: of 1 998 710 clauses, 1 268 594 were written
+/// and 730 116 were skipped because the archive happened to hold the same id with
+/// the same text. Those 730 116 would have been left without a vector — caught by
+/// the step's own NullAtFloor check, but only after a full GPU pass.
+///
+/// So an entry found only in a cache is a COPY, not a skip: it costs no GPU and it
+/// lands in `--out` where the import will find it.
 fn load_done(out: &Path, extra: &[PathBuf]) -> Result<Resume> {
     let mut r = Resume::default();
     scan_ledger(out, &mut r)?;
     for p in extra {
-        scan_ledger(p, &mut r)?;
+        let mut cache = Resume::default();
+        scan_ledger(p, &mut cache)?;
+        for (h, v) in cache.by_hash {
+            r.by_hash.entry(h).or_insert(v);
+        }
     }
     Ok(r)
 }
@@ -977,13 +1034,15 @@ fn scan_ledger(path: &Path, r: &mut Resume) -> Result<()> {
         }
         // Parse leniently so a truncated final line (killed mid-write) never aborts resume.
         if let Ok(rec) = serde_json::from_str::<VecRecord>(&line) {
-            r.done.insert(rec.chunk_id);
+            r.done.insert(rec.chunk_id, rec.hash.clone());
             if !rec.hash.is_empty() && rec.vec.len() == DENSE_DIM {
                 r.by_hash.entry(rec.hash).or_insert(rec.vec);
             }
         } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             if let Some(id) = v.get("chunk_id").and_then(|x| x.as_u64()) {
-                r.done.insert(id);
+                // No hash on this line, so it can never satisfy the skip test — which
+                // is the intent: an entry we cannot verify must not suppress work.
+                r.done.entry(id).or_default();
             }
         }
     }
@@ -992,7 +1051,7 @@ fn scan_ledger(path: &Path, r: &mut Resume) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedup_by_ids, is_oom, load_done, shard_of, DENSE_DIM};
+    use super::{dedup_by_ids, is_oom, load_done, shard_of, Resume, DENSE_DIM};
     use std::io::Write;
 
     #[test]
@@ -1013,6 +1072,92 @@ mod tests {
             seen[shard_of(&format!("{i:016x}"), 8) as usize] = true;
         }
         assert!(seen.iter().all(|&s| s), "all 8 shards should receive work");
+    }
+
+    /// THE DEFECT THIS PINS, caught before it wrote anything.
+    ///
+    /// chunk_ids are assigned sequentially at ingest (offset = max_chunk_id), so they
+    /// describe a POSITION in one build, not an identity. Rebuilding a corpus from
+    /// scratch reuses the same numbers for different clauses. Measured between two
+    /// ETSI builds of the SAME 11 821 documents: chunk_id 138 was
+    /// "ETSI TS 101 671 v3.15.1 §10" in one and "ETSI EN 300 113-1 v1.3.1 §4" in the
+    /// other; 2 500 000 likewise. 1 262 127 clauses were about to be skipped on the id
+    /// alone, and embed-io --import joins the ledger to the corpus on chunk_id — so each
+    /// would have taken a vector computed from an unrelated clause, with every gate
+    /// green (null_at_floor 0, clauses_with_text == vectors, identities agreeing, HNSW
+    /// built). Only the answers would have been wrong.
+    ///
+    /// The resume decision is therefore: same id AND same content hash.
+    #[test]
+    fn a_reused_chunk_id_with_different_text_is_not_resumed() {
+        let mut r = Resume::default();
+        r.done.insert(7, "hash-of-the-old-text".to_string());
+        r.done.insert(8, "unchanged".to_string());
+        r.done.insert(9, String::new()); // an id-only ledger line: unverifiable
+
+        let skip = |id: u64, h: &str| matches!(r.done.get(&id), Some(d) if d == h);
+
+        assert!(
+            !skip(7, "hash-of-the-new-text"),
+            "same id, different text: the ledger's vector belongs to another clause"
+        );
+        assert!(
+            skip(8, "unchanged"),
+            "same id AND same text: genuinely done"
+        );
+        assert!(
+            !skip(9, "anything"),
+            "an entry with no hash cannot be verified and must not suppress work"
+        );
+        assert!(
+            !skip(10, "anything"),
+            "an id the ledger never saw is not done"
+        );
+    }
+
+    /// ONLY --out MAKES A CLAUSE DONE. --resume-from is a vector CACHE, and the
+    /// pipeline imports --out alone: a clause skipped because another ledger held its
+    /// (id, hash) would never reach the corpus. Measured on the real run before this
+    /// was separated: 730 116 of 1 998 710 clauses were skipped that way.
+    #[test]
+    fn a_cache_ledger_supplies_vectors_but_never_marks_a_clause_done() {
+        let dir = std::env::temp_dir();
+        let out = dir.join(format!("embedder-out-{}.jsonl", std::process::id()));
+        let cache = dir.join(format!("embedder-cache-{}.jsonl", std::process::id()));
+        let full = vec![0.0f32; DENSE_DIM];
+        {
+            let mut f = std::fs::File::create(&out).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"chunk_id": 1, "hash": "h1", "vec": full})
+            )
+            .unwrap();
+            let mut g = std::fs::File::create(&cache).unwrap();
+            writeln!(
+                g,
+                "{}",
+                serde_json::json!({"chunk_id": 2, "hash": "h2", "vec": full})
+            )
+            .unwrap();
+        }
+        let r = load_done(&out, &[cache.clone()]).unwrap();
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_file(&cache).ok();
+
+        assert_eq!(
+            r.done.get(&1).map(String::as_str),
+            Some("h1"),
+            "an entry in --out is genuinely done"
+        );
+        assert!(
+            !r.done.contains_key(&2),
+            "an entry that exists only in a CACHE must not mark the clause done — its              vector is not in --out and the import would never see it"
+        );
+        assert!(
+            r.by_hash.contains_key("h2"),
+            "the cache must still supply the vector, so the copy costs no GPU"
+        );
     }
 
     #[test]
@@ -1041,7 +1186,12 @@ mod tests {
         let r = load_done(&path, &[]).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert!(r.done.contains(&1) && r.done.contains(&2) && r.done.contains(&3));
+        // done is keyed by chunk_id and VALUED by the content hash the ledger holds a
+        // vector for; a line with no hash records an empty one, which can never satisfy
+        // the skip test.
+        assert_eq!(r.done.get(&1).map(String::as_str), Some("h1"));
+        assert_eq!(r.done.get(&2).map(String::as_str), Some("h2"));
+        assert_eq!(r.done.get(&3).map(String::as_str), Some(""));
         // Only the full-dim vector is cached for copy-dedup.
         assert!(
             r.by_hash.contains_key("h1"),

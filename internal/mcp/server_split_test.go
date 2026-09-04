@@ -89,3 +89,85 @@ func TestSplitETSIFederation(t *testing.T) {
 		t.Errorf("list_specs union: 3gpp=%v etsi=%v (want both)", have3gpp, haveEtsi)
 	}
 }
+
+// TestETSISearchFindsATRByID is the regression test for a filter that answered a
+// question the caller had already answered.
+//
+// The ETSI half's unset spec_type means "the normative types" (TS + EN), because
+// defaulting to the literal "TS" hid 56% of that catalogue. But a spec_id PINS the
+// document: asking for "ETSI TR 103 101" with no spec_type used to run the
+// normative default, match neither type, and return NOTHING for a deliverable the
+// caller had named.
+func TestETSISearchFindsATRByID(t *testing.T) {
+	ctx := context.Background()
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.UpsertSpec(model.Spec{SpecID: "33.128", Series: "33", DocType: "TS"})
+	_ = st.UpsertVersion(model.SpecVersion{SpecID: "33.128", Release: "Rel-19", Version: "19.6.0"})
+	_ = st.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "33.128", Release: "Rel-19", Version: "19.6.0", ClausePath: "6.1", Heading: "x", Text: "transient voltages"},
+	})
+
+	etsi, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = etsi.Close() })
+	// One of each ETSI type, so the default's effect is visible.
+	for _, s := range []struct{ id, dt string }{
+		{"ETSI TR 103 101", "TR"},
+		{"ETSI EN 301 893", "EN"},
+		{"ETSI TS 103 280", "TS"},
+	} {
+		_ = etsi.UpsertSpec(model.Spec{SpecID: s.id, Series: "ET", DocType: s.dt})
+		_ = etsi.UpsertVersion(model.SpecVersion{SpecID: s.id, Release: "ETSI", Version: "1.1.1"})
+	}
+	_ = etsi.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "ETSI TR 103 101", Release: "ETSI", Version: "1.1.1", ClausePath: "1", Heading: "Scope", Text: "transient voltages at interface A"},
+		{ChunkID: 2, SpecID: "ETSI EN 301 893", Release: "ETSI", Version: "1.1.1", ClausePath: "1", Heading: "Scope", Text: "transient voltages in the 5 GHz band"},
+		{ChunkID: 3, SpecID: "ETSI TS 103 280", Release: "ETSI", Version: "1.1.1", ClausePath: "1", Heading: "Scope", Text: "transient voltages dictionary"},
+	})
+
+	srv, _ := New(st, "test", "", nil, etsi)
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ir mcpgo.InitializeRequest
+	ir.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	ir.Params.ClientInfo = mcpgo.Implementation{Name: "test", Version: "1"}
+	if _, err := c.Initialize(ctx, ir); err != nil {
+		t.Fatal(err)
+	}
+
+	// A named TR must answer, with no spec_type given.
+	got := call(t, c, ctx, "search_spec", map[string]any{
+		"query": "transient voltages", "spec_id": "ETSI TR 103 101",
+	})
+	if n, _ := got["count"].(float64); n < 1 {
+		t.Errorf("search_spec(spec_id=ETSI TR 103 101) found nothing — the type default overrode an explicit id")
+	}
+
+	// And an unqualified search must reach the EN, which the old literal-"TS"
+	// default filtered away.
+	got = call(t, c, ctx, "search_spec", map[string]any{"query": "transient voltages", "top_k": 20})
+	found := false
+	if hits, ok := got["hits"].([]any); ok {
+		for _, h := range hits {
+			if m, ok := h.(map[string]any); ok && m["spec_id"] == "ETSI EN 301 893" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("an unqualified search did not reach the ETSI EN; hits=%v", got["hits"])
+	}
+}

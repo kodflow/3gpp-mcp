@@ -104,7 +104,7 @@ func (c Clause) Cite() Citation {
 		Release: c.Release,
 		Version: c.Version,
 		Clause:  c.ClausePath,
-		URL:     ArchiveURL(c.SpecID, c.Version),
+		URL:     SpecURL(c.SpecID, c.Version),
 		Stable:  IsStableVersion(c.Version),
 	}
 }

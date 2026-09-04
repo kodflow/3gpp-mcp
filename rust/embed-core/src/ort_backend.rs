@@ -370,3 +370,113 @@ fn embed_sparse_batch_res(texts: &[&str], batch: usize) -> Result<Vec<Option<Vec
     }
     Ok(out)
 }
+
+/// embed_both_one runs ONE forward pass and returns BOTH heads.
+///
+/// A hybrid query used to cost two full passes of the transformer over the same
+/// text: embed_one for the dense vector and embed_sparse_one for the learned
+/// lexical weights, each with its own `session.run`. ONNX Runtime computes the
+/// shared encoder either way — asking for one output does not skip the other's
+/// compute — so the second pass bought nothing. Measured on this machine, a
+/// query costs ~166 ms for the pair and the model load is a startup cost, so the
+/// redundant pass is roughly half the latency of every non-lexical search.
+///
+/// Returns None, and the caller falls back to the two separate calls, when:
+///   - the model has no sparse head (a dense-only export), or
+///   - the encoding needs MORE THAN ONE sparse window.
+///
+/// That second condition is the important one. The two paths window differently:
+/// the dense side truncates at MAX_TOKENS while the sparse side chunks at
+/// SPARSE_MAX_SEQ and merges by max weight. Producing both from one pass is only
+/// EQUIVALENT while the text fits a single sparse window, so the fast path is
+/// gated on exactly that rather than on an assumption about query length. A query
+/// long enough to need windowing is not the case this exists for, and it still
+/// gets the correct answer, from the old path.
+pub fn embed_both_one(text: &str) -> Option<([f32; DENSE_DIM], Vec<(u32, f32)>)> {
+    match embed_both_res(text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("embed-core: combined embed failed: {e:#}");
+            None
+        }
+    }
+}
+
+fn embed_both_res(text: &str) -> Result<Option<([f32; DENSE_DIM], Vec<(u32, f32)>)>> {
+    let m = model().as_ref().map_err(|e| anyhow!("model load: {e}"))?;
+    let Some(sparse_out) = m.sparse_output.as_deref() else {
+        return Ok(None); // dense-only export: nothing to combine
+    };
+    let enc = m
+        .tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let ids: Vec<u32> = enc.get_ids().to_vec();
+    if ids.is_empty() || ids.len() > SPARSE_MAX_SEQ {
+        return Ok(None); // empty, or long enough that the two paths would diverge
+    }
+
+    let seq = ids.len();
+    let mut id_arr = Array2::<i64>::zeros((1, seq));
+    let mut mask = Array2::<i64>::zeros((1, seq));
+    for (j, &id) in ids.iter().enumerate() {
+        id_arr[[0, j]] = i64::from(id);
+        mask[[0, j]] = 1;
+    }
+    let mut inputs = ort::inputs![
+        "input_ids" => Tensor::from_array(id_arr)?,
+        "attention_mask" => Tensor::from_array(mask)?,
+    ]?;
+    if m.needs_token_type {
+        inputs.push((
+            "token_type_ids".into(),
+            Tensor::from_array(Array2::<i64>::zeros((1, seq)))?.into(),
+        ));
+    }
+
+    let outputs = m.session.run(inputs)?;
+
+    // Dense, extracted exactly as embed_one_res does.
+    let view = outputs[m.dense_output.as_str()].try_extract_tensor::<f32>()?;
+    let shape = view.shape().to_vec();
+    let mut row: Vec<f32> = match shape.len() {
+        3 => view
+            .into_dimensionality::<Ix3>()?
+            .index_axis(Axis(0), 0)
+            .index_axis(Axis(0), 0)
+            .to_vec(),
+        2 => view
+            .into_dimensionality::<Ix2>()?
+            .index_axis(Axis(0), 0)
+            .to_vec(),
+        n => return Err(anyhow!("unexpected output rank {n} (shape {shape:?})")),
+    };
+    l2_normalize(&mut row);
+    if row.len() < DENSE_DIM {
+        return Err(anyhow!("output dim {} < {DENSE_DIM}", row.len()));
+    }
+    let mut dense = [0f32; DENSE_DIM];
+    dense.copy_from_slice(&row[..DENSE_DIM]);
+
+    // Sparse, extracted exactly as embed_sparse_res does for a single window.
+    let special = |id: u32| matches!(id, 0 | 1 | 2 | 3);
+    let sview = outputs[sparse_out].try_extract_tensor::<f32>()?;
+    let w = sview.into_dimensionality::<Ix2>()?;
+    let mut merged: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for (j, &id) in ids.iter().enumerate() {
+        if special(id) {
+            continue;
+        }
+        let weight = w[[0, j]];
+        if weight <= 0.0 {
+            continue;
+        }
+        let e = merged.entry(id).or_insert(0.0);
+        if weight > *e {
+            *e = weight;
+        }
+    }
+    let mut sparse: Vec<(u32, f32)> = merged.into_iter().collect();
+    sparse.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(Some((dense, sparse)))
+}

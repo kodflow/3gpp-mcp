@@ -9,7 +9,26 @@ BUILD_DIR := bin
 
 ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 
-.PHONY: all build build-bin plan steps status publish build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+# ---------------------------------------------------------------------------
+# The orchestrator, and the two rules that keep it honest. Defined ONCE, here,
+# and reused by mk/local.mk — two copies of this drifted apart before, and the
+# copy that lost was the one people actually typed.
+#
+# GOAL_ENV: every goal target sources the toolchain prelude. It is not optional
+# and it is not the caller's job to remember. Without it `go` is not on PATH, the
+# `toolchain` step fails its validation, and because that step is upstream of
+# everything the plan turns into "26 steps, 15 heavy" — a full re-download of
+# 20 163 spec versions, offered as if it were a rebuild. `make build` must not
+# have a mode where forgetting one `source` costs a day.
+#
+# GOAL: the .exe suffix is load-bearing on Windows. The old recipes guarded with
+# `test -x .local/bin/goal`, which matched a FOUR-DAY-OLD extensionless leftover
+# and skipped the build, so `make build` ran an orchestrator that predated the
+# fixes it was supposed to apply.
+GOAL_ENV := . scripts/local/toolchain-env.sh
+GOAL     := .local/bin/goal$(if $(filter Windows_NT,$(OS)),.exe,)
+
+.PHONY: all build build-bin goal-bin plan steps status eta publish prove build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build EVERYTHING (the corpus pipeline)
 
@@ -24,19 +43,38 @@ all: build ## Build EVERYTHING (the corpus pipeline)
 # keyed by chunk_id. A killed run continues where it stopped. That is what makes
 # `make build` safe to just re-run.
 #
-# ONE WARNING WORTH THE LINE. `goal run` with no -only will re-run `seed`, which
-# cascades discover/fetch/ingest/merge and re-downloads 20 163 spec versions from
-# 3gpp.org. That is correct from a clean checkout and expensive on a machine that
-# already holds the corpus. `make plan` prints what it intends to do, and why, so
-# you find that out before it starts rather than after.
+# WHAT "ONLY WHAT CHANGED" MEANS, PRECISELY — because the honest version of this
+# paragraph used to be a warning that `make build` would re-download 20 163 spec
+# versions on a machine that already held them.
+#
+#   - A step replays when ITS OWN determinants move: the sources it names in Impl,
+#     the data it declares as Inputs, its configuration, its declared Version.
+#   - A step replays when a DATA dependency actually produced something different.
+#     "Different" is measured on what the dependency emitted, not on the fact that
+#     it ran: a step that declined, or that rewrote its output identically, leaves
+#     everything behind it alone.
+#   - A step does NOT replay because a BINARY it launches was relinked. Build steps
+#     are tools, not provenance. Editing an orchestration file rebuilds `goal` and
+#     stops there; it does not re-download the corpus and it does not re-run the
+#     GPU.
+#
+# `make plan` prints the decision and the reason for every step, and changes
+# nothing — so you find out what a run intends before it starts, not after.
 
-build: ## Build EVERYTHING: binaries, corpus, vectors, sparse, compaction, index, validation
-	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
-	.local/bin/goal run
+# goal-bin ALWAYS rebuilds. It is seconds, and the alternative is the failure
+# this repository hit five times with five different binaries: a corrected source
+# on disk, a stale executable next to it, and a run that reports success while
+# doing the old thing. A conditional guard here is how the orchestrator ITSELF
+# joined that list.
+goal-bin: ## (re)build the pipeline orchestrator — always, never conditionally
+	@set -e; $(GOAL_ENV); mkdir -p .local/bin; \
+	  go build $${GOTAGS:+-tags $$GOTAGS} -o "$(GOAL)" ./cmd/goal
 
-plan: ## What `make build` would do, and why — without doing it
-	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
-	.local/bin/goal plan
+build: goal-bin ## Build EVERYTHING: binaries, corpus, vectors, sparse, compaction, index, validation
+	@$(GOAL_ENV); "$(GOAL)" run $(ARGS)
+
+plan: goal-bin ## What `make build` would do, and why — without doing it
+	@$(GOAL_ENV); "$(GOAL)" plan $(ARGS)
 
 steps: plan ## Every pipeline step, in DAG order, with what it would do and why
 
@@ -46,30 +84,53 @@ steps: plan ## Every pipeline step, in DAG order, with what it would do and why
 #   make build/ingest    make build/index     make build/compact
 #
 # `make steps` prints the authoritative list; there is no second copy of it here
-# to drift out of date. Dependencies are NOT run: `-only` executes exactly the
-# step you name, using the recorded state of everything it depends on — which is
-# the point of asking for one step.
+# to drift out of date.
+#
+# DATA dependencies are not run: `make build/embed` uses the recorded state of the
+# corpus rather than rebuilding it, which is the point of asking for one step.
+# TOOL dependencies ARE run, and that is not a contradiction — it is what makes
+# the step do what your working tree says. Fixing sparse_embed.rs and then running
+# `make build/sparse` used to launch yesterday's binary and report success; the
+# build steps are seconds and skip when nothing changed, so they are simply always
+# brought up to date first.
 #
 # Two names people reach for that do not exist, because the pipeline's real seams
 # are elsewhere:
 #   `convert` — `fetch` downloads AND converts to HTML (LibreOffice) in one step;
 #               `ingest` is what parses that HTML into shards.
 #   `download` — that is `fetch` too.
-build/%: ## Run ONE pipeline step: make build/fetch, build/ingest, build/embed, build/sparse, build/index … (`make steps` lists them)
-	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
-	.local/bin/goal run -only $*
+build/%: goal-bin ## Run ONE pipeline step: make build/fetch, build/ingest, build/embed, build/sparse, build/index … (`make steps` lists them)
+	@$(GOAL_ENV); "$(GOAL)" run -only $* $(ARGS)
 
-status: ## Per-step state of the last run
-	@test -x .local/bin/goal || $(GO) build -tags "$${GOTAGS:-duckdb_use_lib}" -o .local/bin/goal ./cmd/goal
-	.local/bin/goal status
+status: goal-bin ## Per-step state of the last run
+	@$(GOAL_ENV); "$(GOAL)" status
 
-publish: ## Publish the corpus `make build` produced, then bake the images
+# ETA answers the question `plan` leaves open: not WHAT will run, but how long
+# before each step counts as finished. Every number is measured — goal records
+# duration_sec on every step — and the ones that are NOT usable as an estimate
+# say so instead of being quietly summed: a step whose last attempt crashed, a
+# step that declined, and `fetch`, whose recorded time was taken on a full
+# source tree that no longer exists.
+eta: goal-bin ## Per-step ETA before each step counts as finished, from measured durations
+	@$(GOAL_ENV); bash scripts/local/eta-steps.sh
+
+# PUBLISH IS LOCAL. The image used to be baked by two workflows that moved ~14 GB
+# per run; they are gone. `make image` cross-compiles the Linux artefacts here
+# (zig — no Docker, no WSL) and composes the OCI image with crane.
+publish: image ## Build the image from the corpus `make build` produced and push it to GHCR
+
+image: ## Build the full image locally and push it to GHCR (:latest)
 	@test -s data/3gpp.duckdb || { echo "no corpus at data/3gpp.duckdb — run: make build"; exit 1; }
-	./scripts/local/publish-corpus.sh
-	@echo ""
-	@echo "corpus published. The images bake on a runner (they need Docker):"
-	@echo "  gh workflow run corpus-data-image.yml -f corpus_tag=latest -f force=true"
-	@echo "  gh workflow run corpus-image.yml      -f release_tag=latest"
+	./scripts/local/build-image.sh
+
+image-local: ## Same, assembled into .local/image/image.tar without pushing
+	./scripts/local/build-image.sh --no-push
+
+image-toolchain: ## Fetch the Linux cross-toolchain the image build needs (zig + Debian libstdc++)
+	./scripts/local/fetch-linux-toolchain.sh
+
+prove: ## Drive server-full over real JSON-RPC and assert every retrieval arm is live on BOTH halves
+	./scripts/local/prove-serving.sh
 
 build-bin: ## Build the server binary alone into bin/ (no corpus)
 	@mkdir -p $(BUILD_DIR)

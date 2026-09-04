@@ -314,11 +314,40 @@ func (s *Store) ReplaceChanges(ctx context.Context, specID string, changes []mod
 // uniqueness constraint, so a --resume run would otherwise APPEND a duplicate
 // curated edge set. The seed is small + deterministic; the truncate-then-load
 // keeps the table in a known canonical state.
+// ONE TRANSACTION, because the two halves used to be two. The DELETE committed on
+// its own and the INSERTs followed in a second transaction, so any failure between
+// them — a constraint, a full disk, a killed process — left the corpus with ZERO
+// edges and no error visible to whoever reads it later. trace_evolution would then
+// answer "nothing" about a graph that had been correct minutes earlier, which is
+// worse than answering with the old seed. Wrapping both makes the replacement
+// atomic: either the new seed is there or the old one still is.
 func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
 		return fmt.Errorf("clear evolutions: %w", err)
 	}
-	return s.InsertEvolutions(evos)
+	if len(evos) > 0 {
+		stmt, perr := tx.PrepareContext(ctx,
+			`INSERT INTO evolutions
+			 (from_term, to_term, evolution_type, justification_spec, justification_clause, confidence)
+			 VALUES (?, ?, ?, ?, ?, ?)`)
+		if perr != nil {
+			return perr
+		}
+		defer func() { _ = stmt.Close() }()
+		for _, e := range evos {
+			if _, err := stmt.ExecContext(ctx, e.FromTerm, e.ToTerm, e.EvolutionType,
+				e.JustificationSpec, e.JustificationClause, e.Confidence); err != nil {
+				return fmt.Errorf("insert %s->%s: %w", e.FromTerm, e.ToTerm, err)
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current
@@ -931,7 +960,7 @@ type ClauseRel struct {
 // forward/backward delta annexes (what a later release adds, what the target
 // release introduced).
 func (s *Store) ClauseAvailability(ctx context.Context, specID, prefix string) ([]ClauseRel, []string, error) {
-	ordered, err := s.releasesOrdered(ctx, specID)
+	axis, ordered, err := s.LineageAxis(ctx, specID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -940,10 +969,10 @@ func (s *Store) ClauseAvailability(ctx context.Context, specID, prefix string) (
 	// below, and the reason the migration makes lineage exact rather than
 	// derived.
 	if s.contentAddressed {
-		out, aErr := s.availabilityCA(ctx, specID, prefix)
+		out, aErr := s.availabilityCA(ctx, specID, prefix, axis)
 		return out, ordered, aErr
 	}
-	q := `SELECT clause_path, max(heading), list(DISTINCT release)
+	q := `SELECT clause_path, max(heading), list(DISTINCT ` + axis + `)
 	      FROM clauses WHERE spec_id = ?`
 	args := []any{specID}
 	if prefix != "" {
@@ -1044,12 +1073,61 @@ func versionOrderSQL(col, dir string) string {
 	return c(1) + `, ` + c(2) + `, ` + c(3)
 }
 
+// LineageAxis names the column along which a spec actually EVOLVES, and returns
+// that axis's values oldest-first.
+//
+// Lineage was written for 3GPP, where a spec is republished per release and
+// `release` is what moves. ETSI has no releases: parse_etsi_meta stamps the
+// constant "ETSI" on every deliverable and it is `version` that moves — TS
+// 103 221-1 has 23 published versions, TS 102 221 has 126. Grouping an ETSI
+// clause by release therefore answers "present in [ETSI]" for every paragraph of
+// every clause: not a wrong answer so much as no answer, on the corpus whose
+// whole point is showing what changed between versions.
+//
+// So the axis is not a per-corpus flag but a fact about the spec in front of us:
+// take the column that VARIES. A spec republished across several releases is
+// traced by release, exactly as before. A spec that exists in one release is
+// traced by version — which is right for every ETSI deliverable, and better than
+// the old single-entry answer for a 3GPP spec that only ever appeared in one
+// release.
+//
+// Version ordering goes through versionOrderSQL rather than a raw sort: "18.9.0"
+// sorts after "18.10.0" as a string, and a lineage that claims a paragraph
+// arrived in the wrong version is worse than one that says nothing.
+func (s *Store) LineageAxis(ctx context.Context, specID string) (string, []string, error) {
+	rels, err := s.releasesOrdered(ctx, specID)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(rels) > 1 {
+		return "release", rels, nil
+	}
+	vers, err := s.orderedValues(ctx, specID, "version", versionOrderSQL("version", "ASC"))
+	if err != nil {
+		return "", nil, err
+	}
+	if len(vers) > 1 {
+		return "version", vers, nil
+	}
+	// One of each (or none): nothing varies, so keep the historical axis rather
+	// than flipping the payload's meaning over a corpus that says nothing either way.
+	return "release", rels, nil
+}
+
 // releasesOrdered returns a spec's releases oldest-first by release recency
-// (Rel-99 first, then Rel-4..Rel-20), via the shared releaseRecencySQL.
+// (Rel-99 first, then Rel-4..Rel-20). Kept as its own name because that ordering
+// is a rule of its own — Rel-99 predates Rel-4 — and LineageAxis is only one of
+// its callers.
 func (s *Store) releasesOrdered(ctx context.Context, specID string) ([]string, error) {
+	return s.orderedValues(ctx, specID, "release", releaseRecencySQL("release"))
+}
+
+// orderedValues reads the DISTINCT values of one spec_versions column, ordered by
+// the caller's expression. col and orderBy are trusted identifiers built here,
+// never user input.
+func (s *Store) orderedValues(ctx context.Context, specID, col, orderBy string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT release FROM spec_versions WHERE spec_id = ?
-		 ORDER BY `+releaseRecencySQL("release"), specID)
+		`SELECT DISTINCT `+col+` FROM spec_versions WHERE spec_id = ? ORDER BY `+orderBy, specID)
 	if err != nil {
 		return nil, err
 	}

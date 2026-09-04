@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -105,7 +109,98 @@ func TestDBCountRunEmitsBothCounters(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(ctx, path); err != nil {
+	if err := run(ctx, path, false); err != nil {
 		t.Fatalf("dbcount run on a valid DB errored: %v", err)
 	}
+}
+
+// TestDBCountBlocksReportsTheAccountingCompactNeeds is the end-to-end half of the
+// compaction gate: `compact` declines a rewrite when these numbers say there is
+// nothing to reclaim, so the numbers have to exist, parse, and add up.
+//
+// It is deliberately run against a REAL DuckDB rather than a fixture string. The
+// gate's own unit tests (internal/goal, nothingToReclaim) prove what it concludes
+// from a transcript; only this proves the transcript is one DuckDB will actually
+// produce. `pragma_database_size()` is the kind of thing that changes shape
+// between versions, and a gate reading a pragma that no longer returns those
+// columns would fail open on every build — quietly, and for ever.
+func TestDBCountBlocksReportsTheAccountingCompactNeeds(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "blocks.duckdb")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.UpsertSpec(model.Spec{SpecID: "29.518", Series: "29", DocType: "TS"})
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := run(ctx, path, true); err != nil {
+			t.Fatalf("dbcount --blocks errored: %v", err)
+		}
+	})
+
+	got := map[string]int64{}
+	for _, field := range strings.Fields(out) {
+		k, v, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			continue
+		}
+		got[k] = n
+	}
+	for _, k := range []string{"block_size", "total_blocks", "used_blocks", "free_blocks", "reclaimable_bytes"} {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("%s is missing from --blocks output, so the compaction gate cannot decide: %q", k, out)
+		}
+	}
+	if got["block_size"] <= 0 || got["total_blocks"] <= 0 {
+		t.Errorf("a DuckDB with a table in it reported block_size=%d total_blocks=%d", got["block_size"], got["total_blocks"])
+	}
+	if got["used_blocks"]+got["free_blocks"] != got["total_blocks"] {
+		t.Errorf("the accounting does not add up: used %d + free %d != total %d",
+			got["used_blocks"], got["free_blocks"], got["total_blocks"])
+	}
+	if got["reclaimable_bytes"] != got["free_blocks"]*got["block_size"] {
+		t.Errorf("reclaimable_bytes=%d is not free_blocks*block_size (%d*%d)",
+			got["reclaimable_bytes"], got["free_blocks"], got["block_size"])
+	}
+	// --blocks must NOT pay for the coverage counts: they are the expensive half,
+	// and on the ETSI corpus spec_versions does not even exist.
+	if strings.Contains(out, "spec_versions=") {
+		t.Error("--blocks ran the coverage counts it exists to skip")
+	}
+}
+
+// captureStdout runs fn with os.Stdout replaced by a pipe and returns what it
+// wrote. dbcount reports through fmt.Printf by contract — the guard reads its
+// stdout — so testing the contract means reading the same stream.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		_, _ = io.Copy(&b, r)
+		done <- b.String()
+	}()
+	fn()
+	os.Stdout = saved
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
 }

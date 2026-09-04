@@ -389,7 +389,24 @@ func warnIfDegradedDataLayer(ctx context.Context, st *store.Store) {
 // hide behind the dashboard's "Sparse: absent" pill. Best-effort; never blocks.
 func warnIfSparseMissing(ctx context.Context, st *store.Store) {
 	if !embed.SparseCapable() {
-		return // dense-only build: nothing to expect
+		// A dense-only build over a corpus that HAS a sparse layer is the
+		// symmetric failure, and it used to return here in silence — the exact
+		// shape of "a degraded search mode said nothing". The corpus paid for
+		// those postings; a build that cannot query them must say so, because
+		// nothing else will: search.Engine simply leaves e.sp nil and drops the
+		// arm, and the dashboard's "Sparse" pill reads the DB, which is fine.
+		//
+		// This is what an image built without the sparse MODEL looks like while
+		// shipping a corpus built with it: retrieval quietly loses an arm and
+		// every answer still looks plausible.
+		if st.SparseAvailable() {
+			fmt.Fprintf(os.Stderr,
+				"[3gpp-mcp] ⚠️  SPARSE UNUSABLE — the served corpus carries a sparse layer (sparse_model=%q) but "+
+					"this build has no sparse-capable model, so the learned-lexical arm is dropped and results are "+
+					"dense+BM25 only. Fix: bake a registry whose active model declares sparse_output (data/models/"+
+					"bge-m3-sparse) and rebuild.\n", st.GetMeta(ctx, "sparse_model"))
+		}
+		return
 	}
 	want := embed.SparseModelID()
 	got := st.GetMeta(ctx, "sparse_model")

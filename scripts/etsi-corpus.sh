@@ -38,10 +38,32 @@ retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; sl
 # The extension is not cosmetic here: convert_pdf dispatches on it, and pdftotext
 # refuses a file it cannot recognise. Make the name ourselves and stay portable.
 tmpfile_ext() {
-	local t
+	local t n
 	t="$(mktemp)" || return 1
-	mv "$t" "$t.$1" || { rm -f "$t"; return 1; }
-	printf '%s\n' "$t.$1"
+	# THE RENAME IS RETRIED, BECAUSE LOSING IT ONCE KILLS THE WHOLE RUN.
+	#
+	# Measured 2026-09-01 with four shards crawling into one temp directory:
+	#
+	#   mv: can't rename '…/Temp/tmp.a07236': Permission denied
+	#
+	# A Windows file lock (indexer, scanner, the other shard's mktemp) holds the
+	# new file for a moment. The script runs under `set -e`, so that one lost
+	# rename ended the shard — after 183 of 2 955 deliverables, and it then sat
+	# dead for an hour while the other three ran on, because a dead shard and a
+	# slow one look identical from the outside.
+	#
+	# The lock is transient by nature, so a few backed-off attempts cost nothing
+	# and remove a whole class of run-ending failure. Giving up still returns 1,
+	# so a genuinely unwritable temp directory is still fatal rather than silent.
+	for n in 1 2 3 4 5; do
+		if mv "$t" "$t.$1" 2>/dev/null; then
+			printf '%s\n' "$t.$1"
+			return 0
+		fi
+		sleep "$n"
+	done
+	rm -f "$t"
+	return 1
 }
 
 # Binaries: supplied by the caller, or built here as a fallback.
@@ -74,6 +96,14 @@ disc_args=(--emit-worklist)
 # ETSI_ALL=1 → enumerate the WHOLE /deliver corpus (etsi_ts+tr+en), not just the LI
 # suite (3GPP-parity completeness). Mutually exclusive with ETSI_SPECS in practice.
 [ -n "${ETSI_ALL:-}" ] && disc_args+=(--all)
+# ETSI_INCLUDE_3GPP=1 → also take ETSI's republications of 3GPP specs. Off by
+# default because the 3GPP half of this corpus already holds those in EVERY
+# release, while the ETSI archive publishes one version of each.
+[ -n "${ETSI_INCLUDE_3GPP:-}" ] && disc_args+=(--include-3gpp-republications)
+# ETSI_ALL_VERSIONS=1 → every PUBLISHED version of each deliverable, not just the
+# latest: the ETSI analogue of keeping every 3GPP release. Multiplies the work
+# list several-fold (TS 103 221-1 alone has 23 published versions).
+[ -n "${ETSI_ALL_VERSIONS:-}" ] && disc_args+=(--all-versions)
 [ -n "${ETSI_TYPE_DIRS:-}" ] && disc_args+=(--type-dirs "$ETSI_TYPE_DIRS")
 "$DISCOVER_ETSI_BIN" "${disc_args[@]}" >"$wl" || { echo "::error::discover-etsi failed"; exit 1; }
 n_total=$(wc -l <"$wl" | tr -dc '0-9'); n_total=${n_total:-0}
@@ -83,11 +113,32 @@ i=0
 ok=0
 fail=0
 # IFS=tab so the id's internal space ("103 221-1") survives; never `for x in $var` (zsh).
-while IFS=$'\t' read -r id url version; do
+#
+# doctype is the fourth column discover-etsi emits ("TS"/"TR"/"EN"). It MUST be read
+# per line rather than defaulted once: read leaves an absent trailing field EMPTY,
+# but a variable set in a previous iteration would otherwise survive into the next
+# one and label a TS as a TR. A three-column work list from an older binary leaves
+# it empty on every line, which the default below turns back into TS.
+while IFS=$'\t' read -r id url version doctype; do
 	[ -n "$id" ] || continue
 	i=$((i + 1))
-	safe="${id// /_}_v${version}"
+	# A TS and a TR can share a number (103 101 is a TR; the TS tree 404s on it),
+	# so the document type is part of the filename or the two would overwrite
+	# each other in the same bucket.
+	doctype="${doctype:-TS}"
+	safe="${doctype}_${id// /_}_v${version}"
 	target="$BUCKET/${safe}.html"
+	# MIGRATE, do not duplicate. Every file converted before the type prefix
+	# existed is named without one, so the resume check below would miss it, the
+	# PDF would be downloaded and converted again under the new name, AND the old
+	# file would still be sitting in the bucket for the ingest to read — one
+	# deliverable, twice, from two files that disagree about nothing. Renaming is
+	# exact rather than a guess: the untyped scheme only ever produced TS.
+	legacy="$BUCKET/${id// /_}_v${version}.html"
+	if [ "$doctype" = "TS" ] && [ ! -e "$target" ] && [ -s "$legacy" ]; then
+		mv "$legacy" "$target"
+		echo "  ↻ migrated the untyped cache entry"
+	fi
 	printf '[etsi] (%d/%d) %s v%s\n' "$i" "$n_total" "$id" "$version"
 	if [ -s "$target" ]; then
 		echo "  ✓ already converted (resume)"
@@ -111,7 +162,7 @@ while IFS=$'\t' read -r id url version; do
 	if convert_pdf "$pdf" "$tmp_html" "$id v$version"; then
 		# Prepend the provenance header htmlparse keys on, then the converted body.
 		{
-			printf '<!-- ETSI-SPEC: %s | %s -->\n' "$id" "$version"
+			printf '<!-- ETSI-SPEC: %s | %s | %s -->\n' "$id" "$version" "$doctype"
 			cat "$tmp_html"
 		} >"$target"
 		echo "  ✓ converted ($(wc -c <"$target" | tr -dc '0-9') bytes)"

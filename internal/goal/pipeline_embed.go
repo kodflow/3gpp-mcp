@@ -2,15 +2,20 @@ package goal
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kodflow/3gpp-mcp/internal/embed"
 )
 
 // ---------------------------------------------------------------- embedder
@@ -23,6 +28,7 @@ func stepBuildEmbedder() *Step {
 		Deps:      []string{"toolchain"},
 		Impl:      []string{"rust/embedder"},
 		Toolchain: true,
+		Tool:      true,
 		Optional:  true, // a machine without a GPU still completes every other step
 		Outputs:   func(c *Ctx) []string { return []string{c.rbin("embedder")} },
 		Run: func(c *Ctx) error {
@@ -60,7 +66,7 @@ func stepBuildEmbedder() *Step {
 func stepEmbed(t corpusTarget) *Step {
 	return &Step{
 		Name:    "embed" + t.Suffix,
-		Version: 1,
+		Version: 2,
 		Doc:     "vectorise the corpus on the GPU, reusing every already-seen content hash",
 		Deps:    append([]string{"build-embedder"}, t.singleProducer()...),
 		// data/3gpp.duckdb has two producers, not one: `merge` folds local shards
@@ -69,9 +75,23 @@ func stepEmbed(t corpusTarget) *Step {
 		// through Deps instead (AnyDeps rejects a one-element set on purpose).
 		AnyDeps: t.multiProducer(),
 		Impl:    []string{"rust/embedder/src", "rust/store/src/bin/embed_io.rs", "internal/embed/identity.go", "internal/embed/models.yaml"},
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{t.dbPath(c)}, nil
-		},
+		// The corpus is NOT an input, although this step reads and rewrites it.
+		//
+		// It is the step's own product, and compact, index and the paragraph
+		// conversion all rewrite it further down the same build. A step that folds
+		// it into its fingerprint therefore never sees a stable input: every build
+		// changes the corpus after the step recorded it, so the next build replays
+		// the step. Same shape as the one that made `merge` replay a 22 GB restore
+		// on every run — measured here on 2026-09-03, where a fully VALID pipeline
+		// still planned "2 certain to run (2 heavy)" on a corpus nothing had
+		// touched.
+		//
+		// What determines this step's work is declared elsewhere and precisely: its
+		// DATA dependency (merge or seed, through provenance), the embed identity
+		// and floor in Extra, and — at run time — the corpus's own answer to "does
+		// any clause still need one of these". That last question is the honest one,
+		// and the step already asks it before declining.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Extra: func(c *Ctx) (map[string]string, error) {
 			// The embed identity is THE determinant: model family, revision,
 			// tokenizer, dimension, normalisation, precision, windowing and
@@ -146,7 +166,9 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 		"--db", t.dbPath(c), "--report", "--embed-floor", t.Floor(c),
 	}})
 	if err != nil {
-		return nil, err
+		// Every caller of this is a Validate, so a corpus somebody else has
+		// open must not read as a corpus that needs rebuilding.
+		return nil, stillOpenElsewhere(t.DB, err)
 	}
 	var rep embedIOReport
 	if err := json.Unmarshal([]byte(out), &rep); err != nil {
@@ -165,6 +187,126 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 // measured corpus that is a 2.74x reduction — 833 924 distinct texts for
 // 2 282 337 embeddable clauses, with 79.8% of clauses duplicated verbatim across
 // releases.
+// ledgerDescribesAnotherBuild answers whether the resume ledger was written against
+// a DIFFERENT build of this corpus.
+//
+// A chunk_id is a POSITION, not an identity: ingest assigns it sequentially
+// (offset = max_chunk_id), so rebuilding a corpus from scratch — a different file
+// order, or one document yielding a different number of clauses — reuses the same
+// numbers for different clauses. The embedder resumes on chunk_id and
+// embed-io --import joins the ledger to the corpus on chunk_id, so a ledger from
+// another build attaches vectors computed from unrelated text.
+//
+// Measured 2026-09-02 between two ETSI builds of the SAME 11 821 documents:
+// chunk_id 138 was "ETSI TS 101 671 v3.15.1 §10" in one and
+// "ETSI EN 300 113-1 v1.3.1 §4" in the other; 1 262 127 clauses were about to be
+// skipped on that basis. Every gate passes that corpus — null_at_floor 0,
+// clauses_with_text equal to vectors, identities agreeing, HNSW built. Only the
+// answers are wrong.
+//
+// The check is cheap and needs no database: the work list already holds
+// (chunk_id, heading, text) for every clause that wants a vector, so a sample of the
+// ledger's OLDEST entries — the ones an incremental run never rewrites — can be
+// re-hashed and compared. A handful of disagreements is normal (a document really
+// was revised); a large share means the numbering itself moved.
+func ledgerDescribesAnotherBuild(ledger, worklist string, hashOf func(heading, text string) string) (moved bool, disagree, checked, hashed int) {
+	want := map[uint64]string{}
+	f, err := os.Open(ledger)
+	if err != nil {
+		return false, 0, 0, 0
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	lines := 0
+	for sc.Scan() && lines < ledgerSampleSize {
+		// The dense ledger names the field "hash", the sparse one "h" — they carry
+		// the same thing (the identity of the TEXT the line was computed from) and
+		// this check asks the same question of both.
+		var rec struct {
+			ChunkID uint64 `json:"chunk_id"`
+			Hash    string `json:"hash"`
+			H       string `json:"h"`
+		}
+		if json.Unmarshal(sc.Bytes(), &rec) != nil {
+			continue
+		}
+		lines++
+		if h := firstNonEmpty(rec.Hash, rec.H); h != "" {
+			want[rec.ChunkID] = h
+		}
+	}
+	// A file whose lines carry NO hash cannot be verified at all. That is not "no
+	// evidence of a problem": it is a file this build has no way to trust, and the
+	// sparse postings file was exactly that until it grew an `h` field. Report it as
+	// moved so the caller archives it rather than importing 510 384 lines whose ids
+	// may name other clauses.
+	if len(want) == 0 {
+		return lines > 0, 0, 0, 0
+	}
+
+	w, err := os.Open(worklist)
+	if err != nil {
+		return false, 0, 0, len(want)
+	}
+	defer func() { _ = w.Close() }()
+	ws := bufio.NewScanner(w)
+	ws.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	for ws.Scan() {
+		var it struct {
+			ChunkID uint64 `json:"chunk_id"`
+			Heading string `json:"heading"`
+			Text    string `json:"text"`
+		}
+		if json.Unmarshal(ws.Bytes(), &it) != nil {
+			continue
+		}
+		h, ok := want[it.ChunkID]
+		if !ok {
+			continue
+		}
+		checked++
+		if hashOf(it.Heading, it.Text) != h {
+			disagree++
+		}
+	}
+	// Require a real sample before drawing a conclusion: on a corpus where almost
+	// everything is already embedded, the work list is short and may overlap the
+	// sample barely at all.
+	if checked < ledgerSampleMin {
+		return false, disagree, checked, len(want)
+	}
+	return disagree*100 >= checked*ledgerMovedPercent, disagree, checked, len(want)
+}
+
+const (
+	// Enough of the ledger's head to be representative without reading a 25 GB file.
+	ledgerSampleSize = 5000
+	// Below this many actual comparisons the sample says nothing.
+	ledgerSampleMin = 200
+	// A revised document moves a few hashes; a renumbered corpus moves most of them.
+	ledgerMovedPercent = 25
+)
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// sparseResumeHash mirrors rust/embed-core's resume_hash byte for byte: the sha256
+// of the text the sparse arm embeds (heading, newline, text, NULs replaced), first
+// 16 hex characters. Kept here rather than reusing embed.ClauseHash because the
+// sparse ledger does not fold a model identity in — its identity lives in
+// schema_meta.sparse_model and is checked by --require-sparse.
+func sparseResumeHash(heading, text string) string {
+	sum := sha256.Sum256([]byte(strings.ReplaceAll(heading+"\n"+text, "\x00", " ")))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 func runEmbed(c *Ctx, t corpusTarget) error {
 	db := t.dbPath(c)
 	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
@@ -230,6 +372,42 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	// instead of 2 752 688, straight through the view's own join. `merge` still restores
 	// (it deletes and re-inserts rows of `clauses`, which really does need the table);
 	// `embed` no longer has any reason to.
+	// A LEDGER FROM ANOTHER BUILD IS WORSE THAN NO LEDGER. Its (hash, vec) pairs stay
+	// valuable — they cost GPU time and the identity has not changed — but its
+	// chunk_ids no longer name the same clauses, and both the resume and the import
+	// key on chunk_id. So archive it and hand it back as a CACHE: --resume-from
+	// contributes vectors by content hash, while the fresh ledger carries only ids
+	// this build assigned. Nothing is recomputed that does not have to be.
+	// AN ARCHIVED LEDGER KEEPS ITS VALUE AS A CACHE beyond the run that archived it.
+	// Its chunk_ids are meaningless here, but its (hash, vector) pairs cost hours of
+	// GPU and the identity has not changed. Without this, a step that is re-entered —
+	// which is what happens when a first pass leaves clauses behind — pays the full
+	// GPU price a second time for vectors already sitting on disk.
+	//
+	// Only the newest archive: each costs several GB of RAM to index by hash, and the
+	// newest is the one that overlaps this corpus most.
+	var resumeFrom string
+	if archives, _ := filepath.Glob(ledger + ".*.otherbuild.bak"); len(archives) > 0 {
+		sort.Strings(archives) // the name carries a UTC timestamp, so this is chronological
+		resumeFrom = archives[len(archives)-1]
+		c.Log.Printf("reusing %s as a vector cache (its ids name another build; its vectors do not)",
+			filepath.Base(resumeFrom))
+	}
+	if fileNonEmpty(ledger) {
+		hashOf := func(heading, text string) string { return embed.ClauseHash(heading, text, id) }
+		if moved, bad, n, _ := ledgerDescribesAnotherBuild(ledger, worklist, hashOf); moved {
+			archive := fmt.Sprintf("%s.%s.otherbuild.bak", ledger, time.Now().UTC().Format("20060102T150405Z"))
+			c.Log.Printf("the resume ledger describes ANOTHER build of this corpus "+
+				"(%d of %d sampled chunk_ids hash differently) — archiving it to %s and "+
+				"reusing it only as a vector cache",
+				bad, n, filepath.Base(archive))
+			if err := os.Rename(ledger, archive); err != nil {
+				return err
+			}
+			resumeFrom = archive
+		}
+	}
+
 	before := countLines(ledger)
 	c.Log.Printf("%d clause(s) to vectorise (ledger already holds %d)", todo, before)
 
@@ -238,14 +416,19 @@ func runEmbed(c *Ctx, t corpusTarget) error {
 	}
 
 	c.Log.Printf("running the GPU pass — only DISTINCT texts reach the model")
-	if err := c.Run(Cmd{Name: c.rbin("embedder"), Args: []string{
+	embedArgs := []string{
 		"--in", worklist, "--out", ledger,
 		"--model-dir", c.Cfg("model_dir"),
 		"--embed-identity", id,
 		"--require-cuda",
 		"--vram-fraction", "0.8",
 		"--max-batch", "512",
-	}, Env: gpuEnv(c), Echo: true}); err != nil {
+	}
+	if resumeFrom != "" {
+		embedArgs = append(embedArgs, "--resume-from", resumeFrom)
+	}
+	if err := c.Run(Cmd{Name: c.rbin("embedder"), Args: embedArgs,
+		Env: gpuEnv(c), Echo: true}); err != nil {
 		// The ledger is append-only and flushed per batch, so a failure here is
 		// resumable: report where we got to rather than losing the position.
 		c.Checkpoint("ledger_lines", strconv.Itoa(countLines(ledger)))
@@ -291,7 +474,11 @@ func stepEnrich() *Step {
 		Deps:    []string{"merge"},
 		// The two fetch scripts are part of this step's implementation now that it
 		// runs them: changing how an overlay is acquired must replay the overlay.
-		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh"},
+		// internal/evolseed is implementation here because this step now APPLIES
+		// the seed: editing an edge must replay the overlay, exactly as editing an
+		// extractor does. Before, the seed's hash moved the published identity
+		// while nothing wrote the seed — see cmd/seed-evolutions.
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -309,7 +496,7 @@ func stepEnrich() *Step {
 			// to TS by default". Prove the overlay actually landed.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return err
+				return stillOpenElsewhere("3gpp.duckdb", err)
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters")
@@ -379,7 +566,12 @@ func stepEnrich() *Step {
 			} else {
 				c.Log.Printf("no TS33128Payloads .asn and none could be fetched — li_events stays empty")
 			}
-			return nil
+
+			// The curated NE->NF edge seed. It is applied LAST because it verifies
+			// each citation against the clauses this corpus actually holds, so it
+			// wants the catalogue overlay already in place.
+			c.Log.Printf("NE->NF evolution seed (curated, citations checked against the corpus)")
+			return c.Run(Cmd{Name: c.bin("seed-evolutions"), Args: []string{"--db", db}, Echo: true})
 		},
 	}
 }
@@ -536,7 +728,21 @@ func stepValidate() *Step {
 		Run: func(c *Ctx) error {
 			args := validateArgs(c)
 			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg("contract_flags"), corpus3GPP().Floor(c))
-			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Echo: true}); err != nil {
+			// SELECT THE SPARSE-CAPABLE REGISTRY ENTRY when the contract asks about
+			// the sparse layer, exactly as runSparse does to resolve the identity it
+			// stamps. cmd/validate compares schema_meta.sparse_model against
+			// embed.SparseModelID(), which reads the ACTIVE model — and the default
+			// entry (bge-m3) is dense-only, so it resolves nothing and the comparison
+			// cannot happen. Leaving that to the operator's environment is a footgun:
+			// the same flag would check the layer on one machine and refuse to on
+			// another. Selecting the dual-head entry does not move the DENSE identity
+			// (38067f8c6efe under both), so this changes what is CHECKED, never what
+			// is expected of the corpus.
+			var env []string
+			if hasFlag(strings.Fields(c.Cfg("contract_flags")), "--require-sparse") {
+				env = append(env, "EMBED_MODEL="+sparseModelName)
+			}
+			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Env: env, Echo: true}); err != nil {
 				return err
 			}
 			return validateAnchor(c)
@@ -589,7 +795,7 @@ func hasFlag(args []string, name string) bool {
 func stepSmoke() *Step {
 	return &Step{
 		Name:    "smoke",
-		Version: 1,
+		Version: 2,
 		Doc:     "start the real server over stdio and prove vector search stays enabled",
 		Deps:    []string{"validate"},
 		Impl:    []string{"cmd/server", "internal/mcp", "internal/search"},
@@ -735,6 +941,57 @@ func runSmoke(c *Ctx) error {
 		id++
 	}
 
+	// ASK THE SERVER WHAT IT CAN DO, rather than only checking that it did not
+	// complain.
+	//
+	// The two stderr checks below are NEGATIVE assertions — "this string is
+	// absent" — and one of them is weaker than it reads. "semantic disabled" is
+	// printed only on the --allow-lexical-fallback path, and the coherence guard
+	// that reaches it is itself behind `if emb.Enabled()`; this step runs
+	// .local/bin/server.exe, the LEXICAL build, whose noop embedder reports false.
+	// So on the binary this step actually drives, that assertion cannot fail, and
+	// the step's own log line claimed vector search was proven.
+	//
+	// server_info is a positive, falsifiable answer about the corpus that does not
+	// depend on which build asked: fts and hnsw are properties of the DB, and
+	// internal/mcp recomputes them per store. What is deliberately NOT asserted
+	// here is `semantic`, because that IS build- and environment-dependent (it
+	// needs embed_ffi, EMBED_MODEL_DIR and ORT), and a gate that fails on a
+	// correct corpus for want of an env var is worse than no gate — it teaches the
+	// operator to skip it. `.local/resume/prove.sh` drives server-full.exe with
+	// that environment set and asserts `semantic` there.
+	if contains(names, "server_info") {
+		if err := send(map[string]any{
+			"jsonrpc": "2.0", "id": id, "method": "tools/call",
+			"params": map[string]any{"name": "server_info", "arguments": map[string]any{}},
+		}); err != nil {
+			return err
+		}
+		info, err := readOne()
+		if err != nil {
+			return fmt.Errorf("server_info failed: %w", err)
+		}
+		// server_info nests the payload as a JSON STRING inside an MCP content
+		// block, so the keys arrive with their quotes: `"fts":true`, not `fts:true`.
+		body := strings.ReplaceAll(fmt.Sprintf("%v", info), " ", "")
+		// AND COUNT THEM. The ETSI half reports its own `"fts"`/`"hnsw"` in the same
+		// payload, so a bare Contains would be satisfied by either half alone — a
+		// 3GPP corpus serving without its index would pass on the strength of the
+		// ETSI one. When both halves are attached, both must say true.
+		wantEach := 1
+		if etsiAttached {
+			wantEach = 2
+		}
+		for _, arm := range []string{`"fts":true`, `"hnsw":true`} {
+			if n := strings.Count(body, arm); n < wantEach {
+				return fmt.Errorf("server_info reports %s %d time(s), want %d (halves attached: %d) — "+
+					"a corpus carries the index and the server will not use it:\n%s",
+					arm, n, wantEach, wantEach, tailString(body, 4))
+			}
+		}
+		c.Log.Printf("server_info: fts and hnsw live on %d served corpus half/halves", wantEach)
+	}
+
 	// THE assertion. The guard prints this exact prefix when it disables vector
 	// search, and a corpus with vectors that is served lexically is a failed goal.
 	errs := stderr.String()
@@ -748,8 +1005,84 @@ func runSmoke(c *Ctx) error {
 		return fmt.Errorf("the server DISABLED vector search at startup — the embed identity does not match the corpus stamp:\n%s", tailString(errs, 20))
 	}
 	c.Checkpoint("tools", strconv.Itoa(len(names)))
-	c.Log.Printf("vector search was NOT disabled at startup")
+	c.Log.Printf("the server did not disable vector search at startup (see prove.sh for the semantic proof)")
+
+	// THIS is the moment compact's own instruction points at: "once served and
+	// verified, remove <db>.pre-compact". Until now nothing did, and the
+	// consequence was not merely wasted disk — compact REFUSES to overwrite an
+	// existing .pre-compact, so the backup left by one build blocked the next
+	// one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB, 3 169 614
+	// clauses) and then failed on the in-place swap because of a backup from the
+	// 2nd. A step that cannot run twice without someone deleting a file by hand is
+	// a step the pipeline cannot converge through.
+	//
+	// Removing it HERE, and nowhere earlier, is the point: the smoke has just
+	// started the shipped binary against this corpus and had it answer. Before
+	// that the backup is the only way back.
+	releasePreCompact(c)
 	return nil
+}
+
+// rotateCompactionArtefacts clears what a previous compaction left behind, so
+// that this one can run at all. It keeps ONE generation of backup, not two.
+//
+// compact leaves two kinds of file and refuses to overwrite either:
+//
+//	<db>.compact      the copy. A completed run renames it into place, so a
+//	                  leftover means the previous attempt died between the copy
+//	                  and the swap.
+//	<db>.pre-compact  the backup. It exists only BECAUSE a swap completed — that
+//	                  is the step that creates it.
+//
+// Both refusals are right about the FILE and wrong about the RUN: they leave the
+// pipeline stuck on a corpus it can never finish compacting, and the only way out
+// is someone deleting a file by hand. That happened three times on 2026-09-03.
+//
+// The release was first attached to `smoke`, on the reasoning that a backup
+// should outlive the corpus until the shipped binary has served it. That reasoning
+// is sound and the placement was not: compact fails BEFORE smoke can run, so the
+// release sat behind the very step it had to unblock. A deadlock, and mine.
+//
+// Rotating here is safe in exactly the way the refusals intend. The live corpus is
+// untouched — compact writes only the copy until it verifies it — and a
+// .pre-compact present at this point backs up a corpus the live one has already
+// superseded. There is no instant at which nothing good exists.
+func rotateCompactionArtefacts(c *Ctx) {
+	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
+		for _, suffix := range []string{".compact", ".pre-compact"} {
+			p := c.dataPath(name + suffix)
+			st, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if err := os.Remove(p); err != nil {
+				c.Log.Printf("WARNING: %s is in the way and could not be removed: %v", p, err)
+				continue
+			}
+			c.Log.Printf("rotated %s (%.1f GiB) — superseded by the live corpus",
+				p, float64(st.Size())/(1<<30))
+		}
+	}
+}
+
+// releasePreCompact drops the pre-compaction backups now that the compacted
+// corpora have been proven to serve.
+//
+// Failures are logged, never fatal: a backup that could not be deleted is a disk
+// problem, not a reason to fail a smoke that passed.
+func releasePreCompact(c *Ctx) {
+	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
+		p := c.dataPath(name + ".pre-compact")
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			c.Log.Printf("WARNING: could not remove %s (%.1f GiB): %v", p, float64(st.Size())/(1<<30), err)
+			continue
+		}
+		c.Log.Printf("released %s — %.1f GiB reclaimed, the compacted corpus has served", p, float64(st.Size())/(1<<30))
+	}
 }
 
 func toolNames(m map[string]any) []string {
@@ -940,7 +1273,12 @@ func (t corpusTarget) indexDeps() []string {
 		// build-go because the index is now built by cmd/freeze-hnsw.
 		return []string{"embed", "enrich", "paragraphs", "compact", "build-go"}
 	}
-	return []string{"embed" + t.Suffix, "build-go"}
+	// compact, for the ETSI index too. COPY FROM DATABASE does not carry custom
+	// indexes and the bin therefore resets hnsw_state to "building", so an ETSI
+	// index frozen BEFORE compaction would be thrown away by it while schema_meta
+	// still claimed the graph was frozen — the same ordering constraint the 3GPP
+	// side already encodes, and the reason compact sits before both freezes.
+	return []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact", "build-go"}
 }
 
 // refreshOverlays reports whether the operator asked for the external overlays
@@ -973,26 +1311,40 @@ func refreshOverlays() bool {
 // OLD shape: the conversion existed only as a tool someone had to remember to
 // run, which is the same failure as the overlays printing the name of a script
 // instead of running it.
-func stepParagraphs() *Step {
+func stepParagraphs(t corpusTarget) *Step {
 	return &Step{
-		Name:    "paragraphs",
-		Version: 1,
+		Name:    "paragraphs" + t.Suffix,
+		Version: 2,
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
-		Deps:    []string{"embed", "enrich", "build-go"},
+		Deps:    t.paragraphsDeps(),
 		Impl:    []string{"cmd/migrate-paragraphs"},
 		Heavy:   true,
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
-		},
-		Outputs: func(c *Ctx) []string { return []string{c.dataPath("3gpp.duckdb")} },
+		// The corpus is NOT an input, although this step reads and rewrites it.
+		//
+		// It is the step's own product, and compact, index and the paragraph
+		// conversion all rewrite it further down the same build. A step that folds
+		// it into its fingerprint therefore never sees a stable input: every build
+		// changes the corpus after the step recorded it, so the next build replays
+		// the step. Same shape as the one that made `merge` replay a 22 GB restore
+		// on every run — measured here on 2026-09-03, where a fully VALID pipeline
+		// still planned "2 certain to run (2 heavy)" on a corpus nothing had
+		// touched.
+		//
+		// What determines this step's work is declared elsewhere and precisely: its
+		// DATA dependency (merge or seed, through provenance), the embed identity
+		// and floor in Extra, and — at run time — the corpus's own answer to "does
+		// any clause still need one of these". That last question is the honest one,
+		// and the step already asks it before declining.
+		Inputs:  func(c *Ctx) ([]string, error) { return nil, nil },
+		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
 			// Prove the corpus can still produce the text it used to store,
 			// rather than trusting that the conversion said so earlier.
 			out, err := c.Output(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
-				"--db", c.dataPath("3gpp.duckdb"), "--verify",
+				"--db", t.dbPath(c), "--verify",
 			}})
 			if err != nil {
-				return fmt.Errorf("the converted corpus does not verify: %w", err)
+				return stillOpenElsewhere(t.DB, fmt.Errorf("the converted corpus does not verify: %w", err))
 			}
 			if !strings.Contains(out, "clause_occ=") {
 				return fmt.Errorf("verification produced no counters: %q", out)
@@ -1000,8 +1352,8 @@ func stepParagraphs() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			db := c.dataPath("3gpp.duckdb")
-			c.Log.Printf("converting to content-addressed storage (paragraphs, bodies, occurrences)")
+			db := t.dbPath(c)
+			c.Log.Printf("converting %s to content-addressed storage (paragraphs, bodies, occurrences)", t.DB)
 			// --drop-clauses is safe to pass unconditionally, but NOT for the reason
 			// this comment used to give. It claimed the build was "a no-op
 			// re-derivation" on an already-converted corpus. It was the opposite: the
@@ -1035,6 +1387,7 @@ func stepBuildSparse() *Step {
 		Deps:      []string{"toolchain"},
 		Impl:      []string{"rust/embed-core/src"},
 		Toolchain: true,
+		Tool:      true,
 		// A box without the sparse model still completes every other step: the
 		// sparse arm is additive, and refusing to build without it would make the
 		// whole pipeline hostage to one optional artefact.
@@ -1083,23 +1436,71 @@ func stepBuildSparse() *Step {
 // Resumable on the same terms as `embed`: the postings file is append-only and
 // embed-core-sparse skips chunk_ids already in it, so a kill costs the current
 // batch and nothing else.
-func stepSparse() *Step {
+// stepSparse builds the learned-lexical arm for one corpus.
+//
+// It is parameterised for the same reason stepEmbed and stepIndex are: BOTH
+// corpora are served, side by side, and an arm that exists on one of them only
+// is an asymmetry a caller cannot see. search.Engine federates the two stores and
+// simply drops the arm the ETSI one does not have, with no error — so a query
+// that the sparse arm would have answered well on 3GPP falls back to dense+BM25
+// the moment it lands on an ETSI deliverable.
+//
+// Nothing in the machinery was 3GPP-specific; only the paths were.
+func stepSparse(t corpusTarget) *Step {
 	return &Step{
-		Name:    "sparse",
-		Version: 1,
-		Doc:     "vectorise the learned-lexical (sparse) arm on the GPU",
-		Deps:    []string{"build-sparse", "build-rust", "paragraphs"},
+		Name:    "sparse" + t.Suffix,
+		Version: 2,
+		Doc:     "vectorise the learned-lexical (sparse) arm of " + t.DB + " on the GPU",
+		Deps:    t.sparseDeps(),
 		Impl:    []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs"},
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
-		},
+		// The corpus is not an input here either: compact rewrites it after this
+		// step, so fingerprinting it guarantees a replay on the next build. The
+		// sparse identity in Extra and the data dependency are what actually decide
+		// this step's work, and it asks the corpus directly — "does every clause
+		// already carry a posting" — before declining.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Extra: func(c *Ctx) (map[string]string, error) {
 			return map[string]string{"sparse_identity": sparseIdentityForPlan(c)}, nil
 		},
 		Heavy:    true,
 		Optional: true,
-		Run:      func(c *Ctx) error { return runSparse(c) },
+		Run:      func(c *Ctx) error { return runSparse(c, t) },
 	}
+}
+
+// paragraphsDeps: the conversion runs AFTER the vectors exist, so they are simply
+// carried across to the bodies that own them and neither embed nor the Rust write
+// side has to change. 3GPP also waits on `enrich`, whose catalogue overlay rewrites
+// rows; ETSI has no such overlay (DynaReport describes 3GPP specs, not ETSI
+// deliverables), so it waits on its own embed alone.
+func (t corpusTarget) paragraphsDeps() []string {
+	if t.Suffix == "" {
+		return []string{"embed", "enrich", "build-go"}
+	}
+	return []string{"embed" + t.Suffix, "build-go"}
+}
+
+// sparseDeps mirrors indexDeps: the work list is exported from the shape the
+// content-addressed conversion produces, so BOTH arms wait for their own.
+//
+// ETSI used to wait on its embed instead, because it had no conversion. That was
+// only ever true while the ETSI half held ONE version per deliverable. With every
+// published version in it, an unconverted ETSI corpus takes the branch in
+// Store.SearchClauses that ranks VERSIONS rather than clauses — the twelve-hit
+// window that was one clause repeated across twelve releases, with the spec that
+// answers the question never in it. The conversion is what makes searchClausesCA
+// the path taken, so it is a dependency, not a nicety.
+func (t corpusTarget) sparseDeps() []string {
+	return []string{"build-sparse", "build-rust", "paragraphs" + t.Suffix}
+}
+
+// sparseFiles are the work list and postings ledger for a corpus. The 3GPP pair
+// keeps its historical names verbatim: `.local/vecs/sparse.jsonl` is append-only
+// and a campaign in flight resumes from it, so renaming it would silently restart
+// hours of GPU.
+func (t corpusTarget) sparseFiles(c *Ctx) (work, out string) {
+	base := filepath.Join(c.Local, "vecs", "sparse"+t.Suffix)
+	return base + ".worklist", base + ".jsonl"
 }
 
 // sparseIdentityForPlan asks cmd/embedid for the SPARSE identity, the digest
@@ -1126,8 +1527,8 @@ func sparseIdentityForPlan(c *Ctx) string {
 // model whose ONNX exposes the learned-lexical head.
 const sparseModelName = "bge-m3-sparse"
 
-func runSparse(c *Ctx) error {
-	db := c.dataPath("3gpp.duckdb")
+func runSparse(c *Ctx, t corpusTarget) error {
+	db := t.dbPath(c)
 	modelDir := c.dataPath("models", sparseModelName)
 	if _, err := os.Stat(filepath.Join(modelDir, "model.onnx")); err != nil {
 		// DECLINE, not fail. BAAI publishes no sparse ONNX; it is produced by
@@ -1146,12 +1547,11 @@ func runSparse(c *Ctx) error {
 	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
 		return err
 	}
-	work := filepath.Join(c.Local, "vecs", "sparse.worklist")
-	out := filepath.Join(c.Local, "vecs", "sparse.jsonl")
+	work, out := t.sparseFiles(c)
 
-	c.Log.Printf("exporting the sparse work list (floor=%q)", corpus3GPP().Floor(c))
+	c.Log.Printf("exporting the sparse work list of %s (floor=%q)", t.DB, t.Floor(c))
 	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
-		"--db", db, "--export-sparse-worklist", work, "--embed-floor", corpus3GPP().Floor(c),
+		"--db", db, "--export-sparse-worklist", work, "--embed-floor", t.Floor(c),
 	}}); err != nil {
 		return err
 	}
@@ -1159,6 +1559,25 @@ func runSparse(c *Ctx) error {
 	c.Checkpoint("sparse_worklist", strconv.Itoa(todo))
 	if todo == 0 {
 		return fmt.Errorf("%w: every clause already carries a sparse posting", ErrDeclined)
+	}
+	// SAME HAZARD AS THE DENSE LEDGER, and worse until now: a posting line carried a
+	// chunk_id and nothing else. chunk_ids are positional, so a rebuilt corpus reuses
+	// them for different clauses and the sparse arm would retrieve the wrong ones,
+	// confidently. Unlike the dense ledger there is nothing to salvage — the postings
+	// carry no reusable per-text cache — so the archive is kept only as evidence.
+	if fileNonEmpty(out) {
+		if moved, bad, n, hashed := ledgerDescribesAnotherBuild(out, work, sparseResumeHash); moved {
+			archive := fmt.Sprintf("%s.%s.otherbuild.bak", out, time.Now().UTC().Format("20060102T150405Z"))
+			why := fmt.Sprintf("%d of %d sampled chunk_ids hash differently", bad, n)
+			if hashed == 0 {
+				why = "it carries no content hash at all, so nothing in it can be verified"
+			}
+			c.Log.Printf("the sparse postings file describes ANOTHER build of this corpus "+
+				"(%s) — archiving it to %s", why, filepath.Base(archive))
+			if err := os.Rename(out, archive); err != nil {
+				return err
+			}
+		}
 	}
 	c.Log.Printf("%d clause(s) to embed (postings file already holds %d)", todo, countLines(out))
 
@@ -1178,7 +1597,70 @@ func runSparse(c *Ctx) error {
 
 // ----------------------------------------------------------- compaction
 
+// A rewrite has to earn its thirty minutes, and there are two ways it can: the
+// dead space is a meaningful SHARE of the file, or it is a large enough
+// ABSOLUTE number of bytes that everyone who pulls the image downloads them.
+// Either alone is sufficient.
+//
+// Neither threshold is finely tuned, because the cases they separate are four
+// orders of magnitude apart. A finished corpus, measured 2026-09-04: 2 free
+// blocks of 87 830 — 0.002 %, 512 KiB. One that genuinely needed compacting,
+// measured 2026-08-30: 182 219 free of 229 166 — 79.5 %, 43.6 GB.
+const (
+	compactMinDeadFraction = 0.05
+	compactMinDeadBytes    = 1 << 30 // 1 GiB
+)
+
+// nothingToReclaim reads a `dbcount --blocks` transcript and reports whether the
+// corpus it describes holds too little dead space to be worth rewriting, together
+// with the measurement — so the log says what was found, not merely that nothing
+// happened.
+//
+// IT FAILS OPEN, and the asymmetry is the point. A transcript this cannot parse —
+// a bin predating --blocks, a reworded line, a truncated pipe — is not evidence
+// that there is nothing to reclaim, it is the absence of evidence. Declining on
+// it would carry the previous provenance forward, skip `index` behind it, and
+// publish a corpus full of dead space with every gate green. Running a compaction
+// that turns out to have been unnecessary costs half an hour and nothing else.
+// That is the same reasoning as ingestedNothing's "no tally at all is not proof
+// of nothing".
+func nothingToReclaim(out string) (bool, string) {
+	free, okFree := kvInt(out, "free_blocks")
+	total, okTotal := kvInt(out, "total_blocks")
+	size, okSize := kvInt(out, "block_size")
+	if !okFree || !okTotal || !okSize || total <= 0 || size <= 0 || free < 0 {
+		return false, ""
+	}
+	dead := free * size
+	share := float64(free) / float64(total)
+	if share >= compactMinDeadFraction || dead >= compactMinDeadBytes {
+		return false, ""
+	}
+	return true, fmt.Sprintf(
+		"%d of %d block(s) free — %.1f MiB (%.3f%%) is all a rewrite would give back",
+		free, total, float64(dead)/(1<<20), 100*share)
+}
+
+// kvInt pulls one KEY=VALUE integer out of a tool's transcript. Absent, or
+// present and unparseable, are the same answer to the caller: not known.
+func kvInt(out, key string) (int64, bool) {
+	for _, field := range strings.Fields(out) {
+		v, ok := strings.CutPrefix(field, key+"=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		return n, err == nil
+	}
+	return 0, false
+}
+
 // stepCompact rewrites the corpus without its dead space, BEFORE the index.
+//
+// IT DECLINES WHEN THERE IS NOTHING TO RECLAIM. `COPY FROM DATABASE` costs
+// thirty minutes on this corpus and doubles its disk while it runs; it is worth
+// exactly the dead space it removes, and on a finished corpus that is 512 KiB.
+// See nothingToReclaim for the measurement and the thresholds.
 //
 // DuckDB never returns free blocks to the filesystem: a CHECKPOINT reclaims them
 // for reuse INSIDE the file. Measured on the 2026-08-30 corpus, 46 947 of 229 166
@@ -1193,23 +1675,47 @@ func runSparse(c *Ctx) error {
 func stepCompact() *Step {
 	return &Step{
 		Name:    "compact",
-		Version: 1,
+		Version: 5,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
-		Deps:  []string{"build-rust", "paragraphs"},
+		// embed-etsi joins the dependencies because this step now compacts the ETSI
+		// corpus too: compacting it before its vectors are written would rewrite a
+		// file that is about to grow again, which is the one thing a compaction
+		// must not do.
+		// build-go is an AVAILABILITY constraint, not a provenance one: this step
+		// launches dbcount, both to decide whether a rewrite is worth doing and to
+		// validate the one it did. build-go is a Tool step, so declaring it orders
+		// and force-builds the binary without folding anything into this
+		// fingerprint. It was already launched from Validate without being declared;
+		// the gate is what makes an out-of-date dbcount able to FAIL the step rather
+		// than merely mis-validate it.
+		Deps:  []string{"build-rust", "build-go", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
-		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
-		},
+		// Not even compact may fingerprint the corpora, though it looked like the
+		// one step that safely could.
+		//
+		// It is the last step to REWRITE them, so the file it records ought to be
+		// the file it is judged against — that was the reasoning, and it was wrong
+		// by one step. `index` and `index-etsi` freeze the HNSW into those same
+		// files afterwards. So compact recorded a corpus without an index and was
+		// re-decided against a corpus with one, and planned a 30-minute rewrite on
+		// every build for ever.
+		//
+		// It is the eleventh instance of one defect, found only by sweeping the DAG
+		// instead of fixing the step in front of me. What decides compact's work is
+		// its data dependencies — paragraphs, paragraphs-etsi and sparse-etsi — and
+		// those already say, through provenance, whether anything was written that
+		// leaves dead space behind.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Validate: func(c *Ctx) error {
 			// The copy is only believable if the corpus still answers. compact
 			// itself refuses to swap on a clause-count mismatch; this re-asks
 			// afterwards so a swap that somehow landed wrong cannot pass silently.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return err
+				return stillOpenElsewhere("3gpp.duckdb", err)
 			}
 			if !strings.Contains(out, "clauses_with_vectors=") {
 				return fmt.Errorf("dbcount reports no vectorised clauses after compaction")
@@ -1217,29 +1723,89 @@ func stepCompact() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			before, _ := os.Stat(c.dataPath("3gpp.duckdb"))
-			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
-				"--db", c.dataPath("3gpp.duckdb"),
-			}, Echo: true}); err != nil {
-				return err
+			rotateCompactionArtefacts(c)
+			// ONE LOOP FOR BOTH CORPORA, and a MEASUREMENT BEFORE EACH.
+			//
+			// This step used to rewrite both files unconditionally, on the theory
+			// that whatever had just written to them left dead space behind. On a
+			// finished corpus that theory is simply false, and the cost of being
+			// wrong is not small: measured 2026-09-04, thirty minutes to take
+			// data/3gpp.duckdb from 18.2 GiB to 18.2 GiB, with a second copy of
+			// the corpus on the same volume for the duration.
+			//
+			// `dbcount --blocks` asks DuckDB's own block accounting instead. Both
+			// corpora answered TWO free blocks — 512 KiB of the ~21 GiB and
+			// ~18 GiB they occupy — because the writers before this step append
+			// rather than delete, and the one that does delete (the paragraph
+			// conversion) is followed by a compaction that already reclaimed it.
+			rewrote := 0
+			for _, corpus := range []struct {
+				name string
+				// The ETSI half may legitimately be absent; the 3GPP corpus may
+				// not, and a missing one must fail loudly rather than quietly
+				// become "nothing to do".
+				optional bool
+			}{{"3gpp.duckdb", false}, {"etsi.duckdb", true}} {
+				db := c.dataPath(corpus.name)
+				if corpus.optional && !fileNonEmpty(db) {
+					continue
+				}
+				out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{
+					"--db", db, "--blocks",
+				}})
+				if err != nil {
+					return err
+				}
+				if skip, why := nothingToReclaim(out); skip {
+					c.Log.Printf("%s: %s — not rewriting it", corpus.name, why)
+					continue
+				}
+				before, _ := os.Stat(db)
+				if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
+					"--db", db,
+				}, Echo: true}); err != nil {
+					return err
+				}
+				rewrote++
+				// The original is kept as <db>.pre-compact by the bin; the
+				// pipeline does not delete it. A corpus is not something to drop
+				// on the strength of a copy verified seconds ago — `validate` and
+				// `smoke` still have to run, and releasePreCompact runs after them.
+				if after, serr := os.Stat(db); serr == nil && before != nil {
+					c.Log.Printf("%s %.2f GiB -> %.2f GiB", corpus.name,
+						float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
+				}
 			}
-			after, err := os.Stat(c.dataPath("3gpp.duckdb"))
-			if err != nil {
-				return err
+			if rewrote == 0 {
+				return fmt.Errorf(
+					"%w: neither corpus carries enough dead space to be worth a rewrite", ErrDeclined)
 			}
-			if before != nil {
-				c.Log.Printf("corpus %.1f GiB -> %.1f GiB",
-					float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
-			}
-			// The original is kept as <db>.pre-compact by the bin; the pipeline does
-			// not delete it. A corpus is not something to drop on the strength of a
-			// copy verified seconds ago — `validate` and `smoke` still have to run.
 			return nil
 		},
 	}
 }
 
 // -------------------------------------------------- serveur sémantique
+
+// ldflagsWith puts `-L<dir>` in front of whatever CGO_LDFLAGS the caller already
+// exported, instead of replacing it.
+//
+// Ctx.Run appends Cmd.Env to os.Environ(), and a later duplicate key wins — so a
+// step that sets CGO_LDFLAGS silently discards the one the environment supplied.
+// This build needs BOTH: -L<cargo target>/release for the embed-core cdylib, and
+// the -L<.local/toolchain/duckdb> that scripts/local/toolchain-env.sh exports
+// because the Windows build links duckdb_use_lib against a supplied libduckdb
+// rather than the embedded archive. Dropping the second failed the link with
+// "ld.exe: cannot find -lduckdb" every single time, which is why this step's
+// recorded state was "never run": it is Optional and the finish chain calls it
+// with `|| echo`, so nothing ever stopped and nobody had to look.
+func ldflagsWith(dir string) string {
+	own := "-L" + dir
+	if prev := strings.TrimSpace(os.Getenv("CGO_LDFLAGS")); prev != "" {
+		return prev + " " + own
+	}
+	return own
+}
 
 // stepBuildServe builds the server binary that can actually answer semantically,
 // and stages the DLLs it needs beside it.
@@ -1268,6 +1834,7 @@ func stepBuildServe() *Step {
 		Deps:      []string{"toolchain", "build-go"},
 		Impl:      []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
 		Toolchain: true,
+		Tool:      true,
 		// A box with no ONNX Runtime still completes every other step; it just gets
 		// the lexical server. Failing the whole pipeline over the optional half of
 		// the search stack would be the wrong trade.
@@ -1291,9 +1858,25 @@ func stepBuildServe() *Step {
 			}
 			tags += "onnx,embed_ffi"
 			c.Log.Printf("go build cmd/server -tags %s", tags)
+			// APPEND to CGO_LDFLAGS, do not replace it.
+			//
+			// This build needs TWO link directories, and it only ever named one.
+			// scripts/local/toolchain-env.sh exports -L<.local/toolchain/duckdb>
+			// because the Windows build links duckdb_use_lib against a supplied
+			// libduckdb rather than the embedded archive (see that file for why the
+			// static path mixes 1.5.3 headers with 1.4.3 objects). Setting
+			// CGO_LDFLAGS here dropped it, and the link failed with
+			//
+			//   ld.exe: cannot find -lduckdb: No such file or directory
+			//
+			// every time — which is why this step's recorded state was "never run".
+			// It is Optional and the chain calls it with `|| echo`, so the failure
+			// never stopped anything and never had to be looked at. The image does
+			// not need this binary; the end-to-end proof does, and the proof is the
+			// only thing that drives the corpus through the code the image ships.
 			if err := c.Run(Cmd{Name: "go", Args: []string{
 				"build", "-tags", tags, "-o", c.bin("server-full"), "./cmd/server",
-			}, Env: []string{"CGO_LDFLAGS=-L" + filepath.Join(target, "release")}}); err != nil {
+			}, Env: []string{"CGO_LDFLAGS=" + ldflagsWith(filepath.Join(target, "release"))}}); err != nil {
 				return err
 			}
 			// Stage every DLL the binary dlopens, beside the binary. Best-effort per

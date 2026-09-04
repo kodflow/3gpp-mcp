@@ -85,6 +85,7 @@ func TestMCPTools(t *testing.T) {
 		"search_spec": true, "get_spec": true, "get_changelog": true, "list_releases": true,
 		"resolve_term": true, "trace_evolution": true, "find_cross_references": true,
 		"list_specs": true, "search_api": true, "server_info": true, "trace_clause": true,
+		"help": true,
 		"li_events": true,
 	}
 	gotTools := map[string]bool{}

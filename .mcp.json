@@ -9,7 +9,8 @@
         "--etsi-db", "data/etsi.duckdb"
       ],
       "env": {
-        "EMBED_MODEL_DIR": "data/models/bge-m3",
+        "EMBED_MODEL": "bge-m3-sparse",
+        "EMBED_MODEL_DIR": "data/models/bge-m3-sparse",
         "ORT_DYLIB_PATH": ".local/bin/onnxruntime.dll"
       }
     }

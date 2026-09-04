@@ -71,6 +71,56 @@ func (r *Runner) toolchainIdentity() string {
 	return r.toolID()
 }
 
+// isTool reports whether a step name denotes a binary producer rather than a
+// data producer. An unknown name is not a tool: NewRunner has already rejected
+// unknown dependencies, so this can only be a caller passing a typo, and
+// treating that as "not a tool" keeps the conservative behaviour.
+func (r *Runner) isTool(name string) bool {
+	s := r.byName[name]
+	return s != nil && s.Tool
+}
+
+// WithToolDeps closes a step selection over the tool steps it needs, transitively.
+//
+// This is what makes `--only` honest. Selecting a step used to run that step and
+// nothing else, so a corrected sparse_embed.rs sat on disk while `--only sparse`
+// launched YESTERDAY's binary and reported success — the "a fix that was not
+// built is inert" failure, which this repository's own runbook records happening
+// five separate times, to five different binaries, before the cause was found.
+// The cause was never carelessness; it was that `--only` skipped the build.
+//
+// Data dependencies stay out. Asking for one step must not silently re-ingest a
+// corpus — that is the whole point of asking for one step. Tool dependencies are
+// different in kind: they are cheap, idempotent, and skip in milliseconds when
+// nothing changed, so including them costs nothing and removes the trap.
+func (r *Runner) WithToolDeps(sel map[string]bool) map[string]bool {
+	if sel == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(sel))
+	for n := range sel {
+		out[n] = true
+	}
+	var add func(name string)
+	add = func(name string) {
+		s := r.byName[name]
+		if s == nil {
+			return
+		}
+		for _, d := range append(append([]string(nil), s.Deps...), s.AnyDeps...) {
+			if !r.isTool(d) || out[d] {
+				continue
+			}
+			out[d] = true
+			add(d) // a tool's own tool deps: build-go needs toolchain
+		}
+	}
+	for n := range sel {
+		add(n)
+	}
+	return out
+}
+
 // topoSort returns a deterministic dependency order (Kahn, ties broken by the
 // declaration order so the plan reads the same way every time).
 func topoSort(steps []*Step) ([]string, error) {
@@ -125,6 +175,12 @@ func topoSort(steps []*Step) ([]string, error) {
 // The four skip conditions are evaluated in the order that gives the most useful
 // reason: "never ran" beats "fingerprint changed" beats "output missing" beats
 // "validation failed".
+//
+// A dirty TOOL dependency is deliberately not one of them. Tool steps produce
+// binaries, not provenance, so "cargo relinked" is not a reason to replay a GPU
+// pass — and since a Tool contributes nothing to the fingerprint either, letting
+// it short-circuit here would have reinstated the whole cascade one layer down,
+// where it would have been much harder to see.
 func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	fp, rec, err := r.Fingerprint(s, r.ctx)
 	if err != nil {
@@ -133,14 +189,16 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	d := Decision{Step: s, Fingerprint: fp, Action: ActionRun}
 
 	for _, dep := range s.Deps {
-		if dirty[dep] {
-			d.Reason = "dependency " + dep + " is re-running"
+		if dirty[dep] && !r.isTool(dep) {
+			d.Reason = "re-checked after " + dep + "; runs only if it changed something"
+			d.Conditional = true
 			return d, nil
 		}
 	}
 	for _, dep := range s.AnyDeps {
-		if dirty[dep] {
-			d.Reason = "producer " + dep + " is re-running"
+		if dirty[dep] && !r.isTool(dep) {
+			d.Reason = "re-checked after producer " + dep + "; runs only if it changed something"
+			d.Conditional = true
 			return d, nil
 		}
 	}
@@ -167,7 +225,7 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 			d.Reason += ": " + firstLine(prev.Error)
 		}
 		return d, nil
-	case prev.Fingerprint != fp:
+	case prev.Fingerprint != fp && !onlyDroppedDeterminants(prev, rec):
 		d.Reason = explainDrift(prev, rec)
 		return d, nil
 	}
@@ -190,6 +248,13 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	}
 	if s.Validate != nil {
 		if err := s.Validate(r.ctx); err != nil {
+			// A verdict of "no" and the ABSENCE of a verdict are not the same
+			// answer, and only one of them is allowed to schedule work. An
+			// undecidable validation stops the plan rather than invalidating the
+			// step: see ErrUndecidable for the 21 GB this distinction protects.
+			if Undecidable(err) {
+				return Decision{}, fmt.Errorf("cannot decide whether %s is still valid: %w", s.Name, err)
+			}
 			d.Reason = "validation failed: " + firstLine(err.Error())
 			return d, nil
 		}
@@ -198,6 +263,55 @@ func (r *Runner) decide(s *Step, dirty map[string]bool) (Decision, error) {
 	d.Action = ActionSkip
 	d.Reason = "fingerprint unchanged, outputs present and valid"
 	return d, nil
+}
+
+// onlyDroppedDeterminants reports whether the fingerprint moved for one reason
+// alone: something that USED to be a determinant no longer is.
+//
+// The fingerprint is a hash of the record's components, so comparing components
+// is the same test with more resolution — and the extra resolution matters
+// exactly once, when the set of determinants itself changes. Making build steps
+// ordering-only dropped `dep:build-go` from every data step's fingerprint, and
+// the plan then offered to replay a finished corpus with the reason "dependency
+// output changed: build-go (removed)". That is not a reason. A determinant nobody
+// counts any more cannot have changed anything; re-running fifteen heavy steps to
+// discover that would have cost days and risked a 22 GB artefact.
+//
+// Everything that still IS a determinant is compared exactly, so a real change —
+// a new version, an edited source, a moved input, a dependency that genuinely
+// produced something different — invalidates as before. Only keys absent from the
+// current record are forgiven, and only when every remaining one agrees.
+func onlyDroppedDeterminants(prev, cur *Record) bool {
+	if prev.StepVersion != cur.StepVersion ||
+		!sameMap(prev.Impl, cur.Impl) ||
+		!sameMap(prev.Environment, cur.Environment) ||
+		!sameMap(prev.Inputs, cur.Inputs) {
+		return false
+	}
+	dropped := false
+	for k, v := range cur.Deps {
+		if prev.Deps[k] != v {
+			return false // a dependency that still counts, and it moved
+		}
+	}
+	for k := range prev.Deps {
+		if _, ok := cur.Deps[k]; !ok {
+			dropped = true
+		}
+	}
+	return dropped
+}
+
+func sameMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // explainDrift names WHAT changed rather than just reporting that something did.
@@ -244,6 +358,103 @@ func summarise(keys []string) string {
 		return strings.Join(keys, ", ")
 	}
 	return fmt.Sprintf("%s and %d more", strings.Join(keys[:max], ", "), len(keys)-max)
+}
+
+// contentIdentityMax is the size below which an output is identified by its
+// CONTENT rather than by size and mtime.
+//
+// The distinction pays for itself on the small, regenerated artefacts: a work
+// list, a series list, a state JSON. `discover-etsi` rewrites its work list on
+// every run, so mtime always moves, so `corpus-etsi` — hours of download and PDF
+// conversion — was replayed by a file that came back byte-for-byte identical.
+// Hashing 64 MiB costs a fraction of a second; the corpus and the ledgers are
+// orders of magnitude above it and keep the cheap identity.
+const contentIdentityMax = 64 << 20
+
+// outputIdentity describes an output well enough to answer one question: did this
+// run change it? Content where content is affordable, size AND mtime where it is
+// not — size alone would call a same-size rewrite "unchanged" and let a stale
+// index be served over changed data, the one direction this must never be wrong
+// in. A file that cannot be read falls back to the cheap identity rather than
+// claiming an identity it does not have.
+func outputIdentity(path string, st os.FileInfo) string {
+	if st.Size() <= contentIdentityMax {
+		if h, err := fileContentHash(path); err == nil {
+			return fmt.Sprintf("%d bytes sha=%s", st.Size(), h)
+		}
+	}
+	return fmt.Sprintf("%d bytes @%d", st.Size(), st.ModTime().UTC().UnixNano())
+}
+
+// publishedProvenance is what a dependant folds in for this record. The empty
+// Provenance of every pre-existing state file means "the fingerprint", so the
+// field could be introduced without invalidating a single recorded step.
+func publishedProvenance(rec *Record) string {
+	if rec.Provenance != "" {
+		return rec.Provenance
+	}
+	return rec.Fingerprint
+}
+
+// carriedProvenance keeps a step's published identity across a run that changed
+// nothing. With no previous record there is nothing to carry: a first run is a
+// change by definition.
+func carriedProvenance(prev *Record) string {
+	if prev == nil || prev.Status != StatusSuccess {
+		return ""
+	}
+	return publishedProvenance(prev)
+}
+
+// sameOutputs reports whether two recorded output sets describe the same
+// artefacts.
+//
+// It has to cope with records written before outputs carried a content hash,
+// which said only "%d bytes". Discarding those as incomparable is not free: it
+// would have made the first run under the new scheme replay `fetch` — 20 163
+// specs and roughly thirty hours of LibreOffice — to reproduce a work list this
+// session had already diffed byte for byte. So a legacy value is compared on the
+// one thing it recorded, its size. That is weaker than the new comparison and
+// strictly stronger than the old behaviour, which compared nothing at all, and
+// the window closes the first time each step runs.
+//
+// A qualifier that merely CHANGED (sha to mtime, because the output crossed
+// contentIdentityMax) is not the legacy case and is treated as a difference.
+func sameOutputs(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		w, ok := b[k]
+		if !ok {
+			return false
+		}
+		if v == w {
+			continue
+		}
+		if isLegacyIdentity(v) || isLegacyIdentity(w) {
+			if sizeOf(v) != "" && sizeOf(v) == sizeOf(w) {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// isLegacyIdentity reports whether a recorded identity predates the qualifier —
+// "12345 bytes" and nothing more.
+func isLegacyIdentity(v string) bool {
+	return !strings.Contains(v, " sha=") && !strings.Contains(v, " @")
+}
+
+// sizeOf returns the leading "<n> bytes" of an identity, or "" if it has none.
+func sizeOf(v string) string {
+	i := strings.Index(v, " bytes")
+	if i < 0 {
+		return ""
+	}
+	return v[:i]
 }
 
 func rel(root, p string) string {
@@ -298,7 +509,22 @@ type Result struct {
 func (r *Runner) Execute(only map[string]bool, dryRun bool) (*Result, error) {
 	res := &Result{}
 	start := time.Now()
-	dirty := map[string]bool{}
+
+	// dirty is a PREDICTION — "this dependency is going to re-run, so assume the
+	// worst" — and it is needed only while nothing actually runs. During a real
+	// execution every upstream step has already finished and saved its record by
+	// the time this step is decided, so the recomputed fingerprint is not a guess:
+	// it is the answer. Consulting the prediction as well would override it, and
+	// would override it in the one direction that costs hours — a dependency that
+	// ran and changed NOTHING (it declined, or it rewrote its output identically)
+	// would still replay everything behind it.
+	//
+	// A nil map reads as all-false, so passing nil is what turns the prediction
+	// off; Plan and the dry run keep it.
+	var dirty map[string]bool
+	if dryRun {
+		dirty = map[string]bool{}
+	}
 
 	for _, name := range r.order {
 		s := r.byName[name]
@@ -316,7 +542,9 @@ func (r *Runner) Execute(only map[string]bool, dryRun bool) (*Result, error) {
 			reportSkip(s, d)
 			continue
 		}
-		dirty[name] = true
+		if dirty != nil {
+			dirty[name] = true
+		}
 
 		if dryRun {
 			reportPlanned(s, d)
@@ -369,6 +597,12 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	}
 	defer log.Close()
 
+	// The record as it stood BEFORE this attempt: the only thing that can say
+	// whether this run actually changed anything, and so whether dependants have
+	// any reason to replay. Loaded here rather than taken from the Decision,
+	// because decide returns early — without it — on a dirty dependency.
+	prev, _ := r.store.Load(s.Name)
+
 	_, rec, err := r.Fingerprint(s, r.ctx)
 	if err != nil {
 		return err
@@ -401,6 +635,11 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 		rec.Status = StatusSuccess
 		rec.Declined = true
 		rec.Error = ""
+		// Publishing a fresh provenance here would be the same gate, worn as a
+		// number: `embed` declines the moment every clause already carries a
+		// vector, and that decline used to re-freeze the HNSW index and re-compact
+		// 22 GB to reproduce bytes nobody had touched.
+		rec.Provenance = carriedProvenance(prev)
 		if err := r.store.Save(rec); err != nil {
 			return err
 		}
@@ -424,8 +663,11 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	// usable artefact is a failure, and calling it a success is exactly the
 	// "orchestrator green while the worker failed" trap this replaces.
 	outs := map[string]string{}
+	comparable := s.Outputs != nil
 	if s.Outputs != nil {
-		for _, o := range s.Outputs(&stepCtx) {
+		declared := s.Outputs(&stepCtx)
+		comparable = len(declared) > 0
+		for _, o := range declared {
 			st, err := os.Stat(o)
 			if err != nil {
 				rec.Status = StatusFailed
@@ -433,10 +675,26 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 				_ = r.store.Save(rec)
 				return fmt.Errorf("%s", rec.Error)
 			}
-			outs[filepath.ToSlash(rel(r.ctx.Root, o))] = fmt.Sprintf("%d bytes", st.Size())
+			// A directory's own size says nothing about its contents, so "unchanged"
+			// could not be established for one. No step declares a directory output
+			// today; if one ever does, it falls back to always propagating rather
+			// than silently vouching for bytes nobody compared.
+			if st.IsDir() {
+				comparable = false
+			}
+			outs[filepath.ToSlash(rel(r.ctx.Root, o))] = outputIdentity(o, st)
 		}
 	}
 	rec.Outputs = outs
+
+	// Did this run change anything a dependant could observe? Only a step that has
+	// declared its outputs to BE its effect may answer that from them; for every
+	// other step, having run at all is the honest answer.
+	rec.Provenance = rec.Fingerprint
+	if s.OutputsComplete && comparable && prev != nil && prev.Status == StatusSuccess &&
+		!prev.Declined && len(prev.Outputs) > 0 && sameOutputs(prev.Outputs, outs) {
+		rec.Provenance = carriedProvenance(prev)
+	}
 
 	if s.Validate != nil {
 		if err := s.Validate(&stepCtx); err != nil {

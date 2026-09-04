@@ -9,8 +9,9 @@
 > describe it doing exactly that, which put the documented design in direct
 > contradiction with [`DATA_NOTICE.md`](../DATA_NOTICE.md): the DB holds verbatim
 > 3GPP/ETSI clause text, and no release asset of this public repository may carry
-> it. It also stopped fitting — GitHub caps an asset at 2 GB, the
-> content-addressed corpus is 12.36 GB.
+> it. It also stopped fitting — GitHub caps an asset at 2 GB, and the
+> content-addressed corpus is 21.2 GB (measured 2026-09-01, after the sparse
+> layer and the HNSW index).
 >
 > The sections below describe the flow that is actually in use. The reasoning
 > about volumes, deltas and clobbering carried over from the retired one; the
@@ -28,18 +29,24 @@ The corpus is pushed by `scripts/local/publish-corpus.sh` to
 `ghcr.io/<owner>/3gpp-corpus`, a **private** package, as one layer holding
 `/3gpp.duckdb`.
 
-```
-GitHub Release `latest` (the only one) — PUBLIC, carries no clause text
-├── mcp-3gpp_linux_amd64.tar.zst   (+ .sha256)   ← Release workflow, on push to main
-├── mcp-3gpp_darwin_arm64.tar.zst  (+ .sha256)   ← Release workflow
+```text
+GitHub Release `latest` — PUBLIC, carries no clause text
 └── corpus-index.json                            ← the delta anchor:
                                                     spec|release → highest indexed
                                                     version. A version list, no text.
+    (the binary archives it used to carry came from release.yml, which is deleted;
+     build one with `make build-bin`, or pull the image, which needs no install)
 
+ghcr.io/<owner>/3gpp-mcp:latest    — PRIVATE, THE PRODUCT: server + both corpora
+                                     + models. Built by `make image` on the machine
+                                     that holds the corpus.
 ghcr.io/<owner>/3gpp-corpus:latest — PRIVATE, one layer = /3gpp.duckdb
 ghcr.io/<owner>/etsi-corpus:latest — PRIVATE, one layer = /etsi.duckdb
+                                     (the corpus packages remain for the binary's
+                                      bootstrap path; the image needs neither)
 
-Client:  mcp-3gpp bootstrap → GHCR manifest → layer (Range-resumable,
+Client:  docker run -i --rm ghcr.io/<owner>/3gpp-mcp:latest   ← nothing to fetch
+    or:  mcp-3gpp bootstrap → GHCR manifest → layer (Range-resumable,
                               digest-verified) → /3gpp.duckdb → serve (offline)
                               needs read:packages; see docs/install.md
 ```
@@ -56,27 +63,34 @@ tag plus a rolling `:latest`.
 | Go source | small | git | ✅ |
 | 3GPP DOCX/.doc sources | ~20 GB | transient on the sync runner | ❌ |
 | Converted HTML | derived | transient on the sync runner | ❌ |
-| Indexed DB `3gpp.duckdb` | 12.36 GB (≈7.9 GB gzip) | `ghcr.io/<owner>/3gpp-corpus`, private | ❌ |
-| BGE-M3 / reranker / ONNX RT | ~2.3 GB | HuggingFace (fetched by `bootstrap --semantic`) | ❌ |
+| Indexed DB `3gpp.duckdb` | 21.2 GB | `ghcr.io/<owner>/3gpp-mcp`, private | ❌ |
+| Indexed DB `etsi.duckdb` | 8.0 GB | same image, same layer | ❌ |
+| BGE-M3 (dense+sparse) / reranker / ONNX RT | 6.4 GB | baked into the image | ❌ |
 
 The corpus never enters git or a Release as raw files. Models stay on
 HuggingFace (`model.onnx_data` is 2.2 GB — over the 2 GB Release-asset cap
-anyway). The corpus does not fit either: 7.9 GB compressed against a 2 GB cap,
-which is the second, independent reason it travels as an OCI layer.
+anyway). The corpus does not fit either — 29.2 GB in one layer, 15.9 GiB once
+gzipped, against a 2 GB cap — which is the second, independent reason it travels
+as an OCI layer.
 
-## Workflows
+## Workflows — there is one left
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `ci.yml` | push/PR `main` | gofmt + vet + `go test -race` matrix {ubuntu, macos}. Lint = ktn-linter (hooks), not golangci-lint. |
-| `release.yml` | push `main` (code paths) + manual | Build binaries natively per-OS → `gh release upload latest … --clobber`. |
-| `rust-bins.yml` | push `main` (rust paths) + manual | Build the Rust binaries per-OS and attach them to `latest`. |
-| `corpus-image.yml` | push `main` + manual | Bake and push the serving image (`full` and `light`) to GHCR. |
-| `corpus-data-image.yml` | manual | Bake the data layer from the published corpus package. |
 | `post-commit.yml` | PR | Gate commit trailers and authorship. |
 
-There is **no scheduled corpus-sync workflow**. Refreshing the corpus is a
-local operation today — see below for why, and what it would take to automate.
+`ci.yml`, `release.yml`, `rust-bins.yml`, `corpus-image.yml` and
+`corpus-data-image.yml` are **deleted**. The image ones moved ~14 GB per run,
+which is the resource this project does not have; the rest went with them when
+the build moved onto the machine that already holds the corpus.
+
+Everything they did happens locally now, and the corpus never had a CI path
+anyway — the constraint below (a hosted runner has ~14 GB disk against a ~20 GB
+corpus) was always the reason. `make build` runs the pipeline, `make image`
+cross-compiles the Linux artefacts and pushes
+`ghcr.io/kodflow/3gpp-mcp:latest` with crane; `post-commit.yml` stays because it
+is the status the branch ruleset requires, and deleting it would block every
+merge. See [automation/data-image.md](automation/data-image.md).
 
 ### Corpus sync — incremental, DB-as-state
 
@@ -128,7 +142,7 @@ The DB has no version number — the **digests of its layer are its identity**.
 2. Compare to the sidecar next to the cached DB.
    - differs / no cache → pull the layer, verify it against the digest, atomic
      swap;
-   - same → use cache, **no download** (the ~7.9 GB moves only when it changed);
+   - same → use cache, **no download** (the corpus layer moves only when it changed);
    - offline / fetch error / credential gone → keep the cached DB
      (degrade-don't-block).
 3. Opt-out via `--no-update` / `MCP3GPP_NO_UPDATE=1` (air-gapped).
