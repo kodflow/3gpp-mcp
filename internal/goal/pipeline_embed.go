@@ -166,7 +166,9 @@ func embedReport(c *Ctx, t corpusTarget) (*embedIOReport, error) {
 		"--db", t.dbPath(c), "--report", "--embed-floor", t.Floor(c),
 	}})
 	if err != nil {
-		return nil, err
+		// Every caller of this is a Validate, so a corpus somebody else has
+		// open must not read as a corpus that needs rebuilding.
+		return nil, stillOpenElsewhere(t.DB, err)
 	}
 	var rep embedIOReport
 	if err := json.Unmarshal([]byte(out), &rep); err != nil {
@@ -494,7 +496,7 @@ func stepEnrich() *Step {
 			// to TS by default". Prove the overlay actually landed.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return err
+				return stillOpenElsewhere("3gpp.duckdb", err)
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters")
@@ -1342,7 +1344,7 @@ func stepParagraphs(t corpusTarget) *Step {
 				"--db", t.dbPath(c), "--verify",
 			}})
 			if err != nil {
-				return fmt.Errorf("the converted corpus does not verify: %w", err)
+				return stillOpenElsewhere(t.DB, fmt.Errorf("the converted corpus does not verify: %w", err))
 			}
 			if !strings.Contains(out, "clause_occ=") {
 				return fmt.Errorf("verification produced no counters: %q", out)
@@ -1595,7 +1597,70 @@ func runSparse(c *Ctx, t corpusTarget) error {
 
 // ----------------------------------------------------------- compaction
 
+// A rewrite has to earn its thirty minutes, and there are two ways it can: the
+// dead space is a meaningful SHARE of the file, or it is a large enough
+// ABSOLUTE number of bytes that everyone who pulls the image downloads them.
+// Either alone is sufficient.
+//
+// Neither threshold is finely tuned, because the cases they separate are four
+// orders of magnitude apart. A finished corpus, measured 2026-09-04: 2 free
+// blocks of 87 830 — 0.002 %, 512 KiB. One that genuinely needed compacting,
+// measured 2026-08-30: 182 219 free of 229 166 — 79.5 %, 43.6 GB.
+const (
+	compactMinDeadFraction = 0.05
+	compactMinDeadBytes    = 1 << 30 // 1 GiB
+)
+
+// nothingToReclaim reads a `dbcount --blocks` transcript and reports whether the
+// corpus it describes holds too little dead space to be worth rewriting, together
+// with the measurement — so the log says what was found, not merely that nothing
+// happened.
+//
+// IT FAILS OPEN, and the asymmetry is the point. A transcript this cannot parse —
+// a bin predating --blocks, a reworded line, a truncated pipe — is not evidence
+// that there is nothing to reclaim, it is the absence of evidence. Declining on
+// it would carry the previous provenance forward, skip `index` behind it, and
+// publish a corpus full of dead space with every gate green. Running a compaction
+// that turns out to have been unnecessary costs half an hour and nothing else.
+// That is the same reasoning as ingestedNothing's "no tally at all is not proof
+// of nothing".
+func nothingToReclaim(out string) (bool, string) {
+	free, okFree := kvInt(out, "free_blocks")
+	total, okTotal := kvInt(out, "total_blocks")
+	size, okSize := kvInt(out, "block_size")
+	if !okFree || !okTotal || !okSize || total <= 0 || size <= 0 || free < 0 {
+		return false, ""
+	}
+	dead := free * size
+	share := float64(free) / float64(total)
+	if share >= compactMinDeadFraction || dead >= compactMinDeadBytes {
+		return false, ""
+	}
+	return true, fmt.Sprintf(
+		"%d of %d block(s) free — %.1f MiB (%.3f%%) is all a rewrite would give back",
+		free, total, float64(dead)/(1<<20), 100*share)
+}
+
+// kvInt pulls one KEY=VALUE integer out of a tool's transcript. Absent, or
+// present and unparseable, are the same answer to the caller: not known.
+func kvInt(out, key string) (int64, bool) {
+	for _, field := range strings.Fields(out) {
+		v, ok := strings.CutPrefix(field, key+"=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		return n, err == nil
+	}
+	return 0, false
+}
+
 // stepCompact rewrites the corpus without its dead space, BEFORE the index.
+//
+// IT DECLINES WHEN THERE IS NOTHING TO RECLAIM. `COPY FROM DATABASE` costs
+// thirty minutes on this corpus and doubles its disk while it runs; it is worth
+// exactly the dead space it removes, and on a finished corpus that is 512 KiB.
+// See nothingToReclaim for the measurement and the thresholds.
 //
 // DuckDB never returns free blocks to the filesystem: a CHECKPOINT reclaims them
 // for reuse INSIDE the file. Measured on the 2026-08-30 corpus, 46 947 of 229 166
@@ -1610,7 +1675,7 @@ func runSparse(c *Ctx, t corpusTarget) error {
 func stepCompact() *Step {
 	return &Step{
 		Name:    "compact",
-		Version: 4,
+		Version: 5,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
 		// After every writer: the dense import, the sparse import and the
 		// content-addressed conversion all leave dead blocks behind.
@@ -1618,7 +1683,14 @@ func stepCompact() *Step {
 		// corpus too: compacting it before its vectors are written would rewrite a
 		// file that is about to grow again, which is the one thing a compaction
 		// must not do.
-		Deps:  []string{"build-rust", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
+		// build-go is an AVAILABILITY constraint, not a provenance one: this step
+		// launches dbcount, both to decide whether a rewrite is worth doing and to
+		// validate the one it did. build-go is a Tool step, so declaring it orders
+		// and force-builds the binary without folding anything into this
+		// fingerprint. It was already launched from Validate without being declared;
+		// the gate is what makes an out-of-date dbcount able to FAIL the step rather
+		// than merely mis-validate it.
+		Deps:  []string{"build-rust", "build-go", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
 		// Not even compact may fingerprint the corpora, though it looked like the
@@ -1643,7 +1715,7 @@ func stepCompact() *Step {
 			// afterwards so a swap that somehow landed wrong cannot pass silently.
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
-				return err
+				return stillOpenElsewhere("3gpp.duckdb", err)
 			}
 			if !strings.Contains(out, "clauses_with_vectors=") {
 				return fmt.Errorf("dbcount reports no vectorised clauses after compaction")
@@ -1652,47 +1724,61 @@ func stepCompact() *Step {
 		},
 		Run: func(c *Ctx) error {
 			rotateCompactionArtefacts(c)
-			before, _ := os.Stat(c.dataPath("3gpp.duckdb"))
-			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
-				"--db", c.dataPath("3gpp.duckdb"),
-			}, Echo: true}); err != nil {
-				return err
-			}
-			after, err := os.Stat(c.dataPath("3gpp.duckdb"))
-			if err != nil {
-				return err
-			}
-			if before != nil {
-				c.Log.Printf("corpus %.1f GiB -> %.1f GiB",
-					float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
-			}
-			// The original is kept as <db>.pre-compact by the bin; the pipeline does
-			// not delete it. A corpus is not something to drop on the strength of a
-			// copy verified seconds ago — `validate` and `smoke` still have to run.
-
-			// THE ETSI HALF, for the same reason and with the same bin. It used to
-			// be left alone because it was fourteen deliverables in 47 MB, where
-			// dead space is not worth a rewrite. Widening the crawl to the whole
-			// /deliver archive makes it thousands, and every writer that touched it
-			// — the ingest, then the embed — leaves free blocks DuckDB only reuses
-			// internally. The image carries this file, so its dead space is bytes
-			// every puller downloads.
+			// ONE LOOP FOR BOTH CORPORA, and a MEASUREMENT BEFORE EACH.
 			//
-			// compact.rs already reads the corpus SHAPE (clauses_is_view) and
-			// rebuilds the FTS index that shape needs, so the ETSI corpus, whose
-			// `clauses` is a real table rather than a view, takes the other branch
-			// and gets fts_main_clauses back. Nothing here is 3GPP-specific.
-			etsi := c.dataPath("etsi.duckdb")
-			if !fileNonEmpty(etsi) {
-				return nil
+			// This step used to rewrite both files unconditionally, on the theory
+			// that whatever had just written to them left dead space behind. On a
+			// finished corpus that theory is simply false, and the cost of being
+			// wrong is not small: measured 2026-09-04, thirty minutes to take
+			// data/3gpp.duckdb from 18.2 GiB to 18.2 GiB, with a second copy of
+			// the corpus on the same volume for the duration.
+			//
+			// `dbcount --blocks` asks DuckDB's own block accounting instead. Both
+			// corpora answered TWO free blocks — 512 KiB of the ~21 GiB and
+			// ~18 GiB they occupy — because the writers before this step append
+			// rather than delete, and the one that does delete (the paragraph
+			// conversion) is followed by a compaction that already reclaimed it.
+			rewrote := 0
+			for _, corpus := range []struct {
+				name string
+				// The ETSI half may legitimately be absent; the 3GPP corpus may
+				// not, and a missing one must fail loudly rather than quietly
+				// become "nothing to do".
+				optional bool
+			}{{"3gpp.duckdb", false}, {"etsi.duckdb", true}} {
+				db := c.dataPath(corpus.name)
+				if corpus.optional && !fileNonEmpty(db) {
+					continue
+				}
+				out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{
+					"--db", db, "--blocks",
+				}})
+				if err != nil {
+					return err
+				}
+				if skip, why := nothingToReclaim(out); skip {
+					c.Log.Printf("%s: %s — not rewriting it", corpus.name, why)
+					continue
+				}
+				before, _ := os.Stat(db)
+				if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
+					"--db", db,
+				}, Echo: true}); err != nil {
+					return err
+				}
+				rewrote++
+				// The original is kept as <db>.pre-compact by the bin; the
+				// pipeline does not delete it. A corpus is not something to drop
+				// on the strength of a copy verified seconds ago — `validate` and
+				// `smoke` still have to run, and releasePreCompact runs after them.
+				if after, serr := os.Stat(db); serr == nil && before != nil {
+					c.Log.Printf("%s %.2f GiB -> %.2f GiB", corpus.name,
+						float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
+				}
 			}
-			beforeE, _ := os.Stat(etsi)
-			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{"--db", etsi}, Echo: true}); err != nil {
-				return err
-			}
-			if afterE, serr := os.Stat(etsi); serr == nil && beforeE != nil {
-				c.Log.Printf("ETSI corpus %.2f GiB -> %.2f GiB",
-					float64(beforeE.Size())/(1<<30), float64(afterE.Size())/(1<<30))
+			if rewrote == 0 {
+				return fmt.Errorf(
+					"%w: neither corpus carries enough dead space to be worth a rewrite", ErrDeclined)
 			}
 			return nil
 		},
