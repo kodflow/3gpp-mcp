@@ -26,24 +26,38 @@ portant `read:packages` avant le premier `pull`.
 
 ### Ce que l'image contient
 
-Chiffres **mesurés** sur l'image publiée le 2026-09-02
-(`sha256:7ca6e0f937269bef97e2c9ffe473e448b45dca796299c166a686da34d5400961`),
-pas des ordres de grandeur. Pour les relire sur VOTRE copie, appelez l'outil
-`help` : il compte dans la base servie au lieu de répéter ce tableau.
+Chiffres **mesurés** dans les bases servies le 2026-09-04, sur l'image publiée
+(`sha256:f2aa17e695871ddf33acb2e419f1250b602ac8b720cea9c329add374ce796642`), pas des ordres de grandeur. Pour les
+relire sur VOTRE copie, appelez l'outil `help` : il compte dans la base servie au
+lieu de répéter ce tableau.
 
 | | 3GPP | ETSI |
 |---|---|---|
-| Clauses | 2 752 688 | 2 994 221 ingérées, **3 168 508** après content-addressing |
-| Vecteurs denses | 821 146 | **2 002 313** |
-| Postings sparse | ~194 M | oui (modèle `b13103bce7ae`) |
-| Index HNSW | gelé | gelé, 1 062 164 embeddings |
+| Clauses indexées | **2 752 688** | **3 169 614** |
+| Specs / deliverables | 3 568 | 5 142 |
+| Versions | 20 163 | 11 822 |
+| Vecteurs denses (1024d) | 821 387 | 902 159 |
+| Postings sparse | 194 111 501 | 127 375 760 |
+| Index HNSW cosinus | gelé | gelé |
 | BM25 / FTS | oui | oui |
-| Taille sur disque | 21,2 GiB | 16,0 GiB |
+| Clause sans vecteur dû | **0** | **0** |
+| Taille sur disque | 21,4 GiB | 18,4 GiB |
 | Axe d'évolution | **release** (Rel-99 → dernière) | **version** (toutes les versions de chaque deliverable) |
 
+Les vecteurs portent sur des **corps de paragraphe dédupliqués** (ADR 0004), pas
+sur les clauses : 821 387 corps distincts couvrent les 2 752 688 occurrences de
+clause côté 3GPP. Un paragraphe identique répété dans quarante versions est
+vectorisé une fois — c'est ce qui rend le corpus complet tenable, et non un trou
+de couverture (`missing_content=0`, `unaccounted=0`).
+
+S'ajoutent au texte des clauses, côté 3GPP : **61 321 CR**, **8 562 opérations**
+et **27 889 schémas** OpenAPI 5GC, **1 131 événements** d'interception légale,
+1 300 acronymes, 18 releases.
+
 Plus : le modèle d'embedding **bi-tête** BGE-M3 (dense + lexical appris,
-identité `38067f8c6efe`), le reranker cross-encoder, ONNX Runtime et les
-extensions DuckDB `fts`/`vss`. Total 48 GiB de couches, ~25 GiB au pull.
+identité `38067f8c6efe`), le modèle sparse `b13103bce7ae`, le reranker
+cross-encoder, ONNX Runtime et les extensions DuckDB `fts`/`vss`. Total ~48 GiB
+de couches.
 
 Les deux moitiés sont **fédérées, jamais fusionnées** : un `spec_id` commençant
 par `ETSI ` part sur la base ETSI, le reste sur la base 3GPP, et une recherche
@@ -122,24 +136,29 @@ code .
 Une fois dans le container :
 
 ```bash
-# Build
-make build                    # → ./bin/mcp-3gpp
+# L'orchestrateur de corpus — il ne refait que ce qui a réellement changé
+make plan                     # ce que `make build` ferait, et POURQUOI. Ne change rien.
+make build                    # tout : fetch → ingest → merge → embed → sparse → index → smoke
+make build/<étape>            # une seule étape ; `make steps` liste les noms
+make status                   # l'état persisté, étape par étape
 
-# Ingestion (one-shot, écrit data/3gpp.duckdb)
-make ingest ARGS="--spec 33.128,33.127,21.905"       # sous-ensemble LI (rapide)
-make ingest ARGS=""                                   # TOUT le corpus (5414 HTML)
-EMBEDDER=local make ingest ARGS="--series 33"         # + vecteurs HNSW (sémantique)
+# Prouver que le serveur sert vraiment les quatre armes, sur les DEUX moitiés
+make prove                    # JSON-RPC réel contre le vrai binaire → `PROVE OK`
 
-# Lancer le MCP en stdio
-make serve
-
-# TESTER soi-même
-make poc                      # test E2E : events LI X2→MDF2 par NE/NF (TS 33.128)
-make demo                     # interroge TOUS les tools en vrai (JSON-RPC) et affiche
-
-# Backend sémantique ONNX réel (optionnel, ~2.3 Go)
-make model                    # bootstrap BGE-M3 + ONNX Runtime, puis build -tags onnx
+# Construire l'image depuis le corpus local et la pousser sur GHCR
+make publish
 ```
+
+> `make build` est **l'orchestrateur du corpus**, pas un `go build` : chaque étape
+> déclare ses sources, et une étape qui n'a rien à faire **décline** au lieu de
+> reprogrammer tout l'aval. Sur un corpus déjà complet, un build converge vers
+> « rien à faire » — un `fetch` qui ne reçoit aucune nouvelle version décline, et
+> ingest, merge, embed et index sautent derrière lui. Les binaires seuls se
+> bâtissent avec `make build/build-go`.
+>
+> Lire un plan : `[SKIP]` prouvé · `[RUN ]` va tourner, pour la raison affichée
+> · `[RUN?]` sera re-décidé contre l'état réel quand sa dépendance aura fini, et
+> sauté si celle-ci n'a rien changé.
 
 > **Comment c'est indexé et les relations entre éléments** : voir
 > [`docs/INDEXING.md`](./docs/INDEXING.md) (tables, index FTS/HNSW/b-tree,
@@ -219,25 +238,33 @@ Variables lues au démarrage du serveur ; `help` en rend la liste à jour.
 | `ORT_EP` | execution provider ONNX (`cpu`, `cuda`) |
 | `MCP3GPP_ALLOW_LEXICAL_FALLBACK` | `true` autorise un démarrage lexical si les vecteurs sont inutilisables ; **par défaut le serveur refuse de démarrer**, pour qu'un service silencieusement dégradé ne soit jamais servi |
 
-## État d'implémentation (V1)
+## État d'implémentation
 
-Les 8 phases du moteur de retrieval sont implémentées et le service build/serve.
+Le corpus complet est construit, indexé, embarqué et **prouvé en JSON-RPC réel**
+(`make prove` → `PROVE OK — every arm live on both halves`).
 
 | Phase | État | Paquet |
 |---|---|---|
 | 1 — Modèle + schéma + store DuckDB | ✅ | `internal/model`, `internal/store` |
 | 2 — Parsing HTML → clauses | ✅ | `internal/htmlparse` |
-| 3 — Indexation FTS BM25 + filtres | ✅ (HNSW câblé, attend les vecteurs) | `internal/store` |
-| 4 — Embeddings BGE-M3 | ⚙️ interface + dégradable ; backend ONNX derrière `-tags onnx` | `internal/embed` |
-| 5 — Glossaire (21.905) | ✅ seeder câblé (best-effort) | `internal/ingest` |
-| 6 — Changelog (Change History) | ✅ | `internal/htmlparse` |
+| 3 — Indexation FTS BM25 + filtres | ✅ | `internal/store` |
+| 4 — Embeddings BGE-M3 dense + sparse appris | ✅ gelés sur les deux moitiés | `internal/embed`, `rust/embedcore` |
+| 5 — Glossaire (21.905) | ✅ 1 300 acronymes | `internal/ingest` |
+| 6 — Changelog (Change History) | ✅ 61 321 CR | `internal/htmlparse` |
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
 | 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
+| 9 — Reranker cross-encoder | ✅ actif par défaut | `internal/rerank` |
+| 10 — Moitié ETSI fédérée | ✅ 3 169 614 clauses | `cmd/goal` (`corpus-etsi`) |
 
-**Deux écarts assumés avec l'archi figée (à régulariser en MR `arch-change`) :**
+**Un écart assumé avec l'archi figée (à régulariser en MR `arch-change`) :**
 
 1. **Parsing HTML, pas DOCX natif** — ~55 % du corpus est du `.doc` binaire ; `scripts/corpus.sh` convertit tout en HTML via LibreOffice et l'ingestion parse ce HTML (couvre 100 % du corpus). Contredit CLAUDE.md §13.
-2. **Embeddings désactivés par défaut** — le mono-binaire build sans le runtime ONNX ni le modèle ~2 Go ; la recherche dégrade en lexical (BM25/LIKE), visible jamais bloquant. Backend réel à brancher avec `-tags onnx`.
+
+Le second écart historique — « embeddings désactivés par défaut » — **n'existe
+plus** : ONNX Runtime et les deux modèles voyagent dans l'image, et le serveur
+**refuse de démarrer** si les vecteurs sont inutilisables, plutôt que de servir
+en silence une recherche dégradée en mots-clés. `MCP3GPP_ALLOW_LEXICAL_FALLBACK`
+lève ce refus quand on le veut explicitement.
 
 ### POC — question cible (Lawful Interception)
 
@@ -261,11 +288,15 @@ Réponse sur **TS 33.128** (Rel-19, 19.6.0), extraite des sous-clauses « Genera
 
 Chaque ligne est citée (`TS 33.128 v19.6.0 §<clause>` + URL d'archive).
 
-## Périmètre MVP
+## Périmètre
 
-- **V1** : Rel-17 / 18 / 19, séries 23, 24, 29, 33, 38 (~150 specs)
-- **V2** : KuzuDB pour les relations NE↔NF, CR pipeline complet, ingestion historique → Rel-15
-- **V3** : reranker, ingestion Phase 1 → Rel-16, multi-utilisateurs Halys
+- **Atteint** — tout le corpus 3GPP (Phase 1 → dernière release : 18 releases,
+  3 568 specs, 20 163 versions) **et** toute la moitié ETSI (5 142 deliverables,
+  11 822 versions) ; FTS + HNSW dense + sparse appris + reranker ; le tout dans
+  **une seule image** qui sert les 13 outils. Couverture vérifiée par contrat :
+  `over_claim=0 missing_content=0 unaccounted=0`.
+- **Reste** — KuzuDB pour le graphe NE↔NF (la table `evolutions` en tient lieu
+  en V1), multi-utilisateurs Halys.
 
 ## Workflow dev (assumé AI-first)
 
