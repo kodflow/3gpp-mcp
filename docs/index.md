@@ -19,8 +19,8 @@ Measured on the built corpus, not estimated — see [`local-pipeline.md`](./loca
 | Series / releases | 31 / Rel-4 → Rel-20 (plus Phase 1–2 on the old series) |
 | 5GC API operations | 8 562 (+27 889 schemas) |
 | LI events (Rel-19) | 405 |
-| ETSI deliverables (separate DB) | 14 |
-| MCP tools | 11 |
+| ETSI deliverables (separate DB) | 5 142 (11 822 versions, 3 169 614 clauses) |
+| MCP tools | 13 |
 
 ## Start here
 
