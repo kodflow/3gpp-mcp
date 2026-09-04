@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,6 +135,30 @@ func (s *Store) Forget(step string) error {
 // Steps use it so a killed process never leaves a truncated artefact that a
 // later run would mistake for a finished one.
 func WriteAtomic(path string, b []byte) error {
+	// A FILE THAT IS NOT CHANGING MUST NOT BE TOUCHED.
+	//
+	// Steps declare their Inputs, and inputsHash identifies an input by size and
+	// modification time. So rewriting a file with the bytes it already had is not
+	// a no-op to the pipeline: the mtime moves, every consumer of that file is
+	// invalidated, and work is replayed to reproduce something nobody changed.
+	//
+	// That is not hypothetical. `discover` rewrites series.json and worklist.txt
+	// on every run, and it runs whenever the cached status report passes its 6 h
+	// TTL — which is a clock, not a change. Measured 2026-09-04: two consecutive
+	// discover runs produced byte-identical outputs (series.json sha 0bb205d02ec8219f,
+	// worklist.txt sha 55087e9d4f3c59ca) and still put `fetch` — a heavy step — back
+	// on the plan, with ingest, merge, embed and the rest conditional behind it.
+	//
+	// The asymmetry this compensates for is real and lives elsewhere: OUTPUTS are
+	// identified by CONTENT below contentIdentityMax (outputIdentity), INPUTS only
+	// ever by size and mtime. Fixing that properly means migrating every recorded
+	// input identity, and a step that SKIPS never rewrites its record, so the
+	// migration cannot complete on its own. Not writing an unchanged file is the
+	// smaller and more general statement, and it is true of every producer here,
+	// not only the enumerators.
+	if cur, err := os.ReadFile(path); err == nil && bytes.Equal(cur, b) {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
