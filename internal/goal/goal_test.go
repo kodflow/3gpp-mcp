@@ -1160,19 +1160,36 @@ func TestTheOverlayFetchScriptsArePartOfEnrich(t *testing.T) {
 
 // Acquiring the LI registry has to make the step dirty, or the corpus keeps
 // whatever li_events it already had.
+//
+// This used to assert that the two DIRECTORIES were named, which is the one form
+// that cannot work: inputsHash records a directory as the constant string "dir",
+// so the trees were declared and never watched — the test passed for two months
+// over a step that could not see a single file arrive. What has to hold is that a
+// file acquired into either tree is fingerprinted, so that is what is asserted.
 func TestTheAcquiredOverlaysAreInputsOfEnrich(t *testing.T) {
 	c, _ := newTestCtx(t)
+	api := filepath.Join(c.Data, "sources", "5g-apis", "Namf_Communication.yaml")
+	asn := filepath.Join(c.Data, "sources", "asn", "TS33128Payloads.asn")
+	for _, p := range []string{api, asn} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	in, err := stepEnrich().Inputs(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var joined string
+	got := map[string]bool{}
 	for _, i := range in {
-		joined += filepath.ToSlash(i) + " "
+		got[filepath.Clean(i)] = true
 	}
-	for _, want := range []string{"sources/5g-apis", "sources/asn"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("enrich does not take %s as an input: filling it would not re-run the overlay", want)
+	for _, want := range []string{api, asn} {
+		if !got[filepath.Clean(want)] {
+			t.Errorf("enrich does not take %s as an input: acquiring it would not re-run the overlay",
+				filepath.Base(want))
 		}
 	}
 }
