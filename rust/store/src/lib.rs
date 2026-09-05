@@ -1979,7 +1979,8 @@ mod tests {
 
         // Cite-or-silent: a spec the corpus does not hold is never invented.
         assert!(
-            !s.update_spec_meta("99.999", "Invented", "TR", "SA9").unwrap(),
+            !s.update_spec_meta("99.999", "Invented", "TR", "SA9")
+                .unwrap(),
             "a spec not on disk must not be created"
         );
         let n: i64 = s
