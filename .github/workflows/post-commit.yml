@@ -61,6 +61,27 @@ jobs:
           # stub stays byte-identical everywhere.
           authors: kodflow
 
+          # `.claude/` here is SOURCE, not an artefact the tooling left behind.
+          #
+          # The agent-artefact rule is right about the general case and it caught
+          # a real one in this repository: 423 files of the devcontainer template
+          # vendored under .devcontainer/images/.claude/ — 89 agents, 78 commands,
+          # 180 docs, none of them about 3GPP — which nothing here read, because
+          # the Dockerfile is a bare FROM and the payload lives in the image.
+          # Those are gone.
+          #
+          # What is left under /.claude/ was written FOR this project and is
+          # useless anywhere else: the /3gpp skill, the /goal and /install-3gpp
+          # commands, the review-fixer agent, and features.json (the requirements
+          # database). .gitignore has committed them deliberately and says so at
+          # each exception. Untracking them would not remove an artefact, it would
+          # delete work.
+          #
+          # The distinction the rule needs is not "is it an agent directory" but
+          # "did this repository author it" — and `agent_files_allow` is the seam
+          # its own design provides for exactly that.
+          agent_files_allow: .claude
+
   # A fallback, deliberately a SEPARATE job — and deliberately not called a gate.
   #
   # Where a ruleset can require the status, that ruleset is the enforcement and

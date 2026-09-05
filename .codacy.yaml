@@ -14,4 +14,3 @@ exclude_paths:
   - ".devcontainer/**/*.md"
   # Claude agent and command files (Markdown used as prompts)
   - ".claude/**/*.md"
-  - ".devcontainer/images/.claude/**/*.md"

@@ -12,7 +12,7 @@ Development container setup for consistent dev environments across languages.
 ├── devcontainer.json         # Main config (synced from template on /update)
 ├── devcontainer.local.json   # Optional per-project overrides (preserved across /update)
 ├── docker-compose.yml        # Multi-service setup
-├── Dockerfile                # Extends images/ base
+├── Dockerfile                # FROM ghcr.io/kodflow/devcontainer-template:latest
 ├── install.sh                # Standalone Claude installer
 ├── scripts/                  # Build utilities
 │   └── generate-assets-archive.sh
@@ -24,11 +24,25 @@ Development container setup for consistent dev environments across languages.
 │   ├── infrastructure/  # Terragrunt, TFLint, Infracost
 │   └── kubernetes/      # Local K8s via kind
 ├── hooks/               # Host-side only (initialize.sh) + project extensions
-├── tests/               # Unit tests (BATS)
-└── images/              # Two-tier Docker images + Claude config
-    ├── Dockerfile.base  # Stable layer (apt, Cloud CLIs) — weekly
-    └── Dockerfile       # Dynamic layer (Claude, tools) — daily
+└── tests/               # Unit tests (BATS)
 ```
+
+`images/` is GONE, and nothing here is worse for it. It held a 423-file copy of
+the template's agent toolkit — 89 agents, 78 commands, 180 docs — that this
+repository read from exactly nowhere: the Dockerfile above is a bare `FROM` with
+no `COPY`, `install.sh` downloads from `raw.githubusercontent.com/kodflow/
+devcontainer-template` rather than from disk, and the image's own onCreate hook
+says it plainly:
+
+```text
+# Note: .claude/ is now baked into the Docker image at /home/vscode/.claude/
+# No longer needs injection from devcontainer feature
+```
+
+A vendored copy of another repository's tree is a snapshot that ages silently:
+it cannot be the thing that runs, and it stops matching what does. The toolkit
+belongs in `ghcr.io/kodflow/devcontainer-template:latest`, which is where the
+container gets it.
 
 ## Key Files
 
