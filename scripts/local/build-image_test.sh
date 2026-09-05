@@ -73,5 +73,70 @@ else
 	fail "field sparse_model on an empty value = '$got', want empty"
 fi
 
+# ---------------------------------------------------------------------------
+# The corpus halves must be packed into SEPARATE layers.
+#
+# A registry dedupes by layer digest: a half that did not change is answered with
+# "existing blob" and never crosses the wire. Both halves in one tar throws that
+# away, and it throws it away SILENTLY — the publish succeeds, the image is
+# correct, and the only symptom is that it took twice as long.
+#
+# Measured on the 2026-09-05 publish, before the split: seeding 679 glossary rows
+# grew 3gpp.duckdb by 9.7 MB and left etsi.duckdb identical to the byte, and
+# 19.7 GB of unchanged ETSI went up the wire regardless. Nothing failed. Nothing
+# reported it. That is why this is pinned in a test rather than a comment.
+#
+# Read out of the real script, not restated here: a copy would keep passing after
+# the original was changed back.
+corpus_layers="$(grep -E '^\[ "\$WITH_CORPUS" = 1 \] && layer ' "$SCRIPT")"
+if [ -z "$corpus_layers" ]; then
+	fail "no corpus layer line in build-image.sh — the packing moved and this check is now blind"
+else
+	# PER LINE, and order-independent. The first version of this check matched
+	# "3gpp.duckdb.*etsi.duckdb" on the whole block, so a single combined layer
+	# written with the two paths the OTHER way round sailed through it — the
+	# check depended on the order of two filenames nobody promised to keep.
+	# Counting how many halves each line carries cannot be fooled that way.
+	shared=0
+	names=""
+	while IFS= read -r ln; do
+		[ -n "$ln" ] || continue
+		n=0
+		case "$ln" in *3gpp.duckdb*) n=$((n + 1)) ;; esac
+		case "$ln" in *etsi.duckdb*) n=$((n + 1)) ;; esac
+		[ "$n" -ge 2 ] && shared=$((shared + 1))
+		names="$names$(printf '%s' "$ln" | awk '{for (i = 1; i < NF; i++) if ($i == "layer") { print $(i + 1); exit }}')
+"
+	done <<EOF
+$corpus_layers
+EOF
+
+	if [ "$shared" -ne 0 ]; then
+		fail "a layer carries BOTH corpus halves; an unchanged half is re-pushed with the changed one"
+	else
+		pass "no layer carries more than one corpus half"
+	fi
+
+	# Two layers under one name would have the second overwrite the first's tar,
+	# and the image would ship a half twice and the other not at all.
+	dups="$(printf '%s' "$names" | sort | uniq -d | grep -c .)"
+	if [ "$dups" -ne 0 ]; then
+		fail "two corpus layers share a name; the second would overwrite the first's tar"
+	else
+		pass "each corpus layer has its own name"
+	fi
+
+	# And each half must actually be packed, or the image ships without it.
+	# "split them" and "drop one" look identical from a distance.
+	for half in 3gpp etsi; do
+		if printf '%s
+' "$corpus_layers" | grep -q "$half\.duckdb"; then
+			pass "$half.duckdb is packed"
+		else
+			fail "$half.duckdb is in no layer — the image would ship without that half"
+		fi
+	done
+fi
+
 [ "$fails" -eq 0 ] || { echo "FAIL  $fails check(s) failed"; exit 1; }
-echo "OK    the identity guards can read their counters"
+echo "OK    the identity guards can read their counters, and the corpus halves ship apart"
