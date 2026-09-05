@@ -105,7 +105,10 @@ func main() {
 	format := flag.String("report", "text", "text | json")
 	flag.Parse()
 	if *db == "" {
-		fmt.Fprintln(os.Stderr, "seed-glossary: --db is required")
+		// Through emit, not Fprintln: --report json advertises that every run
+		// prints one JSON object, and an error path that prints prose instead
+		// makes the mode unusable for the caller that chose it.
+		emit(report{Min: *min, Error: "--db is required"}, *format)
 		os.Exit(2)
 	}
 
@@ -128,6 +131,17 @@ func run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 	}
 	defer func() { _ = s.Close() }()
 
+	// READ EVERYTHING FIRST, WRITE AFTERWARDS. The floor below is what catches a
+	// broken read, and checking it after the writes would let a broken read
+	// leave rows behind: these rows carry the HIGHEST precedence in
+	// Store.ResolveTerm, so a handful of them written before the run aborts
+	// would outrank the corpus's real vocabulary and stay there, with the
+	// command having exited non-zero as if nothing had happened.
+	type pending struct {
+		sr      specReport
+		entries []abbrev.Entry
+	}
+	var todo []pending
 	for _, id := range specIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -137,8 +151,31 @@ func run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		if err != nil {
 			return rep, err
 		}
-		if !checkOnly {
-			for _, e := range entries {
+		todo = append(todo, pending{sr, entries})
+		rep.Parsed += sr.Parsed
+	}
+
+	// THE FLOOR. Every failure this command exists to prevent is silent: the
+	// clause moves, the heading is spelled differently, the parse yields three
+	// rows instead of hundreds — and a run that seeded almost nothing reports
+	// success just as loudly as one that worked. A corpus that holds these specs
+	// has hundreds of abbreviations; anything far below that is a broken read,
+	// not a small vocabulary.
+	//
+	// It is an AGGREGATE floor on purpose. Per-spec floors were considered and
+	// rejected: a legitimate contribution here ranges from 15 rows (23.548) to
+	// 220 (23.501), and 23.502 legitimately declares NONE — its clause defers
+	// wholly to 23.501. Any per-spec threshold high enough to catch a broken
+	// read of 23.501 fails on the small specs that are working correctly.
+	if rep.Parsed < min {
+		return rep, fmt.Errorf("parsed only %d abbreviations across %s, expected at least %d — "+
+			"the Abbreviations clause was probably not found or not recognised",
+			rep.Parsed, strings.Join(specIDs, ","), min)
+	}
+
+	if !checkOnly {
+		for i := range todo {
+			for _, e := range todo[i].entries {
 				if err := s.UpsertAcronym(model.Acronym{
 					Term:      e.Term,
 					Expansion: e.Expansion,
@@ -148,33 +185,22 @@ func run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 					// assert something the source never said — 5G LAN and QoS
 					// live there too.
 					Domain:       "",
-					FirstRelease: sr.Version,
-					LastRelease:  sr.Version,
+					FirstRelease: todo[i].sr.Version,
+					LastRelease:  todo[i].sr.Version,
 					// The owning SPEC, not its two-digit series: it is what
 					// makes the precedence above auditable, and nothing
 					// consumes the series form.
-					SourceSeries: sr.Spec,
+					SourceSeries: todo[i].sr.Spec,
 				}); err != nil {
-					return rep, fmt.Errorf("%s %s: %w", id, e.Term, err)
+					return rep, fmt.Errorf("%s %s: %w", todo[i].sr.Spec, e.Term, err)
 				}
-				sr.Written++
+				todo[i].sr.Written++
 			}
 		}
-		rep.Specs = append(rep.Specs, sr)
-		rep.Parsed += sr.Parsed
-		rep.Written += sr.Written
 	}
-
-	// THE FLOOR. Every failure this command exists to prevent is silent: the
-	// clause moves, the heading is spelled differently, the parse yields three
-	// rows instead of hundreds — and a run that seeded almost nothing reports
-	// success just as loudly as one that worked. A corpus that holds these specs
-	// has hundreds of abbreviations; anything far below that is a broken read,
-	// not a small vocabulary.
-	if rep.Parsed < min {
-		return rep, fmt.Errorf("parsed only %d abbreviations across %s, expected at least %d — "+
-			"the Abbreviations clause was probably not found or not recognised",
-			rep.Parsed, strings.Join(specIDs, ","), min)
+	for i := range todo {
+		rep.Specs = append(rep.Specs, todo[i].sr)
+		rep.Written += todo[i].sr.Written
 	}
 	rep.OK = true
 	return rep, nil
@@ -200,6 +226,14 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (specReport, [
 	// Newest version, compared NUMERICALLY. Lexical max is wrong the moment a
 	// spec reaches double digits: "9.5.0" sorts above "20.2.0" as a string, so
 	// the glossary would be seeded from a decade-old release.
+	//
+	// Version alone is enough here, and that is a measured claim rather than an
+	// assumption: in 3GPP the version's MAJOR NUMBER IS THE RELEASE. Checked
+	// 2026-09-05 across all six specs and every release they hold — 23.401
+	// Rel-8 is 8.18.0 through Rel-20 at 20.0.0, 23.501 Rel-15 is 15.13.0 through
+	// Rel-20 at 20.2.0, without an exception. Ordering by release first would
+	// need a release->ordinal map to answer the same question these digits
+	// already answer.
 	best := ""
 	for _, c := range clauses {
 		if newerVersion(c.Version, best) {

@@ -26,9 +26,15 @@ func TestResolveTermRanksTheDefiningSpecFirst(t *testing.T) {
 	s := newRankStore(t)
 	// Inserted worst-first on purpose: if the ranking is dropped, storage order
 	// hands back the legacy meaning and this test fails, which is the point.
+	//
+	// The defining expansion is also chosen to sort LAST alphabetically of the
+	// three. Without that, `ORDER BY ..., expansion` alone would surface
+	// "Access and Mobility Management Function" and the test would pass on a
+	// build whose precedence clause had been deleted — proving the alphabet,
+	// not the rank.
 	put(t, s, "AMF", "ATM Mapping Functions", "")
 	put(t, s, "AMF", "Authentication Management Field", "21")
-	put(t, s, "AMF", "Access and Mobility Management Function", "23.501")
+	put(t, s, "AMF", "Zone-based Access and Mobility Management Function", "23.501")
 
 	got, err := s.ResolveTerm(context.Background(), "AMF")
 	if err != nil {
@@ -37,7 +43,7 @@ func TestResolveTermRanksTheDefiningSpecFirst(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("got %d rows, want 3 — ranking must not drop meanings: %+v", len(got), got)
 	}
-	if got[0].Expansion != "Access and Mobility Management Function" {
+	if got[0].Expansion != "Zone-based Access and Mobility Management Function" {
 		t.Errorf("first row = %q (source %q), want the 23.501 definition",
 			got[0].Expansion, got[0].SourceSeries)
 	}
