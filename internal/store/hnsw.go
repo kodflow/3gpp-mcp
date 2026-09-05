@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strconv"
 )
 
 // HNSW "build-then-freeze" (axis #6): the index is a disposable cache over the
@@ -313,6 +314,53 @@ func (s *Store) indexExists(ctx context.Context, name string) bool {
 // written down reports "" for all three, which differs from any real value — the
 // fail-safe direction, since an index of unknown shape is exactly one worth
 // rebuilding.
+// HNSWFrozenAndCurrent reports whether the corpus already carries a frozen index
+// that BuildAndFreezeHNSW would rebuild into exactly the same thing, and why not
+// when it does not.
+//
+// WHY IT EXISTS. `freeze-hnsw` rebuilt unconditionally. The index itself survives
+// — the CREATE is `IF NOT EXISTS` — but the run still flips hnsw_state to
+// "building" and back, and checkpoints twice. Measured 2026-09-05 on the shipped
+// 23 GB corpus: a freeze with nothing to do moved the file by 262 144 bytes.
+//
+// A quarter of a megabyte is not the cost. The corpus is one layer of the
+// published image, and scripts/local/imgtar zeroes tar mtimes so a layer digest
+// depends on CONTENT alone: an unchanged corpus is answered "existing blob" and
+// never crosses the wire, while one byte of difference is an 11 GB upload. Every
+// build re-froze, so every build re-pushed.
+//
+// THE CHECK IS DELIBERATELY CONSERVATIVE, because the failure it could cause is
+// the silent kind: an index that is stale, or absent, or built to other
+// parameters, would still answer queries — wrongly, or not at all — and no gate
+// downstream reads it. Anything unproven means rebuild.
+func (s *Store) HNSWFrozenAndCurrent(ctx context.Context, model string) (bool, string) {
+	if got := s.GetMeta(ctx, "hnsw_state"); got != "frozen" {
+		return false, fmt.Sprintf("hnsw_state is %q, not frozen", got)
+	}
+	// schema_meta can claim an index the corpus does not carry — that is the whole
+	// reason HNSWIndexPresent exists.
+	if !s.HNSWIndexPresent(ctx) {
+		return false, "schema_meta says frozen but the index is not in the corpus"
+	}
+	if got := s.GetMeta(ctx, "embedding_model"); got != model {
+		return false, fmt.Sprintf("the corpus is stamped %q and this freeze is for %q", got, model)
+	}
+	if s.hnswParamsDiffer(ctx) {
+		return false, "the frozen index was built to other HNSW parameters"
+	}
+	// The count is what catches an index that is frozen, present, correctly
+	// stamped — and missing the vectors added since it was built.
+	live, err := s.embeddingCount(ctx)
+	if err != nil {
+		return false, fmt.Sprintf("cannot count embeddings: %v", err)
+	}
+	stamped := s.GetMeta(ctx, "embedding_count")
+	if stamped != strconv.Itoa(live) {
+		return false, fmt.Sprintf("the index covers %s vectors and the corpus now holds %d", stamped, live)
+	}
+	return true, ""
+}
+
 func (s *Store) hnswParamsDiffer(ctx context.Context) bool {
 	return s.GetMeta(ctx, "hnsw_m") != hnswM() ||
 		s.GetMeta(ctx, "hnsw_ef_construction") != hnswEfConstruction() ||

@@ -113,10 +113,16 @@ func run(ctx context.Context, path string, strict, checkOnly bool) (report, erro
 		return rep, nil
 	}
 
-	if err := s.ReplaceEvolutions(ctx, seed); err != nil {
+	// The bool says whether the corpus actually changed, and the report repeats it
+	// rather than assuming. A seed re-applied unchanged writes nothing — which is
+	// the whole point, since one changed byte in this 23 GB file is an 11 GB push —
+	// and a run that announced "wrote 45 edges" either way would hide exactly the
+	// thing worth knowing.
+	changed, err := s.ReplaceEvolutions(ctx, seed)
+	if err != nil {
 		return rep, err
 	}
-	rep.Written, rep.OK = true, true
+	rep.Written, rep.OK = changed, true
 	return rep, nil
 }
 
@@ -134,8 +140,14 @@ func emit(rep report, format string) {
 	for _, u := range rep.Unnamed {
 		fmt.Fprintf(os.Stderr, "seed-evolutions: WARN %s\n", u)
 	}
-	if rep.Written {
+	switch {
+	case rep.Written:
 		fmt.Printf("seed-evolutions: wrote %d edge(s)\n", rep.Seed)
+	case rep.OK:
+		// Said out loud, because silence here used to mean "wrote 45 edges" and
+		// now means the opposite. A reader of the enrich log needs to be able to
+		// tell a no-op from a step that did not run.
+		fmt.Printf("seed-evolutions: %d edge(s) already correct — corpus untouched\n", rep.Seed)
 	}
 	if rep.Error != "" {
 		fmt.Fprintln(os.Stderr, "seed-evolutions:", rep.Error)
