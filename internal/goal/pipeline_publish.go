@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -274,10 +275,24 @@ func validatePublished(c *Ctx) error {
 	if p.Tag == "" {
 		return fmt.Errorf("published.json names no tag")
 	}
-	// "sha256:" plus 64 hex digits. A truncated or empty digest is how a failed
-	// push would otherwise be recorded as a successful one.
-	if !strings.HasPrefix(p.Digest, "sha256:") || len(p.Digest) != len("sha256:")+64 {
+	// "sha256:" plus 64 LOWERCASE hex digits, which is the only shape the OCI
+	// spec lets a manifest digest take. A truncated, empty or garbled digest is
+	// how a failed push would otherwise be recorded as a successful one — and
+	// the record is what the planner reads to decide that runPublish can be
+	// SKIPPED, so anything accepted here that no registry could ever serve
+	// leaves the image unpublished with the pipeline calling it done.
+	//
+	// Counting the characters is not enough: it accepts 64 arbitrary bytes.
+	// Decode them.
+	hexDigits, ok := strings.CutPrefix(p.Digest, "sha256:")
+	if !ok || len(hexDigits) != 64 {
 		return fmt.Errorf("published.json carries %q, which is not a manifest digest", p.Digest)
+	}
+	if _, err := hex.DecodeString(hexDigits); err != nil {
+		return fmt.Errorf("published.json carries %q, whose digest is not hex", p.Digest)
+	}
+	if strings.ToLower(hexDigits) != hexDigits {
+		return fmt.Errorf("published.json carries %q, whose digest is not lower-case hex", p.Digest)
 	}
 	return nil
 }
