@@ -478,7 +478,7 @@ func stepEnrich() *Step {
 		// the seed: editing an edge must replay the overlay, exactly as editing an
 		// extractor does. Before, the seed's hash moved the published identity
 		// while nothing wrote the seed — see cmd/seed-evolutions.
-		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions"},
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -585,7 +585,19 @@ func stepEnrich() *Step {
 			// each citation against the clauses this corpus actually holds, so it
 			// wants the catalogue overlay already in place.
 			c.Log.Printf("NE->NF evolution seed (curated, citations checked against the corpus)")
-			return c.Run(Cmd{Name: c.bin("seed-evolutions"), Args: []string{"--db", db}, Echo: true})
+			if err := c.Run(Cmd{Name: c.bin("seed-evolutions"), Args: []string{"--db", db}, Echo: true}); err != nil {
+				return err
+			}
+
+			// The glossary each spec declares about itself. It runs after the
+			// catalogue overlay for the same reason the edge seed does — it
+			// reads clauses out of this corpus — and it is what stops
+			// resolve_term answering "Authentication Management Field" when
+			// asked what an AMF is. Additive and idempotent: it upserts, so the
+			// TS 21.905 and ETSI entries stay exactly where they are and only
+			// the ORDER a reader sees changes.
+			c.Log.Printf("glossary seed (each spec's own Abbreviations clause)")
+			return c.Run(Cmd{Name: c.bin("seed-glossary"), Args: []string{"--db", db}, Echo: true})
 		},
 	}
 }
