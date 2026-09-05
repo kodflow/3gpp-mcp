@@ -478,7 +478,7 @@ func stepEnrich() *Step {
 		// the seed: editing an edge must replay the overlay, exactly as editing an
 		// extractor does. Before, the seed's hash moved the published identity
 		// while nothing wrote the seed — see cmd/seed-evolutions.
-		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "cmd/seed-glossary"},
+		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
