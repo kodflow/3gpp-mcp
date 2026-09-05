@@ -14,6 +14,16 @@ Thumbs.db
 # ============================================
 # Root .claude/ directory (injected by devcontainer, user-specific)
 /.claude/*
+# The agent toolkit is BAKED INTO THE DEVCONTAINER IMAGE, not vendored here.
+# .devcontainer/Dockerfile is `FROM ghcr.io/kodflow/devcontainer-template:latest`
+# with no COPY, and images/hooks/lifecycle/onCreate.sh says so itself: ".claude/ is
+# now baked into the Docker image at /home/vscode/.claude/ — no longer needs
+# injection from devcontainer feature". A tracked copy is a stale snapshot of
+# another repository, and 423 files of it (89 agents, 78 commands, 180 docs, none
+# of them about 3GPP) is what kodflow/post-commit now refuses.
+/.devcontainer/images/
+/.devcontainer/features/claude/.mcp.json
+
 # Exception: project-specific commands are committed
 !/.claude/commands/
 # Exception: project-specific agents are committed
