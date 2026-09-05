@@ -188,10 +188,10 @@ func TestReplaceEvolutionsIdempotent(t *testing.T) {
 		{FromTerm: "MME", ToTerm: "AMF", EvolutionType: "SPLIT", Confidence: 0.9},
 		{FromTerm: "MME", ToTerm: "SMF", EvolutionType: "SPLIT", Confidence: 0.9},
 	}
-	if err := st.ReplaceEvolutions(ctx, seed); err != nil {
+	if _, err := st.ReplaceEvolutions(ctx, seed); err != nil {
 		t.Fatalf("first replace: %v", err)
 	}
-	if err := st.ReplaceEvolutions(ctx, seed); err != nil {
+	if _, err := st.ReplaceEvolutions(ctx, seed); err != nil {
 		t.Fatalf("second replace (resume retry): %v", err)
 	}
 	var n int

@@ -1715,6 +1715,24 @@ impl Store {
     /// update_spec_meta overlays authoritative title/doc_type/working_group onto an EXISTING
     /// spec row; an empty incoming value never clobbers a non-empty one (== Go UpdateSpecMeta).
     /// No-op if the spec is not on disk (cite-or-silent: never invents catalogue-only specs).
+    ///
+    /// AND A NO-OP IF NOTHING WOULD CHANGE, which is what the returned bool has always
+    /// claimed and never delivered. The WHERE used to match on `spec_id` alone, so every
+    /// call rewrote the row and `n > 0` meant "a spec by that name exists" rather than
+    /// "something changed". ingest-catalog reported all 3 565 specs "overlaid" on every
+    /// single run.
+    ///
+    /// That is not a cosmetic miscount. Rewriting rows grows the DuckDB file, the file is
+    /// one layer of the published image, and scripts/local/imgtar zeroes tar mtimes so a
+    /// layer digest depends on CONTENT alone — meaning an unchanged corpus is answered
+    /// "existing blob" and never crosses the wire. Measured 2026-09-05: the upstream status
+    /// report changed by 2 bytes, `discover` re-ran on its 6-hour TTL, `enrich` re-ran, the
+    /// corpus grew 5.8 MB from rewrites alone, and 23 GB went up to the registry. Every six
+    /// hours, for two bytes.
+    ///
+    /// internal/store's TestNoOpWriteLeavesTheFileByteIdentical pins the property this
+    /// relies on: an UPDATE that matches no row, followed by a checkpoint, leaves the file
+    /// byte-identical.
     pub fn update_spec_meta(
         &self,
         spec_id: &str,
@@ -1725,12 +1743,23 @@ impl Store {
         let n = self
             .conn
             .execute(
+                // The WHERE mirrors the SET exactly: a column is only a reason to write
+                // when the incoming value is non-empty AND differs. IS DISTINCT FROM
+                // rather than <> because these columns are nullable, and NULL <> 'TS' is
+                // NULL — which is not true, so a row whose doc_type was never set would
+                // never be filled in.
                 "UPDATE specs SET
                    title         = CASE WHEN ? <> '' THEN ? ELSE title END,
                    doc_type      = CASE WHEN ? <> '' THEN ? ELSE doc_type END,
                    working_group = CASE WHEN ? <> '' THEN ? ELSE working_group END
-                 WHERE spec_id = ?",
-                duckdb::params![title, title, doc_type, doc_type, wg, wg, spec_id],
+                 WHERE spec_id = ?
+                   AND (   (? <> '' AND title         IS DISTINCT FROM ?)
+                        OR (? <> '' AND doc_type      IS DISTINCT FROM ?)
+                        OR (? <> '' AND working_group IS DISTINCT FROM ?))",
+                duckdb::params![
+                    title, title, doc_type, doc_type, wg, wg, spec_id, title, title, doc_type,
+                    doc_type, wg, wg
+                ],
             )
             .with_context(|| format!("update_spec_meta {spec_id}"))?;
         Ok(n > 0)
@@ -1886,6 +1915,107 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// update_spec_meta's bool has always claimed "I changed something" and, until
+    /// 2026-09-05, meant "a spec by that name exists": the WHERE matched on spec_id
+    /// alone, so ingest-catalog rewrote all 3 565 rows on every run and reported all
+    /// 3 565 as overlaid.
+    ///
+    /// The cost was not the miscount. Rewriting rows grows the DuckDB file; the file is
+    /// one layer of the published image; imgtar zeroes tar mtimes so a layer digest
+    /// depends on content alone. An unchanged corpus is answered "existing blob" and
+    /// never crosses the wire — a rewritten one is 23 GB of upload. Measured that day:
+    /// the upstream status report changed by 2 bytes and 23 GB went to the registry.
+    #[test]
+    fn update_spec_meta_writes_only_when_something_differs() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO specs(spec_id, series, title, doc_type, working_group)
+                   VALUES ('23.501','23','System architecture','TS','SA2');",
+            )
+            .unwrap();
+
+        // THE CASE THAT COST THE PUSH: the same values arriving again.
+        assert!(
+            !s.update_spec_meta("23.501", "System architecture", "TS", "SA2")
+                .unwrap(),
+            "re-applying identical metadata must not write"
+        );
+
+        // NEGATIVE CONTROL. A guard that never writes is as broken as one that always
+        // does, and it fails in the direction nobody notices.
+        assert!(
+            s.update_spec_meta("23.501", "System architecture and procedures", "TS", "SA2")
+                .unwrap(),
+            "a changed title must still be written"
+        );
+        let title: String = s
+            .raw()
+            .query_row("SELECT title FROM specs WHERE spec_id='23.501'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "System architecture and procedures");
+
+        // An empty incoming value never clobbers, so it is never a reason to write.
+        assert!(
+            !s.update_spec_meta("23.501", "", "", "").unwrap(),
+            "empty incoming values must not write"
+        );
+        let (t, d, w): (String, String, String) = s
+            .raw()
+            .query_row(
+                "SELECT title, doc_type, working_group FROM specs WHERE spec_id='23.501'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (t.as_str(), d.as_str(), w.as_str()),
+            ("System architecture and procedures", "TS", "SA2"),
+            "empty values must not have clobbered the row"
+        );
+
+        // Cite-or-silent: a spec the corpus does not hold is never invented.
+        assert!(
+            !s.update_spec_meta("99.999", "Invented", "TR", "SA9").unwrap(),
+            "a spec not on disk must not be created"
+        );
+        let n: i64 = s
+            .raw()
+            .query_row("SELECT count(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "no catalogue-only spec may be added");
+    }
+
+    /// A column that was never filled in must still be fillable. `NULL <> 'TS'` is NULL,
+    /// not true, so a WHERE written with <> instead of IS DISTINCT FROM would silently
+    /// refuse to ever populate an empty doc_type — the opposite defect, and quieter.
+    #[test]
+    fn update_spec_meta_fills_a_column_that_is_null() {
+        let s = Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO specs(spec_id, series, title, doc_type, working_group)
+                   VALUES ('23.502','23','Procedures',NULL,NULL);",
+            )
+            .unwrap();
+        assert!(
+            s.update_spec_meta("23.502", "Procedures", "TS", "SA2")
+                .unwrap(),
+            "a NULL column must be recognised as differing"
+        );
+        let (d, w): (String, String) = s
+            .raw()
+            .query_row(
+                "SELECT doc_type, working_group FROM specs WHERE spec_id='23.502'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((d.as_str(), w.as_str()), ("TS", "SA2"));
+    }
 
     /// The embed step used to rematerialise every clause's text just to have a table it
     /// could UPDATE — 11.5 GB to 38.8 GB on the real corpus, before any vector existed.
