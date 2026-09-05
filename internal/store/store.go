@@ -476,6 +476,43 @@ func (s *Store) UpsertAcronym(a model.Acronym) error {
 	return err
 }
 
+// UpsertAcronyms writes a batch of glossary entries in ONE transaction.
+//
+// The batch form is not an optimisation. These rows are seeded from a spec's own
+// Abbreviations clause, and Store.ResolveTerm ranks them ABOVE the general
+// vocabulary — so a run that failed on row 400 of 679 would leave 399 rows that
+// outrank the corpus's real answers, having exited non-zero as though it had
+// changed nothing. All of them land or none do.
+func (s *Store) UpsertAcronyms(as []model.Acronym) error {
+	if len(as) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
+		   first_release=excluded.first_release, last_release=excluded.last_release,
+		   source_series=excluded.source_series`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, a := range as {
+		if _, err := stmt.Exec(a.Term, a.Expansion, a.Domain,
+			a.FirstRelease, a.LastRelease, a.SourceSeries); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("upsert acronym %q: %w", a.Term, err)
+		}
+	}
+	_ = stmt.Close()
+	return tx.Commit()
+}
+
 // InsertEvolutions bulk-inserts NE<->NF evolution edges (the V1 relational
 // stand-in for the V2 KuzuDB graph).
 func (s *Store) InsertEvolutions(evos []model.Evolution) error {
@@ -1285,11 +1322,40 @@ func (s *Store) VersionForRelease(ctx context.Context, specID, release string) (
 	return fallback, haveFallback, nil
 }
 
-// ResolveTerm returns glossary entries for a term (case-insensitive).
+// ResolveTerm returns glossary entries for a term (case-insensitive), MOST
+// AUTHORITATIVE FIRST.
+//
+// The order is the answer. A caller — a person, or a model quoting one — reads
+// the first row, and until 2026-09-05 the first row was whichever the engine
+// happened to return: `ORDER BY domain` sorts on a column that is empty on
+// essentially every row, so ties were broken by storage order. Asked what an AMF
+// is, this corpus answered "Authentication Management Field"; a UPF was a "User
+// Port Function" and an NEF a "Network Element Function". Each row was honestly
+// sourced and the answer was still wrong, which is the one outcome CLAUDE.md §1
+// forbids.
+//
+// The ranking is NOT a preference invented here. TS 23.501 §3.2 states it, and
+// every 3GPP Abbreviations clause opens the same way:
+//
+//	"An abbreviation defined in the present document takes precedence over the
+//	 definition of the same abbreviation, if any, in TR 21.905 [1]."
+//
+// So a row seeded from a spec's own Abbreviations clause (source_series holds
+// the spec id, e.g. "23.501") outranks the general vocabulary (TS 21.905, series
+// "21"). That is the whole rule; expansion breaks the remaining ties so the
+// order is stable rather than merely non-arbitrary.
+//
+// source_series is SELECTED, not just ordered on. It was in the schema and in
+// the model, and this query never read it — so every entry came back with an
+// empty provenance and a caller could not tell a 21.905 row from an ETSI one,
+// which is precisely what server.go's federation comment claims it can do.
 func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT term, expansion, domain, first_release, last_release
-		 FROM acronyms WHERE lower(term) = lower(?) ORDER BY domain`, term)
+		`SELECT term, expansion, domain, first_release, last_release,
+		        coalesce(source_series, '') AS source_series
+		 FROM acronyms WHERE lower(term) = lower(?)
+		 ORDER BY CASE WHEN coalesce(source_series, '') LIKE '%.%' THEN 0 ELSE 1 END,
+		          domain, expansion`, term)
 	if err != nil {
 		return nil, err
 	}
@@ -1297,7 +1363,8 @@ func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, 
 	var out []model.Acronym
 	for rows.Next() {
 		var a model.Acronym
-		if err := rows.Scan(&a.Term, &a.Expansion, &a.Domain, &a.FirstRelease, &a.LastRelease); err != nil {
+		if err := rows.Scan(&a.Term, &a.Expansion, &a.Domain, &a.FirstRelease,
+			&a.LastRelease, &a.SourceSeries); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
