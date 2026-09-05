@@ -92,14 +92,42 @@ corpus_layers="$(grep -E '^\[ "\$WITH_CORPUS" = 1 \] && layer ' "$SCRIPT")"
 if [ -z "$corpus_layers" ]; then
 	fail "no corpus layer line in build-image.sh — the packing moved and this check is now blind"
 else
-	both="$(printf '%s
-' "$corpus_layers" | grep -c '3gpp\.duckdb.*etsi\.duckdb')"
-	if [ "$both" -ne 0 ]; then
-		fail "both corpus halves are packed into ONE layer; an unchanged half is re-pushed with the changed one"
+	# PER LINE, and order-independent. The first version of this check matched
+	# "3gpp.duckdb.*etsi.duckdb" on the whole block, so a single combined layer
+	# written with the two paths the OTHER way round sailed through it — the
+	# check depended on the order of two filenames nobody promised to keep.
+	# Counting how many halves each line carries cannot be fooled that way.
+	shared=0
+	names=""
+	while IFS= read -r ln; do
+		[ -n "$ln" ] || continue
+		n=0
+		case "$ln" in *3gpp.duckdb*) n=$((n + 1)) ;; esac
+		case "$ln" in *etsi.duckdb*) n=$((n + 1)) ;; esac
+		[ "$n" -ge 2 ] && shared=$((shared + 1))
+		names="$names$(printf '%s' "$ln" | awk '{for (i = 1; i < NF; i++) if ($i == "layer") { print $(i + 1); exit }}')
+"
+	done <<EOF
+$corpus_layers
+EOF
+
+	if [ "$shared" -ne 0 ]; then
+		fail "a layer carries BOTH corpus halves; an unchanged half is re-pushed with the changed one"
 	else
-		pass "the corpus halves are packed into separate layers"
+		pass "no layer carries more than one corpus half"
 	fi
-	# And each half must actually be packed, or the image ships without a corpus.
+
+	# Two layers under one name would have the second overwrite the first's tar,
+	# and the image would ship a half twice and the other not at all.
+	dups="$(printf '%s' "$names" | sort | uniq -d | grep -c .)"
+	if [ "$dups" -ne 0 ]; then
+		fail "two corpus layers share a name; the second would overwrite the first's tar"
+	else
+		pass "each corpus layer has its own name"
+	fi
+
+	# And each half must actually be packed, or the image ships without it.
+	# "split them" and "drop one" look identical from a distance.
 	for half in 3gpp etsi; do
 		if printf '%s
 ' "$corpus_layers" | grep -q "$half\.duckdb"; then
