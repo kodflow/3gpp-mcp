@@ -395,7 +395,26 @@ layer 20-duckdb-ext 10001 home/mcp
 layer 30-ort        10001 data/mcp-3gpp/models/onnxruntime
 [ "$WITH_MODELS" = 1 ] && layer 40-models 10001 \
   data/mcp-3gpp/models/bge-m3-sparse data/mcp-3gpp/models/bge-reranker-v2-m3 data/mcp-3gpp/models/models.yaml
-[ "$WITH_CORPUS" = 1 ] && layer 50-corpus 10001 data/mcp-3gpp/3gpp.duckdb data/mcp-3gpp/etsi.duckdb
+# ONE LAYER PER HALF, not one for both.
+#
+# The registry dedupes by layer digest, so a half that did not change is answered
+# with "existing blob" and never crosses the wire. Both halves in one tar threw
+# that away: any byte written to either corpus rewrote a single 42.8 GB layer.
+#
+# Measured on the 2026-09-05 publish. Seeding 679 glossary rows grew
+# 3gpp.duckdb by 9.7 MB and left etsi.duckdb IDENTICAL TO THE BYTE
+# (19 707 736 064 before and after, recorded in .local/state/published.json) —
+# and 19.7 GB of unchanged ETSI went up the wire anyway, because it shared a tar
+# with the half that moved. The push took 54m37s; roughly 25 minutes of it
+# carried data the registry already had.
+#
+# This is the rule stated at the top of this section — "split most-stable first
+# so a re-push moves only what changed" — applied to the one layer where it pays.
+# The first publish after this change re-uploads everything once, because the
+# split gives both halves new digests; every publish after it moves only the half
+# that actually changed.
+[ "$WITH_CORPUS" = 1 ] && layer 50-corpus-3gpp 10001 data/mcp-3gpp/3gpp.duckdb
+[ "$WITH_CORPUS" = 1 ] && layer 51-corpus-etsi 10001 data/mcp-3gpp/etsi.duckdb
 layer 60-bin        0     usr/local/bin usr/local/lib
 
 LAYER_ARGS=()

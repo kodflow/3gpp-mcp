@@ -75,11 +75,22 @@ stable to least:
 20-duckdb-ext  the fts + vss extensions, prefetched
 30-ort         ONNX Runtime (the only arch-specific piece)
 40-models      bge-m3-sparse + the reranker
-50-corpus      3gpp.duckdb + etsi.duckdb          ← the big one, and the last
+50-corpus-3gpp 3gpp.duckdb                        ← 23 GB
+51-corpus-etsi etsi.duckdb                        ← 19.7 GB
 60-bin         mcp-3gpp, the entrypoint, libembed_core.so
 ```
 
-A code-only rebuild moves layer 60. A corpus rebuild moves 50 and 60.
+A code-only rebuild moves layer 60. A rebuild that touches ONE corpus moves that
+half and 60; the other half is answered "existing blob" and never crosses the
+wire.
+
+**One layer per half, and it is not cosmetic.** Both halves shared a tar until
+2026-09-05, so any byte written to either rewrote a single 42.8 GB layer. Measured
+on the publish that day: seeding 679 glossary rows grew `3gpp.duckdb` by 9.7 MB
+and left `etsi.duckdb` identical to the byte — and 19.7 GB of unchanged ETSI went
+up the wire regardless, roughly 25 minutes of a 54-minute push carrying data the
+registry already had. Nothing failed; the only symptom was the clock.
+`scripts/local/build-image_test.sh` pins the split.
 
 ## What is in it, and why each piece has to be
 

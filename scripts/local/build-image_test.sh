@@ -73,5 +73,42 @@ else
 	fail "field sparse_model on an empty value = '$got', want empty"
 fi
 
+# ---------------------------------------------------------------------------
+# The corpus halves must be packed into SEPARATE layers.
+#
+# A registry dedupes by layer digest: a half that did not change is answered with
+# "existing blob" and never crosses the wire. Both halves in one tar throws that
+# away, and it throws it away SILENTLY — the publish succeeds, the image is
+# correct, and the only symptom is that it took twice as long.
+#
+# Measured on the 2026-09-05 publish, before the split: seeding 679 glossary rows
+# grew 3gpp.duckdb by 9.7 MB and left etsi.duckdb identical to the byte, and
+# 19.7 GB of unchanged ETSI went up the wire regardless. Nothing failed. Nothing
+# reported it. That is why this is pinned in a test rather than a comment.
+#
+# Read out of the real script, not restated here: a copy would keep passing after
+# the original was changed back.
+corpus_layers="$(grep -E '^\[ "\$WITH_CORPUS" = 1 \] && layer ' "$SCRIPT")"
+if [ -z "$corpus_layers" ]; then
+	fail "no corpus layer line in build-image.sh — the packing moved and this check is now blind"
+else
+	both="$(printf '%s
+' "$corpus_layers" | grep -c '3gpp\.duckdb.*etsi\.duckdb')"
+	if [ "$both" -ne 0 ]; then
+		fail "both corpus halves are packed into ONE layer; an unchanged half is re-pushed with the changed one"
+	else
+		pass "the corpus halves are packed into separate layers"
+	fi
+	# And each half must actually be packed, or the image ships without a corpus.
+	for half in 3gpp etsi; do
+		if printf '%s
+' "$corpus_layers" | grep -q "$half\.duckdb"; then
+			pass "$half.duckdb is packed"
+		else
+			fail "$half.duckdb is in no layer — the image would ship without that half"
+		fi
+	done
+fi
+
 [ "$fails" -eq 0 ] || { echo "FAIL  $fails check(s) failed"; exit 1; }
-echo "OK    the identity guards can read their counters"
+echo "OK    the identity guards can read their counters, and the corpus halves ship apart"
