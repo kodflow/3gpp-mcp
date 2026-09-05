@@ -87,7 +87,19 @@ fn corpus_key(src: &str) -> Result<String> {
                 continue;
             }
             let sha = sha_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            pairs.push(format!("{rel}/{sha}"));
+            // The file COUNT travels with the pair. A <sha>/ directory is named
+            // after the Forge commit, so its contents should never change — but a
+            // fetch interrupted halfway leaves a real directory with some of the
+            // files in it, and a key built from directory names alone would call
+            // that corpus "already ingested" for good.
+            let n = std::fs::read_dir(&sha_path)?
+                .filter(|e| {
+                    e.as_ref()
+                        .map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
+                        .unwrap_or(false)
+                })
+                .count();
+            pairs.push(format!("{rel}/{sha}:{n}"));
         }
     }
     pairs.sort();
@@ -113,7 +125,7 @@ fn main() -> Result<()> {
     // The key is the corpus's own content addressing, not a guess: the directory
     // names carry the Forge commit SHA the YAML came from.
     let key = corpus_key(&args.src)?;
-    if !key.is_empty() && store.get_meta(API_CORPUS_KEY_META).unwrap_or_default() == key {
+    if !key.is_empty() && store.get_meta(API_CORPUS_KEY_META)? == key {
         eprintln!("ingest-openapi: the api tables already carry this YAML corpus — leaving them untouched");
         return Ok(());
     }
@@ -121,6 +133,7 @@ fn main() -> Result<()> {
     store.clear_api_tables()?;
 
     let mut files = 0usize;
+    let mut skipped = 0usize;
     let mut ops_total = 0usize;
     let mut schemas_total = 0usize;
 
@@ -161,6 +174,7 @@ fn main() -> Result<()> {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("ingest-openapi: skip {filename}: {e}");
+                        skipped += 1;
                         continue;
                     }
                 };
@@ -178,8 +192,16 @@ fn main() -> Result<()> {
     }
     // Recorded only after the tables are actually built, so an interrupted run
     // leaves a key that does not match and the next one rebuilds.
-    if !key.is_empty() {
+    // ONLY WHEN EVERY FILE PARSED. A skipped file is a hole in the api_* tables,
+    // and stamping the key over it would tell every later run that this corpus is
+    // already ingested — so the hole would never be filled, silently and for good.
+    // Better to re-parse 1 774 files on the next build than to lose one.
+    if !key.is_empty() && skipped == 0 {
         store.set_meta(API_CORPUS_KEY_META, &key)?;
+    } else if skipped > 0 {
+        eprintln!(
+            "ingest-openapi: {skipped} file(s) skipped — NOT recording the corpus key, so the next run re-ingests"
+        );
     }
     store.checkpoint()?;
     eprintln!(
