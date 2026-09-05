@@ -476,6 +476,43 @@ func (s *Store) UpsertAcronym(a model.Acronym) error {
 	return err
 }
 
+// UpsertAcronyms writes a batch of glossary entries in ONE transaction.
+//
+// The batch form is not an optimisation. These rows are seeded from a spec's own
+// Abbreviations clause, and Store.ResolveTerm ranks them ABOVE the general
+// vocabulary — so a run that failed on row 400 of 679 would leave 399 rows that
+// outrank the corpus's real answers, having exited non-zero as though it had
+// changed nothing. All of them land or none do.
+func (s *Store) UpsertAcronyms(as []model.Acronym) error {
+	if len(as) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
+		   first_release=excluded.first_release, last_release=excluded.last_release,
+		   source_series=excluded.source_series`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, a := range as {
+		if _, err := stmt.Exec(a.Term, a.Expansion, a.Domain,
+			a.FirstRelease, a.LastRelease, a.SourceSeries); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("upsert acronym %q: %w", a.Term, err)
+		}
+	}
+	_ = stmt.Close()
+	return tx.Commit()
+}
+
 // InsertEvolutions bulk-inserts NE<->NF evolution edges (the V1 relational
 // stand-in for the V2 KuzuDB graph).
 func (s *Store) InsertEvolutions(evos []model.Evolution) error {
