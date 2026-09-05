@@ -82,8 +82,13 @@ type Report struct {
 	Written int          `json:"written_total"`
 	Min     int          `json:"min_required"`
 	Applied bool         `json:"applied"`
-	OK      bool         `json:"ok"`
-	Error   string       `json:"error,omitempty"`
+	// Changed says whether the corpus actually MOVED. Applied only says a write
+	// was attempted; on a corpus already carrying this glossary nothing is
+	// written, and that difference is what decides whether the published image
+	// has to be pushed again.
+	Changed bool   `json:"changed"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
 }
 
 // Run seeds the glossary from the named specs' Abbreviations clauses.
@@ -167,10 +172,17 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 			}
 			todo[i].sr.Written = len(todo[i].entries)
 		}
-		if err := s.UpsertAcronyms(rows); err != nil {
+		// The bool says whether the corpus actually changed, and the report repeats
+		// it rather than assuming. Re-seeding a glossary that is already correct
+		// writes nothing — which is the point, since one changed byte in this 23 GB
+		// file is an 11 GB push — and a run that announced "written=679" either way
+		// would hide exactly the thing worth knowing.
+		changed, err := s.UpsertAcronyms(rows)
+		if err != nil {
 			return rep, err
 		}
 		rep.Applied = true
+		rep.Changed = changed
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)

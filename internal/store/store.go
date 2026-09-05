@@ -321,15 +321,35 @@ func (s *Store) ReplaceChanges(ctx context.Context, specID string, changes []mod
 // answer "nothing" about a graph that had been correct minutes earlier, which is
 // worse than answering with the old seed. Wrapping both makes the replacement
 // atomic: either the new seed is there or the old one still is.
-func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) error {
+func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) (changed bool, err error) {
+	// NOTHING TO REPLACE IS NOT THE SAME AS REPLACING WITH THE SAME THING.
+	//
+	// DELETE-then-INSERT churns the table even when the result is identical, and
+	// this seed is re-applied on every `enrich`. Measured 2026-09-05 on the
+	// shipped 23 GB corpus: re-seeding the same 45 edges moved the file by
+	// 524 288 bytes — the ONLY overlay in enrich that did. (The others rewrite
+	// tens of thousands of rows and cost nothing, because DuckDB does not dirty a
+	// page whose values do not change; measured the same day.)
+	//
+	// Half a megabyte is not the cost. The corpus is one layer of the published
+	// image, and scripts/local/imgtar zeroes tar mtimes so a layer digest depends
+	// on CONTENT alone: an unchanged corpus is answered "existing blob" and never
+	// crosses the wire, one changed byte is an 11 GB upload. Every enrich re-seeded,
+	// so every build re-pushed.
+	if same, err := s.evolutionsAlreadyAre(ctx, evos); err != nil {
+		return false, err
+	} else if same {
+		return false, nil
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM evolutions`); err != nil {
-		return fmt.Errorf("clear evolutions: %w", err)
+		return false, fmt.Errorf("clear evolutions: %w", err)
 	}
 	if len(evos) > 0 {
 		stmt, perr := tx.PrepareContext(ctx,
@@ -337,17 +357,17 @@ func (s *Store) ReplaceEvolutions(ctx context.Context, evos []model.Evolution) e
 			 (from_term, to_term, evolution_type, justification_spec, justification_clause, confidence)
 			 VALUES (?, ?, ?, ?, ?, ?)`)
 		if perr != nil {
-			return perr
+			return false, perr
 		}
 		defer func() { _ = stmt.Close() }()
 		for _, e := range evos {
 			if _, err := stmt.ExecContext(ctx, e.FromTerm, e.ToTerm, e.EvolutionType,
 				e.JustificationSpec, e.JustificationClause, e.Confidence); err != nil {
-				return fmt.Errorf("insert %s->%s: %w", e.FromTerm, e.ToTerm, err)
+				return false, fmt.Errorf("insert %s->%s: %w", e.FromTerm, e.ToTerm, err)
 			}
 		}
 	}
-	return tx.Commit()
+	return true, tx.Commit()
 }
 
 // ResetIngestLog drops every checkpoint row that doesn't match the current
@@ -483,13 +503,73 @@ func (s *Store) UpsertAcronym(a model.Acronym) error {
 // vocabulary — so a run that failed on row 400 of 679 would leave 399 rows that
 // outrank the corpus's real answers, having exited non-zero as though it had
 // changed nothing. All of them land or none do.
-func (s *Store) UpsertAcronyms(as []model.Acronym) error {
+//
+// AND IT WRITES NOTHING when every row is already present with the same values.
+//
+// Measured 2026-09-05 on the shipped 23 GB corpus: re-upserting the 679 seeded
+// rows with identical values grew the file by 3 407 872 bytes. An
+// ON CONFLICT DO UPDATE still writes a new row version; the old one is dead space
+// until a checkpoint reclaims it, and the file has moved either way.
+//
+// A synthetic probe said otherwise — 5 000 identical upserts into a fresh
+// two-megabyte database changed nothing at all — which is exactly why the number
+// above was taken on the real corpus instead. A small isolated table is not a
+// model of a 23 GB one.
+//
+// Three megabytes is not the cost. The corpus is one layer of the published
+// image, and scripts/local/imgtar zeroes tar mtimes so a layer digest depends on
+// CONTENT alone: an unchanged corpus is answered "existing blob" and never
+// crosses the wire, one changed byte is an 11 GB upload.
+//
+// Reading the table first is affordable precisely because it is small — a couple
+// of thousand rows. The same trade would be wrong on clauses.
+func (s *Store) UpsertAcronyms(as []model.Acronym) (changed bool, err error) {
 	if len(as) == 0 {
-		return nil
+		return false, nil
 	}
+	existing, err := s.acronymIndex()
+	if err != nil {
+		return false, err
+	}
+	// DEDUPLICATE THE BATCH FIRST, or the skip below cannot work.
+	//
+	// The identity is (term, expansion, domain), and two specs can declare the
+	// same abbreviation with the same wording — 33.501 and 23.401 both write
+	// "UP  User Plane". Those arrive as two rows sharing one key and differing
+	// only in provenance, so each overwrites the other within a single call and
+	// the last one wins. Comparing each incoming row against the database then
+	// finds 145 of 679 "different" on a corpus that is already correct, because
+	// half of each pair disagrees with whatever the other left behind.
+	//
+	// Measured 2026-09-05: that flip-flop moved the 23 GB corpus by ±3.9 MB on
+	// every run, which is a new layer digest and an 11 GB push. Keeping the last
+	// occurrence — what the database would end up holding anyway — makes the
+	// batch converge, so a re-seed of an unchanged glossary writes nothing.
+	want := make(map[acronymKey]model.Acronym, len(as))
+	order := make([]acronymKey, 0, len(as))
+	for _, a := range as {
+		k := acronymKey{a.Term, a.Expansion, a.Domain}
+		if _, seen := want[k]; !seen {
+			order = append(order, k)
+		}
+		want[k] = a
+	}
+	pending := as[:0:0]
+	for _, k := range order {
+		a := want[k]
+		if cur, ok := existing[k]; ok && cur == a {
+			continue
+		}
+		pending = append(pending, a)
+	}
+	if len(pending) == 0 {
+		return false, nil
+	}
+	as = pending
+
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return false, err
 	}
 	stmt, err := tx.Prepare(
 		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
@@ -499,18 +579,83 @@ func (s *Store) UpsertAcronyms(as []model.Acronym) error {
 		   source_series=excluded.source_series`)
 	if err != nil {
 		_ = tx.Rollback()
-		return err
+		return false, err
 	}
 	for _, a := range as {
 		if _, err := stmt.Exec(a.Term, a.Expansion, a.Domain,
 			a.FirstRelease, a.LastRelease, a.SourceSeries); err != nil {
 			_ = stmt.Close()
 			_ = tx.Rollback()
-			return fmt.Errorf("upsert acronym %q: %w", a.Term, err)
+			return false, fmt.Errorf("upsert acronym %q: %w", a.Term, err)
 		}
 	}
 	_ = stmt.Close()
-	return tx.Commit()
+	return true, tx.Commit()
+}
+
+// acronymKey is the glossary's identity: the same term keeps every distinct
+// expansion/domain, which is the whole point of the table.
+type acronymKey struct{ term, expansion, domain string }
+
+// acronymIndex reads the glossary into memory so UpsertAcronyms can tell a row
+// that needs writing from one that is already correct.
+func (s *Store) acronymIndex() (map[acronymKey]model.Acronym, error) {
+	rows, err := s.db.Query(
+		`SELECT term, expansion, domain, first_release, last_release,
+		        coalesce(source_series, '')
+		   FROM acronyms`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[acronymKey]model.Acronym, 4096)
+	for rows.Next() {
+		var a model.Acronym
+		if err := rows.Scan(&a.Term, &a.Expansion, &a.Domain, &a.FirstRelease,
+			&a.LastRelease, &a.SourceSeries); err != nil {
+			return nil, err
+		}
+		out[acronymKey{a.Term, a.Expansion, a.Domain}] = a
+	}
+	return out, rows.Err()
+}
+
+// evolutionsAlreadyAre reports whether the stored edge set is exactly the one
+// being seeded. Order does not matter — the seed is a SET, and the table has no
+// ordering guarantee — so both sides are compared as counted multisets.
+func (s *Store) evolutionsAlreadyAre(ctx context.Context, want []model.Evolution) (bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT from_term, to_term, evolution_type, justification_spec,
+		        justification_clause, confidence FROM evolutions`)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	have := make(map[model.Evolution]int, len(want)*2)
+	n := 0
+	for rows.Next() {
+		var e model.Evolution
+		if err := rows.Scan(&e.FromTerm, &e.ToTerm, &e.EvolutionType,
+			&e.JustificationSpec, &e.JustificationClause, &e.Confidence); err != nil {
+			return false, err
+		}
+		have[e]++
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if n != len(want) {
+		return false, nil
+	}
+	for _, e := range want {
+		if have[e] == 0 {
+			return false, nil
+		}
+		have[e]--
+	}
+	return true, nil
 }
 
 // InsertEvolutions bulk-inserts NE<->NF evolution edges (the V1 relational

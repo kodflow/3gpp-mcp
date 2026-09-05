@@ -70,6 +70,22 @@ func main() {
 	if m == "" {
 		die("the corpus carries no `embedding_model` and none was given — refusing to stamp an index with an unknown identity")
 	}
+	// ALREADY DONE IS NOT THE SAME AS CHEAP TO REDO. The index survives a rebuild
+	// (the CREATE is IF NOT EXISTS), but the run still flips hnsw_state to
+	// "building" and back and checkpoints twice — measured 2026-09-05 on the
+	// shipped corpus, a freeze with nothing to do moved the file by 262 144 bytes.
+	// The corpus is one layer of the published image and imgtar zeroes tar mtimes,
+	// so content alone decides the layer digest: an unchanged corpus is answered
+	// "existing blob", a changed one is an 11 GB upload. Every build re-froze, so
+	// every build re-pushed.
+	if ok, why := st.HNSWFrozenAndCurrent(ctx, m); ok {
+		fmt.Fprintf(os.Stderr, "freeze-hnsw: already frozen for %s and current — leaving the corpus untouched\n", m)
+		fmt.Printf("hnsw_state=frozen embedding_count=%s\n", st.GetMeta(ctx, "embedding_count"))
+		return
+	} else if why != "" {
+		fmt.Fprintf(os.Stderr, "freeze-hnsw: rebuilding because %s\n", why)
+	}
+
 	fmt.Fprintf(os.Stderr, "freeze-hnsw: building the cosine index for %s (%s)\n", m, strings.Join(knobs, "; "))
 	if err := st.BuildAndFreezeHNSW(ctx, m); err != nil {
 		die("build: %v", err)
