@@ -221,10 +221,18 @@ func TestValidatePublishedRejectsWhatIsNotADigest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	good := `{"tag":"ghcr.io/kodflow/3gpp-mcp:latest","digest":"sha256:` + strings.Repeat("a", 64) + `"}`
-	put(good)
-	if err := validatePublished(c); err != nil {
-		t.Fatalf("a well-formed record was rejected: %v", err)
+	// The positive controls are REAL digests — the one this repository last
+	// published, and 64 identical letters — because a check tightened until it
+	// rejects what a registry actually serves is worse than the loose one it
+	// replaced: it would republish 40 GB on every build.
+	for _, good := range []string{
+		`{"tag":"ghcr.io/kodflow/3gpp-mcp:latest","digest":"sha256:` + strings.Repeat("a", 64) + `"}`,
+		`{"tag":"ghcr.io/kodflow/3gpp-mcp:latest","digest":"sha256:0fcce82b4d3f93b977c776a0b3b7e4d89ab3fd09e14f28c9bdb1cbc245413b57"}`,
+	} {
+		put(good)
+		if err := validatePublished(c); err != nil {
+			t.Fatalf("a well-formed record was rejected: %v", err)
+		}
 	}
 	for name, body := range map[string]string{
 		"not json":       `{`,
@@ -233,6 +241,13 @@ func TestValidatePublishedRejectsWhatIsNotADigest(t *testing.T) {
 		"short digest":   `{"tag":"t","digest":"sha256:abc"}`,
 		"unprefixed":     `{"tag":"t","digest":"` + strings.Repeat("a", 64) + `"}`,
 		"digest missing": `{"tag":"t"}`,
+		// 64 characters that are not hex. Counting them is what a length check
+		// does, and a registry can never serve this — but a record carrying it
+		// would make the planner skip the push.
+		"non-hex": `{"tag":"t","digest":"sha256:` + strings.Repeat("z", 64) + `"}`,
+		// Hex, but the wrong case. The OCI spec is lower-case only, and a digest
+		// is compared as a string, so an upper-case one names nothing.
+		"upper-case hex": `{"tag":"t","digest":"sha256:` + strings.Repeat("A", 64) + `"}`,
 	} {
 		put(body)
 		if err := validatePublished(c); err == nil {
