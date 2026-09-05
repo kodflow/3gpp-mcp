@@ -28,7 +28,7 @@ ORT_LIB  ?= $(CURDIR)/data/models/onnxruntime/lib/libonnxruntime.so
 GOAL_ENV := . scripts/local/toolchain-env.sh
 GOAL     := .local/bin/goal$(if $(filter Windows_NT,$(OS)),.exe,)
 
-.PHONY: all build build-bin goal-bin plan steps status eta publish prove build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
+.PHONY: all build build-bin goal-bin plan steps status eta publish prove prove-pdf script-tests build-onnx build-ffi ingest ingest-onnx ingest-openapi ingest-catalog fetch-apis serve test embed-smoke poc bench benchgo demo audit model lint fmt vet tidy clean install help convert-smoke
 
 all: build ## Build EVERYTHING (the corpus pipeline)
 
@@ -146,6 +146,12 @@ image-toolchain: ## Fetch the Linux cross-toolchain the image build needs (zig +
 
 prove: ## Drive server-full over real JSON-RPC and assert every retrieval arm is live on BOTH halves
 	./scripts/local/prove-serving.sh
+
+prove-pdf: ## Round-trip a PUBLISHED PDF through the MCP: place its text, date it, diff two refs
+	./scripts/local/prove-pdf-lineage.sh
+
+script-tests: ## Run the offline shell-harness tests (scripts/**/*_test.sh) — no corpus, no network
+	@rc=0; for t in $$(find scripts -name '*_test.sh' | sort); do echo "== $$t"; bash "$$t" || rc=1; done; exit $$rc
 
 build-bin: ## Build the server binary alone into bin/ (no corpus)
 	@mkdir -p $(BUILD_DIR)
