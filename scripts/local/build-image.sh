@@ -230,8 +230,13 @@ if [ "$WITH_MODELS" = 1 ]; then
   # internal/embed/registry_dual_head_test.go.
   [ -d data/models/bge-m3-sparse ] || die "data/models/bge-m3-sparse missing (WITH_SPARSE=1 scripts/fetch-model.sh)"
   say "models: bge-m3-sparse (dense + sparse heads) and the reranker"
-  cp -a data/models/bge-m3-sparse "$ROOTFS/data/mcp-3gpp/models/"
-  [ -d data/models/bge-reranker-v2-m3 ] && cp -a data/models/bge-reranker-v2-m3 "$ROOTFS/data/mcp-3gpp/models/"
+  # -l links instead of copying, for the same reason and under the same two
+  # assumptions as stage() below: 6.85 GB of model weights that nothing writes
+  # to after this point. Falls back to a plain copy where links are unavailable.
+  cp -al data/models/bge-m3-sparse "$ROOTFS/data/mcp-3gpp/models/" 2>/dev/null     || cp -a data/models/bge-m3-sparse "$ROOTFS/data/mcp-3gpp/models/"
+  if [ -d data/models/bge-reranker-v2-m3 ]; then
+    cp -al data/models/bge-reranker-v2-m3 "$ROOTFS/data/mcp-3gpp/models/" 2>/dev/null       || cp -a data/models/bge-reranker-v2-m3 "$ROOTFS/data/mcp-3gpp/models/"
+  fi
 
   cat > "$ROOTFS/data/mcp-3gpp/models/models.yaml" <<'YAML'
 active: bge-m3-sparse
@@ -296,12 +301,46 @@ if [ "$WITH_CORPUS" = 1 ]; then
     say "WARNING: validate is not built; baking WITHOUT the contract check"
   fi
 
+# stage <src> <dst> — put a large file in the rootfs WITHOUT copying its bytes.
+#
+# Staging the corpus used to be `cp`, and the corpus is 42.8 GB. Measured on the
+# 2026-09-05 publish, which took 54m37s end to end:
+#
+#     13:55:46 -> 14:04:57   ~9 min   staging (this copy, and the models)
+#     14:04:57 -> 14:11:11   ~6 min   packing the layer tars
+#     14:11:11 -> 14:19:12   ~8 min   crane reading them back to digest
+#     14:19:12 -> 14:50:16  ~31 min   the upload itself
+#
+# So 23 of the 54 minutes never touched the network, and the largest single piece
+# of that was writing a second copy of 42.8 GB onto the same disk it was read
+# from. A hard link is the same bytes under a second name: imgtar reads the file
+# content and cannot tell the difference, and the tar it writes is identical.
+#
+# WHY THIS IS SAFE HERE, and it is worth being explicit because a hard link to a
+# 23 GB corpus is a loaded gun if either assumption stops holding:
+#
+#   - NOTHING WRITES TO THE STAGED FILE. After this point the rootfs copy is only
+#     read — by imgtar when it packs, and by elfneeded which does not look at
+#     .duckdb at all. The identity guards below read data/3gpp.duckdb, the
+#     ORIGINAL, not this name. A write through the link would corrupt the corpus.
+#   - THE ROOTFS IS DELETED, NEVER TRUNCATED. `rm -rf "$STAGE"` at the top of this
+#     script unlinks; the original keeps its own link and its bytes.
+#
+# It falls back to cp when the link cannot be made — a different volume, or a
+# filesystem without hard links — so the build still works, just at the old cost.
+stage() {
+  local src="$1" dst="$2"
+  rm -f "$dst"
+  ln "$src" "$dst" 2>/dev/null && return 0
+  cp "$src" "$dst"
+}
+
   say "corpus: $(du -h data/3gpp.duckdb | cut -f1) 3GPP + $(du -h data/etsi.duckdb 2>/dev/null | cut -f1) ETSI"
   # ETSI travels in the SAME image and stays a SEPARATE file: the entrypoint adds
   # -etsi-db when it finds one, so get_spec, list_specs and the LI tools cover
   # both corpora without either being merged into the other.
-  cp data/3gpp.duckdb "$ROOTFS/data/mcp-3gpp/3gpp.duckdb"
-  [ -s data/etsi.duckdb ] && cp data/etsi.duckdb "$ROOTFS/data/mcp-3gpp/etsi.duckdb"
+  stage data/3gpp.duckdb "$ROOTFS/data/mcp-3gpp/3gpp.duckdb"
+  [ -s data/etsi.duckdb ] && stage data/etsi.duckdb "$ROOTFS/data/mcp-3gpp/etsi.duckdb"
 fi
 
 # ---- 6. identity guards ------------------------------------------------------

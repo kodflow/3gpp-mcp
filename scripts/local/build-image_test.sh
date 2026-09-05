@@ -138,5 +138,67 @@ EOF
 	done
 fi
 
+# ---------------------------------------------------------------------------
+# stage() puts the corpus in the rootfs without copying 42.8 GB, and the whole
+# reason that is acceptable is that deleting the staged name must never touch the
+# original. Sourced out of the real script, like field() above.
+stage_fn=""
+inside=0
+while IFS= read -r line; do
+	case "$line" in
+		"stage() {") inside=1 ;;
+	esac
+	[ "$inside" = 1 ] && stage_fn="$stage_fn$line
+"
+	[ "$inside" = 1 ] && [ "$line" = "}" ] && break
+done <"$SCRIPT"
+case "$stage_fn" in
+	*"stage() {"*) eval "$stage_fn" ;;
+	*) fail "no stage() in build-image.sh — the corpus is being staged some other way" ;;
+esac
+
+if command -v stage >/dev/null 2>&1 || [ -n "$stage_fn" ]; then
+	tmp="$(mktemp -d)"
+	printf 'corpus bytes\n' >"$tmp/src"
+
+	stage "$tmp/src" "$tmp/dst"
+	if [ -f "$tmp/dst" ] && [ "$(cat "$tmp/dst")" = "corpus bytes" ]; then
+		pass "stage puts the content at the destination"
+	else
+		fail "stage did not produce the content at the destination"
+	fi
+
+	# THE SAFETY PROPERTY. rm -rf "$STAGE" runs at the top of every build, and it
+	# runs over a name that may be a hard link to the corpus. Unlinking must leave
+	# the original whole; if this ever stops holding, a build deletes the corpus.
+	rm -f "$tmp/dst"
+	if [ -f "$tmp/src" ] && [ "$(cat "$tmp/src")" = "corpus bytes" ]; then
+		pass "deleting the staged name leaves the original intact"
+	else
+		fail "deleting the staged name destroyed the original — stage() must never be a move"
+	fi
+
+	# Re-staging over an existing destination must replace it, not fail or append:
+	# a rebuild stages into a tree a previous run may have left behind.
+	printf 'new corpus\n' >"$tmp/src2"
+	stage "$tmp/src" "$tmp/dst2"
+	stage "$tmp/src2" "$tmp/dst2"
+	if [ "$(cat "$tmp/dst2")" = "new corpus" ]; then
+		pass "re-staging replaces an existing destination"
+	else
+		fail "re-staging left the old content at the destination"
+	fi
+
+	# And it must still work where hard links are unavailable — the fallback is
+	# what keeps the build portable, so a stage() reduced to a bare ln would pass
+	# every check above on THIS filesystem and fail on someone else's.
+	case "$stage_fn" in
+		*"cp "*) pass "stage falls back to a copy when the link cannot be made" ;;
+		*) fail "stage has no copy fallback; it would break where hard links are unavailable" ;;
+	esac
+
+	rm -rf "$tmp"
+fi
+
 [ "$fails" -eq 0 ] || { echo "FAIL  $fails check(s) failed"; exit 1; }
-echo "OK    the identity guards can read their counters, and the corpus halves ship apart"
+echo "OK    the identity guards read their counters, the corpus halves ship apart, and staging never moves the corpus"
