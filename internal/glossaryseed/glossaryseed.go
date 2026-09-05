@@ -88,7 +88,10 @@ type Report struct {
 
 // Run seeds the glossary from the named specs' Abbreviations clauses.
 func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly bool) (Report, error) {
-	rep := Report{Min: min, Applied: !checkOnly}
+	// Applied stays FALSE until the write actually lands. Setting it from
+	// checkOnly up front makes a failed run report applied=true, which is the
+	// one field a caller reads to decide whether the corpus changed.
+	rep := Report{Min: min}
 
 	s, err := store.Open(path)
 	if err != nil {
@@ -167,6 +170,7 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		if err := s.UpsertAcronyms(rows); err != nil {
 			return rep, err
 		}
+		rep.Applied = true
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
