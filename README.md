@@ -93,7 +93,7 @@ Le dépôt embarque la preuve utilisée en interne : `scripts/local/prove-servin
 démarre le vrai serveur sur stdio et vérifie les sept armes sur les deux moitiés
 en JSON-RPC réel. Elle sort `PROVE OK` ou échoue.
 
-L'image se construit **sur la machine qui a le corpus** — `make image` — et non
+L'image se construit **sur la machine qui a le corpus** — `make publish` — et non
 sur un runner : voir [`docs/automation/data-image.md`](./docs/automation/data-image.md).
 
 ---
@@ -144,14 +144,17 @@ Une fois dans le container :
 ```bash
 # L'orchestrateur de corpus — il ne refait que ce qui a réellement changé
 make plan                     # ce que `make build` ferait, et POURQUOI. Ne change rien.
-make build                    # tout : fetch → ingest → merge → embed → sparse → index → smoke
+make build                    # tout : fetch → ingest → merge → embed → sparse → index → smoke → publish
 make build/<étape>            # une seule étape ; `make steps` liste les noms
 make status                   # l'état persisté, étape par étape
 
 # Prouver que le serveur sert vraiment les quatre armes, sur les DEUX moitiés
 make prove                    # JSON-RPC réel contre le vrai binaire → `PROVE OK`
 
-# Construire l'image depuis le corpus local et la pousser sur GHCR
+# Construire l'image depuis le corpus local et la pousser sur GHCR.
+# `publish` est la DERNIÈRE ÉTAPE du pipeline, pas un point d'entrée séparé :
+# elle a une empreinte comme les autres, donc `make plan` dit si l'image publiée
+# est en retard sur le corpus, et elle ne repousse rien quand elle est à jour.
 make publish
 ```
 
