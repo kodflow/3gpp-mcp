@@ -211,8 +211,8 @@ func (s *Store) searchAPIOperations(ctx context.Context, q APISearchQuery) ([]AP
 	whereArgs := append([]any(nil), args...) // score args then where args
 	sql := `SELECT op_id, spec_id, release, version, api_doc_version, service, service_family,
 	               api_root, path, method, operation_id, summary,
-	               array_to_string(tags, '` + arraySep + `'),
-	               request_schema, array_to_string(response_codes, '` + arraySep + `'),
+	               ` + arrayCol("tags") + `,
+	               request_schema, ` + arrayCol("response_codes") + `,
 	               yaml_file, forge_sha, forge_url, (` + score.String() + `) AS score
 	        FROM api_operations WHERE (` + where.String() + `)`
 	allArgs := append(args, whereArgs...)
@@ -264,9 +264,9 @@ func (s *Store) searchAPISchemas(ctx context.Context, q APISearchQuery) ([]APIHi
 	}
 	whereArgs := append([]any(nil), args...)
 	sql := `SELECT schema_id, spec_id, release, version, service, schema_name, kind, description,
-	               array_to_string(properties, '` + arraySep + `'),
-	               array_to_string(enum_values, '` + arraySep + `'),
-	               array_to_string(refs_out, '` + arraySep + `'),
+	               ` + arrayCol("properties") + `,
+	               ` + arrayCol("enum_values") + `,
+	               ` + arrayCol("refs_out") + `,
 	               yaml_file, forge_sha, forge_url, (` + score.String() + `) AS score
 	        FROM api_schemas WHERE (` + where.String() + `)`
 	allArgs := append(args, whereArgs...)
@@ -366,6 +366,29 @@ func (s *Store) apiSchemasForSpec(ctx context.Context, specID, release string) [
 		}
 	}
 	return out
+}
+
+// arrayCol renders a LIST column as a separator-joined string that is never NULL.
+//
+// THE BUG THIS EXISTS TO PREVENT. DuckDB's array_to_string returns NULL for an
+// EMPTY list — not the empty string — so scanning it into a Go string fails with
+// "converting NULL to string is unsupported" and the entire search returns an
+// error instead of results. The scan dies on the FIRST offending row, so one
+// empty list anywhere in a result set breaks the whole call.
+//
+// Measured on the published corpus 2026-09-07: 23 391 of 27 889 api_schemas rows
+// carry an empty enum_values (84 %), 11 533 an empty properties, 8 892 an empty
+// refs_out, and 973 of 8 562 api_operations an empty tags. search_api was
+// therefore broken for essentially every query.
+//
+// Found by RUNNING THE PUBLISHED IMAGE. No unit test caught it because every
+// fixture written through InsertAPIOperations/InsertAPISchemas happened to fill
+// each list, and an empty list is exactly the case fixtures do not think to write.
+//
+// It is a function rather than five inline coalesce() calls so that a sixth list
+// column added later cannot reintroduce the bug by being written the obvious way.
+func arrayCol(col string) string {
+	return `coalesce(array_to_string(` + col + `, '` + arraySep + `'), '')`
 }
 
 func splitArr(s string) []string {

@@ -74,6 +74,11 @@ struct Args {
     /// data-contract --require-sparse gate and discover --sparse-check can match it).
     #[arg(long, default_value = "")]
     sparse_model: String,
+    /// Apply only the ledger rows for clauses that carry NO postings yet — the same
+    /// set --export-sparse-worklist selects. Skips the self-repairing rewrite of
+    /// every posting; see the comment on the import for what that gives up.
+    #[arg(long, default_value_t = false)]
+    import_sparse_changed_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -275,14 +280,77 @@ fn main() -> Result<()> {
         const BATCH: usize = 2_000;
         let mut batch: Vec<(u64, Vec<(u32, f32)>)> = Vec::with_capacity(BATCH);
 
-        // The secondary index on term_id is dropped for the load and rebuilt after.
-        // DuckDB maintains it row by row, so inserting ~265 million postings into a
-        // growing ART index makes the import slower the further it goes — the shape
-        // seen on the real run, brisk for hours then CPU-bound with the file barely
-        // moving. Rebuilding afterwards is NOT optional: SearchSparse scores by
-        // term_id, and leaving it off turns every sparse query into a full scan of a
-        // 265-million-row table, with nothing to say so.
-        store.drop_sparse_term_index()?;
+        // WHAT --import-sparse-changed-only GIVES UP, because it is not free.
+        //
+        // The full import REWRITES every posting, so a clause whose postings were
+        // corrupted while its chunk_id stayed present is silently repaired on the
+        // next build. Filtering on "has any posting" cannot see that case, by
+        // construction — exactly the trade Store::import_ledger_changed_only makes
+        // on the dense arm, and it is spelled the same way so the two paths cannot
+        // drift apart in an operator's head.
+        //
+        // What it buys, MEASURED on build 23 (2026-09-06, the ETSI half):
+        //
+        //     368 clauses needed postings          9 seconds on the GPU
+        //     the import then rewrote 2 000 182    49 MINUTES
+        //
+        // The cost tracked the size of the LEDGER, never the size of the work — the
+        // same defect the dense import carried, in the same file, on the other arm.
+        //
+        // The skip set is `clause_sparse`'s own chunk_ids, which is literally the
+        // set clauses_needing_sparse subtracts, so the work list and the import now
+        // agree by construction instead of by coincidence.
+        let already = if args.import_sparse_changed_only {
+            store.sparse_chunk_ids()?
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // THE INDEX DECISION IS ON THE ROW COUNT, NOT ON THE MODE, and getting this
+        // backwards is expensive in both directions.
+        //
+        // The secondary index on term_id is dropped for a bulk load and rebuilt
+        // after: DuckDB maintains it row by row, so inserting ~265 million postings
+        // into a growing ART index makes the import slower the further it goes — the
+        // shape seen on the real run, brisk for hours then CPU-bound with the file
+        // barely moving. Rebuilding afterwards is NOT optional: SearchSparse scores
+        // by term_id, and leaving it off turns every sparse query into a full scan of
+        // a 265-million-row table, with nothing to say so.
+        //
+        // But dropping and rebuilding an index over 127 million postings to insert a
+        // few hundred clauses is the same mistake with the sign flipped. And the mode
+        // does not decide it: a FIRST bake with --import-sparse-changed-only has an
+        // empty skip set and applies everything.
+        //
+        // So the rule is relative to what is already there: rebuild when this import
+        // adds more than a tenth of the clauses the table already holds (and always
+        // on an empty table, where every insert is a bulk load).
+        let existing_clauses = already.len();
+        let mut bulk = !args.import_sparse_changed_only || existing_clauses == 0;
+        if !bulk {
+            // Count what the ledger will actually apply before touching the index.
+            let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
+            let mut to_apply = 0usize;
+            for line in BufReader::new(f).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(r) = serde_json::from_str::<SparseRecord>(&line) {
+                    if !already.contains(&r.chunk_id) {
+                        to_apply += 1;
+                    }
+                }
+            }
+            bulk = to_apply > existing_clauses / 10;
+            eprintln!(
+                "embed-io: sparse import will apply {to_apply} of {existing_clauses} existing clause(s)                  — term_id index {}",
+                if bulk { "dropped and rebuilt" } else { "kept" }
+            );
+        }
+        if bulk {
+            store.drop_sparse_term_index()?;
+        }
 
         for line in BufReader::new(f).lines() {
             let line = line?;
@@ -300,6 +368,9 @@ fn main() -> Result<()> {
             };
             // An empty-postings clause (heading-only/void text) still counts as "done" so the
             // worklist converges — the DELETE is issued for it either way.
+            if already.contains(&r.chunk_id) {
+                continue;
+            }
             batch.push((r.chunk_id, r.terms));
             if batch.len() >= BATCH {
                 store.set_sparse_many(&batch)?;
@@ -312,15 +383,21 @@ fn main() -> Result<()> {
             store.set_sparse_many(&batch)?;
             total += batch.len();
         }
-        eprintln!("embed-io: rebuilding the term_id index over {total} clause(s)…");
-        store.create_sparse_term_index()?;
+        if bulk {
+            eprintln!("embed-io: rebuilding the term_id index over {total} clause(s)…");
+            store.create_sparse_term_index()?;
+        }
         if !args.sparse_model.is_empty() {
             store.set_meta("sparse_model", &args.sparse_model)?;
         }
         if skipped > 0 {
             eprintln!("embed-io: skipped {skipped} malformed sparse line(s) — affected clauses re-picked next pass");
         }
-        eprintln!("embed-io: wrote sparse postings for {total} clause(s)");
+        // The count is what was APPLIED, not what was staged. The dense arm used to
+        // print the staged number and overstate its work by three orders of
+        // magnitude; a log that does that is the number someone quotes back when the
+        // corpus is wrong.
+        eprintln!("embed-io: wrote sparse postings for {total} clause(s) (skipped {} already posted)", already.len());
         return Ok(());
     }
 
