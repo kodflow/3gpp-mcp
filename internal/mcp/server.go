@@ -59,6 +59,25 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	}
 	h := &handlers{st: st, etsi: etsi, eng: eng, etsiEng: etsiEng, reg: registry.Default(), baseline: baseline, version: version}
 
+	// EVERY TOOL IS SHIELDED, AND THAT IS WHY THE WRAPPER IS HERE RATHER THAN
+	// INSIDE EACH HANDLER: registrations are a list, and a list is auditable.
+	//
+	// Cancelling a running DuckDB query makes it raise duckdb::InterruptException,
+	// and that C++ exception crosses cgo and ABORTS THE PROCESS — it never becomes
+	// a Go error. A client that disconnects mid-tool-call cancels the request
+	// context, so on Linux any tool could take the server down. Measured against
+	// the published image on 2026-09-06; internal/search carries the numbers.
+	//
+	// database/sql refuses an ALREADY-cancelled context before the driver sees it,
+	// which is why a wrapper at the driver layer cannot help and was removed: the
+	// dangerous case is cancellation arriving DURING the query, and only a context
+	// that cannot be cancelled at all prevents it.
+	shielded := func(f server.ToolHandlerFunc) server.ToolHandlerFunc {
+		return func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return f(context.WithoutCancel(ctx), r)
+		}
+	}
+
 	s.AddTool(mcp.NewTool("search_spec",
 		mcp.WithDescription("Hybrid lexical retrieval over clauses, with citations."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("free-text query")),
@@ -70,7 +89,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("cursor", mcp.Description("opaque pagination cursor from a previous call's next_cursor")),
 		mcp.WithString("mode", mcp.Description("retrieval mode: hybrid (default) | lexical | semantic")),
 		mcp.WithBoolean("rerank", mcp.Description("re-score the top candidates with the cross-encoder (default false; needs the -tags onnx binary + reranker model)")),
-	), h.searchSpec)
+	), shielded(h.searchSpec))
 
 	s.AddTool(mcp.NewTool("get_spec",
 		mcp.WithDescription("Fetch a spec, or a clause/clause-subtree, verbatim with citations."),
@@ -79,7 +98,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("version", mcp.Description("e.g. 19.6.0; default = latest")),
 		mcp.WithString("clause", mcp.Description("clause path or prefix, e.g. 6.2.2.2")),
 		mcp.WithBoolean("full", mcp.Description("inline full clause text instead of snippet+resource URI (default false)")),
-	), h.getSpec)
+	), shielded(h.getSpec))
 
 	s.AddTool(mcp.NewTool("get_changelog",
 		mcp.WithDescription("Change Request records for a spec between releases."),
@@ -87,18 +106,18 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("from_release", mcp.Description("e.g. Rel-18")),
 		mcp.WithString("to_release", mcp.Description("e.g. Rel-19")),
 		mcp.WithString("clause", mcp.Description("filter by affected clause")),
-	), h.getChangelog)
+	), shielded(h.getChangelog))
 
 	s.AddTool(mcp.NewTool("list_releases",
 		mcp.WithDescription("All (release, version, freeze_date) of a spec, newest first."),
 		mcp.WithString("spec_id", mcp.Required()),
-	), h.listReleases)
+	), shielded(h.listReleases))
 
 	s.AddTool(mcp.NewTool("resolve_term",
 		mcp.WithDescription("Glossary lookup of an acronym/term (TS 21.905 seed)."),
 		mcp.WithString("term", mcp.Required()),
 		mcp.WithString("release", mcp.Description("optional release context")),
-	), h.resolveTerm)
+	), shielded(h.resolveTerm))
 
 	s.AddTool(mcp.NewTool("trace_evolution",
 		mcp.WithDescription("How a 4G/legacy network element maps to its 5GC network function(s), "+
@@ -108,13 +127,13 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("entity", mcp.Required()),
 		mcp.WithString("from_release", mcp.Description("")),
 		mcp.WithString("to_release", mcp.Description("")),
-	), h.traceEvolution)
+	), shielded(h.traceEvolution))
 
 	s.AddTool(mcp.NewTool("find_cross_references",
 		mcp.WithDescription("Specs referenced by a spec/clause (TS/TR mentions)."),
 		mcp.WithString("spec_id", mcp.Required()),
 		mcp.WithString("clause", mcp.Description("restrict to a clause/subtree")),
-	), h.findCrossRefs)
+	), shielded(h.findCrossRefs))
 
 	s.AddTool(mcp.NewTool("list_specs",
 		mcp.WithDescription("Catalogue filter by release/series/working_group."),
@@ -122,7 +141,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("series", mcp.Description("e.g. 33")),
 		mcp.WithString("working_group", mcp.Description("e.g. SA3")),
 		mcp.WithString("spec_type", mcp.Description("TS (default), TR, EN, or any. Omitted = the NORMATIVE types: TS on the 3GPP half (TS-first doctrine), TS+EN on the ETSI half, where a European Norm is a standard and filtering it out would hide most of the catalogue.")),
-	), h.listSpecs)
+	), shielded(h.listSpecs))
 
 	s.AddTool(mcp.NewTool("search_api",
 		mcp.WithDescription("Lexical search over 5GC OpenAPI operations and schemas parsed from the "+
@@ -135,7 +154,7 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithString("method", mcp.Description("HTTP method: GET/PUT/POST/DELETE/PATCH")),
 		mcp.WithString("kind", mcp.Description("operation | schema | any (default any)")),
 		mcp.WithNumber("top_k", mcp.Description("max results (default 10)")),
-	), h.searchAPI)
+	), shielded(h.searchAPI))
 
 	s.AddTool(mcp.NewTool("trace_clause",
 		mcp.WithDescription("How a clause's TEXT evolved, PARAGRAPH by paragraph: which points of the spec's "+
@@ -151,19 +170,19 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		// them in. An ETSI deliverable is traced between two VERSIONS here.
 		mcp.WithString("from_release", mcp.Description("with to_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
 		mcp.WithString("to_release", mcp.Description("with from_release: report the +/- between the two. A release (Rel-18) or a version (18.4.0) — whichever this spec is published along")),
-	), h.traceClause)
+	), shielded(h.traceClause))
 
 	s.AddTool(mcp.NewTool("help",
 		mcp.WithDescription("What this corpus HOLDS and how to drive it: counts per half "+
 			"(specs, clauses, vectors), the map from question to tool, and the environment "+
 			"knobs that change what you get back. Capabilities and their on/off reasons are "+
 			"server_info's job. Read-only, no arguments."),
-	), h.help)
+	), shielded(h.help))
 
 	s.AddTool(mcp.NewTool("server_info",
 		mcp.WithDescription("Report the server's retrieval capabilities and why semantic search is on/off "+
 			"(so a client knows whether to use mode=semantic). Read-only, no arguments."),
-	), h.serverInfo)
+	), shielded(h.serverInfo))
 
 	registerResources(s, h)
 
