@@ -665,3 +665,75 @@ func TestRepairViewRefusesAnythingElse(t *testing.T) {
 		}
 	})
 }
+
+// --- le plafond memoire (2026-09-06) ------------------------------------------
+//
+// Deux builds ont ete tues parce que DuckDB prenait 80 % de la RAM par defaut.
+// Ces tests pinnent le correctif : la valeur, sa surcharge, et le fait que DuckDB
+// l'accepte reellement.
+
+// La valeur par defaut doit rester FIXE. Un plafond derive de la RAM physique
+// serait exactement le defaut qui a tue les builds.
+func TestMemoryLimitDefaultIsFixed(t *testing.T) {
+	t.Setenv(memoryLimitEnv, "")
+	if got := memoryLimit(); got != defaultMemoryLimit {
+		t.Fatalf("memoryLimit() = %q, want %q", got, defaultMemoryLimit)
+	}
+}
+
+// LE CONTROLE NEGATIF : une surcharge explicite gagne, une surcharge VIDE non.
+// Une chaine vide atteindrait DuckDB comme `SET memory_limit = ”`, qui est une
+// erreur de syntaxe — une variable parasite tuerait la migration au lieu d'etre
+// ignoree.
+func TestMemoryLimitOverride(t *testing.T) {
+	t.Setenv(memoryLimitEnv, "4GB")
+	if got := memoryLimit(); got != "4GB" {
+		t.Fatalf("explicit override ignored: %q", got)
+	}
+	t.Setenv(memoryLimitEnv, "   ")
+	if got := memoryLimit(); got != defaultMemoryLimit {
+		t.Fatalf("a blank override must fall back, got %q", got)
+	}
+}
+
+// Le fichier de debordement doit tomber a cote du corpus — le volume qui a
+// forcement la place — et jamais dans un repertoire vide.
+func TestSpillDirSitsBesideTheCorpus(t *testing.T) {
+	got := spillDir(filepath.Join("data", "etsi.duckdb"))
+	if want := filepath.Join("data", "migrate-paragraphs.tmp"); got != want {
+		t.Fatalf("spillDir = %q, want %q", got, want)
+	}
+	if got := spillDir("etsi.duckdb"); got == "" || strings.HasPrefix(got, string(filepath.Separator)) {
+		t.Fatalf("a bare corpus name must still yield a local path, got %q", got)
+	}
+}
+
+// Les reglages ne valent rien si DuckDB les refuse. On ouvre une vraie base et on
+// RELIT le reglage, pour qu'une option renommee echoue ici plutot qu'a 22 Go sur
+// la machine de build.
+func TestBoundMemoryIsAcceptedByDuckDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cap.duckdb")
+	h, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	t.Setenv(memoryLimitEnv, "3GB")
+	if err := boundMemory(h, dbPath); err != nil {
+		t.Fatalf("DuckDB rejected the knobs: %v", err)
+	}
+
+	var got string
+	if err := h.QueryRow("SELECT current_setting('memory_limit')").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	// DuckDB normalise l'unite ("3GB" -> "2.7 GiB"), donc on verifie que le
+	// plafond a BOUGE et reste modeste, pas la chaine exacte.
+	if strings.Contains(got, "GiB") == false && strings.Contains(got, "GB") == false {
+		t.Fatalf("memory_limit unreadable: %q", got)
+	}
+	if strings.HasPrefix(got, "2") == false && strings.HasPrefix(got, "3") == false {
+		t.Fatalf("memory_limit did not take, got %q (default would be ~80%% of RAM)", got)
+	}
+}
