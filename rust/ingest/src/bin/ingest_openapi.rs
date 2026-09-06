@@ -64,16 +64,60 @@ fn schema_in(s: &ParsedSchema, release: &str) -> ApiSchemaIn {
     }
 }
 
-/// API_CORPUS_KEY_META records which YAML corpus the api_* tables were built from.
+/// API_CORPUS_KEY_META records which YAML corpus the api_* tables were built from,
+/// AND which parser read it.
 const API_CORPUS_KEY_META: &str = "api_corpus_key";
 
-/// corpus_key identifies the YAML corpus on disk by its own content addressing.
+/// PARSER_SOURCE is the text of the parser this binary was compiled with.
+///
+/// AN INPUT KEY ANSWERS THE WRONG QUESTION, and this is the fix for that.
+/// `corpus_pairs` identifies the YAML on disk, which answers "is the input the
+/// same?". The rows come from `parse3gpp::openapi::parse_openapi`, so a change in
+/// the PARSER produces different rows from identical files — and a pure input key
+/// would call that corpus already-ingested and keep the stale api_* tables for
+/// good, silently. The same hole was closed in ingest-li by hashing the parsed
+/// ROWS; here that would cost a full parse of 1 774 YAML files on every build,
+/// measured at 62 s, which is most of what PR #282 removed from `enrich`.
+///
+/// Embedding the source costs nothing at run time and is exact for this parser:
+/// openapi.rs uses regex, serde_yaml and std, and NO other module of the crate —
+/// so its text is the whole of the logic that produces these rows. External crate
+/// versions are pinned by Cargo.lock.
+///
+/// include_str! resolves at COMPILE time, so moving or renaming the parser breaks
+/// the build rather than silently detaching the key from what it describes.
+const PARSER_SOURCE: &str = include_str!("../../../parse/src/openapi.rs");
+
+/// FNV-1a 64, written out rather than pulled in — `DefaultHasher` is explicitly
+/// not stable across Rust releases and this value is persisted in the corpus and
+/// compared across builds. Deliberately duplicated from ingest_li.rs: the crate
+/// has no lib target, and adding one to share ten lines would put a new file in
+/// the provenance of every step that names this crate's sources.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// corpus_key joins WHAT was read to WHO read it. Either half changing must
+/// re-ingest; neither half alone is an identity.
+fn corpus_key(pairs: &str, parser_source: &str) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    format!("{pairs}|parser={:016x}", fnv1a(parser_source))
+}
+
+/// corpus_pairs identifies the YAML corpus on disk by its own content addressing.
 ///
 /// The layout is `<src>/<Rel>/<sha>/<file>.yaml`, where `<sha>` is the 3GPP Forge
 /// commit the files were taken from — so the sorted set of `<Rel>/<sha>` pairs IS
 /// the identity of the corpus, and reading it costs two directory listings rather
 /// than hashing 1 774 files.
-fn corpus_key(src: &str) -> Result<String> {
+fn corpus_pairs(src: &str) -> Result<String> {
     let mut pairs: Vec<String> = Vec::new();
     for rel_ent in std::fs::read_dir(src).with_context(|| format!("read_dir {src}"))? {
         let rel_path = rel_ent?.path();
@@ -124,7 +168,7 @@ fn main() -> Result<()> {
     //
     // The key is the corpus's own content addressing, not a guess: the directory
     // names carry the Forge commit SHA the YAML came from.
-    let key = corpus_key(&args.src)?;
+    let key = corpus_key(&corpus_pairs(&args.src)?, PARSER_SOURCE);
     if !key.is_empty() && store.get_meta(API_CORPUS_KEY_META)? == key {
         eprintln!("ingest-openapi: the api tables already carry this YAML corpus — leaving them untouched");
         return Ok(());
@@ -208,4 +252,75 @@ fn main() -> Result<()> {
         "ingest-openapi: {files} file(s) → {ops_total} operation(s), {schemas_total} schema(s)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property the skip rests on.
+    #[test]
+    fn the_same_corpus_and_parser_give_the_same_key() {
+        assert_eq!(
+            corpus_key("Rel-18/abc:120", "fn parse() {}"),
+            corpus_key("Rel-18/abc:120", "fn parse() {}")
+        );
+    }
+
+    /// THE FIX, as a test. An input-only key would pass this by returning the same
+    /// value for both — and the corpus would keep rows the new parser would never
+    /// have produced.
+    #[test]
+    fn a_changed_parser_changes_the_key_even_on_an_identical_corpus() {
+        let a = corpus_key("Rel-18/abc:120", "fn parse() {}");
+        let b = corpus_key("Rel-18/abc:120", "fn parse() { /* one byte */ }");
+        assert_ne!(
+            a, b,
+            "a parser change must re-ingest, or the api_* tables go stale for good"
+        );
+    }
+
+    /// The other half must still count. Narrowing the key to the parser alone
+    /// would be the mirror mistake.
+    #[test]
+    fn a_changed_corpus_changes_the_key_with_an_identical_parser() {
+        let a = corpus_key("Rel-18/abc:120", "fn parse() {}");
+        assert_ne!(
+            a,
+            corpus_key("Rel-18/abc:121", "fn parse() {}"),
+            "one more file"
+        );
+        assert_ne!(
+            a,
+            corpus_key("Rel-18/def:120", "fn parse() {}"),
+            "another Forge commit"
+        );
+        assert_ne!(
+            a,
+            corpus_key("Rel-19/abc:120", "fn parse() {}"),
+            "another release"
+        );
+    }
+
+    /// An empty corpus yields an empty key, which main() treats as "never skip".
+    /// Without this an unreadable or empty source directory would stamp a key that
+    /// describes nothing and suppress every future ingest.
+    #[test]
+    fn an_empty_corpus_has_no_key() {
+        assert_eq!(corpus_key("", "fn parse() {}"), "");
+    }
+
+    /// The parser really is embedded — a stub or an empty file would make the
+    /// guard above vacuous while every test still passed.
+    #[test]
+    fn the_embedded_parser_source_is_the_real_one() {
+        assert!(
+            PARSER_SOURCE.contains("pub fn parse_openapi"),
+            "PARSER_SOURCE does not contain the parser entry point"
+        );
+        assert!(
+            PARSER_SOURCE.len() > 2000,
+            "PARSER_SOURCE is suspiciously small"
+        );
+    }
 }
