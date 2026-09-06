@@ -46,6 +46,7 @@ func main() {
 	dropClauses := flag.Bool("drop-clauses", false, "after a passing verification, drop the now-redundant `clauses` table")
 	restoreFlag := flag.Bool("restore", false, "put `clauses` back as a real table and remove the content-addressed tables (the inverse of --drop-clauses)")
 	repairFlag := flag.Bool("repair-view", false, "recover an INTERRUPTED --restore: drop the empty `clauses` shell it left behind and put the view back")
+	attested := flag.Bool("attested", false, "cheap check: the corpus still has the shape a verification proved, without redoing the rebuild")
 	flag.Parse()
 
 	h, err := sql.Open("duckdb", *db)
@@ -78,6 +79,21 @@ func main() {
 		die("bound memory: %v", err)
 	}
 
+	// THE CHEAP HALF. `paragraphs.Validate` runs on every plan, including for a
+	// step that would be skipped, so it must not read 23 GB. The full rebuild
+	// happens where the claim is MADE — see the attestation stamped below — and
+	// this only asks whether that claim is still about this corpus.
+	//
+	// Read-only, like --verify: a check that repairs what it checks cannot be
+	// trusted to report.
+	if *attested {
+		if err := store.CheckParagraphAttestation(h); err != nil {
+			die("attestation: %v", err)
+		}
+		report(h)
+		return
+	}
+
 	if *repairFlag {
 		// Narrow by design, and the whole run: there is nothing to verify or report
 		// against a corpus whose `clauses` is the empty shell of a killed restore.
@@ -101,6 +117,22 @@ func main() {
 		// `paragraphs` on a corpus it already converted. See alreadyConverted.
 		switch err := build(h); {
 		case errors.Is(err, errAlreadyConverted):
+			// Already converted, but possibly never ATTESTED — an older corpus, or
+			// one whose attestation a restore reset. Prove it once, here, so every
+			// later plan can use the cheap check instead of re-reading the corpus.
+			// This is the migration path, and it is why it costs one full verify
+			// rather than none.
+			if err := store.CheckParagraphAttestation(h); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate-paragraphs: %v — verifying once to attest it\n", err)
+				if err := verify(h); err != nil {
+					die("VERIFICATION FAILED on an already-converted corpus: %v", err)
+				}
+				c, err := store.StampParagraphAttestation(h)
+				if err != nil {
+					die("attest: %v", err)
+				}
+				fmt.Fprintf(os.Stderr, "  attested        %s\n", c)
+			}
 			report(h)
 			return
 		case err != nil:
@@ -109,6 +141,16 @@ func main() {
 	}
 	if err := verify(h); err != nil {
 		die("VERIFICATION FAILED — the corpus is NOT safe to shrink: %v", err)
+	}
+	// Stamped ONLY after the rebuild passed, and never in --verify (which promises
+	// to write nothing). A record that outlives what it describes is the failure
+	// mode worth fearing here, so the order is: prove, then claim.
+	if !*verifyOnly {
+		c, err := store.StampParagraphAttestation(h)
+		if err != nil {
+			die("attest: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "  attested        %s\n", c)
 	}
 	if *dropClauses {
 		if err := drop(h); err != nil {

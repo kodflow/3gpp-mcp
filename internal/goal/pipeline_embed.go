@@ -478,7 +478,7 @@ func stepEnrich() *Step {
 		// the seed: editing an edge must replay the overlay, exactly as editing an
 		// extractor does. Before, the seed's hash moved the published identity
 		// while nothing wrote the seed — see cmd/seed-evolutions.
-		Impl: []string{"rust/ingest/src/bin", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		Impl: []string{"rust/ingest/src/bin", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -1364,10 +1364,22 @@ func stepParagraphs(t corpusTarget) *Step {
 		Inputs:  func(c *Ctx) ([]string, error) { return nil, nil },
 		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
-			// Prove the corpus can still produce the text it used to store,
-			// rather than trusting that the conversion said so earlier.
+			// --attested, NOT --verify. The full rebuild reads the whole corpus:
+			// ~8 min on 23 GB, and the step is instantiated for both halves, so it
+			// was ~15 min of tax on every plan and every build — including plans
+			// where this step was going to be SKIPPED.
+			//
+			// That is the trade validatePublished refuses a few files away, in this
+			// repository's own words: "Validate runs on EVERY plan, including for
+			// steps that would be skipped … What the record claims is confirmed at
+			// the moment it is written instead." The rebuild now runs where the
+			// claim is made, and leaves the counters it covered in the corpus;
+			// this re-counts them, which DuckDB answers from metadata.
+			//
+			// A corpus that was never attested fails here on purpose: the step then
+			// RUNS, proves itself once, and every later plan is cheap.
 			out, err := c.Output(Cmd{Name: c.bin("migrate-paragraphs"), Args: []string{
-				"--db", t.dbPath(c), "--verify",
+				"--db", t.dbPath(c), "--attested",
 			}})
 			if err != nil {
 				return stillOpenElsewhere(t.DB, fmt.Errorf("the converted corpus does not verify: %w", err))
