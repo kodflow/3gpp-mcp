@@ -34,7 +34,20 @@ const MemoryLimitEnv = "DUCKDB_MEMORY_LIMIT"
 // DefaultMemoryLimit is FIXED, and deliberately not a share of physical RAM. A
 // percentage-of-machine default is precisely the bug this package removes: the
 // goal is to leave the operating system room, not to claim a fraction of the box.
-const DefaultMemoryLimit = "12GB"
+//
+// SIXTEEN, AND THE NUMBER IS MEASURED RATHER THAN CHOSEN. A cap has to clear the
+// largest legitimate operation or it turns an out-of-memory kill into an
+// out-of-memory error, which is not an improvement. The largest one here is
+// migrate-paragraphs' verification: it rebuilds every body with string_agg over
+// a GROUP BY, and DuckDB cannot spill that aggregate — no temp file appears, it
+// simply fails. On the shipped 3GPP corpus, 2026-09-06:
+//
+//	12GB  Out of Memory Error: failed to allocate 16.0 MiB (11.1 GiB/11.1 GiB used)
+//	16GB  verified 2 752 688/2 752 688 occurrences rebuild byte-for-byte, 7m12
+//
+// 16 GB still leaves 12 GB on this 28 GB machine, and the kills happened at 22.
+// The ETSI half verifies in 17 s well under either cap; do not size on it.
+const DefaultMemoryLimit = "16GB"
 
 // PickMemoryLimit is the whole policy, as a pure function of its input.
 //
