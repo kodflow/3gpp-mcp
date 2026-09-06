@@ -99,25 +99,48 @@ struct VecRecord {
 /// this step, twice, for an import that had 368 new vectors to write.
 ///
 /// The cap is not a diet, it is a spill threshold: past it DuckDB writes to
-/// temp_directory instead of asking the OS for more. `copy_database_compact` already
-/// does this, for the same reason, with the same two knobs and the same kind of env
-/// escape hatch — this is the crate's existing answer applied to the one writer that
-/// had been left out of it.
+/// temp_directory instead of asking the OS for more. `copy_database_compact` and
+/// `freeze-hnsw` already do this — this is the crate's existing answer applied to the
+/// writer that had been left out of it.
+const MEMORY_LIMIT_ENV: &str = "EMBED_IMPORT_MEMORY_LIMIT";
+
+/// FIXED, and deliberately not a share of physical RAM: a percentage-of-machine
+/// default is precisely the bug being removed.
+const DEFAULT_MEMORY_LIMIT: &str = "12GB";
+
+/// pick_limit is the whole policy, as a pure function of its input.
 ///
-/// The spill directory sits beside the LEDGER on purpose: that volume already holds
-/// tens of gigabytes of vectors, so it has the room, whereas the process's working
-/// directory is wherever `make` happened to be invoked from.
-fn import_memory_knobs(ledger: &str) -> (String, std::path::PathBuf) {
-    let tmp = std::path::Path::new(ledger)
+/// PURE ON PURPOSE. The obvious shape reads the variable inside, and then the only
+/// way to test the fallback is for a test to mutate the process environment — which
+/// cargo runs in parallel threads, and which Unix does not permit while another
+/// thread may be reading it. Separating the decision from where the value comes from
+/// means the policy is tested with values and no test touches the environment.
+///
+/// A blank value must NOT be forwarded: `SET memory_limit = ''` is a DuckDB parse
+/// error, so a whitespace-only override would kill the import instead of being
+/// ignored.
+fn pick_limit(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => DEFAULT_MEMORY_LIMIT.to_string(),
+    }
+}
+
+/// spill_dir puts DuckDB's temporary files beside the LEDGER: that volume already
+/// holds tens of gigabytes of vectors, so it has the room, whereas the process's
+/// working directory is wherever `make` happened to be invoked from.
+fn spill_dir(ledger: &str) -> std::path::PathBuf {
+    std::path::Path::new(ledger)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("import-ledger.tmp"))
-        .unwrap_or_else(|| std::path::PathBuf::from("import-ledger.tmp"));
-    let buf = std::env::var("EMBED_IMPORT_MEMORY_LIMIT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "12GB".into());
-    (buf, tmp)
+        .unwrap_or_else(|| std::path::PathBuf::from("import-ledger.tmp"))
+}
+
+/// import_memory_knobs is the thin wrapper: it READS, pick_limit DECIDES.
+fn import_memory_knobs(ledger: &str) -> (String, std::path::PathBuf) {
+    let raw = std::env::var(MEMORY_LIMIT_ENV).ok();
+    (pick_limit(raw.as_deref()), spill_dir(ledger))
 }
 
 fn main() -> Result<()> {
@@ -317,71 +340,60 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The spill file must land beside the ledger — that is the volume with room for
-    /// it. A relative ledger path with no parent must still yield a usable path
-    /// rather than an empty one.
+    /// The policy, tested with VALUES. Nothing here reads or writes the process
+    /// environment: cargo runs tests in threads, the environment is shared by all of
+    /// them, and mutating it while another thread may read it is not permitted on
+    /// Unix. An earlier version of this suite did mutate it, passed when run alone,
+    /// and failed under `cargo test` — measured, not theorised.
+    #[test]
+    fn pick_limit_is_the_whole_policy() {
+        assert_eq!(pick_limit(None), "12GB", "unset falls back");
+        assert_eq!(pick_limit(Some("4GB")), "4GB", "explicit wins");
+        assert_eq!(
+            pick_limit(Some("  6GB  ")),
+            "6GB",
+            "surrounding space is trimmed"
+        );
+        assert_eq!(pick_limit(Some("")), "12GB", "empty is not a value");
+        assert_eq!(pick_limit(Some("   ")), "12GB", "whitespace is not a value");
+        assert_eq!(
+            pick_limit(Some("\t\n")),
+            "12GB",
+            "tabs and newlines are not a value"
+        );
+    }
+
+    /// A cap derived from physical RAM would be the very default that killed the
+    /// builds, so pin the shape rather than trusting the comment above it.
+    #[test]
+    fn the_default_is_a_fixed_modest_literal() {
+        assert!(
+            DEFAULT_MEMORY_LIMIT.ends_with("GB"),
+            "{DEFAULT_MEMORY_LIMIT}"
+        );
+        assert!(
+            !DEFAULT_MEMORY_LIMIT.contains('%'),
+            "must not be a share of RAM"
+        );
+    }
+
+    /// The spill file belongs beside the ledger — the volume that already holds the
+    /// vectors — and a bare filename must still yield a usable path, never an empty
+    /// one.
     #[test]
     fn the_spill_directory_sits_beside_the_ledger() {
-        let (_, tmp) = import_memory_knobs("/c/vecs/etsi-ledger.jsonl");
         assert_eq!(
-            tmp,
+            spill_dir("/c/vecs/etsi-ledger.jsonl"),
             std::path::Path::new("/c/vecs").join("import-ledger.tmp")
         );
-
-        let (_, bare) = import_memory_knobs("etsi-ledger.jsonl");
+        let bare = spill_dir("etsi-ledger.jsonl");
         assert_eq!(bare, std::path::PathBuf::from("import-ledger.tmp"));
         assert!(!bare.as_os_str().is_empty());
     }
 
-    /// THE ONLY TEST THAT TOUCHES THE ENVIRONMENT, and it has to stay that way.
-    ///
-    /// `std::env` is process-wide and cargo runs tests in THREADS, so a test that sets
-    /// this variable sets it for every other test running at that instant. Split across
-    /// two tests, this suite passed alone and failed under `cargo test` — measured, not
-    /// theorised. Go's `t.Setenv` refuses to coexist with `t.Parallel` for exactly this
-    /// reason; Rust offers no equivalent, so the discipline is manual: one test.
-    ///
-    /// It covers three things at once because they cannot safely be separated:
-    ///   - the default is FIXED at 12GB, never derived from physical RAM — a
-    ///     percentage-of-RAM default is precisely the bug this whole change removes;
-    ///   - an explicit override wins;
-    ///   - a BLANK override falls back rather than reaching DuckDB, where
-    ///     `SET memory_limit = ''` is a parse error that would kill the import over a
-    ///     stray variable.
-    #[test]
-    fn the_cap_is_fixed_by_default_and_overridable_but_never_blank() {
-        let key = "EMBED_IMPORT_MEMORY_LIMIT";
-        let restore = std::env::var(key).ok();
-
-        std::env::remove_var(key);
-        assert_eq!(import_memory_knobs("/tmp/l.jsonl").0, "12GB", "default");
-
-        std::env::set_var(key, "4GB");
-        assert_eq!(
-            import_memory_knobs("/tmp/l.jsonl").0,
-            "4GB",
-            "explicit override"
-        );
-
-        std::env::set_var(key, "   ");
-        assert_eq!(
-            import_memory_knobs("/tmp/l.jsonl").0,
-            "12GB",
-            "a blank override must fall back, not reach DuckDB"
-        );
-
-        match restore {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-
     /// The knobs are worthless if DuckDB refuses them, so open a real corpus and read
     /// the setting BACK — a renamed option fails here rather than at 22 GB on a build
-    /// machine.
-    ///
-    /// The cap is written literally rather than taken from `import_memory_knobs`, so
-    /// this test never reads the environment and cannot race the one above.
+    /// machine. The cap is written literally, so this test reads no environment either.
     #[test]
     fn duckdb_accepts_the_knobs_and_reports_them_back() {
         let dir = std::env::temp_dir().join(format!("embedio-knobs-{}", std::process::id()));
@@ -390,7 +402,7 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let store = Store::open_rw(db.to_str().unwrap()).unwrap();
-        let tmp = dir.join("import-ledger.tmp");
+        let tmp = spill_dir(dir.join("l.jsonl").to_str().unwrap());
         store
             .raw()
             .execute_batch(&format!(
