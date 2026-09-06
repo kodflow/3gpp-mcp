@@ -16,6 +16,16 @@ import (
 // snippet + a resource URI; the full body is fetched via resources/read only
 // when the client decides it needs it — bounding token cost.
 func registerResources(s *server.MCPServer, h *handlers) {
+	// Same shield as the tools, same reason: a client that disconnects mid-read
+	// cancels the request context, and a cancelled DuckDB query aborts the process
+	// on Linux rather than returning an error. See the note at the tool
+	// registrations in server.go.
+	shielded := func(f server.ResourceTemplateHandlerFunc) server.ResourceTemplateHandlerFunc {
+		return func(ctx context.Context, r mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			return f(context.WithoutCancel(ctx), r)
+		}
+	}
+
 	// Clause subtree: 3gpp://<spec>/<release>/<clause>[@<version>]. {+clause}
 	// (RFC6570 reserved expansion) matches dotted paths literally.
 	s.AddResourceTemplate(
@@ -27,7 +37,7 @@ func registerResources(s *server.MCPServer, h *handlers) {
 					"URI: 3gpp://<spec_id>/<release>/<clause>[@<version>]."),
 			mcp.WithTemplateMIMEType("text/markdown"),
 		),
-		h.readClauseResource,
+		shielded(h.readClauseResource),
 	)
 	// Whole spec at a release: 3gpp://<spec>/<release>[@<version>].
 	s.AddResourceTemplate(
@@ -39,7 +49,7 @@ func registerResources(s *server.MCPServer, h *handlers) {
 					"URI: 3gpp://<spec_id>/<release>[@<version>]."),
 			mcp.WithTemplateMIMEType("text/markdown"),
 		),
-		h.readSpecResource,
+		shielded(h.readSpecResource),
 	)
 }
 

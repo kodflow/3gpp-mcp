@@ -467,7 +467,27 @@ func stepIngest() *Step {
 		// it, and build-rust cannot cover the gap — build steps are Step.Tool by
 		// design, so a dirty tool never replays a data step. The result would have
 		// been a rebuilt binary and a corpus kept from the old one.
-		Impl: []string{"rust/parse", "rust/ingest/src/main.rs", "rust/ingest/Cargo.toml", "rust/store/src", "internal/store/schema.sql"},
+		Impl: []string{
+			// The binary this step runs, and its manifest.
+			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml",
+			// The crates it links. rust/store/src/lib.rs, NOT rust/store/src: the
+			// latter also holds src/bin (embed-io, merge, overlay), binaries this
+			// step never runs — the same false positive that cost an hour of ETSI
+			// rework when it was rust/ingest/src. src holds only lib.rs and bin, so
+			// naming lib.rs loses nothing.
+			"rust/parse", "rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			// identity3gpp is re-exported as store_rs::identity and decides release
+			// ordering; nothing else declared here contains it.
+			"rust/identity",
+			// The workspace manifest and the LOCKFILE. Cargo resolves every crate
+			// above through them, so `cargo update` alone — no source touched, no
+			// manifest touched — can produce a different binary. build-rust cannot
+			// cover it: build steps are Step.Tool by design and never replay a data
+			// step, so the corpus would be kept from the previous binary in silence.
+			"rust/Cargo.toml", "rust/Cargo.lock",
+			// The shape the rows are written into.
+			"internal/store/schema.sql",
+		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// The converted tree is the input. Enumerating every HTML file would
 			// make the fingerprint enormous; the per-series directories carry the
