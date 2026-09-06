@@ -97,7 +97,15 @@ func stepCorpusETSI() *Step {
 		// declaration, minus the binaries neither of them runs.
 		Impl: []string{
 			"scripts/etsi-corpus.sh", "scripts/lib/convert.sh",
-			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml", "rust/parse", "rust/store/src",
+			// The binary this step runs, and its manifest.
+			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml",
+			// The crates it links. rust/store/src/lib.rs, NOT rust/store/src, which
+			// also holds src/bin — binaries this step never runs.
+			"rust/parse", "rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			"rust/identity",
+			// The workspace manifest and LOCKFILE: `cargo update` alone can change
+			// the binary, and build-rust is a Tool that never replays a data step.
+			"rust/Cargo.toml", "rust/Cargo.lock",
 			"internal/store/schema.sql",
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
