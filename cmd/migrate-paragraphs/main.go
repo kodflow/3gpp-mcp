@@ -70,6 +70,14 @@ func main() {
 	_, _ = h.Exec(`LOAD vss`)
 	_, _ = h.Exec(`SET hnsw_enable_experimental_persistence = true`)
 
+	// AND BOUND THE BUFFER MANAGER, because nobody else does: DuckDB's
+	// memory_limit defaults to ~80% of physical RAM and this binary was measured
+	// at 22.0 GB on a 28 GB machine, which is what got two builds killed. The
+	// policy, the numbers and the reasoning live in internal/store (memory.go).
+	if err := store.BoundMemory(h, *db); err != nil {
+		die("bound memory: %v", err)
+	}
+
 	if *repairFlag {
 		// Narrow by design, and the whole run: there is nothing to verify or report
 		// against a corpus whose `clauses` is the empty shell of a killed restore.
@@ -318,6 +326,7 @@ func restamp(h *sql.DB) error {
 //
 // It is deliberately NARROW because it drops a table: it refuses unless the corpus
 // carries exactly the signature of an interrupted restore.
+
 func repairView(h *sql.DB) error {
 	var kind string
 	if err := h.QueryRow(
