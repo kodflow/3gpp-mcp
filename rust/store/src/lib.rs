@@ -903,6 +903,8 @@ impl Store {
     /// import_ledger applies EVERY row of the ledger. Self-repairing, and priced
     /// accordingly — see `import_ledger_changed_only` for when that price is not
     /// worth paying.
+    ///
+    /// Returns (rows staged from the ledger, rows the UPDATE actually touched).
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
         self.import_ledger_inner(path, false)
     }
@@ -1000,24 +1002,23 @@ impl Store {
                    FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id {clauses_filter};"
             )
         };
+        // execute, not execute_batch, so the UPDATE reports how many rows it ACTUALLY
+        // touched. The caller used to be handed `staged` twice over and print it as
+        // "wrote N vector(s)" — which was true of the full import and a lie about the
+        // incremental one, where the whole point is that most staged rows are skipped.
+        // A log that overstates its work by three orders of magnitude is worse than
+        // no log: it is the number someone will quote back when the corpus is wrong.
+        let applied = self.conn.execute(&apply, []).with_context(|| {
+            if to_bodies {
+                "apply ledger to bodies"
+            } else {
+                "apply ledger to clauses"
+            }
+        })? as i64;
         self.conn
-            .execute_batch(&format!("{apply} DROP TABLE _ledger; COMMIT;"))
-            .with_context(|| {
-                if to_bodies {
-                    "apply ledger to bodies"
-                } else {
-                    "apply ledger to clauses"
-                }
-            })?;
-        let embedded: i64 = self
-            .conn
-            .query_row(
-                "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .context("count embedded clauses")?;
-        Ok((staged, embedded))
+            .execute_batch("DROP TABLE _ledger; COMMIT;")
+            .context("close the ledger import")?;
+        Ok((staged, applied))
     }
 
     /// set_sparse replaces the sparse posting for one clause (idempotent: stale terms
@@ -2116,10 +2117,30 @@ mod tests {
         let path = std::env::temp_dir().join("ledger_bodies_test.jsonl");
         std::fs::write(&path, ledger).unwrap();
 
-        let (staged, embedded) = s.import_ledger(path.to_str().unwrap()).unwrap();
+        let (staged, applied) = s.import_ledger(path.to_str().unwrap()).unwrap();
         assert_eq!(staged, 3, "three ledger rows staged");
+        // The second value is now what the UPDATE actually touched, which on a
+        // content-addressed corpus says the sharing out loud: three occurrences,
+        // two bodies, two writes. It used to be the total count of embedded
+        // clauses — a number that never described the work and that embed-io then
+        // reported as "wrote N vector(s)".
         assert_eq!(
-            embedded, 3,
+            applied, 2,
+            "two BODIES are written for three occurrences — that is the collapse"
+        );
+        // And the property the old assertion was really about, now asked directly
+        // instead of riding on a return value: every occurrence sees a vector
+        // THROUGH THE VIEW, even the one whose body was written for another.
+        let occ_with_vec: i64 = s
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM clauses WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            occ_with_vec, 3,
             "all three occurrences read a vector through the view"
         );
 

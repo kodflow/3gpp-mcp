@@ -97,7 +97,7 @@ func stepCorpusETSI() *Step {
 		// declaration, minus the binaries neither of them runs.
 		Impl: []string{
 			"scripts/etsi-corpus.sh", "scripts/lib/convert.sh",
-			"rust/ingest/src/main.rs", "rust/parse", "rust/store/src",
+			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml", "rust/parse", "rust/store/src",
 			"internal/store/schema.sql",
 		},
 		Inputs: func(c *Ctx) ([]string, error) {

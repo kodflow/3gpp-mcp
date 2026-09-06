@@ -461,7 +461,13 @@ func stepIngest() *Step {
 		// whole crate made a fix to ingest_li.rs invalidate this step too. Harmless
 		// here (it declines in 4 s when fetch found nothing) and an hour of rework on
 		// corpus-etsi, which had the same declaration. Measured 2026-09-06.
-		Impl: []string{"rust/parse", "rust/ingest/src/main.rs", "rust/store/src", "internal/store/schema.sql"},
+		// Cargo.toml IS provenance: it selects the dependency versions and the
+		// features the binary is compiled with, so a manifest-only change produces a
+		// different `ingest` from identical sources. Narrowing to src/main.rs dropped
+		// it, and build-rust cannot cover the gap — build steps are Step.Tool by
+		// design, so a dirty tool never replays a data step. The result would have
+		// been a rebuilt binary and a corpus kept from the old one.
+		Impl: []string{"rust/parse", "rust/ingest/src/main.rs", "rust/ingest/Cargo.toml", "rust/store/src", "internal/store/schema.sql"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// The converted tree is the input. Enumerating every HTML file would
 			// make the fingerprint enormous; the per-series directories carry the

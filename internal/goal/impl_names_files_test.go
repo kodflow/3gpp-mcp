@@ -93,6 +93,7 @@ func TestIngestStepsStillWatchWhatTheyActuallyUse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, rel := range []string{
 				"rust/ingest/src/main.rs", // the binary both of them run
+				"rust/ingest/Cargo.toml",  // its dependencies and features
 				"rust/parse/placeholder.rs",
 				"rust/store/src/placeholder.rs",
 			} {
@@ -130,6 +131,16 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 		}
 		if !contains(tc.step.Impl, "rust/ingest/src/main.rs") {
 			t.Errorf("%s must declare the source of the binary it runs", tc.name)
+		}
+		// AND ITS MANIFEST. Cargo.toml selects the dependency versions and features
+		// the binary is compiled with, so a manifest-only change produces a different
+		// `ingest` from identical sources. build-rust cannot cover the gap: build
+		// steps are Step.Tool by design, so a dirty tool never replays a data step —
+		// the corpus would be kept from the previous binary, silently. Narrowing to
+		// src/main.rs dropped it once; this is what stops that recurring.
+		if !contains(tc.step.Impl, "rust/ingest/Cargo.toml") {
+			t.Errorf("%s must declare rust/ingest/Cargo.toml — a dependency or feature "+
+				"change alters the binary and would otherwise leave the corpus stale", tc.name)
 		}
 	}
 }

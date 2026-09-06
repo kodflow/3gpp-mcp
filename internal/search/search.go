@@ -293,9 +293,18 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// So bctx keeps exactly the job the paragraph above describes — bounding the
 	// EXPENSIVE ONNX passes (query embed, sparse embed, cross-encoder rerank),
 	// which are Go-side and cancel safely — and it keeps gating whether each arm
-	// is entered at all. The store calls take the caller's ctx: an arm that starts
-	// is allowed to finish. What is lost is the ability to cut a single long
-	// DuckDB query short; what is kept is a process.
+	// is entered at all.
+	//
+	// AND THE STORE CALLS TAKE A CONTEXT THAT CANNOT BE CANCELLED AT ALL. Handing
+	// them the caller's ctx was not enough and the first version of this fix did
+	// exactly that: an HTTP client that disconnects, or a request deadline in the
+	// transport, cancels the caller's ctx just as effectively as the budget did,
+	// and the abort comes back. context.WithoutCancel keeps the VALUES — tracing,
+	// deadlines other code may read — and drops only the cancellation signal.
+	//
+	// What is lost is the ability to cut a long DuckDB query short by any means.
+	// What is kept is a process that survives a client pressing Ctrl-C.
+	dbctx := context.WithoutCancel(ctx)
 	bctx := ctx
 	if budget := searchBudgetFor(); budget > 0 {
 		var cancel context.CancelFunc
@@ -333,7 +342,14 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 
 	var lists [][]model.SearchHit
 	if wantLex {
-		lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
+		// dbctx here too, and this is the arm that made it obvious. The comment above
+		// says the cheap lexical arm runs on the CALLER's ctx so an expired budget
+		// still returns BM25 — true, and it quietly assumed the caller's ctx is
+		// alive. It is not when the client has disconnected, and then this call
+		// hands a cancelled context to DuckDB: an error on Windows, a process abort
+		// on Linux. The arm that exists to guarantee "degrade, never block" was the
+		// one that could block hardest.
+		lex, err := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
 		if err != nil {
 			return nil, err
 		}
@@ -347,19 +363,19 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		if err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
-			// ctx, NOT bctx, FROM HERE DOWN — see storeCtxNote below.
+			// dbctx, NOT bctx AND NOT ctx — see storeCtxNote above.
 			switch {
 			case len(e.vecShards) > 0:
 				// Option B: scatter-gather across the attached per-series sub-bases.
-				vhits, verr = e.st.SearchVectorsSharded(ctx, vecs[0], e.vecShards, r.Filter, topK)
+				vhits, verr = e.st.SearchVectorsSharded(dbctx, vecs[0], e.vecShards, r.Filter, topK)
 			case e.st.VSSAvailable() && !e.offHNSW.Load():
-				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // single-DB HNSW
+				vhits, verr = e.st.SearchVectors(dbctx, vecs[0], r.Filter, topK) // single-DB HNSW
 			default:
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
 				// never a full-corpus scan.
-				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
+				cand, cerr := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
 				if cerr == nil {
-					vhits, verr = e.st.SearchVectorsAmong(ctx, vecs[0], chunkIDsOf(cand), topK)
+					vhits, verr = e.st.SearchVectorsAmong(dbctx, vecs[0], chunkIDsOf(cand), topK)
 				}
 			}
 			if verr == nil && len(vhits) > 0 {
@@ -384,8 +400,8 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 			svecs, err = e.sp.EmbedSparse(bctx, []string{r.Text})
 		}
 		if err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
-			// ctx, not bctx: the store call must never be interrupted mid-query.
-			if shits, serr := e.st.SearchSparse(ctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
+			// dbctx: the store call must never be interrupted mid-query, by anyone.
+			if shits, serr := e.st.SearchSparse(dbctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
 				lists = append(lists, shits)
 			}
 		}
