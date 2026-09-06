@@ -88,6 +88,38 @@ struct VecRecord {
     vec: Vec<f32>,
 }
 
+/// DuckDB's memory_limit DEFAULTS TO ~80% OF PHYSICAL RAM, and that default is what
+/// killed two builds.
+///
+/// `import_ledger` materialises the whole ledger as a TEMP TABLE — 2.0 M rows of
+/// 1024 floats is ~8 GB of vectors before a single parsing buffer — and DuckDB is
+/// entitled to grow until its own cap. Measured 2026-09-06 on a 28 GB machine:
+/// embed-io plateaued at 22.3 GB, which is 28 x 0.8 to within a tenth of a gigabyte.
+/// DuckDB never felt pressure. The MACHINE did, and the build was killed at exactly
+/// this step, twice, for an import that had 368 new vectors to write.
+///
+/// The cap is not a diet, it is a spill threshold: past it DuckDB writes to
+/// temp_directory instead of asking the OS for more. `copy_database_compact` already
+/// does this, for the same reason, with the same two knobs and the same kind of env
+/// escape hatch — this is the crate's existing answer applied to the one writer that
+/// had been left out of it.
+///
+/// The spill directory sits beside the LEDGER on purpose: that volume already holds
+/// tens of gigabytes of vectors, so it has the room, whereas the process's working
+/// directory is wherever `make` happened to be invoked from.
+fn import_memory_knobs(ledger: &str) -> (String, std::path::PathBuf) {
+    let tmp = std::path::Path::new(ledger)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("import-ledger.tmp"))
+        .unwrap_or_else(|| std::path::PathBuf::from("import-ledger.tmp"));
+    let buf = std::env::var("EMBED_IMPORT_MEMORY_LIMIT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "12GB".into());
+    (buf, tmp)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let store = Store::open_rw(&args.db)?;
@@ -130,6 +162,20 @@ fn main() -> Result<()> {
         // Malformed lines stay tolerated: `ignore_errors` inside the reader plus a
         // width filter drop them exactly as the loop's `skipped` counter did, so a
         // killed embedder's half-written final line still cannot cost the ledger.
+        let (buf, tmp) = import_memory_knobs(inp);
+        store
+            .raw()
+            .execute_batch(&format!(
+                "SET temp_directory = '{}';
+                 SET memory_limit = '{buf}';",
+                tmp.to_string_lossy().replace('\'', "''")
+            ))
+            .context("bound the ledger import's memory")?;
+        eprintln!(
+            "embed-io: import capped at {buf}, spilling to {} if it needs more",
+            tmp.display()
+        );
+
         let (staged, _) = store.import_ledger(inp)?;
         let total = staged;
 
@@ -265,4 +311,106 @@ fn main() -> Result<()> {
     }
 
     anyhow::bail!("embed-io: pass --export-worklist <file>, --import-vectors <file>, or --report");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The spill file must land beside the ledger — that is the volume with room for
+    /// it. A relative ledger path with no parent must still yield a usable path
+    /// rather than an empty one.
+    #[test]
+    fn the_spill_directory_sits_beside_the_ledger() {
+        let (_, tmp) = import_memory_knobs("/c/vecs/etsi-ledger.jsonl");
+        assert_eq!(
+            tmp,
+            std::path::Path::new("/c/vecs").join("import-ledger.tmp")
+        );
+
+        let (_, bare) = import_memory_knobs("etsi-ledger.jsonl");
+        assert_eq!(bare, std::path::PathBuf::from("import-ledger.tmp"));
+        assert!(!bare.as_os_str().is_empty());
+    }
+
+    /// THE ONLY TEST THAT TOUCHES THE ENVIRONMENT, and it has to stay that way.
+    ///
+    /// `std::env` is process-wide and cargo runs tests in THREADS, so a test that sets
+    /// this variable sets it for every other test running at that instant. Split across
+    /// two tests, this suite passed alone and failed under `cargo test` — measured, not
+    /// theorised. Go's `t.Setenv` refuses to coexist with `t.Parallel` for exactly this
+    /// reason; Rust offers no equivalent, so the discipline is manual: one test.
+    ///
+    /// It covers three things at once because they cannot safely be separated:
+    ///   - the default is FIXED at 12GB, never derived from physical RAM — a
+    ///     percentage-of-RAM default is precisely the bug this whole change removes;
+    ///   - an explicit override wins;
+    ///   - a BLANK override falls back rather than reaching DuckDB, where
+    ///     `SET memory_limit = ''` is a parse error that would kill the import over a
+    ///     stray variable.
+    #[test]
+    fn the_cap_is_fixed_by_default_and_overridable_but_never_blank() {
+        let key = "EMBED_IMPORT_MEMORY_LIMIT";
+        let restore = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(import_memory_knobs("/tmp/l.jsonl").0, "12GB", "default");
+
+        std::env::set_var(key, "4GB");
+        assert_eq!(
+            import_memory_knobs("/tmp/l.jsonl").0,
+            "4GB",
+            "explicit override"
+        );
+
+        std::env::set_var(key, "   ");
+        assert_eq!(
+            import_memory_knobs("/tmp/l.jsonl").0,
+            "12GB",
+            "a blank override must fall back, not reach DuckDB"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// The knobs are worthless if DuckDB refuses them, so open a real corpus and read
+    /// the setting BACK — a renamed option fails here rather than at 22 GB on a build
+    /// machine.
+    ///
+    /// The cap is written literally rather than taken from `import_memory_knobs`, so
+    /// this test never reads the environment and cannot race the one above.
+    #[test]
+    fn duckdb_accepts_the_knobs_and_reports_them_back() {
+        let dir = std::env::temp_dir().join(format!("embedio-knobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let _ = std::fs::remove_file(&db);
+
+        let store = Store::open_rw(db.to_str().unwrap()).unwrap();
+        let tmp = dir.join("import-ledger.tmp");
+        store
+            .raw()
+            .execute_batch(&format!(
+                "SET temp_directory = '{}'; SET memory_limit = '3GB';",
+                tmp.to_string_lossy().replace('\'', "''")
+            ))
+            .expect("DuckDB rejected the knobs");
+
+        let got: String = store
+            .raw()
+            .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
+            .unwrap();
+        // DuckDB normalises the unit ("3GB" -> "2.7 GiB"), so assert the cap MOVED and
+        // stayed modest rather than matching a formatted string.
+        assert!(
+            got.starts_with('2') || got.starts_with('3'),
+            "memory_limit did not take: {got} (the default would be ~80% of RAM)"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
