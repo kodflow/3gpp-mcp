@@ -900,7 +900,37 @@ impl Store {
         Ok(())
     }
 
+    /// import_ledger applies EVERY row of the ledger. Self-repairing, and priced
+    /// accordingly — see `import_ledger_changed_only` for when that price is not
+    /// worth paying.
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
+        self.import_ledger_inner(path, false)
+    }
+
+    /// import_ledger_changed_only applies just the rows whose vector the corpus
+    /// does not already carry.
+    ///
+    /// WHAT THIS GIVES UP, because it is not free. The full import is
+    /// SELF-REPAIRING: it rewrites every vector, so a body whose embedding was
+    /// corrupted while its `embedding_hash` stayed correct is silently fixed on
+    /// the next build. That property is not theoretical — it is what recovered
+    /// this corpus after a killed import on 2026-09-06. Filtering on the hash
+    /// cannot see that case, by construction.
+    ///
+    /// What it buys, measured the same day: the ETSI half had 368 new vectors and
+    /// re-applied 1 999 814, re-reading a 25.6 GB ledger for over 32 minutes to
+    /// end with `ledger grew from 1999814 to 1999814`. The cost tracked the size
+    /// of the ledger, never the size of the work.
+    ///
+    /// So both stay, and the choice is explicit at the call site rather than
+    /// implied by a default. The guards are shared: ambiguous chunk_ids and a
+    /// body/ledger disagreement are refused on BOTH paths, because the fast path
+    /// is the one that will actually run.
+    pub fn import_ledger_changed_only(&self, path: &str) -> Result<(i64, i64)> {
+        self.import_ledger_inner(path, true)
+    }
+
+    fn import_ledger_inner(&self, path: &str, only_changed: bool) -> Result<(i64, i64)> {
         let p = path.replace('\\', "/").replace('\'', "''");
         self.conn
             .execute_batch(&format!(
@@ -935,6 +965,23 @@ impl Store {
         if to_bodies {
             self.check_body_ledger_agreement()?;
         }
+        // THE FILTER, and why it reads like this. `IS DISTINCT FROM` and not `<>`:
+        // a row that has never been embedded holds NULL in both columns, and `<>`
+        // would skip exactly the rows that need the vector most. The NULL check on
+        // `embedding` is not redundant with the hash check either — a corpus can
+        // carry a hash from a previous model with no vector behind it.
+        let bodies_filter = if only_changed {
+            "AND (bodies.embedding IS NULL
+                  OR bodies.embedding_hash IS DISTINCT FROM d.embedding_hash)"
+        } else {
+            ""
+        };
+        let clauses_filter = if only_changed {
+            "AND (clauses.embedding IS NULL
+                  OR clauses.embedding_hash IS DISTINCT FROM l.embedding_hash)"
+        } else {
+            ""
+        };
         let apply = if to_bodies {
             format!(
                 "UPDATE bodies SET embedding = d.vec::FLOAT[{DENSE_DIM}],
@@ -944,13 +991,13 @@ impl Store {
                                 any_value(l.embedding_hash) AS embedding_hash
                            FROM _ledger l JOIN clause_occ o USING (chunk_id)
                           GROUP BY o.body_id) AS d
-                  WHERE bodies.body_id = d.body_id;"
+                  WHERE bodies.body_id = d.body_id {bodies_filter};"
             )
         } else {
             format!(
                 "UPDATE clauses SET embedding = l.vec::FLOAT[{DENSE_DIM}],
                                     embedding_hash = l.embedding_hash
-                   FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;"
+                   FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id {clauses_filter};"
             )
         };
         self.conn
