@@ -420,10 +420,27 @@ func gitState(root string) (string, string) {
 // dataContractFlags asks scripts/data-contract.sh, which the ADR designates as
 // the single source of the completeness contract. Duplicating its logic here is
 // exactly the drift the ADR exists to prevent.
+//
+// DATA_ETSI_DB IS SUPPLIED BECAUSE THE LAYOUTS DIFFER. --require-etsi takes the
+// second corpus's PATH, and the script's default is the IMAGE's (/data/mcp-3gpp).
+// A local build keeps it under the repo, so without this the ETSI half of the
+// contract would point at a file that does not exist here and the gate would fail
+// for the wrong reason.
+//
+// THE FALLBACK IS THE STRONG CONTRACT, NOT THE WEAK ONE. It used to return the
+// dense-only flags, so anything that stopped the script from running — bash off
+// the PATH, a bad exit — silently downgraded the gate that decides what gets
+// published. Failing loudly on a corpus that is genuinely incomplete is the
+// correct outcome; publishing an unchecked one is not. Loosening stays available
+// through DATA_CONTRACT, where it is a decision someone typed.
 func dataContractFlags(root string) string {
-	out, err := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh")).Output()
+	etsi := filepath.Join(root, "data", "etsi.duckdb")
+	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"))
+	cmd.Env = append(os.Environ(), "DATA_ETSI_DB="+etsi)
+	out, err := cmd.Output()
 	if err != nil {
-		return "--require-fts --require-hnsw --require-embed-complete"
+		return "--require-fts --require-hnsw --require-embed-complete " +
+			"--require-sparse --require-etsi " + etsi
 	}
 	return strings.TrimSpace(string(out))
 }
