@@ -35,6 +35,16 @@ struct Args {
     /// EmbedIdentity stamped into embedding_model on import (and into the frozen HNSW).
     #[arg(long, default_value = "")]
     embed_identity: String,
+    /// Re-apply EVERY vector instead of only the ones the corpus lacks.
+    ///
+    /// The default is incremental because the full pass costs the size of the
+    /// LEDGER, not the size of the work: measured 2026-09-06, 1 999 814 vectors
+    /// re-applied to change 368, over 32 minutes. The full pass is kept and is not
+    /// a legacy path — it is SELF-REPAIRING, the only thing that fixes a vector
+    /// corrupted while its embedding_hash stayed correct, and it is what recovered
+    /// this corpus after a killed import. Reach for it when a corpus is suspect.
+    #[arg(long)]
+    reapply_all: bool,
     /// After import, build + freeze the HNSW — but only on the final (null_after==0) pass.
     #[arg(long, default_value_t = false)]
     build_hnsw: bool,
@@ -80,14 +90,6 @@ struct WlRecord {
     text: String,
 }
 
-#[derive(Deserialize)]
-struct VecRecord {
-    chunk_id: u64,
-    #[serde(default)]
-    hash: String,
-    vec: Vec<f32>,
-}
-
 /// DuckDB's memory_limit DEFAULTS TO ~80% OF PHYSICAL RAM, and that default is what
 /// killed two builds.
 ///
@@ -106,7 +108,7 @@ const MEMORY_LIMIT_ENV: &str = "EMBED_IMPORT_MEMORY_LIMIT";
 
 /// FIXED, and deliberately not a share of physical RAM: a percentage-of-machine
 /// default is precisely the bug being removed.
-const DEFAULT_MEMORY_LIMIT: &str = "12GB";
+const DEFAULT_MEMORY_LIMIT: &str = "16GB";
 
 /// pick_limit is the whole policy, as a pure function of its input.
 ///
@@ -199,7 +201,12 @@ fn main() -> Result<()> {
             tmp.display()
         );
 
-        let (staged, _) = store.import_ledger(inp)?;
+        let (staged, _) = if args.reapply_all {
+            eprintln!("embed-io: re-applying EVERY vector (--reapply-all)");
+            store.import_ledger(inp)?
+        } else {
+            store.import_ledger_changed_only(inp)?
+        };
         let total = staged;
 
         if !args.embed_identity.is_empty() {
@@ -347,18 +354,26 @@ mod tests {
     /// and failed under `cargo test` — measured, not theorised.
     #[test]
     fn pick_limit_is_the_whole_policy() {
-        assert_eq!(pick_limit(None), "12GB", "unset falls back");
+        assert_eq!(pick_limit(None), DEFAULT_MEMORY_LIMIT, "unset falls back");
         assert_eq!(pick_limit(Some("4GB")), "4GB", "explicit wins");
         assert_eq!(
             pick_limit(Some("  6GB  ")),
             "6GB",
             "surrounding space is trimmed"
         );
-        assert_eq!(pick_limit(Some("")), "12GB", "empty is not a value");
-        assert_eq!(pick_limit(Some("   ")), "12GB", "whitespace is not a value");
+        assert_eq!(
+            pick_limit(Some("")),
+            DEFAULT_MEMORY_LIMIT,
+            "empty is not a value"
+        );
+        assert_eq!(
+            pick_limit(Some("   ")),
+            DEFAULT_MEMORY_LIMIT,
+            "whitespace is not a value"
+        );
         assert_eq!(
             pick_limit(Some("\t\n")),
-            "12GB",
+            DEFAULT_MEMORY_LIMIT,
             "tabs and newlines are not a value"
         );
     }
