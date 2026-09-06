@@ -30,7 +30,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -71,24 +70,11 @@ func main() {
 	_, _ = h.Exec(`LOAD vss`)
 	_, _ = h.Exec(`SET hnsw_enable_experimental_persistence = true`)
 
-	// AND BOUND THE BUFFER MANAGER, because nobody else does.
-	//
-	// DuckDB's memory_limit defaults to ~80% of physical RAM. Measured 2026-09-06 on
-	// a 28 GB machine: this binary plateaued at 22.0 GB during --restore, and
-	// embed-io at 22.3 GB during its import — 28 x 0.8 in both cases, to within a
-	// tenth of a gigabyte. Neither process was leaking and neither felt any
-	// pressure; they were spending exactly what they had been allowed. The MACHINE
-	// is what ran out, and two builds were killed for it.
-	//
-	// A cap is not a diet. Past it DuckDB spills to temp_directory instead of asking
-	// the OS for more, so the work still completes — slower in the worst case, and
-	// alive in every case. rust/store's copy_database_compact already does this,
-	// with the same two knobs and the same kind of escape hatch; this binary and
-	// embed-io were the writers left out of it.
-	//
-	// The spill file goes beside the CORPUS: that volume has to have room for the
-	// result anyway, whereas the working directory is wherever make was invoked.
-	if err := boundMemory(h, *db); err != nil {
+	// AND BOUND THE BUFFER MANAGER, because nobody else does: DuckDB's
+	// memory_limit defaults to ~80% of physical RAM and this binary was measured
+	// at 22.0 GB on a 28 GB machine, which is what got two builds killed. The
+	// policy, the numbers and the reasoning live in internal/store (memory.go).
+	if err := store.BoundMemory(h, *db); err != nil {
 		die("bound memory: %v", err)
 	}
 
@@ -340,41 +326,6 @@ func restamp(h *sql.DB) error {
 //
 // It is deliberately NARROW because it drops a table: it refuses unless the corpus
 // carries exactly the signature of an interrupted restore.
-
-// memoryLimitEnv lets a smaller or larger machine override the cap without a rebuild.
-const memoryLimitEnv = "MIGRATE_MEMORY_LIMIT"
-
-// defaultMemoryLimit is FIXED on purpose. A cap derived from physical RAM would be
-// the very default that killed the builds — the point is to leave the operating
-// system room, not to claim a percentage of the box.
-const defaultMemoryLimit = "12GB"
-
-// memoryLimit reads the override, falling back on anything blank. A blank value must
-// NOT reach DuckDB: `SET memory_limit = ”` is a parse error, so a stray environment
-// variable would kill the migration instead of being ignored.
-func memoryLimit() string {
-	if v := strings.TrimSpace(os.Getenv(memoryLimitEnv)); v != "" {
-		return v
-	}
-	return defaultMemoryLimit
-}
-
-// spillDir puts DuckDB's temporary files beside the corpus it is rewriting.
-func spillDir(dbPath string) string {
-	return filepath.Join(filepath.Dir(dbPath), "migrate-paragraphs.tmp")
-}
-
-// boundMemory caps the buffer manager and gives it somewhere to spill.
-func boundMemory(h *sql.DB, dbPath string) error {
-	q := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-	if _, err := h.Exec(fmt.Sprintf("SET temp_directory = '%s'", q(spillDir(dbPath)))); err != nil {
-		return err
-	}
-	if _, err := h.Exec(fmt.Sprintf("SET memory_limit = '%s'", q(memoryLimit()))); err != nil {
-		return err
-	}
-	return nil
-}
 
 func repairView(h *sql.DB) error {
 	var kind string
