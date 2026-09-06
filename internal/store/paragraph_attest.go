@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // PROVING THE CONVERSION IS EXPENSIVE. PROVING THE PROOF STILL HOLDS IS NOT.
@@ -106,6 +107,32 @@ func (ErrNoParagraphAttestation) Error() string {
 // about this corpus", not "is this corpus correct" — and the difference is the
 // point of splitting them.
 func CheckParagraphAttestation(h *sql.DB) error {
+	// THE SHAPE FIRST, BECAUSE COUNTERS CANNOT SEE IT.
+	//
+	// `--restore` puts `clauses` back as a real table and removes the
+	// content-addressed tables — in that order. Interrupted in between, it leaves
+	// an EMPTY `clauses` TABLE while paragraphs, bodies, body_seq and clause_occ
+	// still hold every row they had. All four counters match the attestation
+	// exactly, so a check built on counters alone would call that corpus verified
+	// and let the pipeline skip the repair, while every search reads the empty
+	// table. cmd/migrate-paragraphs has a whole flag for recovering that state
+	// (--repair-view), which is the proof it happens.
+	//
+	// On a converted corpus `clauses` is the VIEW over those tables. Anything else
+	// is either an unconverted corpus or the wreckage of a killed restore, and
+	// neither is what the attestation describes.
+	var kind string
+	if err := h.QueryRow(
+		`SELECT COALESCE(max(table_type),'') FROM information_schema.tables WHERE table_name='clauses'`,
+	).Scan(&kind); err != nil {
+		return fmt.Errorf("inspecting the shape of `clauses`: %w", err)
+	}
+	if !strings.EqualFold(kind, "VIEW") {
+		return fmt.Errorf("`clauses` is %q, not the view a converted corpus carries — "+
+			"an unconverted corpus, or an interrupted --restore (see --repair-view)",
+			kind)
+	}
+
 	var stored string
 	err := h.QueryRow(`SELECT COALESCE(MAX(value), '') FROM schema_meta WHERE key = ?`,
 		ParagraphAttestationKey).Scan(&stored)

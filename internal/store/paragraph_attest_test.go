@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
@@ -28,6 +29,11 @@ func attestFixture(t *testing.T, occ int) *sql.DB {
 		if _, err := h.Exec(q); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// A converted corpus serves `clauses` as the VIEW over these tables — the
+	// attestation checks that shape, so the fixture has to carry it.
+	if _, err := h.Exec(`CREATE VIEW clauses AS SELECT chunk_id, 'x' AS text FROM clause_occ`); err != nil {
+		t.Fatal(err)
 	}
 	for i := 0; i < occ; i++ {
 		if _, err := h.Exec(`INSERT INTO clause_occ VALUES (?, 1)`, i); err != nil {
@@ -132,5 +138,54 @@ func TestReStampingTracksTheNewShape(t *testing.T) {
 	}
 	if err := CheckParagraphAttestation(h); err != nil {
 		t.Fatalf("re-stamping did not take: %v", err)
+	}
+}
+
+// THE INTERRUPTED RESTORE, which counters alone cannot see.
+//
+// `--restore` puts `clauses` back as a real table and THEN removes the
+// content-addressed tables. Killed in between, it leaves an EMPTY `clauses`
+// table while all four counters still match the attestation exactly. A check
+// built on counters alone would call that corpus verified, the pipeline would
+// skip the repair, and every search would read the empty table.
+//
+// cmd/migrate-paragraphs ships --repair-view specifically to recover this state,
+// which is the evidence that it happens.
+func TestAnInterruptedRestoreFailsTheCheck(t *testing.T) {
+	h := attestFixture(t, 3)
+	if _, err := StampParagraphAttestation(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckParagraphAttestation(h); err != nil {
+		t.Fatalf("the fixture must pass before the damage: %v", err)
+	}
+
+	// The signature of a killed restore: clauses is a TABLE, and empty, while the
+	// content-addressed tables are untouched.
+	if _, err := h.Exec(`DROP VIEW clauses`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Exec(`CREATE TABLE clauses (chunk_id UBIGINT, text VARCHAR)`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CheckParagraphAttestation(h)
+	if err == nil {
+		t.Fatal("an interrupted restore passed the check — the pipeline would skip the repair " +
+			"and serve an empty corpus")
+	}
+	if !strings.Contains(err.Error(), "repair-view") {
+		t.Fatalf("the error must point at the recovery it needs, got: %v", err)
+	}
+}
+
+// And the converse: the VIEW a converted corpus carries must pass.
+func TestTheConvertedShapePasses(t *testing.T) {
+	h := attestFixture(t, 3)
+	if _, err := StampParagraphAttestation(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckParagraphAttestation(h); err != nil {
+		t.Fatalf("a converted corpus failed its own check: %v", err)
 	}
 }

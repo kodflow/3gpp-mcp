@@ -62,18 +62,24 @@ func TestIngestStepsIgnoreBinariesTheyNeverRun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			implFixture(t, root, tc.step.Impl)
-			// The bins live in the crate but outside anything declared.
+			// The bins live in the crates but outside anything declared: ingest's
+			// four overlays, and the store's own binaries (embed-io, merge, overlay).
 			write(t, filepath.Join(root, "rust", "ingest", "src", "bin", "ingest_li.rs"), "fn main() {}\n")
+			write(t, filepath.Join(root, "rust", "store", "src", "bin", "embed_io.rs"), "fn main() {}\n")
 
 			before, _, err := implHash(root, tc.step.Impl, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			after := implAfterWriting(t, root, tc.step.Impl,
-				"rust/ingest/src/bin/ingest_li.rs", "fn main() { let _ = 1; }\n")
-			if before != after {
-				t.Fatalf("%s re-runs when ingest_li.rs changes — it never invokes that binary; "+
-					"measured cost on corpus-etsi: ~1 h and 18.8 GiB", tc.name)
+			for _, bin := range []string{
+				"rust/ingest/src/bin/ingest_li.rs",
+				"rust/store/src/bin/embed_io.rs",
+			} {
+				after := implAfterWriting(t, root, tc.step.Impl, bin, "fn main() { let _ = 1; }\n")
+				if before != after {
+					t.Fatalf("%s re-runs when %s changes — it never invokes that binary; "+
+						"measured cost on corpus-etsi: ~1 h and 18.8 GiB", tc.name, bin)
+				}
 			}
 		})
 	}
@@ -93,8 +99,13 @@ func TestIngestStepsStillWatchWhatTheyActuallyUse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, rel := range []string{
 				"rust/ingest/src/main.rs", // the binary both of them run
+				"rust/ingest/Cargo.toml",  // its dependencies and features
+				"rust/store/src/lib.rs",   // the library it links
+				"rust/store/Cargo.toml",   // that library's own dependencies
+				"rust/Cargo.toml",         // the workspace that resolves them
+				"rust/Cargo.lock",         // and the versions it resolved to
 				"rust/parse/placeholder.rs",
-				"rust/store/src/placeholder.rs",
+				"rust/identity/placeholder.rs",
 			} {
 				root := t.TempDir()
 				implFixture(t, root, tc.step.Impl)
@@ -130,6 +141,16 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 		}
 		if !contains(tc.step.Impl, "rust/ingest/src/main.rs") {
 			t.Errorf("%s must declare the source of the binary it runs", tc.name)
+		}
+		// AND ITS MANIFEST. Cargo.toml selects the dependency versions and features
+		// the binary is compiled with, so a manifest-only change produces a different
+		// `ingest` from identical sources. build-rust cannot cover the gap: build
+		// steps are Step.Tool by design, so a dirty tool never replays a data step —
+		// the corpus would be kept from the previous binary, silently. Narrowing to
+		// src/main.rs dropped it once; this is what stops that recurring.
+		if !contains(tc.step.Impl, "rust/ingest/Cargo.toml") {
+			t.Errorf("%s must declare rust/ingest/Cargo.toml — a dependency or feature "+
+				"change alters the binary and would otherwise leave the corpus stale", tc.name)
 		}
 	}
 }
