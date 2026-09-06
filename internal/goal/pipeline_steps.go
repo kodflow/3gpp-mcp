@@ -455,7 +455,13 @@ func stepIngest() *Step {
 		Version: 2,
 		Doc:     "parse the converted HTML into per-series DuckDB shards",
 		Deps:    []string{"fetch", "build-rust"},
-		Impl:    []string{"rust/parse", "rust/ingest", "rust/store/src", "internal/store/schema.sql"},
+		// rust/ingest/src/main.rs, not the crate: this step runs `ingest` and nothing
+		// else. The crate also carries ingest-catalog, ingest-openapi, ingest-li and
+		// ingest-glossary in src/bin, which only `enrich` invokes — declaring the
+		// whole crate made a fix to ingest_li.rs invalidate this step too. Harmless
+		// here (it declines in 4 s when fetch found nothing) and an hour of rework on
+		// corpus-etsi, which had the same declaration. Measured 2026-09-06.
+		Impl: []string{"rust/parse", "rust/ingest/src/main.rs", "rust/store/src", "internal/store/schema.sql"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// The converted tree is the input. Enumerating every HTML file would
 			// make the fingerprint enormous; the per-series directories carry the

@@ -274,6 +274,28 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// concurrency degrades to whatever it has rather than running to the edge
 	// timeout. The cheap lexical arm always runs on the caller's ctx so an
 	// already-expired budget still returns BM25 results (degrade, never block).
+	// storeCtxNote — WHY THE BUDGET NEVER REACHES A DuckDB QUERY.
+	//
+	// Cancelling a running DuckDB query makes it raise duckdb::InterruptException,
+	// and on Linux that C++ exception crosses cgo and ABORTS THE PROCESS. It never
+	// becomes a Go error, so there is no degraded answer, no message to the client
+	// and no server left. Measured 2026-09-06 against the published image, on the
+	// published corpus:
+	//
+	//	SEARCH_BUDGET default (20s)   terminate called after throwing an instance
+	//	                              of 'duckdb::InterruptException' — SIGABRT
+	//	SEARCH_BUDGET=900s            exit 0, citations returned, 203 s
+	//
+	// A budget whose expiry kills the server is worse than no budget: the whole
+	// point of it is "degrade, never block", and aborting is the one outcome that
+	// is neither.
+	//
+	// So bctx keeps exactly the job the paragraph above describes — bounding the
+	// EXPENSIVE ONNX passes (query embed, sparse embed, cross-encoder rerank),
+	// which are Go-side and cancel safely — and it keeps gating whether each arm
+	// is entered at all. The store calls take the caller's ctx: an arm that starts
+	// is allowed to finish. What is lost is the ability to cut a single long
+	// DuckDB query short; what is kept is a process.
 	bctx := ctx
 	if budget := searchBudgetFor(); budget > 0 {
 		var cancel context.CancelFunc
@@ -325,18 +347,19 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		if err == nil && len(vecs) == 1 {
 			var vhits []model.SearchHit
 			var verr error
+			// ctx, NOT bctx, FROM HERE DOWN — see storeCtxNote below.
 			switch {
 			case len(e.vecShards) > 0:
 				// Option B: scatter-gather across the attached per-series sub-bases.
-				vhits, verr = e.st.SearchVectorsSharded(bctx, vecs[0], e.vecShards, r.Filter, topK)
+				vhits, verr = e.st.SearchVectorsSharded(ctx, vecs[0], e.vecShards, r.Filter, topK)
 			case e.st.VSSAvailable() && !e.offHNSW.Load():
-				vhits, verr = e.st.SearchVectors(bctx, vecs[0], r.Filter, topK) // single-DB HNSW
+				vhits, verr = e.st.SearchVectors(ctx, vecs[0], r.Filter, topK) // single-DB HNSW
 			default:
 				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
 				// never a full-corpus scan.
-				cand, cerr := e.st.SearchClauses(bctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
+				cand, cerr := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
 				if cerr == nil {
-					vhits, verr = e.st.SearchVectorsAmong(bctx, vecs[0], chunkIDsOf(cand), topK)
+					vhits, verr = e.st.SearchVectorsAmong(ctx, vecs[0], chunkIDsOf(cand), topK)
 				}
 			}
 			if verr == nil && len(vhits) > 0 {
@@ -361,7 +384,8 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 			svecs, err = e.sp.EmbedSparse(bctx, []string{r.Text})
 		}
 		if err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
-			if shits, serr := e.st.SearchSparse(bctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
+			// ctx, not bctx: the store call must never be interrupted mid-query.
+			if shits, serr := e.st.SearchSparse(ctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
 				lists = append(lists, shits)
 			}
 		}

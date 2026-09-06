@@ -82,7 +82,24 @@ func stepCorpusETSI() *Step {
 		Version: 2,
 		Doc:     "download, extract and ingest the ETSI deliverables into data/etsi.duckdb",
 		Deps:    []string{"discover-etsi", "build-rust"},
-		Impl:    []string{"scripts/etsi-corpus.sh", "scripts/lib/convert.sh", "rust/ingest/src"},
+		// NAMED FILES, NOT THE CRATE. This step runs exactly one binary, `ingest`,
+		// whose source is rust/ingest/src/main.rs. It never invokes anything from
+		// rust/ingest/src/bin — ETSI has no Lawful-Interception registry, no 5GC
+		// OpenAPI overlay and no DynaReport catalogue. Declaring the directory made
+		// a fix to ingest_li.rs invalidate the whole ETSI half: measured 2026-09-06,
+		// ~1 h of rework and 18.8 GiB re-pushed for a file this step cannot reach.
+		//
+		// rust/parse and rust/store/src are ADDED, not kept: they were missing, and
+		// that is the opposite mistake. `ingest` parses ETSI HTML with parse3gpp and
+		// writes it with store-rs, so a change in either produces different clauses
+		// from identical input — and this step would have kept the old ones without
+		// a word. The 3GPP `ingest` step already declares both; this is the same
+		// declaration, minus the binaries neither of them runs.
+		Impl: []string{
+			"scripts/etsi-corpus.sh", "scripts/lib/convert.sh",
+			"rust/ingest/src/main.rs", "rust/parse", "rust/store/src",
+			"internal/store/schema.sql",
+		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			return []string{c.statePath("etsi-worklist.tsv")}, nil
 		},

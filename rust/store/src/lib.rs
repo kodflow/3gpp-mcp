@@ -900,7 +900,37 @@ impl Store {
         Ok(())
     }
 
+    /// import_ledger applies EVERY row of the ledger. Self-repairing, and priced
+    /// accordingly — see `import_ledger_changed_only` for when that price is not
+    /// worth paying.
     pub fn import_ledger(&self, path: &str) -> Result<(i64, i64)> {
+        self.import_ledger_inner(path, false)
+    }
+
+    /// import_ledger_changed_only applies just the rows whose vector the corpus
+    /// does not already carry.
+    ///
+    /// WHAT THIS GIVES UP, because it is not free. The full import is
+    /// SELF-REPAIRING: it rewrites every vector, so a body whose embedding was
+    /// corrupted while its `embedding_hash` stayed correct is silently fixed on
+    /// the next build. That property is not theoretical — it is what recovered
+    /// this corpus after a killed import on 2026-09-06. Filtering on the hash
+    /// cannot see that case, by construction.
+    ///
+    /// What it buys, measured the same day: the ETSI half had 368 new vectors and
+    /// re-applied 1 999 814, re-reading a 25.6 GB ledger for over 32 minutes to
+    /// end with `ledger grew from 1999814 to 1999814`. The cost tracked the size
+    /// of the ledger, never the size of the work.
+    ///
+    /// So both stay, and the choice is explicit at the call site rather than
+    /// implied by a default. The guards are shared: ambiguous chunk_ids and a
+    /// body/ledger disagreement are refused on BOTH paths, because the fast path
+    /// is the one that will actually run.
+    pub fn import_ledger_changed_only(&self, path: &str) -> Result<(i64, i64)> {
+        self.import_ledger_inner(path, true)
+    }
+
+    fn import_ledger_inner(&self, path: &str, only_changed: bool) -> Result<(i64, i64)> {
         let p = path.replace('\\', "/").replace('\'', "''");
         self.conn
             .execute_batch(&format!(
@@ -935,6 +965,23 @@ impl Store {
         if to_bodies {
             self.check_body_ledger_agreement()?;
         }
+        // THE FILTER, and why it reads like this. `IS DISTINCT FROM` and not `<>`:
+        // a row that has never been embedded holds NULL in both columns, and `<>`
+        // would skip exactly the rows that need the vector most. The NULL check on
+        // `embedding` is not redundant with the hash check either — a corpus can
+        // carry a hash from a previous model with no vector behind it.
+        let bodies_filter = if only_changed {
+            "AND (bodies.embedding IS NULL
+                  OR bodies.embedding_hash IS DISTINCT FROM d.embedding_hash)"
+        } else {
+            ""
+        };
+        let clauses_filter = if only_changed {
+            "AND (clauses.embedding IS NULL
+                  OR clauses.embedding_hash IS DISTINCT FROM l.embedding_hash)"
+        } else {
+            ""
+        };
         let apply = if to_bodies {
             format!(
                 "UPDATE bodies SET embedding = d.vec::FLOAT[{DENSE_DIM}],
@@ -944,13 +991,13 @@ impl Store {
                                 any_value(l.embedding_hash) AS embedding_hash
                            FROM _ledger l JOIN clause_occ o USING (chunk_id)
                           GROUP BY o.body_id) AS d
-                  WHERE bodies.body_id = d.body_id;"
+                  WHERE bodies.body_id = d.body_id {bodies_filter};"
             )
         } else {
             format!(
                 "UPDATE clauses SET embedding = l.vec::FLOAT[{DENSE_DIM}],
                                     embedding_hash = l.embedding_hash
-                   FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id;"
+                   FROM _ledger AS l WHERE clauses.chunk_id = l.chunk_id {clauses_filter};"
             )
         };
         self.conn
@@ -3331,6 +3378,174 @@ mod import_bench {
             new,
             old.as_secs_f64() / new.as_secs_f64().max(1e-9)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod import_self_repair {
+    use super::*;
+
+    /// A corpus of `n` clauses, none embedded.
+    fn seed(store: &Store, n: u64) {
+        let mut sql = String::from("BEGIN;");
+        for i in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO clauses(chunk_id,spec_id,release,version,clause_path,heading,text,is_normative) \
+                 VALUES ({i},'23.501','Rel-19','19.5.0','5.{i}','H','body {i}',true);"
+            ));
+        }
+        sql.push_str("COMMIT;");
+        store.raw().execute_batch(&sql).unwrap();
+    }
+
+    /// A ledger whose every vector is `fill`, so a wrong vector is visible at a
+    /// glance instead of needing a cosine comparison.
+    fn ledger(path: &std::path::Path, n: u64, fill: f32) {
+        use std::io::Write;
+        let v: Vec<String> = (0..DENSE_DIM).map(|_| format!("{fill:.6}")).collect();
+        let joined = v.join(",");
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for i in 1..=n {
+            writeln!(
+                w,
+                "{{\"chunk_id\":{i},\"hash\":\"h{i}\",\"vec\":[{joined}]}}"
+            )
+            .unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    fn first_component(store: &Store) -> f32 {
+        store
+            .raw()
+            .query_row(
+                "SELECT embedding[1] FROM clauses WHERE chunk_id = 1",
+                [],
+                |r| r.get::<_, f32>(0),
+            )
+            .unwrap()
+    }
+
+    fn fixture(name: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!("selfrepair-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_rw(dir.join("c.duckdb").to_str().unwrap()).unwrap();
+        seed(&store, 8);
+        (dir, store)
+    }
+
+    /// Corrupt one vector WITHOUT touching its embedding_hash — the exact shape the
+    /// incremental filter cannot see, because the hash is what it compares.
+    fn corrupt_one(store: &Store) {
+        store
+            .raw()
+            .execute_batch(&format!(
+                "UPDATE clauses SET embedding = [{}]::FLOAT[{DENSE_DIM}] WHERE chunk_id = 1;",
+                (0..DENSE_DIM).map(|_| "9.0").collect::<Vec<_>>().join(",")
+            ))
+            .unwrap();
+    }
+
+    /// HALF ONE OF THE TRADE: the full pass repairs it. This is the property that
+    /// recovered the shipped corpus after the killed import of build 20, and the
+    /// reason --reapply-all is kept rather than deleted.
+    #[test]
+    fn the_full_import_repairs_a_vector_whose_hash_still_matches() {
+        let (dir, store) = fixture("full");
+        let led = dir.join("l.jsonl");
+        ledger(&led, 8, 0.25);
+        store.import_ledger(led.to_str().unwrap()).unwrap();
+        assert_eq!(
+            first_component(&store),
+            0.25,
+            "the first import did not land"
+        );
+
+        corrupt_one(&store);
+        assert_eq!(first_component(&store), 9.0, "the corruption did not land");
+
+        store.import_ledger(led.to_str().unwrap()).unwrap();
+        assert_eq!(
+            first_component(&store),
+            0.25,
+            "the FULL import must repair a corrupted vector — that is what it is for"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HALF TWO, AND THE ONE THAT MUST NOT BE FORGOTTEN: the incremental pass does
+    /// NOT repair it. Written to FAIL if someone ever makes the fast path "also
+    /// repair", because that would silently restore the cost the fast path exists
+    /// to avoid — and to fail if someone deletes the full path believing the fast
+    /// one covers it.
+    #[test]
+    fn the_incremental_import_does_not_repair_it_and_that_is_the_trade() {
+        let (dir, store) = fixture("incr");
+        let led = dir.join("l.jsonl");
+        ledger(&led, 8, 0.25);
+        store.import_ledger(led.to_str().unwrap()).unwrap();
+
+        corrupt_one(&store);
+        store
+            .import_ledger_changed_only(led.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            first_component(&store),
+            9.0,
+            "the incremental import repaired a hash-identical corruption — if this is now \
+             wanted, the full path has lost its reason to exist and the docs are wrong"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the incremental pass must still do its actual job: a row the corpus has
+    /// never embedded, and a row whose hash moved, are both written.
+    #[test]
+    fn the_incremental_import_writes_what_is_missing_or_changed() {
+        let (dir, store) = fixture("work");
+        let led = dir.join("l.jsonl");
+
+        // Nothing embedded yet: every row is new.
+        ledger(&led, 8, 0.25);
+        store
+            .import_ledger_changed_only(led.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            first_component(&store),
+            0.25,
+            "a NULL embedding must be filled — IS DISTINCT FROM, not <>"
+        );
+
+        // Same ids, new hashes and new vectors: the model changed.
+        {
+            use std::io::Write;
+            let v: Vec<String> = (0..DENSE_DIM).map(|_| "0.75".to_string()).collect();
+            let joined = v.join(",");
+            let f = std::fs::File::create(&led).unwrap();
+            let mut w = std::io::BufWriter::new(f);
+            for i in 1..=8u64 {
+                writeln!(
+                    w,
+                    "{{\"chunk_id\":{i},\"hash\":\"NEW{i}\",\"vec\":[{joined}]}}"
+                )
+                .unwrap();
+            }
+            w.flush().unwrap();
+        }
+        store
+            .import_ledger_changed_only(led.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            first_component(&store),
+            0.75,
+            "a changed hash must be re-applied, or a model upgrade would never land"
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

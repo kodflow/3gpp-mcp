@@ -55,20 +55,46 @@ func (s *Store) probeContentAddressed(ctx context.Context) {
 // 97 s in its join form — because nothing pushes the caller's filter down into
 // body_seq. Bounded, the same work is 0.035 ms per body. So the caller filters
 // first and hands the ids here.
+// quoteSQLString renders a Go string as a DuckDB single-quoted literal.
+//
+// Only ever called with package constants, which is why doubling the quote is
+// enough: there is no user input on this path and adding one would be the bug,
+// not the escaping.
+func quoteSQLString(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+}
+
 func (s *Store) bodyTexts(ctx context.Context, ids []int64) (map[int64]string, error) {
 	out := make(map[int64]string, len(ids))
 	if len(ids) == 0 {
 		return out, nil
 	}
 	ph := make([]string, len(ids))
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, paraSep)
+	args := make([]any, 0, len(ids))
 	for i, id := range ids {
 		ph[i] = "?"
 		args = append(args, id)
 	}
+	// THE SEPARATOR IS A LITERAL, AND IT HAS TO BE.
+	//
+	// It used to be a bound parameter, and the SHIPPED LINUX BINARY ABORTED on it:
+	//
+	//	terminate called after throwing an instance of
+	//	  'duckdb::ParameterNotResolvedException'
+	//	SIGABRT: abort — signal arrived during cgo execution
+	//
+	// DuckDB cannot always infer the TYPE of a prepared parameter sitting in
+	// string_agg's separator position, and when it cannot, the C++ exception
+	// crosses cgo and takes the PROCESS down — it never becomes a Go error the
+	// server could report. Measured 2026-09-06 against the published image: the
+	// Windows build resolved it and answered, the Linux build in the image killed
+	// itself on the first search. Same code, same corpus, same query.
+	//
+	// paraSep is a compile-time constant this package owns, so nothing is gained by
+	// binding it and a whole class of binder ambiguity is lost by inlining it.
+	// quoteSQLString keeps that true if the constant ever stops being two newlines.
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.body_id, string_agg(p.part, ? ORDER BY s.ord)
+		SELECT s.body_id, string_agg(p.part, `+quoteSQLString(paraSep)+` ORDER BY s.ord)
 		FROM body_seq s JOIN paragraphs p USING (para_id)
 		WHERE s.body_id IN (`+strings.Join(ph, ",")+`)
 		GROUP BY s.body_id`, args...)
