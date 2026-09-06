@@ -201,13 +201,12 @@ fn main() -> Result<()> {
             tmp.display()
         );
 
-        let (staged, _) = if args.reapply_all {
+        let (staged, applied) = if args.reapply_all {
             eprintln!("embed-io: re-applying EVERY vector (--reapply-all)");
             store.import_ledger(inp)?
         } else {
             store.import_ledger_changed_only(inp)?
         };
-        let total = staged;
 
         if !args.embed_identity.is_empty() {
             store.set_meta("embedding_model", &args.embed_identity)?;
@@ -226,7 +225,12 @@ fn main() -> Result<()> {
                 built = true;
             }
         }
-        eprintln!("embed-io: wrote {total} vector(s) (hnsw={built})");
+        // BOTH numbers, because either alone misleads. `staged` is the size of the
+        // ledger and says nothing about the work; `applied` is the work and says
+        // nothing about what was examined to find it. On the ETSI half of build 21
+        // the honest line reads 368 of 1 999 814 — and that gap is the whole reason
+        // the incremental path exists.
+        eprintln!("embed-io: wrote {applied} vector(s) of {staged} staged (hnsw={built})");
         return Ok(());
     }
 
