@@ -217,6 +217,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // INVALIDATE FIRST, WRITE SECOND, STAMP LAST. clear_li, write_li_registry and set_meta
+    // commit separately, so "stamp only after the rows are in" is not enough on its own:
+    // if clear_li commits and write_li_registry then fails, the rows are gone and the OLD
+    // key survives to describe them. A later run that parses back to that old content —
+    // the .asn reverted, a parser change rolled back — matches it, returns early, and the
+    // registry stays empty for good. Blanking the key before touching a row makes the
+    // window fail safe instead: nothing can equal "" (a key is always 16 hex digits), so
+    // any interruption leaves a corpus that rebuilds on the next run.
+    //
+    // The alternative is to fold all three into one transaction inside store-rs. It is the
+    // tidier shape and it is deliberately NOT taken here: the `merge` binary links
+    // rust/store, so an edit there re-runs merge and re-derives the corpus — 37 min of
+    // rewrite plus 22 min of paragraphs behind it, measured 2026-09-05. This orders three
+    // existing commits and buys the same guarantee for one extra meta write, on the path
+    // that was going to write anyway.
+    store.set_meta(&meta_key, "")?;
     store.clear_li(LI_SPEC_ID, &release)?;
     store.write_li_registry(
         LI_SPEC_ID,
@@ -227,9 +243,6 @@ fn main() -> Result<()> {
         &nf_clauses,
         &types,
     )?;
-    // Stamped only after the rows are actually in. An interrupted run leaves a key that
-    // does not match, and the next one rebuilds — the failure mode to avoid is the
-    // opposite one, where a key outlives the rows it describes and the hole is permanent.
     store.set_meta(&meta_key, &key)?;
     store.checkpoint()?;
     eprintln!(
@@ -247,39 +260,41 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn ev(name: &str, tag: i64) -> LiEventIn {
+    // One row of each kind, all fields set to something distinguishable. Every test below
+    // starts from these and changes exactly one thing.
+    fn base_ev() -> LiEventIn {
         LiEventIn {
             interface: "X2".into(),
-            event_name: name.into(),
-            asn1_type: "AMFRegistration".into(),
-            asn1_tag: tag,
+            event_name: "AMFRegistration".into(),
+            asn1_type: "AMFRegistrationType".into(),
+            asn1_tag: 1,
             originating_nf: "AMF".into(),
             domain: "5GC".into(),
             spec_clause: "6.2.2.2".into(),
             field_count: 3,
         }
     }
-    fn fl(ordinal: i64, optional: bool) -> LiFieldIn {
+    fn base_fl() -> LiFieldIn {
         LiFieldIn {
             interface: "X2".into(),
             event_name: "AMFRegistration".into(),
             field_name: "sUPI".into(),
             asn1_type: "SUPI".into(),
-            asn1_tag: 1,
-            is_optional: optional,
-            ordinal,
+            asn1_tag: 2,
+            is_optional: false,
+            ordinal: 0,
         }
     }
-    fn nf() -> LiNfClauseIn {
+    fn base_nf() -> LiNfClauseIn {
         LiNfClauseIn {
             originating_nf: "AMF".into(),
             interface: "X2".into(),
             spec_clause: "6.2.2".into(),
         }
     }
-    fn ty(name: &str) -> Asn1TypeIn {
+    fn base_ty() -> Asn1TypeIn {
         Asn1TypeIn {
-            type_name: name.into(),
+            type_name: "AMFRegistrationType".into(),
             kind: "SEQUENCE".into(),
             members_json: "[]".into(),
         }
@@ -293,87 +308,215 @@ mod tests {
     ) -> String {
         content_key("Rel-19", "version7", evs, fs, ns, ts)
     }
+    fn base_key() -> String {
+        key_of(&[base_ev()], &[base_fl()], &[base_nf()], &[base_ty()])
+    }
+
+    // Four one-row registries, each with a single field mutated by the caller. Keeping the
+    // other three rows at their base values is what makes a failure name one field.
+    fn ev_with(f: impl FnOnce(&mut LiEventIn)) -> String {
+        let mut r = base_ev();
+        f(&mut r);
+        key_of(&[r], &[base_fl()], &[base_nf()], &[base_ty()])
+    }
+    fn fl_with(f: impl FnOnce(&mut LiFieldIn)) -> String {
+        let mut r = base_fl();
+        f(&mut r);
+        key_of(&[base_ev()], &[r], &[base_nf()], &[base_ty()])
+    }
+    fn nf_with(f: impl FnOnce(&mut LiNfClauseIn)) -> String {
+        let mut r = base_nf();
+        f(&mut r);
+        key_of(&[base_ev()], &[base_fl()], &[r], &[base_ty()])
+    }
+    fn ty_with(f: impl FnOnce(&mut Asn1TypeIn)) -> String {
+        let mut r = base_ty();
+        f(&mut r);
+        key_of(&[base_ev()], &[base_fl()], &[base_nf()], &[r])
+    }
 
     /// The property the skip depends on: identical rows, identical key. If this fails the
     /// binary re-ingests on every build and the layer is re-pushed every time.
     #[test]
     fn same_rows_same_key() {
-        let a = key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("T")]);
-        let b = key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("T")]);
-        assert_eq!(a, b);
+        assert_eq!(base_key(), base_key());
     }
 
-    /// THE NEGATIVE CONTROL, and the one that matters. A skip is only safe if every field
-    /// that reaches the corpus reaches the key: anything omitted here is a change the
-    /// binary would silently refuse to write, and the corpus would keep stale rows for
-    /// good. One case per field, so a field added to a struct without being added to
-    /// content_key fails here rather than in production.
+    /// THE NEGATIVE CONTROL, and the one that matters. A skip is only safe if EVERY field
+    /// that reaches the corpus reaches the key: a field left out of content_key is a change
+    /// the binary would silently refuse to write, and the corpus would keep stale rows for
+    /// good.
+    ///
+    /// Every field of every struct write_li_registry persists gets its own case. An earlier
+    /// version of this test covered five of the twenty-one and still passed, which is
+    /// exactly the hole it was supposed to close — hence `every_persisted_field_is_covered`
+    /// below, which turns a newly added field into a compile error rather than trusting
+    /// this list to be kept complete by hand.
     #[test]
     fn any_changed_field_changes_the_key() {
-        let base = key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("T")]);
-
-        let mut cases: Vec<(&str, String)> = Vec::new();
-        cases.push((
-            "event_name",
-            key_of(&[ev("B", 1)], &[fl(0, false)], &[nf()], &[ty("T")]),
-        ));
-        cases.push((
-            "asn1_tag",
-            key_of(&[ev("A", 2)], &[fl(0, false)], &[nf()], &[ty("T")]),
-        ));
-        cases.push((
-            "field ordinal",
-            key_of(&[ev("A", 1)], &[fl(1, false)], &[nf()], &[ty("T")]),
-        ));
-        cases.push((
-            "is_optional",
-            key_of(&[ev("A", 1)], &[fl(0, true)], &[nf()], &[ty("T")]),
-        ));
-        cases.push((
-            "type_name",
-            key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("U")]),
-        ));
-        cases.push((
-            "row count",
-            key_of(
-                &[ev("A", 1), ev("B", 2)],
-                &[fl(0, false)],
-                &[nf()],
-                &[ty("T")],
+        let base = base_key();
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "LiEventIn.interface",
+                ev_with(|r| r.interface = "X3".into()),
             ),
-        ));
-        cases.push((
-            "no events",
-            key_of(&[], &[fl(0, false)], &[nf()], &[ty("T")]),
-        ));
-        cases.push((
-            "release",
-            content_key(
-                "Rel-18",
-                "version7",
-                &[ev("A", 1)],
-                &[fl(0, false)],
-                &[nf()],
-                &[ty("T")],
+            (
+                "LiEventIn.event_name",
+                ev_with(|r| r.event_name = "AMFDeregistration".into()),
             ),
-        ));
-        cases.push((
-            "module_version",
-            content_key(
-                "Rel-19",
-                "version8",
-                &[ev("A", 1)],
-                &[fl(0, false)],
-                &[nf()],
-                &[ty("T")],
+            (
+                "LiEventIn.asn1_type",
+                ev_with(|r| r.asn1_type = "Other".into()),
             ),
-        ));
-
+            ("LiEventIn.asn1_tag", ev_with(|r| r.asn1_tag = 99)),
+            (
+                "LiEventIn.originating_nf",
+                ev_with(|r| r.originating_nf = "SMF".into()),
+            ),
+            ("LiEventIn.domain", ev_with(|r| r.domain = "EPC".into())),
+            (
+                "LiEventIn.spec_clause",
+                ev_with(|r| r.spec_clause = "6.2.3.1".into()),
+            ),
+            ("LiEventIn.field_count", ev_with(|r| r.field_count = 4)),
+            (
+                "LiFieldIn.interface",
+                fl_with(|r| r.interface = "X3".into()),
+            ),
+            (
+                "LiFieldIn.event_name",
+                fl_with(|r| r.event_name = "Other".into()),
+            ),
+            (
+                "LiFieldIn.field_name",
+                fl_with(|r| r.field_name = "gPSI".into()),
+            ),
+            (
+                "LiFieldIn.asn1_type",
+                fl_with(|r| r.asn1_type = "GPSI".into()),
+            ),
+            ("LiFieldIn.asn1_tag", fl_with(|r| r.asn1_tag = 99)),
+            ("LiFieldIn.is_optional", fl_with(|r| r.is_optional = true)),
+            ("LiFieldIn.ordinal", fl_with(|r| r.ordinal = 7)),
+            (
+                "LiNfClauseIn.originating_nf",
+                nf_with(|r| r.originating_nf = "SMF".into()),
+            ),
+            (
+                "LiNfClauseIn.interface",
+                nf_with(|r| r.interface = "X3".into()),
+            ),
+            (
+                "LiNfClauseIn.spec_clause",
+                nf_with(|r| r.spec_clause = "6.2.4".into()),
+            ),
+            (
+                "Asn1TypeIn.type_name",
+                ty_with(|r| r.type_name = "Other".into()),
+            ),
+            ("Asn1TypeIn.kind", ty_with(|r| r.kind = "CHOICE".into())),
+            (
+                "Asn1TypeIn.members_json",
+                ty_with(|r| r.members_json = r#"[{"n":"a"}]"#.into()),
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            21,
+            "a field was added or removed without a case"
+        );
         for (what, k) in cases {
             assert_ne!(
                 base, k,
-                "{what} did not change the key — that change would never be written"
+                "{what} is not part of the key — a change to it would never be written"
             );
+        }
+    }
+
+    /// The list above is only as good as someone remembering to extend it. These
+    /// destructurings carry no `..`, so adding a field to any of the four structs stops
+    /// this file from COMPILING, and the compiler names the field. That is the reminder.
+    #[test]
+    fn every_persisted_field_is_covered() {
+        let LiEventIn {
+            interface: _,
+            event_name: _,
+            asn1_type: _,
+            asn1_tag: _,
+            originating_nf: _,
+            domain: _,
+            spec_clause: _,
+            field_count: _,
+        } = base_ev();
+        let LiFieldIn {
+            interface: _,
+            event_name: _,
+            field_name: _,
+            asn1_type: _,
+            asn1_tag: _,
+            is_optional: _,
+            ordinal: _,
+        } = base_fl();
+        let LiNfClauseIn {
+            originating_nf: _,
+            interface: _,
+            spec_clause: _,
+        } = base_nf();
+        let Asn1TypeIn {
+            type_name: _,
+            kind: _,
+            members_json: _,
+        } = base_ty();
+    }
+
+    /// The rows are not the only thing written: the release and the module version travel
+    /// into the corpus too, and the row COUNTS decide whether a row was dropped.
+    #[test]
+    fn shape_and_provenance_are_part_of_the_key() {
+        let base = base_key();
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "release",
+                content_key(
+                    "Rel-18",
+                    "version7",
+                    &[base_ev()],
+                    &[base_fl()],
+                    &[base_nf()],
+                    &[base_ty()],
+                ),
+            ),
+            (
+                "module_version",
+                content_key(
+                    "Rel-19",
+                    "version8",
+                    &[base_ev()],
+                    &[base_fl()],
+                    &[base_nf()],
+                    &[base_ty()],
+                ),
+            ),
+            (
+                "an extra event",
+                key_of(
+                    &[base_ev(), base_ev()],
+                    &[base_fl()],
+                    &[base_nf()],
+                    &[base_ty()],
+                ),
+            ),
+            (
+                "no events at all",
+                key_of(&[], &[base_fl()], &[base_nf()], &[base_ty()]),
+            ),
+            (
+                "no types at all",
+                key_of(&[base_ev()], &[base_fl()], &[base_nf()], &[]),
+            ),
+        ];
+        for (what, k) in cases {
+            assert_ne!(base, k, "{what} is not part of the key");
         }
     }
 
@@ -381,16 +524,22 @@ mod tests {
     /// differ only in where one string ends must not share a key.
     #[test]
     fn field_boundaries_are_part_of_the_key() {
-        let a = key_of(&[ev("AB", 1)], &[fl(0, false)], &[nf()], &[ty("C")]);
-        let b = key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("BC")]);
+        let a = ev_with(|r| r.event_name = "AB".into());
+        let b = ev_with(|r| {
+            r.event_name = "A".into();
+            r.asn1_type = "BAMFRegistrationType".into();
+        });
         assert_ne!(a, b);
     }
 
-    /// The stored value is compared as a string, so its shape is part of the contract.
+    /// The stored value is compared as a string, and the empty string is what the binary
+    /// writes to invalidate the key before it touches a row. A real key must never be able
+    /// to collide with that, or an interrupted run would look complete.
     #[test]
-    fn the_key_is_16_hex_digits() {
-        let k = key_of(&[ev("A", 1)], &[fl(0, false)], &[nf()], &[ty("T")]);
+    fn the_key_is_16_hex_digits_and_never_empty() {
+        let k = base_key();
         assert_eq!(k.len(), 16, "{k}");
+        assert!(!k.is_empty());
         assert!(
             k.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
