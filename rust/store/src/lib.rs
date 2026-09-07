@@ -27,6 +27,74 @@ pub const DENSE_DIM: usize = 1024;
 /// can never declare different tables. Idempotent (CREATE TABLE IF NOT EXISTS).
 const SCHEMA_SQL: &str = include_str!("../../../internal/store/schema.sql");
 
+/// columns_of lists a table's columns, in declaration order, in one attached database.
+fn columns_of(conn: &Connection, db: &str, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT column_name FROM duckdb_columns()
+              WHERE database_name = ? AND table_name = ?
+              ORDER BY column_index",
+        )
+        .context("prepare duckdb_columns")?;
+    let rows = stmt
+        .query_map(duckdb::params![db, table], |r| r.get::<_, String>(0))
+        .with_context(|| format!("columns of {db}.{table}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// shared_columns is the column list a copy between two databases must NAME: the
+/// ones both sides have, in the source's order, quoted for interpolation.
+///
+/// WHY THIS EXISTS, and it is not defensive programming. Every copy here used to be
+/// `INSERT INTO dst SELECT * FROM src`, under a comment that said the premise out
+/// loud: "Column order is identical — both sides were bootstrapped from the same
+/// schema.sql — so SELECT * is the right shape, not a shortcut."
+///
+/// That premise holds only while the schema never GROWS. The destination of a
+/// compact copy is bootstrapped from TODAY's schema.sql; the source is a corpus
+/// built whenever it was built. Adding one nullable column to `acronyms` therefore
+/// killed the merge of a 22 GB corpus after ten minutes of work:
+///
+/// ```text
+/// copy table acronyms rows [0,20000000)
+/// Binder Error: table acronyms has 7 columns but 6 values were supplied
+/// ```
+///
+/// A column the destination has and the source does not gets its default, which is
+/// exactly what an additive migration means. The reverse — a source column the
+/// destination lacks — is a corpus NEWER than this binary, and it is reported
+/// rather than dropped in silence.
+fn shared_columns(
+    conn: &Connection,
+    src_db: &str,
+    dst_db: &str,
+    table: &str,
+) -> Result<(String, String)> {
+    let src = columns_of(conn, src_db, table)?;
+    let dst: std::collections::HashSet<String> =
+        columns_of(conn, dst_db, table)?.into_iter().collect();
+    let kept: Vec<String> = src.iter().filter(|c| dst.contains(*c)).cloned().collect();
+    if kept.is_empty() {
+        anyhow::bail!("no column of {table} is present in both {src_db} and {dst_db}");
+    }
+    let dropped: Vec<&String> = src.iter().filter(|c| !dst.contains(*c)).collect();
+    if !dropped.is_empty() {
+        eprintln!(
+            "store: WARNING: {table} in {src_db} has column(s) {dropped:?} that {dst_db} does not —              this binary is older than the corpus it is copying, and those values are NOT carried"
+        );
+    }
+    let list = kept
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((list.clone(), list))
+}
+
 /// The embeddable-text predicate: a clause with no real body (heading-only / void /
 /// table-stripped) is skipped by the embedder, so it must not be counted as "needs a
 /// vector". Mirrors Go store's embeddableTextSQL.
@@ -311,14 +379,16 @@ impl Store {
                 let Some(max_rowid) = max_rowid else {
                     continue; // empty table: nothing to carry
                 };
+                // NAMED COLUMNS, not SELECT *. The destination is bootstrapped from
+                // TODAY's schema.sql and the source from whenever it was built, so the
+                // two agree only while the schema never grows. See shared_columns.
+                let (cols, sel) = shared_columns(&conn, "copy_src", "copy_dst", t)?;
                 let mut lo: i64 = 0;
                 while lo <= max_rowid {
                     let hi = lo.saturating_add(step);
-                    // Column order is identical — both sides were bootstrapped from the
-                    // same schema.sql — so SELECT * is the right shape, not a shortcut.
                     conn.execute_batch(&format!(
-                        "INSERT INTO copy_dst.main.\"{t}\"
-                           SELECT * FROM copy_src.main.\"{t}\"
+                        "INSERT INTO copy_dst.main.\"{t}\" ({cols})
+                           SELECT {sel} FROM copy_src.main.\"{t}\"
                             WHERE rowid >= {lo} AND rowid < {hi};"
                     ))
                     .with_context(|| format!("copy table {t} rows [{lo},{hi})"))?;
@@ -1068,25 +1138,52 @@ impl Store {
                 )
             }
         };
-        let sql = format!(
-            "ATTACH '{shard_path}' AS s (READ_ONLY);
-             INSERT INTO specs SELECT * FROM s.specs ON CONFLICT DO NOTHING;
-             INSERT INTO spec_versions SELECT * FROM s.spec_versions ON CONFLICT DO NOTHING;
-             INSERT INTO releases SELECT * FROM s.releases ON CONFLICT DO NOTHING;
-             INSERT INTO acronyms SELECT * FROM s.acronyms ON CONFLICT DO NOTHING;
-             INSERT INTO clauses
-               SELECT chunk_id + {offset}, spec_id, release, version, clause_path, heading, text,
-                      is_normative, embedding, embedding_hash
-               FROM s.clauses{clause_where};
-             INSERT INTO clause_sparse
-               SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse{sparse_where};
-             INSERT INTO changes SELECT * FROM s.changes;
-             INSERT INTO evolutions SELECT * FROM s.evolutions;
-             DETACH s;"
-        );
+        // ATTACH FIRST, then build the inserts, because the column lists have to be
+        // READ from the shard rather than assumed of it. A shard written by a newer
+        // binary than the base — or the reverse, which is what a migration produces
+        // for one build — differs by exactly the columns that were added, and
+        // `SELECT *` turns that into "table X has N columns but M values were
+        // supplied" after the expensive part of the merge has already run.
         self.conn
-            .execute_batch(&sql)
-            .with_context(|| format!("fold_shard {shard_path}"))?;
+            .execute_batch(&format!("ATTACH '{shard_path}' AS s (READ_ONLY);"))
+            .with_context(|| format!("attach shard {shard_path}"))?;
+        let res = (|| -> Result<()> {
+            let dst: String = self
+                .conn
+                .query_row("SELECT current_database()", [], |r| r.get(0))
+                .context("current database name")?;
+            let mut copies = String::new();
+            for (t, conflict) in [
+                ("specs", " ON CONFLICT DO NOTHING"),
+                ("spec_versions", " ON CONFLICT DO NOTHING"),
+                ("releases", " ON CONFLICT DO NOTHING"),
+                ("acronyms", " ON CONFLICT DO NOTHING"),
+                ("changes", ""),
+                ("evolutions", ""),
+            ] {
+                let (cols, sel) = shared_columns(&self.conn, "s", &dst, t)?;
+                copies.push_str(&format!(
+                    "INSERT INTO {t} ({cols}) SELECT {sel} FROM s.{t}{conflict};
+"
+                ));
+            }
+            let sql = format!(
+                "{copies}
+                 INSERT INTO clauses
+                   SELECT chunk_id + {offset}, spec_id, release, version, clause_path, heading, text,
+                          is_normative, embedding, embedding_hash
+                   FROM s.clauses{clause_where};
+                 INSERT INTO clause_sparse
+                   SELECT chunk_id + {offset}, term_id, weight FROM s.clause_sparse{sparse_where};"
+            );
+            self.conn
+                .execute_batch(&sql)
+                .with_context(|| format!("fold_shard {shard_path}"))
+        })();
+        // DETACH whatever happened: a shard left attached poisons the next fold with
+        // "database with name s already exists", turning one failure into all of them.
+        let _ = self.conn.execute_batch("DETACH s;");
+        res?;
         Ok(())
     }
 
