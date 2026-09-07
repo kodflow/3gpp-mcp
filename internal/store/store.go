@@ -1558,6 +1558,16 @@ func (s *Store) CountClauses(ctx context.Context) (int, error) { return s.count(
 func (s *Store) CountSpecVersions(ctx context.Context) (int, error) {
 	return s.count(ctx, "spec_versions")
 }
+
+// CountAcronyms is the glossary's size, and it lives here for the reason the two
+// counters above do: cmd/* are thin CLIs over internal packages (cmd/CLAUDE.md),
+// so a command that writes its own glossary SQL makes a schema change reach into
+// the command layer. dbcount already asks the store for spec_versions and
+// api_operations; this one is asked the same way.
+func (s *Store) CountAcronyms(ctx context.Context) (int, error) {
+	return s.count(ctx, "acronyms")
+}
+
 func (s *Store) CountAPIOperations(ctx context.Context) (int, error) {
 	return s.count(ctx, "api_operations")
 }
