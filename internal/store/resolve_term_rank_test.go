@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -236,5 +237,63 @@ func put(t *testing.T, s *Store, term, expansion, source string) {
 		FirstRelease: "Rel-20", LastRelease: "Rel-20",
 	}); err != nil {
 		t.Fatalf("upsert %s/%s: %v", term, expansion, err)
+	}
+}
+
+// A CORPUS WITHOUT THE COLUMN MUST STILL ANSWER — and this is not hypothetical:
+// it is every image published before declared_by existed.
+//
+// cmd/server opens the corpus with OpenReadOnly, which opens
+// access_mode=read_only and runs no migration by design ("schema already
+// exists"). Only Open applies the ALTER. So a binary carrying the new query and
+// a corpus predating the column meet in exactly the shape that killed search_api
+// for 84 % of the corpus in build 23: a query that names a column which is not
+// there does not degrade, it fails, and the tool is dead for every term.
+//
+// The store probes the capability instead, the way it already probes the
+// content-addressed shape, and the older corpus keeps precisely the order it had.
+func TestResolveTermAnswersOnACorpusWithoutTheCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.duckdb")
+
+	rw, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	putETSI(t, rw, "MSC", "Main Service Channel", "ETSI EN 300 175-1", 1)
+	putETSI(t, rw, "MSC", "Mobile Switching Centre", "ETSI TS 101 200", 9)
+	// Make it an OLD corpus: the column goes away, exactly as it is absent from
+	// every DB built before this change.
+	if _, err := rw.DB().Exec(`ALTER TABLE acronyms DROP COLUMN declared_by`); err != nil {
+		t.Fatalf("drop declared_by: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	ro, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+	if ro.declaredBy {
+		t.Fatal("the probe reports a column the corpus does not have")
+	}
+
+	got, err := ro.ResolveTerm(context.Background(), "MSC")
+	if err != nil {
+		t.Fatalf("ResolveTerm on a corpus without declared_by: %v — resolve_term would "+
+			"be dead for every term on every image published before the column", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(got), got)
+	}
+	// Unranked by count, the order is the one that corpus always had: the bucket,
+	// then the alphabet. Asserting it pins that the fallback is the OLD behaviour
+	// and not some third thing.
+	if got[0].Expansion != "Main Service Channel" {
+		t.Errorf("first row = %q, want the order the old corpus had", got[0].Expansion)
+	}
+	if got[0].DeclaredBy != 1 {
+		t.Errorf("declared_by = %d on a corpus that cannot store it, want 1", got[0].DeclaredBy)
 	}
 }

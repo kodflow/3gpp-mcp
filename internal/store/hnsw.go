@@ -77,6 +77,11 @@ func OpenReadOnly(path string) (*Store, error) {
 	// run. etsi.duckdb is served alongside and has NOT been migrated, so this is
 	// asked of each database rather than assumed of the build.
 	s.probeContentAddressed(ctx)
+	// …and whether the glossary carries its declaration count. THIS PATH IS THE
+	// REASON THE PROBE EXISTS: it runs no migration, so a corpus published before
+	// the column was added is served by a binary whose query would otherwise name
+	// a column it does not have.
+	s.probeDeclaredBy(ctx)
 	// Producer marker (migration Phase 11a A14): a DB built by the Rust write-side stamps
 	// schema_meta.producer + .schema_version. Warn (never fail) on a schema_version the
 	// read side wasn't built for — a self-describing guard that the served corpus matches.
