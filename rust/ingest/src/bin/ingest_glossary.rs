@@ -22,7 +22,13 @@
 //! deliverables and their abbreviation lists barely move, so this reads the NEWEST
 //! version of each: the current meaning of a term, at a fraction of the work.
 //!
-//! Usage: ingest-glossary --convert <dir> --db <db> [--source-series etsi]
+//! WHAT IT COUNTS, AND WHY THE COUNT IS THE PRODUCT. 938 of the 3 042 terms in the
+//! ETSI half carry more than one expansion, and ETSI states no precedence rule to
+//! choose between them — so before this pass counted agreement, the first row a
+//! caller read was the alphabetical one: MSC as "Main Service Channel", IMS as "IP
+//! Multimdia Subsystem" (a typo), TS as a sentence about SimulCrypt. See `Tally`.
+//!
+//! Usage: ingest-glossary --convert <dir> --db <db>
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::HashMap;
@@ -39,11 +45,16 @@ struct Args {
     /// DuckDB to write the acronyms into (the ETSI half).
     #[arg(long)]
     db: String,
-    /// Stamped on every row so a later purge can scope these without touching the
-    /// 3GPP vocabulary, which carries its own series ("21").
-    #[arg(long, default_value = "etsi")]
-    source_series: String,
 }
+
+// --source-series IS GONE, and its absence is the fix rather than a tidy-up.
+//
+// It stamped the constant "etsi" on all 4 941 rows: a value that names no
+// document, so nothing could be cited and — because Store.ResolveTerm ranks on
+// what source_series says — nothing could be ranked either. Every ETSI row landed
+// in the same bucket and the tie-break decided the answer alphabetically. Each row
+// now carries the deliverable that declares it ("ETSI TS 103 221-1"), which still
+// tells the halves apart, since every ETSI id begins with "ETSI ".
 
 /// version_key turns "18.4.0" into a comparable tuple, so 18.10.0 sorts after
 /// 18.9.0. A string compare puts them the other way round, which is the same defect
@@ -162,6 +173,69 @@ fn collect_html(root: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// What the corpus, taken as a whole, says about one (term, expansion).
+///
+/// AGREEMENT IS THE ONLY AUTHORITY ETSI OFFERS. 3GPP ranks a term by WHO declares
+/// it — TS 23.501 §3.2: "An abbreviation defined in the present document takes
+/// precedence over the definition of the same abbreviation, if any, in TR 21.905"
+/// — and Store.ResolveTerm implements exactly that. ETSI publishes no TR 21.905
+/// and states no precedence: 5 142 deliverables each declare their own vocabulary
+/// and none outranks another in general. So the honest signal is how many of them
+/// say the same thing, and it has to be counted HERE, because the primary key
+/// keeps one row per expansion — after the write, the corpus can no longer tell
+/// forty declarations from one.
+struct Consensus {
+    /// How many DELIVERABLES declare this exact expansion.
+    declared_by: i64,
+    /// The deliverable cited on the row, and its version.
+    ///
+    /// The lexicographically smallest declaring id, which is a REPRODUCIBILITY
+    /// rule and not a claim of authority: the same corpus must yield the same row
+    /// on every run, and "whichever file the walker reached last" does not. The
+    /// count is what says how many others agree.
+    cite_spec: String,
+    cite_version: String,
+}
+
+/// Tally folds each deliverable's kept acronyms into the corpus-wide consensus.
+///
+/// A BTreeMap, so the write order is the corpus's own order rather than a hash
+/// seed's: an idempotent pass has to produce the same rows in the same sequence,
+/// or "nothing changed" cannot be told from "everything moved".
+#[derive(Default)]
+struct Tally {
+    rows: std::collections::BTreeMap<(String, String), Consensus>,
+}
+
+impl Tally {
+    /// add_file folds ONE deliverable in.
+    ///
+    /// DISTINCT PER DELIVERABLE. An Abbreviations clause can list the same pair
+    /// twice — ETSI TS 102 221 lists TC under both its Symbols and Abbreviations
+    /// headings — and counting both would let one document outvote two.
+    fn add_file(&mut self, spec_id: &str, version: &str, acs: &[(String, String)]) {
+        let mut seen = std::collections::HashSet::new();
+        for (term, expansion) in acs {
+            if !seen.insert((term.as_str(), expansion.as_str())) {
+                continue;
+            }
+            let e = self
+                .rows
+                .entry((term.clone(), expansion.clone()))
+                .or_insert_with(|| Consensus {
+                    declared_by: 0,
+                    cite_spec: spec_id.to_string(),
+                    cite_version: version.to_string(),
+                });
+            e.declared_by += 1;
+            if spec_id < e.cite_spec.as_str() {
+                e.cite_spec = spec_id.to_string();
+                e.cite_version = version.to_string();
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let store = store_rs::Store::open_rw(&args.db)?;
@@ -172,8 +246,9 @@ fn main() -> Result<()> {
         files.len()
     );
 
-    let (mut specs, mut rows, mut written) = (0usize, 0usize, 0usize);
+    let (mut specs, mut rows) = (0usize, 0usize);
     let (mut candidates, mut dropped_files, mut dropped_rows) = (0usize, 0usize, 0usize);
+    let mut tally = Tally::default();
     for (i, f) in files.iter().enumerate() {
         let html = parse3gpp::html_bytes::read_html(f).with_context(|| format!("read {f}"))?;
         let Some(meta) = parse3gpp::etsi::parse_etsi_meta(&html) else {
@@ -189,9 +264,10 @@ fn main() -> Result<()> {
             continue;
         }
         candidates += acs.len();
-        let kept: Vec<_> = acs
+        let kept: Vec<(String, String)> = acs
             .iter()
             .filter(|a| initials_match(&a.term, &a.expansion))
+            .map(|a| (a.term.clone(), a.expansion.clone()))
             .collect();
         if (kept.len() as f64) < MIN_FILE_CONSISTENCY * (acs.len() as f64) {
             dropped_files += 1;
@@ -201,17 +277,7 @@ fn main() -> Result<()> {
         dropped_rows += acs.len() - kept.len();
         specs += 1;
         rows += kept.len();
-        for a in kept {
-            store.upsert_acronym(
-                &a.term,
-                &a.expansion,
-                "",
-                &a.first_release,
-                &a.last_release,
-                &args.source_series,
-            )?;
-            written += 1;
-        }
+        tally.add_file(&meta.spec_id, &meta.version, &kept);
         if (i + 1) % 500 == 0 {
             eprintln!(
                 "ingest-glossary: {}/{} file(s), {rows} row(s) so far",
@@ -220,8 +286,35 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // THE WRITE IS THE SECOND PASS, and it is what makes this idempotent.
+    //
+    // Row-at-a-time writing could not carry the count, and it could not carry an
+    // honest citation either: the same (term, expansion) is upserted by every
+    // deliverable that declares it, so source_series ended up naming whichever
+    // file the walker happened to reach last. That was hidden while every row was
+    // stamped with the constant "etsi" — a value that names no document, cites
+    // nothing, and left the ETSI half unrankable.
+    let mut written = 0usize;
+    for ((term, expansion), c) in &tally.rows {
+        store.upsert_acronym(
+            term,
+            expansion,
+            "",
+            &c.cite_version,
+            &c.cite_version,
+            &c.cite_spec,
+            c.declared_by,
+        )?;
+        written += 1;
+    }
+
+    let agreed = tally.rows.values().filter(|c| c.declared_by > 1).count();
     eprintln!(
-        "ingest-glossary: {candidates} candidate row(s); dropped {dropped_rows}          (of which {dropped_files} whole file(s) whose columns did not line up);          kept {written} row(s) from {specs} deliverable(s)"
+        "ingest-glossary: {candidates} candidate row(s); dropped {dropped_rows} \
+         (of which {dropped_files} whole file(s) whose columns did not line up); \
+         kept {rows} declaration(s) from {specs} deliverable(s) -> {written} row(s), \
+         {agreed} of them declared by more than one deliverable"
     );
     // A pass that writes nothing is a regression, not "no work": every ETSI TS/EN
     // carries clause 3. Fail loudly rather than leave resolve_term silently
@@ -235,6 +328,102 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decls(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(t, e)| (t.to_string(), e.to_string()))
+            .collect()
+    }
+
+    /// THE ANSWER THE ETSI HALF USED TO GIVE, and why counting changes it.
+    ///
+    /// Measured on the shipped corpus 2026-09-07: MSC carries twelve expansions
+    /// and Store.ResolveTerm ordered them `domain, expansion` with domain empty on
+    /// every ETSI row — so the first row a caller read was "Main Service Channel",
+    /// alphabetically first and, for anyone asking about a mobile network, wrong.
+    /// The switching centre is what the archive overwhelmingly declares, and that
+    /// is a countable fact rather than a preference.
+    #[test]
+    fn the_expansion_most_deliverables_declare_wins_over_the_alphabet() {
+        let mut t = Tally::default();
+        for spec in ["ETSI TS 101 200", "ETSI TS 102 221", "ETSI TS 103 221-1"] {
+            t.add_file(
+                spec,
+                "1.1.1",
+                &decls(&[("MSC", "Mobile-services Switching Centre")]),
+            );
+        }
+        t.add_file(
+            "ETSI EN 300 175-1",
+            "2.7.1",
+            &decls(&[("MSC", "Main Service Channel")]),
+        );
+
+        let switching = &t.rows[&("MSC".into(), "Mobile-services Switching Centre".into())];
+        let channel = &t.rows[&("MSC".into(), "Main Service Channel".into())];
+        assert_eq!(switching.declared_by, 3);
+        assert_eq!(channel.declared_by, 1);
+        // BOTH ARE KEPT. Ranking is not filtering: "Main Service Channel" is a real
+        // DECT term and the corpus reproduces its sources rather than choosing for
+        // them. What changes is which one a caller reads first.
+        assert_eq!(t.rows.len(), 2);
+    }
+
+    /// ONE DELIVERABLE, ONE VOTE. An Abbreviations clause can list the same pair
+    /// twice — a Symbols heading and an Abbreviations heading in the same region —
+    /// and counting both would let one document outvote two.
+    #[test]
+    fn a_pair_listed_twice_in_one_file_counts_once() {
+        let mut t = Tally::default();
+        t.add_file(
+            "ETSI TS 102 221",
+            "18.4.0",
+            &decls(&[
+                ("TC", "Transmission Convergence"),
+                ("TC", "Transmission Convergence"),
+            ]),
+        );
+        assert_eq!(
+            t.rows[&("TC".into(), "Transmission Convergence".into())].declared_by,
+            1
+        );
+    }
+
+    /// THE CITATION IS REPRODUCIBLE, and that is all it claims.
+    ///
+    /// The row names the lexicographically smallest declaring deliverable, with
+    /// its version, because the same corpus must produce the same row on every
+    /// run — the previous pass stamped whichever file the walker reached last,
+    /// under a constant "etsi" that hid it. It is not a claim that this
+    /// deliverable is more authoritative; `declared_by` is what says how many
+    /// others agree.
+    #[test]
+    fn the_cited_deliverable_does_not_depend_on_walk_order() {
+        let files: [(&str, &str); 3] = [
+            ("ETSI TS 103 221-1", "1.12.1"),
+            ("ETSI TS 102 221", "18.4.0"),
+            ("ETSI EN 300 175-1", "2.7.1"),
+        ];
+        let mut forward = Tally::default();
+        for (spec, ver) in files {
+            forward.add_file(spec, ver, &decls(&[("AID", "Application IDentifier")]));
+        }
+        let mut backward = Tally::default();
+        for (spec, ver) in files.iter().rev() {
+            backward.add_file(spec, ver, &decls(&[("AID", "Application IDentifier")]));
+        }
+
+        let key = ("AID".to_string(), "Application IDentifier".to_string());
+        assert_eq!(forward.rows[&key].cite_spec, "ETSI EN 300 175-1");
+        assert_eq!(forward.rows[&key].cite_version, "2.7.1");
+        assert_eq!(backward.rows[&key].cite_spec, forward.rows[&key].cite_spec);
+        assert_eq!(
+            backward.rows[&key].cite_version, forward.rows[&key].cite_version,
+            "the version must travel with the deliverable it cites, not with the last file read"
+        );
+        assert_eq!(forward.rows[&key].declared_by, 3);
+    }
 
     /// THE DEFECT THE GUARD EXISTS FOR, taken verbatim from EN 300 286-2 v1.2.4.
     /// `pdftotext -layout` prints a tall cell's expansion ABOVE its term, so from

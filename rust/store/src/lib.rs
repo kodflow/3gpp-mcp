@@ -117,6 +117,22 @@ impl Store {
         conn.execute_batch(&schema_for(&conn))
             .context("bootstrap schema")?;
 
+        // ADDITIVE COLUMNS, because CREATE TABLE IF NOT EXISTS cannot add one.
+        //
+        // The two runtimes single-source the DDL (SCHEMA_SQL above is the Go file),
+        // which makes a FRESH corpus identical either way — and hides that only the
+        // Go store carried migrations. An existing corpus opened by this writer kept
+        // whatever columns it was created with, so adding one to schema.sql would
+        // have compiled, passed every test on a temp database, and then failed on
+        // the 44 GiB corpus that matters with "Binder Error: table acronyms has 6
+        // columns but 7 values were supplied".
+        //
+        // IF NOT EXISTS makes it a no-op on a corpus that already has the column,
+        // and this runs on open rather than at first write so a reader of an old
+        // corpus sees the same shape a writer does.
+        conn.execute_batch("ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS declared_by INTEGER;")
+            .context("add acronyms.declared_by")?;
+
         // A WRITER MUST BE ABLE TO BIND AN HNSW INDEX THAT IS ALREADY THERE.
         //
         // Once `clauses` carries a frozen HNSW, DuckDB refuses to modify the table
@@ -1432,6 +1448,11 @@ impl Store {
 
     /// upsert_acronym inserts/updates a glossary acronym (== Go UpsertAcronym). The PK is
     /// (term, expansion, domain) so the same term keeps every distinct expansion/domain.
+    ///
+    /// `declared_by` is how many documents declare this exact expansion; 0 means NOT
+    /// COUNTED and is stored as NULL, which Store.ResolveTerm reads as 1. It is what
+    /// ranks the ETSI half, which has no precedence rule of its own to rank it by —
+    /// see internal/store/schema.sql.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_acronym(
         &self,
@@ -1441,15 +1462,24 @@ impl Store {
         first_release: &str,
         last_release: &str,
         source_series: &str,
+        declared_by: i64,
     ) -> Result<()> {
+        // NULL, not 0, for an uncounted row: zero would sort BELOW every counted row
+        // while asserting "no document declares this", which is false of a row that
+        // exists at all.
+        let declared: Option<i64> = if declared_by > 0 {
+            Some(declared_by)
+        } else {
+            None
+        };
         self.conn
             .execute(
-                "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series)
-                 VALUES (?, ?, ?, ?, ?, ?)
+                "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (term, expansion, domain) DO UPDATE SET
                    first_release = excluded.first_release, last_release = excluded.last_release,
-                   source_series = excluded.source_series",
-                duckdb::params![term, expansion, domain, first_release, last_release, source_series],
+                   source_series = excluded.source_series, declared_by = excluded.declared_by",
+                duckdb::params![term, expansion, domain, first_release, last_release, source_series, declared],
             )
             .with_context(|| format!("upsert_acronym {term}"))?;
         Ok(())

@@ -144,6 +144,11 @@ fn write_spec(store: &Store, meta: &SpecMeta, html: &str, offset: u64) -> Result
                 &a.first_release,
                 &a.last_release,
                 &a.source_series,
+                // NOT COUNTED, which is what 0 means. This pass reads ONE spec —
+                // TS 21.905 — so it has no agreement to count, and the 3GPP half
+                // does not rank on agreement anyway: TS 23.501 §3.2 gives it a
+                // precedence rule instead. Stored NULL, read as 1.
+                0,
             )?;
         }
     }

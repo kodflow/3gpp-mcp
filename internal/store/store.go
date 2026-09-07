@@ -188,6 +188,16 @@ func (s *Store) migrate() error {
 		`ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS source_series VARCHAR`); err != nil {
 		return fmt.Errorf("add acronyms source_series column: %w", err)
 	}
+	// declared_by, added the same way and for the same kind of reason: it is
+	// metadata ABOUT the vocabulary rather than lexical content, so it does not
+	// bump schema_version either, and a corpus built before it carries NULL —
+	// which ResolveTerm reads as 1, the value every 3GPP writer means anyway.
+	//
+	// It is what lets the ETSI half be ranked at all; see schema.sql.
+	if _, err := s.db.Exec(
+		`ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS declared_by INTEGER`); err != nil {
+		return fmt.Errorf("add acronyms declared_by column: %w", err)
+	}
 	return nil
 }
 
@@ -487,13 +497,29 @@ func (s *Store) InsertChanges(changes []model.Change) error {
 // UpsertAcronym inserts or updates a glossary entry.
 func (s *Store) UpsertAcronym(a model.Acronym) error {
 	_, err := s.db.Exec(
-		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series, declared_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
 		   first_release=excluded.first_release, last_release=excluded.last_release,
-		   source_series=excluded.source_series`,
-		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease, a.SourceSeries)
+		   source_series=excluded.source_series, declared_by=excluded.declared_by`,
+		a.Term, a.Expansion, a.Domain, a.FirstRelease, a.LastRelease, a.SourceSeries,
+		declaredBy(a))
 	return err
+}
+
+// declaredBy renders the count for storage: a caller that did not count writes
+// NULL, not 0.
+//
+// The distinction is the whole point of the column. Zero would mean "no document
+// declares this", which is false of a row that exists at all, and it would sort
+// BELOW every counted row — so a 3GPP writer that simply does not populate the
+// field, as seed-glossary does not, would silently demote the spec-sourced rows
+// the 3GPP ranking exists to promote. NULL reads as 1: one document, uncounted.
+func declaredBy(a model.Acronym) any {
+	if a.DeclaredBy <= 0 {
+		return nil
+	}
+	return a.DeclaredBy
 }
 
 // UpsertAcronyms writes a batch of glossary entries in ONE transaction.
@@ -572,18 +598,18 @@ func (s *Store) UpsertAcronyms(as []model.Acronym) (changed bool, err error) {
 		return false, err
 	}
 	stmt, err := tx.Prepare(
-		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series, declared_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
 		   first_release=excluded.first_release, last_release=excluded.last_release,
-		   source_series=excluded.source_series`)
+		   source_series=excluded.source_series, declared_by=excluded.declared_by`)
 	if err != nil {
 		_ = tx.Rollback()
 		return false, err
 	}
 	for _, a := range as {
 		if _, err := stmt.Exec(a.Term, a.Expansion, a.Domain,
-			a.FirstRelease, a.LastRelease, a.SourceSeries); err != nil {
+			a.FirstRelease, a.LastRelease, a.SourceSeries, declaredBy(a)); err != nil {
 			_ = stmt.Close()
 			_ = tx.Rollback()
 			return false, fmt.Errorf("upsert acronym %q: %w", a.Term, err)
@@ -599,10 +625,18 @@ type acronymKey struct{ term, expansion, domain string }
 
 // acronymIndex reads the glossary into memory so UpsertAcronyms can tell a row
 // that needs writing from one that is already correct.
+//
+// declared_by IS SELECTED, and leaving it out would have been the exact defect
+// this repository's idempotence rule names: the comparison is a struct equality,
+// so a field the reader does not load reads as its zero value on both sides and
+// every row whose ONLY change is that field compares equal. The write would be
+// skipped, the caller told "nothing to do", and the count would keep whatever a
+// previous corpus had — an idempotence key that does not cover the output it
+// claims to have written.
 func (s *Store) acronymIndex() (map[acronymKey]model.Acronym, error) {
 	rows, err := s.db.Query(
 		`SELECT term, expansion, domain, first_release, last_release,
-		        coalesce(source_series, '')
+		        coalesce(source_series, ''), coalesce(declared_by, 0)
 		   FROM acronyms`)
 	if err != nil {
 		return nil, err
@@ -612,7 +646,7 @@ func (s *Store) acronymIndex() (map[acronymKey]model.Acronym, error) {
 	for rows.Next() {
 		var a model.Acronym
 		if err := rows.Scan(&a.Term, &a.Expansion, &a.Domain, &a.FirstRelease,
-			&a.LastRelease, &a.SourceSeries); err != nil {
+			&a.LastRelease, &a.SourceSeries, &a.DeclaredBy); err != nil {
 			return nil, err
 		}
 		out[acronymKey{a.Term, a.Expansion, a.Domain}] = a
@@ -1494,12 +1528,34 @@ func (s *Store) VersionForRelease(ctx context.Context, specID, release string) (
 // the model, and this query never read it — so every entry came back with an
 // empty provenance and a caller could not tell a 21.905 row from an ETSI one,
 // which is precisely what server.go's federation comment claims it can do.
+//
+// AND THE SAME DEFECT WAS STILL LIVE ON THE ETSI HALF, which the precedence rule
+// above cannot reach. ETSI publishes no TR 21.905 and states no precedence: each
+// deliverable declares its own vocabulary, so every ETSI row landed in the same
+// bucket and the tie-break — `domain, expansion`, with domain empty on every one
+// of them — decided the answer ALPHABETICALLY. Measured on the shipped corpus,
+// 2026-09-07: 938 of 3 042 ETSI terms carry more than one expansion, and the
+// first row a caller reads was
+//
+//	MSC  -> "Main Service Channel"        (not the Mobile Switching Centre)
+//	IMS  -> "IP Multimdia Subsystem"      (a typo, ranked above the spelling)
+//	TS   -> "SimulCrypt involves the …"   (a sentence, ranked above "Technical
+//	                                       Specification")
+//
+// declared_by is the signal that replaces the alphabet: how many deliverables
+// declare that exact expansion. It is a FACT about the corpus rather than a
+// preference, it is counted at write time because the primary key keeps one row
+// per expansion, and it leaves the 3GPP order untouched — those rows carry NULL,
+// which reads as 1, so the precedence bucket still decides and `expansion` still
+// breaks what remains.
 func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT term, expansion, domain, first_release, last_release,
-		        coalesce(source_series, '') AS source_series
+		        coalesce(source_series, '') AS source_series,
+		        coalesce(nullif(declared_by, 0), 1) AS declared_by
 		 FROM acronyms WHERE lower(term) = lower(?)
 		 ORDER BY CASE WHEN coalesce(source_series, '') LIKE '%.%' THEN 0 ELSE 1 END,
+		          coalesce(nullif(declared_by, 0), 1) DESC,
 		          domain, expansion`, term)
 	if err != nil {
 		return nil, err
@@ -1509,7 +1565,7 @@ func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, 
 	for rows.Next() {
 		var a model.Acronym
 		if err := rows.Scan(&a.Term, &a.Expansion, &a.Domain, &a.FirstRelease,
-			&a.LastRelease, &a.SourceSeries); err != nil {
+			&a.LastRelease, &a.SourceSeries, &a.DeclaredBy); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
