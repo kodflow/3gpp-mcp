@@ -169,7 +169,24 @@ CREATE TABLE IF NOT EXISTS acronyms (
     domain        VARCHAR,               -- '5GC'|'EPC'|'IMS'|'RAN'|''
     first_release VARCHAR,
     last_release  VARCHAR,
-    source_series VARCHAR,               -- owning subject's 3GPP series (e.g. '21' for glossary)
+    source_series VARCHAR,               -- the document that declares it: a 3GPP series ('21'),
+                                         -- a 3GPP spec ('23.501'), or an ETSI deliverable
+                                         -- ('ETSI TS 103 221-1')
+    -- HOW MANY DOCUMENTS DECLARE THIS EXACT EXPANSION.
+    --
+    -- The 3GPP half ranks a term by WHO declares it: TS 23.501 §3.2 says an
+    -- abbreviation defined in the present document takes precedence over TR 21.905,
+    -- so a spec-sourced row outranks the general vocabulary. ETSI states no such
+    -- rule and has no TR 21.905 — every deliverable declares its own vocabulary and
+    -- none of them is more authoritative in general. So the only honest signal left
+    -- is agreement, and it has to be COUNTED at write time: the primary key keeps
+    -- one row per distinct expansion, so by the time a reader asks, the corpus can
+    -- no longer say whether "Mobile-services Switching Centre" came from forty
+    -- deliverables or from one.
+    --
+    -- NULL means "not counted" and reads as 1, which is what every 3GPP writer
+    -- means: one spec's Abbreviations clause, one declaration.
+    declared_by   INTEGER,
     PRIMARY KEY (term, expansion, domain)
 );
 

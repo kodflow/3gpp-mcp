@@ -64,6 +64,17 @@ ERR="$ROOT/.local/prove.stderr"
   echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_spec","arguments":{"query":"AMF registration procedure over N1","mode":"semantic","limit":3}}}'
   echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_spec","arguments":{"query":"lawful interception X1 ADMF task activation","spec_type":"any","limit":5}}}'
   echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"trace_evolution","arguments":{"term":"MME"}}}'
+  # THE GLOSSARY WAS NOT PROVEN HERE AT ALL, on either half — and it is the arm
+  # that answers in WORDS rather than in hits, so a wrong row is read as a fact
+  # instead of skimmed as a result. PR #279 repaired the 3GPP ranking; this
+  # harness could not have caught the defect it repaired, nor the identical one
+  # that was still live on the ETSI half a month later.
+  #
+  # UICC is the ETSI-ONLY probe: TS 21.905 does not carry it, so an answer can
+  # only have come from the federated half. MSC is the AMBIGUOUS probe: twelve
+  # expansions in the ETSI archive, which is where an arbitrary order shows.
+  echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"resolve_term","arguments":{"term":"UICC"}}}'
+  echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"resolve_term","arguments":{"term":"MSC"}}}'
 } | .local/bin/server-full.exe serve -no-update --db data/3gpp.duckdb --etsi-db data/etsi.duckdb >"$OUT" 2>"$ERR"
 
 echo "===== server_info ====="
