@@ -49,42 +49,78 @@ func TestThePublishIsAStepNotAnEntryPoint(t *testing.T) {
 	}
 }
 
-// TestPublishRunsAfterBothHalvesAreFrozen, with the negative control that makes
-// the second dependency load-bearing: index-etsi is NOT reachable from smoke, so
-// depending on smoke alone would leave the publish unordered against the ETSI
-// freeze — and an ETSI corpus whose HNSW is still "building" is one the server
-// refuses to serve.
+// TestPublishRunsAfterBothHalvesAreFrozen — an ETSI corpus whose HNSW is still
+// "building" is one the server refuses to serve, so the publish must be ordered
+// after that freeze.
+//
+// THIS TEST WAS RE-DERIVED ON 2026-09-07, at its own instruction. Its control
+// used to be that index-etsi is NOT reachable from smoke: while that held,
+// publish naming index-etsi directly was the only thing ordering the two, and the
+// control kept that dependency load-bearing rather than decorative. It then
+// fired, exactly as designed:
+//
+//	index-etsi is already reachable from smoke — this test no longer proves
+//	anything; re-derive what orders the publish after the ETSI freeze
+//
+// What changed is that `validate` gained a dependency on index-etsi, because the
+// strengthened contract asserts the ETSI HNSW is frozen and validate was running
+// BEFORE the step that freezes it (build 24 failed on exactly that). smoke
+// depends on validate, so the reachability the control forbade is now the very
+// thing that guarantees the ordering — and it guarantees it better: the old chain
+// merely ran after the freeze, this one runs after a gate that CHECKED it.
+//
+// So the assertion moves from "publish names index-etsi" to "publish cannot run
+// before index-etsi", which is the property that was always meant. The control
+// moves with it: the ordering must not rest on publish's own Deps alone, or
+// removing the validate dependency would silently restore the build-24 failure
+// with this test still green.
 func TestPublishRunsAfterBothHalvesAreFrozen(t *testing.T) {
 	steps := map[string]*Step{}
 	for _, s := range Pipeline() {
 		steps[s.Name] = s
 	}
-	pub := steps["publish"]
-	for _, want := range []string{"smoke", "index-etsi"} {
-		if !slices.Contains(pub.Deps, want) {
-			t.Errorf("publish does not depend on %s — it can ship a half nothing finished (deps: %v)", want, pub.Deps)
-		}
-	}
 
-	// The control: if smoke already ordered index-etsi, naming it would be
-	// decoration and this test would pass for the wrong reason.
-	seen := map[string]bool{}
-	var reach func(string)
-	reach = func(n string) {
-		if seen[n] {
-			return
-		}
-		seen[n] = true
-		if s, ok := steps[n]; ok {
+	reachFrom := func(start string, skipDirect string) map[string]bool {
+		seen := map[string]bool{}
+		var reach func(string)
+		reach = func(n string) {
+			if seen[n] {
+				return
+			}
+			seen[n] = true
+			s, ok := steps[n]
+			if !ok {
+				return
+			}
 			for _, d := range append(append([]string{}, s.Deps...), s.AnyDeps...) {
+				if n == start && d == skipDirect {
+					continue
+				}
 				reach(d)
 			}
 		}
+		reach(start)
+		return seen
 	}
-	reach("smoke")
-	if seen["index-etsi"] {
-		t.Error("index-etsi is already reachable from smoke — this test no longer proves anything; " +
-			"re-derive what orders the publish after the ETSI freeze")
+
+	if !slices.Contains(steps["publish"].Deps, "smoke") {
+		t.Errorf("publish does not depend on smoke — it can ship a corpus nothing exercised (deps: %v)",
+			steps["publish"].Deps)
+	}
+	for _, want := range []string{"index", "index-etsi", "validate"} {
+		if !reachFrom("publish", "")[want] {
+			t.Errorf("publish can run before %s — it would ship a half nothing finished", want)
+		}
+	}
+
+	// THE CONTROL, re-derived. Ignore publish's own direct edge to index-etsi and
+	// the ordering must still hold, through validate. If it does not, this test is
+	// green only because of a dependency that the build-24 failure showed is not
+	// where the guarantee belongs.
+	if !reachFrom("publish", "index-etsi")["index-etsi"] {
+		t.Error("the ordering rests only on publish's direct dependency: nothing between " +
+			"index-etsi and publish requires the ETSI freeze, so validate could drift back " +
+			"before it (build 24 failed exactly that way) with this test still passing")
 	}
 }
 
