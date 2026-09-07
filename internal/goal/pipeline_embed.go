@@ -748,12 +748,31 @@ func envOr(key, def string) string {
 
 // ------------------------------------------------------------------ validate
 
+// stepValidate runs the data-completeness contract.
+//
+// IT DEPENDS ON index-etsi, AND THAT IS NOT COSMETIC ORDERING. The contract now
+// carries --require-etsi, which asserts the ETSI half's HNSW is FROZEN — and the
+// step that freezes it is index-etsi. With only "index" declared, validate ran
+// between the 3GPP index and the ETSI one and failed on a corpus that was
+// perfectly fine:
+//
+//	[FAIL] require-etsi: … hnsw_state="building"
+//	       the server would REFUSE the ETSI index: hnsw not frozen
+//
+// Measured on build 24 (2026-09-07), the first run of the strengthened contract.
+// The ordering defect was always there; the weak contract never looked at the
+// ETSI half, so nothing could see it. A gate that is not on the path proves
+// nothing — and this is the same lesson one level down, found by fixing it.
+//
+// validate is the LAST gate before smoke and publish, so it must come after
+// everything it inspects. Declaring the dependency rather than relying on list
+// order is what makes that true of the DAG and not just of this file.
 func stepValidate() *Step {
 	return &Step{
 		Name:    "validate",
 		Version: 1,
 		Doc:     "run the data-completeness contract against the finished corpus",
-		Deps:    []string{"index"},
+		Deps:    []string{"index", "index-etsi"},
 		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			return []string{c.dataPath("3gpp.duckdb")}, nil
