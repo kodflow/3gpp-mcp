@@ -76,3 +76,24 @@ func testRepoRoot(t *testing.T) string {
 	}
 	return root
 }
+
+// AN OPERATOR-SUPPLIED DATA_ETSI_DB MUST WIN.
+//
+// The repo path is a DEFAULT, not an override. It used to be appended to
+// os.Environ() unconditionally, and later entries take precedence in exec's
+// environment — so a corpus kept somewhere else was silently checked at the repo
+// path instead. Silently checking the wrong file is worse than checking none:
+// the gate still reports [ok].
+func TestAnOperatorSuppliedETSIPathIsNotOverridden(t *testing.T) {
+	root := testRepoRoot(t)
+	custom := filepath.Join(t.TempDir(), "elsewhere.duckdb")
+	t.Setenv("DATA_ETSI_DB", custom)
+
+	flags := dataContractFlags(root)
+	if !strings.Contains(flags, custom) {
+		t.Errorf("the operator's DATA_ETSI_DB was ignored: %q", flags)
+	}
+	if strings.Contains(flags, filepath.Join(root, "data", "etsi.duckdb")) {
+		t.Errorf("the repo default overrode the operator's path: %q", flags)
+	}
+}

@@ -200,3 +200,31 @@ fn a_first_bake_with_the_flag_is_still_treated_as_a_bulk_load() {
         "an empty clause_sparse was loaded with the term_id index in place: {log}"
     );
 }
+
+/// THE SKIP COUNT MUST BE WHAT THIS LEDGER SKIPPED, not how much the corpus holds.
+///
+/// It used to print `already.len()` — the size of the whole existing set — which
+/// is right only when the ledger happens to cover the entire corpus. With a ledger
+/// that is a SUBSET, it overstated the skip by everything the ledger never
+/// mentioned. That is the same overstatement the dense arm was fixed for, and a
+/// log that does it is the number someone quotes back when the corpus is wrong.
+#[test]
+fn the_skip_count_describes_the_ledger_not_the_corpus() {
+    let t = Tmp::new("count");
+    let db = t.db();
+    seed(&db, 5);
+    let led = t.join("l.jsonl");
+
+    ledger(&led, 5, 0.5);
+    run(&db, &led, false);
+    assert_eq!(posted_clauses(&db), 5);
+
+    // A ledger covering only 2 of the 5 posted clauses.
+    ledger(&led, 2, 0.5);
+    let log = run(&db, &led, true);
+
+    assert!(
+        log.contains("skipped 2 already posted"),
+        "the skip count reports the corpus, not the ledger — expected 2, log said: {log}"
+    );
+}
