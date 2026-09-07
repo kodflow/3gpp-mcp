@@ -11,15 +11,31 @@
 # between the two gates (the "half-baked image" failure mode this exists to prevent).
 #
 # Env (CI repo variables / job env):
-#   DATA_CONTRACT     dense | dense+sparse | dense+sparse+etsi   (default: dense)
+#   DATA_CONTRACT     dense | dense+sparse | dense+sparse+etsi   (default: dense+sparse+etsi)
 #   DATA_EMBED_FLOOR  release floor for dense convergence, e.g. Rel-99 (default: all)
 #
-# RATCHET: keep DATA_CONTRACT=dense until the first full sparse bake exists, then flip
-# to dense+sparse; add +etsi only once cmd/validate/check-data gain --require-etsi
-# (ETSI ingestion, Phase C). dense = FTS + frozen HNSW + dense embed converged.
+# RATCHET — ADVANCED 2026-09-07 to dense+sparse+etsi, both conditions now met.
+#
+# The original note said: keep dense until the first full sparse bake exists, then
+# flip to dense+sparse; add +etsi once both gate binaries gain --require-etsi.
+#
+#   full sparse bake   3GPP 194 111 501 postings, ETSI 127 476 905, both at
+#                      sparse_model=b13103bce7ae            (build 23, measured)
+#   --require-etsi     declared by cmd/validate AND mcp-3gpp check-data
+#
+# WHY THE DEFAULT AND NOT THE CALLERS. The strong contract already existed and was
+# already passed by hand in .local/resume/*.sh — but `make build`, the command that
+# actually publishes, sourced only the toolchain prelude and therefore validated
+# with the WEAK contract. Build 23 published a corpus whose sparse layer and whose
+# entire ETSI half were never checked. A gate that exists but is not on the path
+# that runs is the failure mode this file was written to prevent, so the strength
+# belongs in the DEFAULT, where forgetting to pass it cannot silently weaken it.
+#
+# Loosening is still possible and still deliberate: DATA_CONTRACT=dense for a
+# corpus that genuinely has no sparse layer yet.
 set -euo pipefail
 
-level="${DATA_CONTRACT:-dense}"
+level="${DATA_CONTRACT:-dense+sparse+etsi}"
 floor="${DATA_EMBED_FLOOR:-}"
 
 flags="--require-fts --require-hnsw --require-embed-complete"
