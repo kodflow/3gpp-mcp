@@ -643,8 +643,6 @@ impl Store {
         Ok(v)
     }
 
-
-
     /// set_embeddings_batch writes (vector, hash) onto each clause in ONE transaction —
     /// the scalable write path (== Go SetEmbeddingsBatch). ids/vecs/hashes are parallel.
     pub fn set_embeddings_batch(
@@ -723,11 +721,6 @@ impl Store {
         Ok(t.eq_ignore_ascii_case("VIEW"))
     }
 
-
-
-
-
-
     /// set_sparse replaces the sparse posting for one clause (idempotent: stale terms
     /// deleted first). `terms` are (term_id, weight) pairs. == Go SetSparse.
     pub fn set_sparse(&self, chunk_id: u64, terms: &[(u32, f32)]) -> Result<()> {
@@ -741,8 +734,6 @@ impl Store {
         self.conn.execute_batch(&sql).context("set_sparse")?;
         Ok(())
     }
-
-
 
     /// drop_clause_indexes / create_clause_indexes bracket a bulk load of `clauses`,
     /// for the same reason the sparse pair above brackets `clause_sparse` — and the
@@ -794,8 +785,6 @@ impl Store {
             .context("rebuild clause indexes after bulk load")?;
         Ok(())
     }
-
-
 
     /// enable_fts builds the BM25 FTS index over heading+text (best-effort; the caller
     /// degrades to LIKE if the extension is unavailable). == Go EnableFTS.
