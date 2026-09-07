@@ -51,9 +51,11 @@ fn is_descendant(root: &str, path: &str) -> bool {
 /// digit, which is every numbered sibling AND every sub-clause. In the shape ETSI
 /// and 3GPP both use most of the time:
 ///
-///     3    Definitions and abbreviations   <- matched here
-///     3.1  Definitions                     <- numeric path: STOPPED here
-///     3.2  Abbreviations                   <- the actual list, never read
+/// ```text
+/// 3    Definitions and abbreviations   <- matched here
+/// 3.1  Definitions                     <- numeric path: STOPPED here
+/// 3.2  Abbreviations                   <- the actual list, never read
+/// ```
 ///
 /// the region was the parent heading alone, which holds no abbreviation lines. The
 /// list two clauses down was never reached, and the pass reported success over it.
