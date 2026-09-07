@@ -62,12 +62,24 @@ type Acronym struct {
 	Domain       string `json:"domain"` // 5GC|EPC|IMS|RAN|""
 	FirstRelease string `json:"first_release"`
 	LastRelease  string `json:"last_release"`
-	// SourceSeries is the 2-digit 3GPP series of the spec that seeded this entry
-	// (e.g. "21" for the glossary subject's TS 21.905). It is provenance, not part
-	// of the (Term, Expansion, Domain) identity: the incremental merge uses it to
-	// scope-purge a changed subject's acronym rows before re-folding the shard, so
-	// a corrected/removed term actually replaces the stale base row (plan PR-4).
+	// SourceSeries is the document this entry was seeded from: the 2-digit 3GPP
+	// series of a glossary subject ("21" for TS 21.905), the spec id when a spec
+	// declares the term in its own Abbreviations clause ("23.501"), or the ETSI
+	// deliverable that declares it ("ETSI TS 103 221-1"). It is provenance, not
+	// part of the (Term, Expansion, Domain) identity: the incremental merge uses
+	// it to scope-purge a changed subject's acronym rows before re-folding the
+	// shard, so a corrected/removed term actually replaces the stale base row
+	// (plan PR-4).
 	SourceSeries string `json:"source_series"`
+	// DeclaredBy is HOW MANY documents declare this exact expansion, and it is
+	// what ranks a corpus that states no precedence rule of its own.
+	//
+	// 3GPP states one — TS 23.501 §3.2 puts the present document above TR 21.905 —
+	// so SourceSeries decides there and this stays 0: uncounted, stored NULL, read
+	// as 1. ETSI states none and publishes no vocabulary deliverable: 5 142
+	// deliverables each declare their own terms, so the only honest signal is how
+	// many of them agree. Without it the ETSI half answered alphabetically.
+	DeclaredBy int `json:"declared_by,omitempty"`
 }
 
 // Evolution is an inter-entity evolution edge (table: evolutions), e.g.

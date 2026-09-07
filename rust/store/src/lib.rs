@@ -44,6 +44,20 @@ pub struct WorkItem {
     pub text: String,
 }
 
+/// One mined glossary row for replace_mined_acronyms.
+///
+/// `source` is the deliverable that declares it ("ETSI TS 103 221-1") and `version`
+/// that deliverable's version — an ETSI release is the constant "ETSI", so stamping
+/// it would put no information in a field the caller reads to know when a term
+/// applied. `declared_by` is how many deliverables declare this exact expansion.
+pub struct MinedAcronym {
+    pub term: String,
+    pub expansion: String,
+    pub version: String,
+    pub source: String,
+    pub declared_by: i64,
+}
+
 /// A clause to ingest (no vector yet — embedding/embedding_hash default NULL). Mirrors
 /// the columns Go's InsertClauses writes; the Rust ingest builds these from the parser.
 pub struct ClauseIn {
@@ -116,6 +130,22 @@ impl Store {
         let conn = Connection::open(path).with_context(|| format!("open duckdb rw {path}"))?;
         conn.execute_batch(&schema_for(&conn))
             .context("bootstrap schema")?;
+
+        // ADDITIVE COLUMNS, because CREATE TABLE IF NOT EXISTS cannot add one.
+        //
+        // The two runtimes single-source the DDL (SCHEMA_SQL above is the Go file),
+        // which makes a FRESH corpus identical either way — and hides that only the
+        // Go store carried migrations. An existing corpus opened by this writer kept
+        // whatever columns it was created with, so adding one to schema.sql would
+        // have compiled, passed every test on a temp database, and then failed on
+        // the 44 GiB corpus that matters with "Binder Error: table acronyms has 6
+        // columns but 7 values were supplied".
+        //
+        // IF NOT EXISTS makes it a no-op on a corpus that already has the column,
+        // and this runs on open rather than at first write so a reader of an old
+        // corpus sees the same shape a writer does.
+        conn.execute_batch("ALTER TABLE acronyms ADD COLUMN IF NOT EXISTS declared_by INTEGER;")
+            .context("add acronyms.declared_by")?;
 
         // A WRITER MUST BE ABLE TO BIND AN HNSW INDEX THAT IS ALREADY THERE.
         //
@@ -1432,6 +1462,11 @@ impl Store {
 
     /// upsert_acronym inserts/updates a glossary acronym (== Go UpsertAcronym). The PK is
     /// (term, expansion, domain) so the same term keeps every distinct expansion/domain.
+    ///
+    /// `declared_by` is how many documents declare this exact expansion; 0 means NOT
+    /// COUNTED and is stored as NULL, which Store.ResolveTerm reads as 1. It is what
+    /// ranks the ETSI half, which has no precedence rule of its own to rank it by —
+    /// see internal/store/schema.sql.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_acronym(
         &self,
@@ -1441,18 +1476,108 @@ impl Store {
         first_release: &str,
         last_release: &str,
         source_series: &str,
+        declared_by: i64,
     ) -> Result<()> {
+        // NULL, not 0, for an uncounted row: zero would sort BELOW every counted row
+        // while asserting "no document declares this", which is false of a row that
+        // exists at all.
+        let declared: Option<i64> = if declared_by > 0 {
+            Some(declared_by)
+        } else {
+            None
+        };
         self.conn
             .execute(
-                "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series)
-                 VALUES (?, ?, ?, ?, ?, ?)
+                "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (term, expansion, domain) DO UPDATE SET
                    first_release = excluded.first_release, last_release = excluded.last_release,
-                   source_series = excluded.source_series",
-                duckdb::params![term, expansion, domain, first_release, last_release, source_series],
+                   source_series = excluded.source_series, declared_by = excluded.declared_by",
+                duckdb::params![term, expansion, domain, first_release, last_release, source_series, declared],
             )
             .with_context(|| format!("upsert_acronym {term}"))?;
         Ok(())
+    }
+
+    /// replace_mined_acronyms REPLACES the ETSI half's mined vocabulary, in ONE
+    /// transaction, instead of adding to it.
+    ///
+    /// WHY REPLACE. The pass reads the NEWEST version of every deliverable and
+    /// upserts what it finds, so it could only ever grow the table: an expansion a
+    /// later version corrected, or dropped, kept its row for ever beside the
+    /// current one and stayed visible through resolve_term. The vocabulary is a
+    /// SNAPSHOT of what the archive says now, and an additive writer cannot express
+    /// that.
+    ///
+    /// THE SCOPE IS THE PROVENANCE, which is why this could not have been written
+    /// before the rows carried one: `ETSI TS 103 221-1` and the rest all begin with
+    /// "ETSI ", and the legacy constant "etsi" is included so the first run after
+    /// this change clears the un-citable rows it replaces. Nothing else in the
+    /// table matches, so a 3GPP row cannot be caught by it.
+    ///
+    /// ONE TRANSACTION, because a delete that commits without its insert is an
+    /// empty glossary — and `enrich-etsi`'s Validate would then be the only thing
+    /// standing between that and a published corpus.
+    pub fn replace_mined_acronyms(&self, rows: &[MinedAcronym]) -> Result<usize> {
+        self.conn
+            .execute_batch("BEGIN;")
+            .context("begin acronym replace")?;
+        let res = (|| -> Result<usize> {
+            self.conn
+                .execute(
+                    "DELETE FROM acronyms WHERE source_series = 'etsi' OR source_series LIKE 'ETSI %'",
+                    [],
+                )
+                .context("purge the previously mined vocabulary")?;
+            let mut n = 0usize;
+            for r in rows {
+                // A row with no term or no expansion is not a glossary entry, and it
+                // would be INVISIBLE afterwards: the primary key accepts it, and
+                // resolve_term matches on lower(term), so an empty one answers
+                // nothing and can never be found again to be removed. Rejecting it
+                // here is also what makes the transaction observable — the rollback
+                // path has to be reachable by a test, or "one transaction" is a
+                // claim rather than a behaviour.
+                if r.term.trim().is_empty() || r.expansion.trim().is_empty() {
+                    anyhow::bail!(
+                        "refusing to write a glossary row with an empty term or expansion (source {})",
+                        r.source
+                    );
+                }
+                self.conn
+                    .execute(
+                        "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (term, expansion, domain) DO UPDATE SET
+                           first_release = excluded.first_release, last_release = excluded.last_release,
+                           source_series = excluded.source_series, declared_by = excluded.declared_by",
+                        duckdb::params![
+                            r.term,
+                            r.expansion,
+                            "",
+                            r.version,
+                            r.version,
+                            r.source,
+                            r.declared_by
+                        ],
+                    )
+                    .with_context(|| format!("insert acronym {}", r.term))?;
+                n += 1;
+            }
+            Ok(n)
+        })();
+        match res {
+            Ok(n) => {
+                self.conn
+                    .execute_batch("COMMIT;")
+                    .context("commit acronym replace")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 }
 
