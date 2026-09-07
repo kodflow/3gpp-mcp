@@ -1,7 +1,7 @@
 // Command discover-etsi is the ETSI analogue of cmd/discover: it decides which ETSI
 // deliverables to (re)fetch by crawling the deterministic /deliver directory tree and
 // diffing the live PUBLISHED versions against a persisted etsi-index.json. It feeds
-// the SAME shape of work-list scripts/etsi-corpus.sh consumes, so the ETSI builder and
+// the SAME shape of work-list scripts/etsi-fetch.sh consumes, so the ETSI builder and
 // its index agree by construction (the property that closes 3GPP's attribution gap).
 //
 //	discover-etsi --emit-worklist [--specs "103 221-1,103 280,…"] [--index etsi-index.json]
@@ -44,7 +44,7 @@ var defaultLISpecs = []string{
 func main() {
 	specsFlag := flag.String("specs", "", "comma/space-separated ETSI TS ids to scope (e.g. '103 221-1,103 280'); empty = the built-in LI suite")
 	indexPath := flag.String("index", "", "etsi-index.json (id -> indexed version); empty/missing => full (every scoped spec selected)")
-	emitWL := flag.Bool("emit-worklist", false, "print the FETCH worklist '<id>\\t<pdf-url>\\t<version>' for every CHANGED/new scoped spec (drives etsi-corpus.sh)")
+	emitWL := flag.Bool("emit-worklist", false, "print the FETCH worklist '<id>\\t<pdf-url>\\t<version>' for every CHANGED/new scoped spec (drives etsi-fetch.sh)")
 	report := flag.String("report", "matrix", "matrix (JSON array of changed ids, for the CI matrix) | worklist")
 	allFlag := flag.Bool("all", false, "enumerate the WHOLE ETSI /deliver corpus (etsi_ts+etsi_tr+etsi_en) — the latest PUBLISHED version of EVERY deliverable, not just the LI suite. Tens of thousands of specs; pair with --report worklist + a chunked CI matrix.")
 	typeDirsFlag := flag.String("type-dirs", strings.Join(etsicat.DeliverTypeDirs, ","), "with --all: which /deliver document-type folders to crawl (comma/space-separated)")
@@ -304,7 +304,7 @@ func main() {
 			if td == "" {
 				td = model.EtsiTypeTS
 			}
-			// Fourth column: the document type ("TS"/"TR"/"EN"). scripts/etsi-corpus.sh
+			// Fourth column: the document type ("TS"/"TR"/"EN"). scripts/etsi-fetch.sh
 			// puts it in the provenance header so the corpus can call a TR a TR
 			// instead of filing every deliverable as "ETSI TS". A reader of an older
 			// three-column list still parses (the field is simply empty) and the

@@ -95,6 +95,11 @@ func Pipeline() []*Step {
 		// lexical-only ETSI — would let one corpus fall silently behind, which is
 		// precisely the state the tooling was in.
 		stepDiscoverETSI(),
+		// fetch-etsi and corpus-etsi are the ETSI analogues of fetch and ingest.
+		// They were one step until 2026-09-07, which meant a change to the Rust
+		// parser re-ran the downloads and a change to the download script re-ran the
+		// parse.
+		stepFetchETSI(),
 		stepCorpusETSI(),
 		stepEmbed(corpusETSI()),
 		// The ETSI half gets the content-addressed conversion too. Without it
@@ -641,7 +646,7 @@ func stepTest() *Step {
 // nobody.
 //
 // A missing bash is FATAL here rather than skipped: the pipeline already requires
-// bash for corpus.sh and etsi-corpus.sh, so "no bash" means the run was never
+// bash for corpus.sh, etsi-fetch.sh and etsi-ingest.sh, so "no bash" means the run was never
 // going to work, and quietly passing a test step would say the opposite.
 func runShellTests(c *Ctx) (int, error) {
 	// Both levels: scripts/ and scripts/<pkg>/. A single-level glob would have

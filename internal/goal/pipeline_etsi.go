@@ -69,19 +69,101 @@ func stepDiscoverETSI() *Step {
 	}
 }
 
-// stepCorpusETSI downloads, converts and ingests the ETSI deliverables.
+// stepFetchETSI downloads and converts the ETSI deliverables to HTML. It is the
+// ETSI analogue of `fetch`, and it exists because acquisition and ingestion used
+// to be ONE step.
 //
-// Acquisition and ingestion are one step rather than three because
-// scripts/etsi-corpus.sh already streams them per deliverable (download →
-// pdftotext → HTML → ingest at the end) and is itself resumable: an existing
-// converted HTML is skipped. Splitting it would mean rewriting that streaming
-// into the pipeline for no gain.
+// THE COMMENT THIS REPLACES SAID "splitting it would mean rewriting that
+// streaming into the pipeline for no gain", and it was wrong on both halves.
+//
+// There was no streaming to rewrite: scripts/etsi-corpus.sh ran the whole
+// download loop to completion and only then called the ingest once. The cut is
+// where the script already had a seam.
+//
+// And the gain is provenance. One step declaring both the downloader and the
+// Rust parser means either invalidates both. Measured on build 24 (2026-09-07):
+//
+//	STEP corpus-etsi
+//	  reason  implementation changed: rust/store/src/lib.rs
+//
+// rust/store/src/lib.rs cannot alter one downloaded byte, and this is the same
+// over-broad-declaration defect that cost an hour on this very step in build 20 —
+// one level up, and still unfixed at that level.
+//
+// It is also the only place in the ETSI chain where PARALLELISM is available.
+// Every other heavy step is bounded by the 16 GB DuckDB writer cap, and the
+// machine has 28 GB, so no two of those can overlap — measured before writing any
+// of this. Downloads are network-bound and pdftotext is small and short-lived, so
+// the loop is a worker pool now (see scripts/etsi-fetch.sh).
+func stepFetchETSI() *Step {
+	return &Step{
+		Name:    "fetch-etsi",
+		Version: 1,
+		Doc:     "download the ETSI deliverables and convert them to HTML (PDF text layer)",
+		// build-go, not build-rust: this step runs cmd/discover-etsi and never
+		// touches the Rust ingest. That asymmetry IS the split.
+		Deps: []string{"discover-etsi", "build-go"},
+		Impl: []string{
+			"scripts/etsi-fetch.sh",
+			"scripts/lib/etsi-common.sh",
+			// convert_pdf lives here and is called from the worker.
+			"scripts/lib/convert.sh",
+			// The binary this step runs to build its work list.
+			"cmd/discover-etsi",
+		},
+		Inputs: func(c *Ctx) ([]string, error) {
+			return []string{c.statePath("etsi-worklist.tsv")}, nil
+		},
+		Heavy: true,
+		// No Outputs, exactly as `fetch` declares none. What this step produces is a
+		// tree of converted HTML whose per-file enumeration would make the
+		// fingerprint enormous; `corpus-etsi` takes that tree as its INPUT instead,
+		// which is where the signal is actually needed.
+		Outputs: func(c *Ctx) []string { return nil },
+		Run: func(c *Ctx) error {
+			if _, err := c.Output(Cmd{Name: "pdftotext", Args: []string{"-v"}}); err != nil {
+				// pdftotext -v exits non-zero on some builds while still printing a
+				// version, so only a missing binary is fatal.
+				if _, lookErr := lookPath("pdftotext"); lookErr != nil {
+					return fmt.Errorf("pdftotext (poppler/xpdf) is required to read ETSI PDFs and is not on PATH: %w", lookErr)
+				}
+			}
+			env := []string{
+				"DISCOVER_ETSI_BIN=" + c.bin("discover-etsi"),
+				"ETSI_CONVERT=" + c.dataPath("sources", "convert-etsi"),
+				"ETSI_ORIGIN=" + c.dataPath("sources", "etsi-origin"),
+			}
+			env = append(env, etsiScopeEnv(c.Cfg("etsi_scope"))...)
+
+			c.Log.Printf("fetching the ETSI deliverables (PDF text layer, never OCR)")
+			if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-fetch.sh"}, Env: env, Echo: true}); err != nil {
+				return err
+			}
+			n := countFiles(c.dataPath("sources", "convert-etsi"), ".html")
+			c.Checkpoint("etsi_converted", strconv.Itoa(n))
+			// ZERO CONVERTED FILES IS A FAILURE, NOT AN EMPTY RESULT. The ingest would
+			// otherwise run on nothing and leave a schema-only DB that serves as an
+			// empty corpus without complaining — the failure mode corpus-etsi's own
+			// Validate was written to catch, caught one step earlier and named.
+			if n == 0 {
+				return fmt.Errorf("the ETSI fetch converted no deliverable at all under %s",
+					c.dataPath("sources", "convert-etsi"))
+			}
+			return nil
+		},
+	}
+}
+
+// stepCorpusETSI ingests the converted ETSI deliverables into data/etsi.duckdb.
+//
+// Acquisition is `fetch-etsi`; this step is the ETSI analogue of `ingest`, and it
+// declares the Rust chain and nothing else.
 func stepCorpusETSI() *Step {
 	return &Step{
 		Name:    "corpus-etsi",
-		Version: 2,
-		Doc:     "download, extract and ingest the ETSI deliverables into data/etsi.duckdb",
-		Deps:    []string{"discover-etsi", "build-rust"},
+		Version: 3,
+		Doc:     "ingest the converted ETSI deliverables into data/etsi.duckdb",
+		Deps:    []string{"fetch-etsi", "build-rust"},
 		// NAMED FILES, NOT THE CRATE. This step runs exactly one binary, `ingest`,
 		// whose source is rust/ingest/src/main.rs. It never invokes anything from
 		// rust/ingest/src/bin — ETSI has no Lawful-Interception registry, no 5GC
@@ -95,8 +177,12 @@ func stepCorpusETSI() *Step {
 		// from identical input — and this step would have kept the old ones without
 		// a word. The 3GPP `ingest` step already declares both; this is the same
 		// declaration, minus the binaries neither of them runs.
+		// scripts/lib/convert.sh IS GONE FROM THIS LIST, and its absence is the
+		// point of the split: convert_pdf is called by the fetch and by nothing
+		// here. It is not sourced by the shared prelude either, so the omission is
+		// a fact about the code rather than a claim about it.
 		Impl: []string{
-			"scripts/etsi-corpus.sh", "scripts/lib/convert.sh",
+			"scripts/etsi-ingest.sh", "scripts/lib/etsi-common.sh",
 			// The binary this step runs, and its manifest.
 			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml",
 			// The crates it links. rust/store/src/lib.rs, NOT rust/store/src, which
@@ -109,7 +195,14 @@ func stepCorpusETSI() *Step {
 			"internal/store/schema.sql",
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.statePath("etsi-worklist.tsv")}, nil
+			// THE CONVERTED TREE IS THE INPUT NOW, not the work list. The work list
+			// says what SHOULD have been fetched; the tree is what the fetch actually
+			// produced, and it is the only thing this step reads. Declaring the
+			// directory rather than every file mirrors `ingest` on the 3GPP side: the
+			// per-file enumeration would make the fingerprint enormous, and
+			// `ingest --resume` is the real per-deliverable checkpoint through the
+			// ingest_log table.
+			return []string{c.dataPath("sources", "convert-etsi", "ETSI")}, nil
 		},
 		Heavy:   true,
 		Outputs: func(c *Ctx) []string { return []string{c.dataPath("etsi.duckdb")} },
@@ -130,21 +223,15 @@ func stepCorpusETSI() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			if _, err := c.Output(Cmd{Name: "pdftotext", Args: []string{"-v"}}); err != nil {
-				// pdftotext -v exits non-zero on some builds while still printing a
-				// version, so only a missing binary is fatal.
-				if _, lookErr := lookPath("pdftotext"); lookErr != nil {
-					return fmt.Errorf("pdftotext (poppler/xpdf) is required to read ETSI PDFs and is not on PATH: %w", lookErr)
-				}
-			}
+			// pdftotext IS NOT CHECKED HERE ANY MORE. It is the fetch's tool, and this
+			// step neither converts nor reads a PDF. Keeping the guard would have been
+			// the same over-broad coupling as the provenance it just shed.
 			env := []string{
-				"DISCOVER_ETSI_BIN=" + c.bin("discover-etsi"),
 				"INGEST_BIN=" + c.rbin("ingest"),
 				"ETSI_OUT=" + c.dataPath("etsi.duckdb"),
 				"ETSI_CONVERT=" + c.dataPath("sources", "convert-etsi"),
 				"ETSI_ORIGIN=" + c.dataPath("sources", "etsi-origin"),
 			}
-			env = append(env, etsiScopeEnv(c.Cfg("etsi_scope"))...)
 
 			// THIS STEP WRITES CLAUSES, so it needs the corpus in write shape.
 			//
@@ -163,8 +250,8 @@ func stepCorpusETSI() *Step {
 				return fmt.Errorf("the ETSI corpus could not be put back into write shape: %w", err)
 			}
 
-			c.Log.Printf("building the ETSI corpus (PDF text layer, never OCR)")
-			return c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-corpus.sh"}, Env: env, Echo: true})
+			c.Log.Printf("ingesting the converted ETSI deliverables")
+			return c.Run(Cmd{Name: "bash", Args: []string{"scripts/etsi-ingest.sh"}, Env: env, Echo: true})
 		},
 	}
 }
