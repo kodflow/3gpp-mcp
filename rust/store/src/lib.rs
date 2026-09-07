@@ -1626,6 +1626,26 @@ impl Store {
                     [],
                 )
                 .context("purge the previously mined vocabulary")?;
+            // ONE PREPARED STATEMENT, REUSED. Measured on build 26c: this loop called
+            // conn.execute() per row, which re-parses and re-plans the INSERT against
+            // a 49.7 GB catalog every time — 28 154 rows took about 95 MINUTES, and
+            // the step's whole cost was that loop rather than the mining it exists to
+            // do. The parse of all 5 142 deliverables before it takes ~35 min.
+            //
+            // The transaction is what hides it: DuckDB keeps the changes in memory
+            // until COMMIT, so the corpus file's mtime never moves and the step looks
+            // like it is still reading. It is not — it is re-planning one statement
+            // twenty-eight thousand times.
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (term, expansion, domain) DO UPDATE SET
+                       first_release = excluded.first_release, last_release = excluded.last_release,
+                       source_series = excluded.source_series, declared_by = excluded.declared_by",
+                )
+                .context("prepare the glossary insert")?;
             let mut n = 0usize;
             for r in rows {
                 // A row with no term or no expansion is not a glossary entry, and it
@@ -1641,24 +1661,16 @@ impl Store {
                         r.source
                     );
                 }
-                self.conn
-                    .execute(
-                        "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (term, expansion, domain) DO UPDATE SET
-                           first_release = excluded.first_release, last_release = excluded.last_release,
-                           source_series = excluded.source_series, declared_by = excluded.declared_by",
-                        duckdb::params![
-                            r.term,
-                            r.expansion,
-                            "",
-                            r.version,
-                            r.version,
-                            r.source,
-                            r.declared_by
-                        ],
-                    )
-                    .with_context(|| format!("insert acronym {}", r.term))?;
+                stmt.execute(duckdb::params![
+                    r.term,
+                    r.expansion,
+                    "",
+                    r.version,
+                    r.version,
+                    r.source,
+                    r.declared_by
+                ])
+                .with_context(|| format!("insert acronym {}", r.term))?;
                 n += 1;
             }
             Ok(n)
