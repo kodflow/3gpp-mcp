@@ -155,13 +155,55 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 	}
 }
 
-// enrich is the STEP THAT MAY declare the bin directory, and the contrast is the
-// point: it invokes ingest-catalog, ingest-openapi and ingest-li, so those files
-// really are its implementation. Left as-is deliberately — this test records why
-// it is not a leftover.
-func TestEnrichKeepsTheBinDirectoryOnPurpose(t *testing.T) {
-	if !contains(stepEnrich().Impl, "rust/ingest/src/bin") {
-		t.Fatal("enrich no longer watches the binaries it runs — an overlay fix would not replay")
+// EACH ENRICH ARM WATCHES THE BINARIES IT RUNS, AND ONLY THOSE.
+//
+// This test used to say the opposite, and recorded it as deliberate: enrich was
+// "the step that MAY declare the bin directory […] every file in there really is
+// its implementation". That held while rust/ingest/src/bin contained exactly the
+// three overlays the 3GPP arm runs. ingest_glossary.rs sits in the same
+// directory and belongs to the ETSI arm, so the directory form now makes an ETSI
+// glossary fix replay the 3GPP catalogue overlay — and paragraphs, sparse,
+// compact, index and publish behind it.
+//
+// The rule is the one corpus-etsi states after paying for it: a step declares
+// the source of what it RUNS. The two arms are asserted together because the
+// defect is only visible as a pair — each must hold the other's binary at arm's
+// length.
+func TestEachEnrichArmWatchesOnlyTheBinariesItRuns(t *testing.T) {
+	gppImpl := stepEnrich(corpus3GPP()).Impl
+	etsiImpl := stepEnrich(corpusETSI()).Impl
+
+	if contains(gppImpl, "rust/ingest/src/bin") {
+		t.Error("enrich declares the whole bin directory again: a change to the ETSI " +
+			"glossary miner would replay the 3GPP overlay and everything after it")
+	}
+	for _, want := range []string{
+		"rust/ingest/src/bin/ingest_catalog.rs",
+		"rust/ingest/src/bin/ingest_openapi.rs",
+		"rust/ingest/src/bin/ingest_li.rs",
+	} {
+		if !contains(gppImpl, want) {
+			t.Errorf("enrich runs %s and does not watch it — an overlay fix would not replay", want)
+		}
+	}
+	if contains(gppImpl, "rust/ingest/src/bin/ingest_glossary.rs") {
+		t.Error("enrich watches the ETSI glossary miner, which it never runs")
+	}
+
+	if !contains(etsiImpl, "rust/ingest/src/bin/ingest_glossary.rs") {
+		t.Error("enrich-etsi runs ingest-glossary and does not watch it — a fix to the " +
+			"extraction rule would leave the ETSI vocabulary as it was")
+	}
+	for _, unwanted := range []string{
+		"rust/ingest/src/bin",
+		"rust/ingest/src/bin/ingest_catalog.rs",
+		"rust/ingest/src/bin/ingest_openapi.rs",
+		"rust/ingest/src/bin/ingest_li.rs",
+	} {
+		if contains(etsiImpl, unwanted) {
+			t.Errorf("enrich-etsi watches %s, which it never runs: ETSI has no DynaReport "+
+				"catalogue, no 5GC OpenAPI corpus and no LI ASN.1 registry", unwanted)
+		}
 	}
 }
 

@@ -1146,7 +1146,7 @@ func TestTheAcquiredSetIsPartOfWhatFetchProduces(t *testing.T) {
 // all 19 steps, reported success, and served an empty search_api and an empty
 // li_events — the pipeline had named the command instead of running it.
 func TestTheOverlayFetchScriptsArePartOfEnrich(t *testing.T) {
-	step := stepEnrich()
+	step := stepEnrich(corpus3GPP())
 	var got string
 	for _, i := range step.Impl {
 		got += i + " "
@@ -1178,7 +1178,7 @@ func TestTheAcquiredOverlaysAreInputsOfEnrich(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	in, err := stepEnrich().Inputs(c)
+	in, err := stepEnrich(corpus3GPP()).Inputs(c)
 	if err != nil {
 		t.Fatal(err)
 	}
