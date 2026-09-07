@@ -164,3 +164,72 @@ func TestEnrichKeepsTheBinDirectoryOnPurpose(t *testing.T) {
 		t.Fatal("enrich no longer watches the binaries it runs — an overlay fix would not replay")
 	}
 }
+
+// THE LEDGER IMPORT BELONGS TO embed-io, NOT TO merge — and until 2026-09-07 the
+// provenance said the opposite, in both directions at once.
+//
+// Store::import_ledger lived in rust/store/src/lib.rs. `merge` declares that file
+// and genuinely links the library, so a change to the vector import replayed a
+// 38-MINUTE reconstruction of a corpus the change could not affect. Build 23 paid
+// exactly that. Meanwhile `embed` and `sparse` declared only the BINARY, so the
+// same change did NOT replay the steps whose entire output it decides — a silent
+// staleness, which is the worse half.
+//
+// Splitting the file into rust/store/src/vectors.rs is what makes both statements
+// expressible at once. The split was driven by evidence, not taste: every Store
+// method each binary calls was listed first, and only what nothing but embed-io
+// calls moved (clauses_is_view stayed, because compact.rs calls it too).
+func TestTheLedgerImportInvalidatesEmbedAndSparseButNotMerge(t *testing.T) {
+	const ledger = "rust/store/src/vectors.rs"
+
+	for _, tc := range []struct {
+		name    string
+		step    *Step
+		replays bool
+	}{
+		{"embed", stepEmbed(corpus3GPP()), true},
+		{"sparse", stepSparse(corpus3GPP()), true},
+		{"merge", stepMerge(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			implFixture(t, root, tc.step.Impl)
+			// The ledger file must exist either way, or "unchanged" would only mean
+			// "absent" and the merge case would pass for the wrong reason.
+			write(t, filepath.Join(root, filepath.FromSlash(ledger)), "fn a() {}\n")
+
+			before, _, err := implHash(root, tc.step.Impl, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := implAfterWriting(t, root, tc.step.Impl, ledger, "fn a() { let _ = 1; }\n")
+
+			if tc.replays && before == after {
+				t.Fatalf("%s does NOT re-run when the ledger import changes — it is the step "+
+					"that import decides, and a stale corpus does not announce itself", tc.name)
+			}
+			if !tc.replays && before != after {
+				t.Fatalf("%s re-runs when the ledger import changes — it never calls it; "+
+					"measured cost on build 23: 38m01 of reconstruction", tc.name)
+			}
+		})
+	}
+}
+
+// And merge must still re-run for the library it DOES use: the narrowing above
+// must not have turned a loud waste into a silent staleness.
+func TestMergeStillReRunsForTheLibraryItActuallyLinks(t *testing.T) {
+	step := stepMerge()
+	root := t.TempDir()
+	implFixture(t, root, step.Impl)
+
+	before, _, err := implHash(root, step.Impl, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := implAfterWriting(t, root, step.Impl, "rust/store/src/lib.rs", "fn a() { let _ = 1; }\n")
+	if before == after {
+		t.Fatal("merge ignores rust/store/src/lib.rs — the narrowing went too far, and a " +
+			"stale corpus is worse than a wasted hour")
+	}
+}

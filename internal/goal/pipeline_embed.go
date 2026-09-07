@@ -74,7 +74,14 @@ func stepEmbed(t corpusTarget) *Step {
 		// paths to a vectorisable corpus. ETSI has a single producer, so it goes
 		// through Deps instead (AnyDeps rejects a one-element set on purpose).
 		AnyDeps: t.multiProducer(),
-		Impl:    []string{"rust/embedder/src", "rust/store/src/bin/embed_io.rs", "internal/embed/identity.go", "internal/embed/models.yaml"},
+		// rust/store/src/vectors.rs closes a FALSE NEGATIVE, and it is the mirror
+		// image of the one this file's provenance work has been fixing all along.
+		// The ledger import lived in rust/store/src/lib.rs, which `merge` declares
+		// and this step did NOT — so editing the import replayed a 38-minute merge
+		// that could not be affected by it, and did NOT replay the step whose entire
+		// output it decides. Both halves were wrong, in opposite directions.
+		Impl: []string{"rust/embedder/src", "rust/store/src/bin/embed_io.rs",
+			"rust/store/src/vectors.rs", "internal/embed/identity.go", "internal/embed/models.yaml"},
 		// The corpus is NOT an input, although this step reads and rewrites it.
 		//
 		// It is the step's own product, and compact, index and the paragraph
@@ -1490,7 +1497,11 @@ func stepSparse(t corpusTarget) *Step {
 		Version: 2,
 		Doc:     "vectorise the learned-lexical (sparse) arm of " + t.DB + " on the GPU",
 		Deps:    t.sparseDeps(),
-		Impl:    []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs"},
+		// rust/store/src/vectors.rs carries set_sparse_many, sparse_chunk_ids and
+		// the term_id index handling — the import this step's whole cost lives in.
+		// It was in lib.rs, which this step never declared.
+		Impl: []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs",
+			"rust/store/src/vectors.rs"},
 		// The corpus is not an input here either: compact rewrites it after this
 		// step, so fingerprinting it guarantees a replay on the next build. The
 		// sparse identity in Extra and the data dependency are what actually decide
@@ -1627,9 +1638,20 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	}
 	c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
 
+	// --import-sparse-changed-only, for the same reason the dense arm imports the
+	// changed rows only. Build 23 (2026-09-06, ETSI half): 368 clauses needed
+	// postings and took 9 seconds on the GPU, then this import rewrote all
+	// 2 000 182 of them and took 49 MINUTES. The cost tracked the ledger, not the
+	// work.
+	//
+	// What it gives up is the self-repairing rewrite of every posting, and that is
+	// still reachable — `embed-io --import-sparse` without the flag — for the case
+	// it exists to answer: postings damaged under a chunk_id that is still present,
+	// which no work list can see.
 	c.Log.Printf("importing the postings into clause_sparse (stamping %s)", id)
 	return c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
 		"--db", db, "--import-sparse", out, "--sparse-model", id,
+		"--import-sparse-changed-only",
 	}, Echo: true})
 }
 

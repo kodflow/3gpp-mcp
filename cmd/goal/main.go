@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -420,10 +421,52 @@ func gitState(root string) (string, string) {
 // dataContractFlags asks scripts/data-contract.sh, which the ADR designates as
 // the single source of the completeness contract. Duplicating its logic here is
 // exactly the drift the ADR exists to prevent.
+//
+// DATA_ETSI_DB IS SUPPLIED BECAUSE THE LAYOUTS DIFFER. --require-etsi takes the
+// second corpus's PATH, and the script's default is the IMAGE's (/data/mcp-3gpp).
+// A local build keeps it under the repo, so without this the ETSI half of the
+// contract would point at a file that does not exist here and the gate would fail
+// for the wrong reason.
+//
+// THE FALLBACK IS THE STRONG CONTRACT, NOT THE WEAK ONE. It used to return the
+// dense-only flags, so anything that stopped the script from running — bash off
+// the PATH, a bad exit — silently downgraded the gate that decides what gets
+// published. Failing loudly on a corpus that is genuinely incomplete is the
+// correct outcome; publishing an unchecked one is not. Loosening stays available
+// through DATA_CONTRACT, where it is a decision someone typed.
+//
+// ...and a fallback that is never mentioned is the same defect one level down: it
+// would decide the publish gate without leaving a trace. The failure is therefore
+// printed, with the script's own stderr, which is where the reason lives.
+//
+// DATA_ETSI_DB IS A DEFAULT, NOT AN OVERRIDE. Appending it unconditionally would
+// win over an operator who set it — later entries take precedence in exec's
+// environment — so a corpus kept somewhere else would be checked at the repo path
+// instead, silently. It is supplied only when absent.
+//
+// AND THE FALLBACK USES THE SAME PATH. Resolving it once, above both branches, is
+// the point: a fallback that quietly reverted to the repo path would check a
+// DIFFERENT corpus than the script would have, and only in the branch that already
+// means something went wrong — the hardest case to notice and the worst one to be
+// wrong in.
 func dataContractFlags(root string) string {
-	out, err := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh")).Output()
+	etsi := filepath.Join(root, "data", "etsi.duckdb")
+	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"))
+	cmd.Env = os.Environ()
+	if v, set := os.LookupEnv("DATA_ETSI_DB"); set && v != "" {
+		etsi = v
+	} else {
+		cmd.Env = append(cmd.Env, "DATA_ETSI_DB="+etsi)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return "--require-fts --require-hnsw --require-embed-complete"
+		fmt.Fprintf(os.Stderr,
+			"goal: scripts/data-contract.sh failed (%v) -- falling back to the strong contract; stderr: %s\n",
+			err, strings.TrimSpace(stderr.String()))
+		return "--require-fts --require-hnsw --require-embed-complete " +
+			"--require-sparse --require-etsi " + etsi
 	}
 	return strings.TrimSpace(string(out))
 }
