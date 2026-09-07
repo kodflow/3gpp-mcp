@@ -589,8 +589,15 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	// carries its own Abbreviations clause, and ingest-glossary mines them.
 	//
 	// 3GPP first: it is the canonical vocabulary for a term both halves define, and
-	// the ETSI rows carry source_series "etsi" so a caller can tell them apart
-	// without this having to say so twice.
+	// an ETSI row names the DELIVERABLE that declares it — "ETSI TS 103 221-1" — so
+	// a caller can still tell the halves apart without this having to say so twice,
+	// and can now open the document the answer came from.
+	//
+	// That used to be the constant "etsi", which named nothing and could therefore
+	// be neither cited nor ranked: every ETSI row tied, and Store.ResolveTerm's
+	// tie-break handed back the alphabetically first expansion. Each row now also
+	// carries declared_by, the number of deliverables that agree on it, which is
+	// what orders a corpus that publishes no precedence rule of its own.
 	a, err := h.st.ResolveTerm(ctx, term)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("resolve_term failed", err), nil
