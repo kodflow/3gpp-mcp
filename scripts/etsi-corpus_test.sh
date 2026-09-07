@@ -5,7 +5,7 @@
 # Why this exists: `mktemp --suffix=.pdf` is GNU coreutils only. The Windows
 # toolchain ships w64devkit's BUSYBOX mktemp, which rejects it — and because the
 # call sat inside the per-deliverable loop, the very first ETSI deliverable killed
-# the whole corpus-etsi step. The extension is load-bearing (convert_pdf dispatches
+# the whole ingest-etsi step. The extension is load-bearing (convert_pdf dispatches
 # on it, pdftotext refuses an unrecognised file), so it cannot simply be dropped.
 set -euo pipefail
 

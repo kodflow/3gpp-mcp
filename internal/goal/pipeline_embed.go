@@ -515,7 +515,7 @@ func stepEnrich(t corpusTarget) *Step {
 		// ingest_glossary.rs lives in the same directory and this step never runs
 		// it — so editing the ETSI glossary miner would replay the 3GPP catalogue
 		// overlay, and paragraphs, sparse, compact, index and publish behind it.
-		// That is the shape corpus-etsi paid ~1 h and 18.8 GiB to learn on
+		// That is the shape ingest-etsi paid ~1 h and 18.8 GiB to learn on
 		// 2026-09-06, in the opposite direction.
 		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
@@ -662,8 +662,8 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		Name:    "enrich" + t.Suffix,
 		Version: 1,
 		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary",
-		Deps:    []string{"corpus-etsi", "build-rust"},
-		// NAMED FILES, NOT THE CRATE — the declaration corpus-etsi carries, for the
+		Deps:    []string{"ingest-etsi", "build-rust"},
+		// NAMED FILES, NOT THE CRATE — the declaration ingest-etsi carries, for the
 		// reason measured on 2026-09-06: naming rust/ingest/src/bin made a fix to
 		// ingest_li.rs invalidate the whole ETSI half (~1 h of rework, 18.8 GiB
 		// re-pushed) over a binary that half never runs. This step runs exactly
@@ -695,9 +695,9 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		//
 		// What actually determines this step's work is its DATA dependency, which is
 		// what stepParagraphs says in the same situation and for the same reason:
-		// corpus-etsi declares data/etsi.duckdb as its output, so a fetch that
+		// ingest-etsi declares data/etsi.duckdb as its output, so a fetch that
 		// brought new deliverables shows up here as "dependency output changed", and
-		// a corpus-etsi that declined leaves this correctly skipped.
+		// a ingest-etsi that declined leaves this correctly skipped.
 		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Heavy:  true,
 		Validate: func(c *Ctx) error {
@@ -1432,7 +1432,7 @@ func corpusETSI() corpusTarget {
 		DB:        "etsi.duckdb",
 		Ledger:    "etsi-ledger.jsonl",
 		Floor:     func(c *Ctx) string { return "" },
-		Producers: []string{"corpus-etsi"},
+		Producers: []string{"ingest-etsi"},
 	}
 }
 

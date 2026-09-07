@@ -3,7 +3,7 @@
 # etsi-ingest.sh — parse the converted ETSI HTML into data/etsi.duckdb.
 #
 # The second half of what used to be etsi-corpus.sh. It is separate so that the
-# `corpus-etsi` pipeline step declares the Rust chain and NOTHING ELSE: before the
+# `ingest-etsi` pipeline step declares the Rust chain and NOTHING ELSE: before the
 # split one step's provenance covered both the downloader and the parser, so a
 # change to either re-ran both.
 #

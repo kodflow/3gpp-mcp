@@ -56,7 +56,7 @@ printf '%-18s %-10s %-20s %s\n' "ETAPE" "ETAT" "FINIE LE (UTC)" "REMARQUE"
 printf -- '------------------ ---------- -------------------- ------------------------------\n'
 
 stale=0
-for s in corpus-etsi embed-etsi paragraphs-etsi sparse-etsi compact index-etsi validate smoke; do
+for s in ingest-etsi embed-etsi paragraphs-etsi sparse-etsi compact index-etsi validate smoke; do
 	IFS='|' read -r status fin dbsz <<<"$(st "$s")"
 	note=""
 	if [ "$status" = "success" ] && [ "$dbsz" != "-" ] && [ -n "$cur" ] && [ "$dbsz" != "$cur" ]; then

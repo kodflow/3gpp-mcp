@@ -101,12 +101,12 @@ func Pipeline() []*Step {
 		// lexical-only ETSI — would let one corpus fall silently behind, which is
 		// precisely the state the tooling was in.
 		stepDiscoverETSI(),
-		// fetch-etsi and corpus-etsi are the ETSI analogues of fetch and ingest.
+		// fetch-etsi and ingest-etsi are the ETSI analogues of fetch and ingest.
 		// They were one step until 2026-09-07, which meant a change to the Rust
 		// parser re-ran the downloads and a change to the download script re-ran the
 		// parse.
 		stepFetchETSI(),
-		stepCorpusETSI(),
+		stepIngestETSI(),
 		stepEmbed(corpusETSI()),
 		// The ETSI half gets an enrichment pass too, in the same position its 3GPP
 		// twin holds: after the vectors, before the conversion. Its content is not
