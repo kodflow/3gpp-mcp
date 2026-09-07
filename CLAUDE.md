@@ -401,7 +401,9 @@ oublie de transmettre ce plancher recale un corpus complet.
 │   ├── local/           # toolchain portable Windows (bootstrap + env)
 │   ├── lib/             # helpers de conversion partagés
 │   ├── corpus.sh        # download → unzip → LibreOffice → HTML
-│   ├── etsi-corpus.sh   # idem côté ETSI
+│   ├── etsi-fetch.sh    # ETSI : download → pdftotext → HTML (pool de workers)
+│   ├── etsi-ingest.sh   # ETSI : HTML → etsi.duckdb (ingest --etsi)
+│   ├── etsi-corpus.sh   # wrapper appelant les deux (usage autonome/CI)
 │   ├── fetch-5g-apis.sh # overlay OpenAPI 5GC
 │   ├── fetch-li-asn.sh  # overlay registre ASN.1 TS 33.128
 │   └── *_test.sh        # suites shell, exécutées par l'étape `test`

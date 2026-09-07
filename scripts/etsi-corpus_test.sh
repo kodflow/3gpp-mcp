@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline test for scripts/etsi-corpus.sh's portable temp-file helper.
+# Offline test for the portable temp-file helper the ETSI scripts share.
 # Run: bash scripts/etsi-corpus_test.sh
 #
 # Why this exists: `mktemp --suffix=.pdf` is GNU coreutils only. The Windows
@@ -10,14 +10,19 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/etsi-corpus.sh"
+# tmpfile_ext lives in scripts/lib/etsi-common.sh since the fetch and the ingest
+# became two pipeline steps. The test follows the REAL definition to its new home
+# rather than keeping a copy here — not drifting from the shipped code is the whole
+# property the extraction below exists to preserve.
+SCRIPT="$HERE/lib/etsi-common.sh"
 fails=0
 
 pass() { echo "PASS  $1"; }
 fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
 
-# etsi-corpus.sh runs its whole pipeline on load, so it cannot be sourced. Lift the
-# helper's REAL definition out of it — testing a copy would let the two drift.
+# etsi-common.sh is sourceable, but sourcing it also resolves the corpus paths and
+# mkdir -p's them, which a unit test has no business doing. Lift the helper's REAL
+# definition out of it instead — testing a copy would let the two drift.
 #
 # Done in pure bash, with no sed/awk, on purpose. Under scripts/local/toolchain-env.sh
 # the PATH's `sed` is w64devkit's ("This is not GNU sed version 4.0"), which rejects
