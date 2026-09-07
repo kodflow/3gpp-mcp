@@ -12,11 +12,11 @@ import (
 //
 // MEASURED 2026-09-06, build 20:
 //
-//	STEP corpus-etsi
+//	STEP ingest-etsi
 //	  reason  implementation changed: rust/ingest/src/bin/ingest_li.rs
 //
 // ingest_li.rs writes the Lawful-Interception registry from TS 33.128. ETSI has
-// no such registry, corpus-etsi never invokes ingest-li, and the whole ETSI half
+// no such registry, ingest-etsi never invokes ingest-li, and the whole ETSI half
 // was re-derived anyway: ~1 h of rework and 18.8 GiB re-pushed for a file the
 // step cannot reach. `ingest` carried the same over-broad declaration.
 //
@@ -56,7 +56,7 @@ func TestIngestStepsIgnoreBinariesTheyNeverRun(t *testing.T) {
 		name string
 		step *Step
 	}{
-		{"corpus-etsi", stepCorpusETSI()},
+		{"ingest-etsi", stepIngestETSI()},
 		{"ingest", stepIngest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,7 +78,7 @@ func TestIngestStepsIgnoreBinariesTheyNeverRun(t *testing.T) {
 				after := implAfterWriting(t, root, tc.step.Impl, bin, "fn main() { let _ = 1; }\n")
 				if before != after {
 					t.Fatalf("%s re-runs when %s changes — it never invokes that binary; "+
-						"measured cost on corpus-etsi: ~1 h and 18.8 GiB", tc.name, bin)
+						"measured cost on ingest-etsi: ~1 h and 18.8 GiB", tc.name, bin)
 				}
 			}
 		})
@@ -93,7 +93,7 @@ func TestIngestStepsStillWatchWhatTheyActuallyUse(t *testing.T) {
 		name string
 		step *Step
 	}{
-		{"corpus-etsi", stepCorpusETSI()},
+		{"ingest-etsi", stepIngestETSI()},
 		{"ingest", stepIngest()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -130,7 +130,7 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 		name string
 		step *Step
 	}{
-		{"corpus-etsi", stepCorpusETSI()},
+		{"ingest-etsi", stepIngestETSI()},
 		{"ingest", stepIngest()},
 	} {
 		for _, p := range tc.step.Impl {
@@ -165,7 +165,7 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 // glossary fix replay the 3GPP catalogue overlay — and paragraphs, sparse,
 // compact, index and publish behind it.
 //
-// The rule is the one corpus-etsi states after paying for it: a step declares
+// The rule is the one ingest-etsi states after paying for it: a step declares
 // the source of what it RUNS. The two arms are asserted together because the
 // defect is only visible as a pair — each must hold the other's binary at arm's
 // length.

@@ -460,7 +460,7 @@ func stepIngest() *Step {
 		// ingest-glossary in src/bin, which only `enrich` invokes — declaring the
 		// whole crate made a fix to ingest_li.rs invalidate this step too. Harmless
 		// here (it declines in 4 s when fetch found nothing) and an hour of rework on
-		// corpus-etsi, which had the same declaration. Measured 2026-09-06.
+		// ingest-etsi, which had the same declaration. Measured 2026-09-06.
 		// Cargo.toml IS provenance: it selects the dependency versions and the
 		// features the binary is compiled with, so a manifest-only change produces a
 		// different `ingest` from identical sources. Narrowing to src/main.rs dropped

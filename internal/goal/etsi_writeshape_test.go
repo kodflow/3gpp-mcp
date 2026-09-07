@@ -16,7 +16,7 @@ import (
 //
 // The 3GPP half had always called ensureWriteShape before folding. The ETSI half
 // was written before its corpus was ever converted, so the requirement was never
-// carried across, and nothing failed until corpus-etsi first ran after
+// carried across, and nothing failed until ingest-etsi first ran after
 // paragraphs-etsi had converted the ETSI corpus. Neither step had changed.
 //
 // This pins the rule by source, because the failure only appears in a
@@ -24,7 +24,7 @@ import (
 // Run writes clauses must call ensureWriteShape first.
 func TestEveryStepThatWritesClausesRestoresTheWriteShape(t *testing.T) {
 	for _, f := range []string{
-		"pipeline_etsi.go",  // corpus-etsi ingests ETSI deliverables
+		"pipeline_etsi.go",  // ingest-etsi ingests ETSI deliverables
 		"pipeline_steps.go", // merge folds the 3GPP shards
 	} {
 		b, err := os.ReadFile(f)
@@ -38,11 +38,11 @@ func TestEveryStepThatWritesClausesRestoresTheWriteShape(t *testing.T) {
 	}
 }
 
-// TestTheETSIStepSaysItChanged. corpus-etsi does something new — it restores the
+// TestTheETSIStepSaysItChanged. ingest-etsi does something new — it restores the
 // write shape — and the orchestrator's own Go source is deliberately not
 // provenance, so Version is the only thing that can invalidate it.
 func TestTheETSIStepSaysItChanged(t *testing.T) {
-	if v := stepCorpusETSI().Version; v < 2 {
-		t.Errorf("corpus-etsi changed what it does but still declares Version %d", v)
+	if v := stepIngestETSI().Version; v < 2 {
+		t.Errorf("ingest-etsi changed what it does but still declares Version %d", v)
 	}
 }

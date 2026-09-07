@@ -9,7 +9,7 @@
 # cannot alter a single downloaded byte — therefore re-ran the whole ETSI half.
 # Measured on build 24 (2026-09-07):
 #
-#     STEP corpus-etsi
+#     STEP ingest-etsi
 #       reason  implementation changed: rust/store/src/lib.rs
 #
 # The 3GPP side has had `fetch` and `ingest` as separate steps from the start;
