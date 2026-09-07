@@ -73,9 +73,11 @@ fn posted_clauses(db: &str) -> i64 {
     let store = store_rs::Store::open_rw(db).unwrap();
     store
         .raw()
-        .query_row("SELECT count(DISTINCT chunk_id) FROM clause_sparse", [], |r| {
-            r.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT count(DISTINCT chunk_id) FROM clause_sparse",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
         .unwrap()
 }
 
@@ -147,7 +149,10 @@ fn the_full_import_still_repairs_a_damaged_posting() {
             .execute_batch("UPDATE clause_sparse SET weight = 0.01 WHERE chunk_id = 1;")
             .unwrap();
     }
-    assert!((weight_of(&db, 1) - 0.01).abs() < 1e-6, "fixture did not damage the posting");
+    assert!(
+        (weight_of(&db, 1) - 0.01).abs() < 1e-6,
+        "fixture did not damage the posting"
+    );
 
     run(&db, &led, false);
 
