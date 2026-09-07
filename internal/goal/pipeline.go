@@ -50,7 +50,13 @@ var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta"
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own
 // step so a machine without a GPU can still complete every other step.
 var rustBins = map[string][]string{
-	"rust/ingest/Cargo.toml":   {"ingest", "ingest-catalog", "ingest-openapi", "ingest-li"},
+	// ingest-glossary WAS MISSING, and the binary in .local/rust-bin was a
+	// hand-built leftover from the session that ran it by hand once. `cargo build`
+	// here names each --bin explicitly, so a binary absent from this list is never
+	// compiled and never staged: a fresh clone would fail enrich-etsi with "the
+	// binary is missing", and the only reason this machine did not was that a
+	// stale file happened to sit at the path.
+	"rust/ingest/Cargo.toml":   {"ingest", "ingest-catalog", "ingest-openapi", "ingest-li", "ingest-glossary"},
 	"rust/store/Cargo.toml":    {"merge", "overlay", "freeze-hnsw", "embed-io", "compact"},
 	"rust/discover/Cargo.toml": {"discover"},
 }
@@ -81,7 +87,7 @@ func Pipeline() []*Step {
 		stepIngest(),
 		stepMerge(),
 		stepEmbed(corpus3GPP()),
-		stepEnrich(),
+		stepEnrich(corpus3GPP()),
 		stepParagraphs(corpus3GPP()),
 		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
 		// does not carry custom indexes), so both sit between the conversion and the
@@ -102,6 +108,13 @@ func Pipeline() []*Step {
 		stepFetchETSI(),
 		stepCorpusETSI(),
 		stepEmbed(corpusETSI()),
+		// The ETSI half gets an enrichment pass too, in the same position its 3GPP
+		// twin holds: after the vectors, before the conversion. Its content is not
+		// the same — ETSI publishes no DynaReport catalogue, no 5GC OpenAPI corpus
+		// and no LI ASN.1 registry — but it HAS a vocabulary, one Abbreviations
+		// clause per deliverable, and ingest-glossary was written to mine it and
+		// then wired to nothing. See stepEnrich.
+		stepEnrich(corpusETSI()),
 		// The ETSI half gets the content-addressed conversion too. Without it
 		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
 		// clauses, which was harmless only while ETSI held one version per

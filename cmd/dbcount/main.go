@@ -146,5 +146,22 @@ func run(ctx context.Context, path string, blocksOnly bool) error {
 	}
 	fmt.Printf("clauses_with_sparse=%d\n", sparse)
 	fmt.Printf("sparse_model=%s\n", s.GetMeta(ctx, "sparse_model"))
+
+	// The glossary, because `enrich` is the step that fills it and a step needs a
+	// counter to validate against. The 3GPP arm proves its overlay landed by
+	// reading spec_versions; the ETSI arm's whole product IS this table, so
+	// without a counter its Validate would have to re-read the corpus to say
+	// anything at all — the tax stepParagraphs.Validate exists to avoid.
+	//
+	// Counted through the STORE rather than with SQL written here: cmd/* are thin
+	// CLIs over internal packages (cmd/CLAUDE.md), and spec_versions and
+	// api_operations above are already asked that way — a glossary schema change
+	// should not have to reach into the command layer. A corpus predating the
+	// glossary pass answers 0 rather than an error, like clause_sparse.
+	acr, err := s.CountAcronyms(ctx)
+	if err != nil {
+		acr = 0
+	}
+	fmt.Printf("acronyms=%d\n", acr)
 	return nil
 }

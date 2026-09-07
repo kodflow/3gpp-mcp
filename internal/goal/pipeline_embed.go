@@ -473,7 +473,30 @@ func countLines(p string) int {
 
 // ------------------------------------------------------------------- enrich
 
-func stepEnrich() *Step {
+// stepEnrich is the enrichment pass of ONE half of the corpus.
+//
+// BOTH HALVES HAVE ONE NOW, and the parameter is what says so. The 3GPP arm
+// overlays the DynaReport catalogue, the 5GC OpenAPI corpus, the LI registry and
+// the two curated seeds; the ETSI arm mines the vocabulary each deliverable
+// declares about itself. The two bodies share nothing — different sources,
+// different binaries — and unifying them would be a false abstraction. What they
+// share is the NAME, the contract and the position in the DAG, and the ETSI half
+// had none of the three.
+//
+// WHAT THIS REPAIRS, and it is not a nicety.
+// rust/ingest/src/bin/ingest_glossary.rs was written, tested, built by
+// `build-rust` — and run by NO step. The 4 941 acronyms the shipped ETSI half
+// carries got there from .local/resume/v3-chain2.sh: by hand, once, in a session
+// nobody can replay. So a fresh clone built an ETSI corpus with an EMPTY
+// glossary and reported success, and a deliverable fetched after that never
+// contributed its Abbreviations clause to a corpus already built. This file
+// names that failure one step away, in stepEnrich's own words — "A pipeline that
+// names the command instead of running it has not built the product" — and here
+// the command was not even named.
+func stepEnrich(t corpusTarget) *Step {
+	if t.Suffix != "" {
+		return stepEnrichETSI(t)
+	}
 	return &Step{
 		Name:    "enrich",
 		Version: 1,
@@ -485,7 +508,16 @@ func stepEnrich() *Step {
 		// the seed: editing an edge must replay the overlay, exactly as editing an
 		// extractor does. Before, the seed's hash moved the published identity
 		// while nothing wrote the seed — see cmd/seed-evolutions.
-		Impl: []string{"rust/ingest/src/bin", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		// THE THREE BINARIES IT RUNS, NOT THE DIRECTORY THEY SIT IN. This used to
+		// declare rust/ingest/src/bin whole, and a test recorded that as deliberate:
+		// every file in there was one of this step's overlays. That stopped being
+		// true the moment the ETSI arm got an enrich of its own, because
+		// ingest_glossary.rs lives in the same directory and this step never runs
+		// it — so editing the ETSI glossary miner would replay the 3GPP catalogue
+		// overlay, and paragraphs, sparse, compact, index and publish behind it.
+		// That is the shape corpus-etsi paid ~1 h and 18.8 GiB to learn on
+		// 2026-09-06, in the opposite direction.
+		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -607,6 +639,121 @@ func stepEnrich() *Step {
 			return c.Run(Cmd{Name: c.bin("seed-glossary"), Args: []string{"--db", db}, Echo: true})
 		},
 	}
+}
+
+// stepEnrichETSI mines the vocabulary the ETSI half declares about itself.
+//
+// ETSI HAS NO TS 21.905. There is no vocabulary deliverable to ingest once: every
+// TS/EN carries its own "Abbreviations" clause, so the vocabulary is spread over
+// the whole archive and mining it is a pass over the converted HTML — the same
+// shape as ingest-catalog / ingest-li / ingest-openapi on the other arm, which is
+// why ingest-glossary was written as one.
+//
+// IT WRITES ONLY `acronyms`. It reads the converted HTML, never a clause, and it
+// touches no table the content-addressed conversion owns — so its position
+// relative to `paragraphs-etsi` is a matter of symmetry with the 3GPP arm, not a
+// constraint. It declares NO Outputs for the same reason the 3GPP arm declares
+// none: naming the corpus here would make every glossary refresh report
+// "dependency output changed" to paragraphs-etsi and replay the conversion, the
+// sparse arm, the compaction and the publish behind it — hours, to add a row to
+// a table none of them read.
+func stepEnrichETSI(t corpusTarget) *Step {
+	return &Step{
+		Name:    "enrich" + t.Suffix,
+		Version: 1,
+		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary",
+		Deps:    []string{"corpus-etsi", "build-rust"},
+		// NAMED FILES, NOT THE CRATE — the declaration corpus-etsi carries, for the
+		// reason measured on 2026-09-06: naming rust/ingest/src/bin made a fix to
+		// ingest_li.rs invalidate the whole ETSI half (~1 h of rework, 18.8 GiB
+		// re-pushed) over a binary that half never runs. This step runs exactly
+		// one, so it names exactly its source and the crates it links.
+		Impl: []string{
+			"rust/ingest/src/bin/ingest_glossary.rs", "rust/ingest/Cargo.toml",
+			// The extraction rule and the ETSI provenance header it keys on — AND the
+			// crate's manifest, for the reason rust/ingest/Cargo.toml is here: a
+			// dependency or feature change produces a different binary from identical
+			// sources, and build-rust is a Tool that never replays a data step.
+			"rust/parse/src/glossary.rs", "rust/parse/src/etsi.rs", "rust/parse/Cargo.toml",
+			"rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			// The workspace manifest and LOCKFILE: `cargo update` alone can change
+			// the binary, and build-rust is a Tool that never replays a data step.
+			"rust/Cargo.toml", "rust/Cargo.lock",
+			"internal/store/schema.sql",
+		},
+		// NO Inputs, AND NAMING THE CONVERTED TREE HERE WOULD BE WORSE THAN NONE.
+		//
+		// This step reads data/sources/convert-etsi, so declaring that directory is
+		// the obvious thing to write — and it is the exact declaration `enrich`
+		// carries a comment about, forty lines up, after it cost two months:
+		// inputsHash records a directory as the constant string "dir"
+		// (fingerprint.go), so the tree is DECLARED and never watched. A hundred new
+		// deliverables would land and the fingerprint would not move.
+		//
+		// Enumerating the files instead would be honest but wrong here: 11 822 paths
+		// for a pass that reads the newest 5 142 of them, re-stat-ed on every plan.
+		//
+		// What actually determines this step's work is its DATA dependency, which is
+		// what stepParagraphs says in the same situation and for the same reason:
+		// corpus-etsi declares data/etsi.duckdb as its output, so a fetch that
+		// brought new deliverables shows up here as "dependency output changed", and
+		// a corpus-etsi that declined leaves this correctly skipped.
+		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
+		Heavy:  true,
+		Validate: func(c *Ctx) error {
+			// LOCAL and CHEAP, the doctrine validatePublished states and
+			// stepParagraphs.Validate had to be taught: this runs on EVERY plan,
+			// including plans where the step would be skipped. One dbcount — the
+			// same call the 3GPP arm's Validate already makes on its own half, a
+			// few seconds — never a re-mine of the corpus.
+			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", t.dbPath(c)}})
+			if err != nil {
+				return stillOpenElsewhere(t.DB, err)
+			}
+			n, ok := counterValue(out, "acronyms")
+			if !ok {
+				return fmt.Errorf("dbcount produced no glossary counter")
+			}
+			// AN EMPTY GLOSSARY IS THE STATE THIS STEP EXISTS TO END, and it is
+			// indistinguishable from a good run unless the counter is READ rather
+			// than merely printed. Every ETSI TS/EN carries a clause 3.
+			if n == 0 {
+				return fmt.Errorf("the ETSI glossary is empty — resolve_term would answer from the 3GPP half alone")
+			}
+			c.Log.Printf("ETSI glossary: %d acronym row(s)", n)
+			return nil
+		},
+		Run: func(c *Ctx) error {
+			c.Log.Printf("mining the Abbreviations clause of each ETSI deliverable (newest version of each)")
+			return c.Run(Cmd{Name: c.rbin("ingest-glossary"), Args: []string{
+				"--convert", c.dataPath("sources", "convert-etsi"),
+				"--db", t.dbPath(c),
+			}, Echo: true})
+		},
+	}
+}
+
+// counterValue pulls "<key>=<n>" out of a counter-printing binary's output.
+//
+// strings.Contains(out, "acronyms=0") is what this replaces, and it is wrong in
+// both directions: it matches the prefix of "acronyms=0" in a longer number and
+// it cannot tell "absent" from "zero" — the two states a Validate most needs to
+// separate, since an absent counter means the binary is older than the check
+// while a zero means the corpus is empty.
+func counterValue(out, key string) (int64, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, key+"=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
 }
 
 func dirExists(p string) bool {
@@ -1314,9 +1461,12 @@ func (t corpusTarget) multiProducer() []string {
 
 // indexDeps: the vector index needs the vectors, and for 3GPP it also waits on
 // `enrich` — the catalogue overlay rewrites rows, and rebuilding the index before
-// it would index a corpus that is about to change. ETSI has no catalogue overlay
-// (DynaReport describes 3GPP specs, not ETSI deliverables), so it depends on its
-// embed alone.
+// it would index a corpus that is about to change.
+//
+// The ETSI arm names its own enrich TRANSITIVELY, through paragraphs-etsi: that
+// step now depends on enrich-etsi (see paragraphsDeps), and enrich-etsi writes
+// only `acronyms`, a table no vector index reads. Listing it again here would be
+// a dependency that documents nothing the DAG does not already enforce.
 func (t corpusTarget) indexDeps() []string {
 	if t.Suffix == "" {
 		// The 3GPP index is built AFTER the corpus is content-addressed: the
@@ -1538,14 +1688,16 @@ func stepSparse(t corpusTarget) *Step {
 
 // paragraphsDeps: the conversion runs AFTER the vectors exist, so they are simply
 // carried across to the bodies that own them and neither embed nor the Rust write
-// side has to change. 3GPP also waits on `enrich`, whose catalogue overlay rewrites
-// rows; ETSI has no such overlay (DynaReport describes 3GPP specs, not ETSI
-// deliverables), so it waits on its own embed alone.
+// side has to change. BOTH arms also wait on their own `enrich`.
+//
+// The ETSI arm did not, and the comment here explained why: "ETSI has no such
+// overlay (DynaReport describes 3GPP specs, not ETSI deliverables)". That was
+// true of the CATALOGUE and got generalised to enrichment as a whole — while
+// ingest-glossary sat in the tree, built and unrun, precisely because there was
+// no ETSI enrich step to run it. The claim was about one overlay; the dependency
+// it justified removed all of them.
 func (t corpusTarget) paragraphsDeps() []string {
-	if t.Suffix == "" {
-		return []string{"embed", "enrich", "build-go"}
-	}
-	return []string{"embed" + t.Suffix, "build-go"}
+	return []string{"embed" + t.Suffix, "enrich" + t.Suffix, "build-go"}
 }
 
 // sparseDeps mirrors indexDeps: the work list is exported from the shape the
