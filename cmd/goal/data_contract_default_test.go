@@ -97,3 +97,20 @@ func TestAnOperatorSuppliedETSIPathIsNotOverridden(t *testing.T) {
 		t.Errorf("the repo default overrode the operator's path: %q", flags)
 	}
 }
+
+// THE FALLBACK MUST CHECK THE SAME CORPUS THE SCRIPT WOULD HAVE.
+//
+// The fallback path used to hardcode the repo's data/etsi.duckdb, so when the
+// script failed AND the operator had pointed DATA_ETSI_DB elsewhere, the gate
+// silently switched to a different corpus — only in the branch that already means
+// something went wrong, which is the hardest case to notice.
+func TestTheFallbackHonoursTheOperatorsETSIPath(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "elsewhere.duckdb")
+	t.Setenv("DATA_ETSI_DB", custom)
+
+	// A root with no scripts/data-contract.sh forces the fallback branch.
+	flags := dataContractFlags(t.TempDir())
+	if !strings.Contains(flags, "--require-etsi "+custom) {
+		t.Errorf("the fallback ignored the operator's DATA_ETSI_DB: %q", flags)
+	}
+}

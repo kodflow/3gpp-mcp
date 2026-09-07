@@ -443,11 +443,19 @@ func gitState(root string) (string, string) {
 // win over an operator who set it — later entries take precedence in exec's
 // environment — so a corpus kept somewhere else would be checked at the repo path
 // instead, silently. It is supplied only when absent.
+//
+// AND THE FALLBACK USES THE SAME PATH. Resolving it once, above both branches, is
+// the point: a fallback that quietly reverted to the repo path would check a
+// DIFFERENT corpus than the script would have, and only in the branch that already
+// means something went wrong — the hardest case to notice and the worst one to be
+// wrong in.
 func dataContractFlags(root string) string {
 	etsi := filepath.Join(root, "data", "etsi.duckdb")
 	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"))
 	cmd.Env = os.Environ()
-	if _, set := os.LookupEnv("DATA_ETSI_DB"); !set {
+	if v, set := os.LookupEnv("DATA_ETSI_DB"); set && v != "" {
+		etsi = v
+	} else {
 		cmd.Env = append(cmd.Env, "DATA_ETSI_DB="+etsi)
 	}
 	var stderr bytes.Buffer
