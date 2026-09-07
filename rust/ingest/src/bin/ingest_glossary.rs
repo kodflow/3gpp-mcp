@@ -295,19 +295,24 @@ fn main() -> Result<()> {
     // file the walker happened to reach last. That was hidden while every row was
     // stamped with the constant "etsi" — a value that names no document, cites
     // nothing, and left the ETSI half unrankable.
-    let mut written = 0usize;
-    for ((term, expansion), c) in &tally.rows {
-        store.upsert_acronym(
-            term,
-            expansion,
-            "",
-            &c.cite_version,
-            &c.cite_version,
-            &c.cite_spec,
-            c.declared_by,
-        )?;
-        written += 1;
-    }
+    // AND IT REPLACES RATHER THAN ADDS. The pass reads the newest version of every
+    // deliverable, so an expansion a later version corrected — or dropped — kept
+    // its row for ever beside the current one and stayed visible through
+    // resolve_term. The vocabulary is a snapshot of what the archive says now, and
+    // an additive writer cannot express that. The scope is the provenance itself,
+    // which is why this could not have been written while every row said "etsi".
+    let mined: Vec<store_rs::MinedAcronym> = tally
+        .rows
+        .iter()
+        .map(|((term, expansion), c)| store_rs::MinedAcronym {
+            term: term.clone(),
+            expansion: expansion.clone(),
+            version: c.cite_version.clone(),
+            source: c.cite_spec.clone(),
+            declared_by: c.declared_by,
+        })
+        .collect();
+    let written = store.replace_mined_acronyms(&mined)?;
 
     let agreed = tally.rows.values().filter(|c| c.declared_by > 1).count();
     eprintln!(
