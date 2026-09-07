@@ -28,6 +28,13 @@ saw() { # saw <label> <regex>
   if grep -qE "$2" "$OUT"; then printf '  OK      %s\n' "$1"
   else printf '  MISSING %s\n' "$1"; fail=$((fail + 1)); fi
 }
+# absent is the mirror of saw, and the glossary is why it exists: some defects are
+# a value that IS there rather than one that is missing, and a harness that can
+# only look for presence cannot see them.
+absent() { # absent <label> <regex> <why>
+  if grep -qE "$2" "$OUT"; then printf '  PRESENT %s\n          %s\n' "$1" "$3"; fail=$((fail + 1))
+  else printf '  OK      %s\n' "$1"; fi
+}
 
 echo "===== arms, counted across both corpus halves ====="
 need "lexical/BM25"      fts       true 2
@@ -38,10 +45,26 @@ need "cross-encoder"     reranker  true 1
 need "ETSI federated"    attached  true 1
 need "identities agree"  embedding_model_ok true 1
 
-echo "===== the four calls answered ====="
+echo "===== the calls answered ====="
 saw "semantic search answered"   '"id":3'
 saw "federated search answered"  '"id":4'
 saw "trace_evolution answered"   '"id":5'
+saw "resolve_term answered"      '"id":6'
+saw "resolve_term (ambiguous)"   '"id":7'
+
+echo "===== the glossary, which nothing here used to look at ====="
+# UICC is defined in the ETSI deliverables and NOT in TS 21.905, so a match at all
+# proves the federation reached the ETSI half — the arm `attached` only claims.
+saw "the ETSI half answers UICC" 'Universal Integrated Circuit Card'
+# EVERY ETSI ROW MUST NAME THE DELIVERABLE THAT DECLARES IT. The payload is a JSON
+# string inside an MCP content block, so the quotes arrive escaped; `.?` absorbs
+# the backslash the way `need` already does.
+saw "an ETSI row cites a deliverable" 'source_series.?": *.?"ETSI (TS|EN|TR|ES|EG|SR) '
+# …AND THE CONSTANT MUST BE GONE. "etsi" names no document: it can be neither
+# opened by a reader nor ranked by Store.ResolveTerm, so all 4 941 rows tied and
+# the tie-break — domain, expansion, with domain empty — answered by ALPHABET.
+absent "no un-citable \"etsi\" provenance" 'source_series.?": *.?"etsi.?"' \
+  'this corpus predates enrich-etsi: run `make build` so the glossary pass runs'
 
 if grep -q '"error"' "$OUT"; then
   echo "  MISSING no JSON-RPC error — the transcript carries one"
