@@ -60,6 +60,18 @@ type Store struct {
 	// ftsAvailable, which is about `clauses` — a corpus can be migrated and not
 	// yet re-indexed, and search must degrade rather than fail on it.
 	paraFTS bool
+	// declaredBy: the acronyms table carries the declared_by column.
+	//
+	// A CAPABILITY, NOT AN ASSUMPTION, for the same reason contentAddressed is
+	// one — and this is the reason it must be. Open applies the ALTER that adds
+	// the column, but the SERVER does not use Open: cmd/server/main.go defaults
+	// to OpenReadOnly, which opens with access_mode=read_only and by design runs
+	// no migration ("schema already exists"). So every corpus published before
+	// this column existed — including every image already pulled — is served by a
+	// binary that has it in its query. A query naming a column that is not there
+	// does not degrade, it FAILS, and resolve_term would have been dead on those
+	// corpora exactly as search_api was for 84 % of the corpus in build 23.
+	declaredBy bool
 }
 
 // Open opens (or creates) the DuckDB file at path and applies the schema.
@@ -76,7 +88,20 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s.probeContentAddressed(context.Background())
+	s.probeDeclaredBy(context.Background())
 	return s, nil
+}
+
+// probeDeclaredBy asks whether this corpus carries acronyms.declared_by.
+//
+// One query, asked of each database rather than assumed of the build — the same
+// contract probeContentAddressed keeps, and for the same reason: the ETSI half is
+// attached alongside and need not have been through the same migration as the
+// 3GPP one.
+func (s *Store) probeDeclaredBy(ctx context.Context) {
+	var n int
+	s.declaredBy = s.db.QueryRowContext(ctx,
+		`SELECT count(declared_by) FROM acronyms LIMIT 1`).Scan(&n) == nil
 }
 
 // Close releases the database handle.
@@ -1549,13 +1574,22 @@ func (s *Store) VersionForRelease(ctx context.Context, specID, release string) (
 // which reads as 1, so the precedence bucket still decides and `expansion` still
 // breaks what remains.
 func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, error) {
+	// TWO QUERIES, ONE RANKING. A corpus published before declared_by existed is
+	// served by this binary through OpenReadOnly, which runs no migration — so the
+	// column cannot be named unconditionally. Where it is absent every row counts
+	// as one declaration, which is precisely what the coalesce means where it is
+	// present, so the older corpus keeps exactly the order it had.
+	count := `coalesce(nullif(declared_by, 0), 1)`
+	if !s.declaredBy {
+		count = `1`
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT term, expansion, domain, first_release, last_release,
 		        coalesce(source_series, '') AS source_series,
-		        coalesce(nullif(declared_by, 0), 1) AS declared_by
+		        `+count+` AS declared_by
 		 FROM acronyms WHERE lower(term) = lower(?)
 		 ORDER BY CASE WHEN coalesce(source_series, '') LIKE '%.%' THEN 0 ELSE 1 END,
-		          coalesce(nullif(declared_by, 0), 1) DESC,
+		          `+count+` DESC,
 		          domain, expansion`, term)
 	if err != nil {
 		return nil, err
