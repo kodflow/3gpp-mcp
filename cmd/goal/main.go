@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -433,12 +434,29 @@ func gitState(root string) (string, string) {
 // published. Failing loudly on a corpus that is genuinely incomplete is the
 // correct outcome; publishing an unchecked one is not. Loosening stays available
 // through DATA_CONTRACT, where it is a decision someone typed.
+//
+// ...and a fallback that is never mentioned is the same defect one level down: it
+// would decide the publish gate without leaving a trace. The failure is therefore
+// printed, with the script's own stderr, which is where the reason lives.
+//
+// DATA_ETSI_DB IS A DEFAULT, NOT AN OVERRIDE. Appending it unconditionally would
+// win over an operator who set it — later entries take precedence in exec's
+// environment — so a corpus kept somewhere else would be checked at the repo path
+// instead, silently. It is supplied only when absent.
 func dataContractFlags(root string) string {
 	etsi := filepath.Join(root, "data", "etsi.duckdb")
 	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"))
-	cmd.Env = append(os.Environ(), "DATA_ETSI_DB="+etsi)
+	cmd.Env = os.Environ()
+	if _, set := os.LookupEnv("DATA_ETSI_DB"); !set {
+		cmd.Env = append(cmd.Env, "DATA_ETSI_DB="+etsi)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"goal: scripts/data-contract.sh failed (%v) -- falling back to the strong contract; stderr: %s\n",
+			err, strings.TrimSpace(stderr.String()))
 		return "--require-fts --require-hnsw --require-embed-complete " +
 			"--require-sparse --require-etsi " + etsi
 	}

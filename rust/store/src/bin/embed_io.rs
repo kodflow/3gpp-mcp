@@ -268,6 +268,12 @@ fn main() -> Result<()> {
         let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
         let mut total = 0usize;
         let mut skipped = 0usize;
+        // Counted, not inferred from already.len(): that is the size of the whole
+        // existing set, which is what the corpus HOLDS, not what this ledger
+        // skipped. Reporting one as the other is the same overstatement the dense
+        // arm was fixed for — off by the entire corpus whenever the ledger is a
+        // subset of it.
+        let mut skipped_posted = 0usize;
 
         // BATCHED, and it is not an optimisation detail. One transaction per clause
         // is 2.2 million transactions and ~110 million individually-parsed INSERT
@@ -369,6 +375,7 @@ fn main() -> Result<()> {
             // An empty-postings clause (heading-only/void text) still counts as "done" so the
             // worklist converges — the DELETE is issued for it either way.
             if already.contains(&r.chunk_id) {
+                skipped_posted += 1;
                 continue;
             }
             batch.push((r.chunk_id, r.terms));
@@ -397,7 +404,9 @@ fn main() -> Result<()> {
         // print the staged number and overstate its work by three orders of
         // magnitude; a log that does that is the number someone quotes back when the
         // corpus is wrong.
-        eprintln!("embed-io: wrote sparse postings for {total} clause(s) (skipped {} already posted)", already.len());
+        eprintln!(
+            "embed-io: wrote sparse postings for {total} clause(s) (skipped {skipped_posted} already posted)"
+        );
         return Ok(());
     }
 
