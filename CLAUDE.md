@@ -287,7 +287,7 @@ serveur est démarré au-dessus des deux stores, une seule image est poussée.
 | `merge` | plie les shards 3GPP, réécrit l'ancre, construit le FTS | ~6 min |
 | `embed` / `embed-etsi` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
-| `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | ~35 min (le parse ; l'écriture est passée de 2 h 29 à 16 s) |
+| `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | **21,5 s** (mesuré le 08/09 sur les 5 142 livrables ; c'était 2 h 29 avant le correctif quadratique) |
 | `paragraphs` / `paragraphs-etsi` | stocke chaque paragraphe une fois et pointe dessus (ADR 0004) | ~9 min |
 | `sparse` / `sparse-etsi` | postings lexicaux appris (couche additive) | ~30 min |
 | `compact` / `compact-etsi` | réécrit le corpus sans son espace mort — **décline** s'il n'y a rien à récupérer | ~30 min, ou 0 |
