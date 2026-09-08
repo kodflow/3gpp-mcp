@@ -622,25 +622,61 @@ func (s *Store) UpsertAcronyms(as []model.Acronym) (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	stmt, err := tx.Prepare(
-		`INSERT INTO acronyms (term, expansion, domain, first_release, last_release, source_series, declared_by)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (term, expansion, domain) DO UPDATE SET
-		   first_release=excluded.first_release, last_release=excluded.last_release,
-		   source_series=excluded.source_series, declared_by=excluded.declared_by`)
-	if err != nil {
+	// STAGE, THEN SWAP — one conflict check instead of one per row.
+	//
+	// This ran `INSERT … ON CONFLICT` per row inside the transaction, and DuckDB
+	// checks each statement's conflict key against the transaction's OWN
+	// uncommitted rows: quadratic in the batch. At the 679 rows six specs produce
+	// it is invisible. At the 30 000 a corpus-wide sweep produces it does not
+	// finish — measured 2026-09-08, 661 s of CPU and ZERO bytes written, which is
+	// the same wall, the same signature and the same cause as the ETSI glossary
+	// write killed twice at 2 h 29 earlier the same day.
+	//
+	// The rows land first in a TEMP table with no key and no index, so nothing is
+	// checked against anything, and the swap is then two set-based statements
+	// inside the same transaction. The batch is already unique on
+	// (term, expansion, domain) — the `want` map above guarantees it — so the
+	// delete-then-insert has exactly the ON CONFLICT DO UPDATE semantics it
+	// replaces, and rows the batch does not mention are untouched.
+	if _, err := tx.Exec(`CREATE OR REPLACE TEMP TABLE staged_acronyms(
+		term VARCHAR, expansion VARCHAR, domain VARCHAR,
+		first_release VARCHAR, last_release VARCHAR, source_series VARCHAR, declared_by BIGINT)`); err != nil {
 		_ = tx.Rollback()
 		return false, err
 	}
-	for _, a := range as {
-		if _, err := stmt.Exec(a.Term, a.Expansion, a.Domain,
-			a.FirstRelease, a.LastRelease, a.SourceSeries, declaredBy(a)); err != nil {
-			_ = stmt.Close()
+	// Multi-row VALUES in chunks, because the cost removed is PER STATEMENT:
+	// DuckDB parses, plans and optimises each one.
+	const chunk = 1000
+	for start := 0; start < len(as); start += chunk {
+		end := min(start+chunk, len(as))
+		batch := as[start:end]
+		q := `INSERT INTO staged_acronyms VALUES `
+		args := make([]any, 0, len(batch)*7)
+		for i, a := range batch {
+			if i > 0 {
+				q += ","
+			}
+			q += "(?,?,?,?,?,?,?)"
+			args = append(args, a.Term, a.Expansion, a.Domain,
+				a.FirstRelease, a.LastRelease, a.SourceSeries, declaredBy(a))
+		}
+		if _, err := tx.Exec(q, args...); err != nil {
 			_ = tx.Rollback()
-			return false, fmt.Errorf("upsert acronym %q: %w", a.Term, err)
+			return false, fmt.Errorf("stage a batch of %d acronym(s): %w", len(batch), err)
 		}
 	}
-	_ = stmt.Close()
+	if _, err := tx.Exec(`DELETE FROM acronyms WHERE (term, expansion, domain) IN
+		(SELECT term, expansion, domain FROM staged_acronyms)`); err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("clear the rows this batch replaces: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO acronyms
+		(term, expansion, domain, first_release, last_release, source_series, declared_by)
+		SELECT term, expansion, domain, first_release, last_release, source_series, declared_by
+		  FROM staged_acronyms`); err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("write the glossary batch: %w", err)
+	}
 	return true, tx.Commit()
 }
 
