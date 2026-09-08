@@ -17,22 +17,34 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 		wantArgs []string
 		wantEnv  []string
 	}{
-		{"empty keeps the built-in LI suite", "", nil, nil},
-		{"all widens to the whole deliver archive", "all", []string{"--all"}, []string{"ETSI_ALL=1"}},
+		// EMPTY IS THE WHOLE ARCHIVE since 2026-09-08. It used to be the LI suite,
+		// and `make build` passes no scope — so the command that publishes resolved
+		// fourteen deliverables while `discover` diffed 20 163 3GPP versions.
+		{
+			"empty is the whole archive, every version — this is what `make build` uses",
+			"",
+			[]string{"--all", "--all-versions"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1", "ETSI_SPECS="},
+		},
+		{"the LI suite is still reachable, by name", ScopeLISuite,
+			nil, []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}},
+		{"all widens to the whole deliver archive", "all", []string{"--all"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}},
 		{
 			// The ETSI analogue of keeping every 3GPP release: --all plus every
 			// published version, which multiplies the work list several-fold.
 			"all-versions widens further, to every published version",
 			"all-versions",
 			[]string{"--all", "--all-versions"},
-			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1", "ETSI_SPECS="},
 		},
-		{"whitespace around all still means all", "  all  ", []string{"--all"}, []string{"ETSI_ALL=1"}},
+		{"whitespace around all still means all", "  all  ", []string{"--all"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}},
 		{
 			"an explicit list scopes explicitly",
 			"103 221-1,103 280",
 			[]string{"--specs", "103 221-1,103 280"},
-			[]string{"ETSI_SPECS=103 221-1,103 280"},
+			[]string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS=103 221-1,103 280"},
 		},
 		{
 			// The trim must reach the VALUE, not just the dispatch: a leading
@@ -41,7 +53,7 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 			"whitespace around an explicit list is trimmed off the value too",
 			"  103 280  ",
 			[]string{"--specs", "103 280"},
-			[]string{"ETSI_SPECS=103 280"},
+			[]string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS=103 280"},
 		},
 	}
 	for _, tc := range cases {
