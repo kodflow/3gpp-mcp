@@ -37,7 +37,7 @@ toolchain ─┬─ build-go ── test
                                │  │
   3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
                                                                                                                      ├─ smoke ─ publish
-  ETSI       discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
+  ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
 
 **The two arms are the same list twice.** Every data step of the 3GPP arm has a
@@ -51,11 +51,20 @@ shared `compact` declared the ETSI sparse import and not the 3GPP one.
 `TestTheTwoArmsRunTheSameSteps` pins the pairing, and its `shared` map is the only
 place an exception can be recorded.
 
-`seed` and `merge` have no twin, structurally: `merge` folds the 3GPP shards while
-the ETSI ingest writes one database directly, and `seed` applies the two curated
-3GPP seeds while the ETSI vocabulary is MINED, by `enrich-etsi`. `smoke` and
-`publish` are not per corpus either — one server is started over both stores, one
-image is pushed carrying both.
+`merge` has no twin, structurally: it folds the 3GPP shards, while the ETSI ingest
+writes one database directly, so there is nothing to fold. `smoke` and `publish`
+are not per corpus either — one server is started over both stores, one image is
+pushed carrying both.
+
+`seed` DID appear in that list, with a reason that described the curated seeds in
+`enrich` rather than what the step does. `bootstrap.CorpusETSI` existed, was
+exported, was tested and was called by `cmd/server` — and by no pipeline step, so
+a fresh clone pulled 3GPP from a published snapshot in minutes and rebuilt ETSI
+from etsi.org over hours. The exception was the defect, which is why
+`TestNoArmExceptionOutlivesItsStep` now reads that map instead of only trusting
+it. What `seed-etsi` does NOT yet close: ETSI has no delta anchor, so
+`discover-etsi` and `fetch-etsi` still re-enumerate the archive. The expensive
+half — `embed-etsi` and `sparse-etsi` — declines against the restored vectors.
 
 | Step | Does | Cost |
 |---|---|---|
