@@ -1413,6 +1413,27 @@ func validateAnchor(c *Ctx) error {
 		}
 	}
 	if err != nil {
+		// A TOOL THAT NEVER RAN HAS NOT ACCUSED THE CORPUS OF ANYTHING.
+		//
+		// This used to wrap every anchorcheck failure in the same sentence, and the
+		// sentence names a data defect and prescribes `goal run --repair` — a full
+		// repair fetch, hours of downloads. Measured 2026-09-08 10:26: anchorcheck
+		// died with 0xC0000142 (STATUS_DLL_INIT_FAILED, a process that could not
+		// start at all — this machine produced four of them in one morning under
+		// commit pressure from the heavy DuckDB steps), and the build reported that
+		// the corpus was missing spec text. It was not: the contract had just passed
+		// all seven of its checks against that very corpus, seconds earlier.
+		//
+		// anchorcheck prints one line per violation, so a non-zero exit with NOTHING
+		// on stdout is a tool that did not get as far as having an opinion. Saying so
+		// is the whole fix: the run still fails — an unrun gate proves nothing — but
+		// it fails naming what actually happened, and it does not send anyone to
+		// re-download the archive over a corpus that is intact.
+		if strings.TrimSpace(out) == "" {
+			return fmt.Errorf("anchorcheck did not run — it exited without reporting a single "+
+				"anchor line, so this says nothing about the corpus. Re-run the step; if it "+
+				"persists, launch it by hand to see why the binary will not start: %w", err)
+		}
 		return fmt.Errorf("the delta anchor claims specs the corpus holds no text for; "+
 			"run `goal run --repair` to fetch them, or record the unfetchable ones in "+
 			"contracts/accepted-absences.txt: %w", err)
