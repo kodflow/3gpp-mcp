@@ -7,6 +7,33 @@ import (
 	"testing"
 )
 
+// armShared records the steps that are legitimately not per corpus, each with the
+// reason it is not. This map is the ONLY place an exception can be recorded, so
+// adding one is a decision someone typed and a reviewer can see.
+var armShared = map[string]string{
+	"toolchain":       "verifies the machine, not a corpus",
+	"build-go":        "builds the binaries both arms run",
+	"build-rust":      "builds the binaries both arms run",
+	"build-embedder":  "builds the binaries both arms run",
+	"build-sparse":    "builds the binaries both arms run",
+	"build-serve":     "builds the binaries both arms run",
+	"test":            "runs the suite, not a corpus",
+	"seed":            "applies the two curated 3GPP seeds; the ETSI vocabulary is MINED, by enrich-etsi",
+	"merge":           "folds the 3GPP shards; the ETSI ingest writes one database directly",
+	"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither",
+	"publish":         "pushes ONE image carrying both corpora",
+	"discover-etsi":   "twin of discover",
+	"fetch-etsi":      "twin of fetch",
+	"ingest-etsi":     "twin of ingest",
+	"embed-etsi":      "twin of embed",
+	"enrich-etsi":     "twin of enrich",
+	"paragraphs-etsi": "twin of paragraphs",
+	"sparse-etsi":     "twin of sparse",
+	"compact-etsi":    "twin of compact",
+	"index-etsi":      "twin of index",
+	"validate-etsi":   "twin of validate",
+}
+
 // THE TWO ARMS MUST BE THE SAME LIST TWICE.
 //
 // Every hole this pipeline has had in the ETSI half was a MISSING TWIN, and not
@@ -40,32 +67,7 @@ func TestTheTwoArmsRunTheSameSteps(t *testing.T) {
 		names[s.Name] = true
 	}
 
-	// The steps that are legitimately not per corpus, each with the reason it is
-	// not. This list is the ONLY place an exception can be recorded, so adding one
-	// is a decision someone typed and a reviewer can see.
-	shared := map[string]string{
-		"toolchain":       "verifies the machine, not a corpus",
-		"build-go":        "builds the binaries both arms run",
-		"build-rust":      "builds the binaries both arms run",
-		"build-embedder":  "builds the binaries both arms run",
-		"build-sparse":    "builds the binaries both arms run",
-		"build-serve":     "builds the binaries both arms run",
-		"test":            "runs the suite, not a corpus",
-		"seed":            "applies the two curated 3GPP seeds; the ETSI vocabulary is MINED, by enrich-etsi",
-		"merge":           "folds the 3GPP shards; the ETSI ingest writes one database directly",
-		"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither",
-		"publish":         "pushes ONE image carrying both corpora",
-		"discover-etsi":   "twin of discover",
-		"fetch-etsi":      "twin of fetch",
-		"ingest-etsi":     "twin of ingest",
-		"embed-etsi":      "twin of embed",
-		"enrich-etsi":     "twin of enrich",
-		"paragraphs-etsi": "twin of paragraphs",
-		"sparse-etsi":     "twin of sparse",
-		"compact-etsi":    "twin of compact",
-		"index-etsi":      "twin of index",
-		"validate-etsi":   "twin of validate",
-	}
+	shared := armShared
 
 	// Every 3GPP data step must have an ETSI twin.
 	var missing []string
@@ -248,5 +250,43 @@ func TestEachCompactionNamesItsOwnWriters(t *testing.T) {
 					"rewrite a file nothing had touched (deps: %v)", suffix, unwanted, s.Deps)
 			}
 		}
+	}
+}
+
+// EVERY DECLARED EXCEPTION MUST NAME A STEP THAT ACTUALLY EXISTS. A stale entry is
+// worse than no entry at all: `armShared` is consulted to decide whether a missing
+// twin is deliberate, so an entry that outlives its step silently excuses a step
+// that has since been renamed or removed — and the next one to carry that name
+// inherits the excuse without anyone choosing it. `corpus-etsi` is exactly how that
+// happens: rename a step and the old key keeps answering "this is fine".
+func TestNoArmExceptionOutlivesItsStep(t *testing.T) {
+	names := map[string]bool{}
+	for _, s := range Pipeline() {
+		names[s.Name] = true
+	}
+	for step, why := range armShared {
+		if !names[step] {
+			t.Errorf("armShared still excuses %q (%s), and no such step is in the pipeline: "+
+				"delete the entry, or restore the step it was written for", step, why)
+		}
+	}
+}
+
+// THE ETSI INGEST IS NAMED FOR WHAT IT DOES, like its twin. The pairing test above
+// reads names, so the rename is the thing that makes it able to see this step at
+// all — under the old name `corpus-etsi` the ETSI arm's ingest paired with nothing
+// and the absence looked like a deliberate exception. This pins the name rather
+// than trusting it to survive the next edit.
+func TestTheETSIIngestIsCalledIngestETSI(t *testing.T) {
+	names := map[string]bool{}
+	for _, s := range Pipeline() {
+		names[s.Name] = true
+	}
+	if !names["ingest-etsi"] {
+		t.Error("no `ingest-etsi` step: the ETSI arm's ingest must pair with `ingest` by name")
+	}
+	if names["corpus-etsi"] {
+		t.Error("`corpus-etsi` is back: the step is the ETSI arm's INGEST, and calling it " +
+			"something else is what made the two arms impossible to line up")
 	}
 }
