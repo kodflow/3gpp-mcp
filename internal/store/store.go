@@ -1654,6 +1654,39 @@ func (s *Store) CountSpecVersions(ctx context.Context) (int, error) {
 // so a command that writes its own glossary SQL makes a schema change reach into
 // the command layer. dbcount already asks the store for spec_versions and
 // api_operations; this one is asked the same way.
+// SpecsWithAbbreviations lists every spec in the corpus that carries a clause
+// headed exactly "Abbreviations".
+//
+// IT EXISTS BECAUSE THE GLOSSARY WAS SEEDED FROM SIX SPECS. Measured 2026-09-08
+// on the shipped corpus: 3 497 specs carry such a clause and the seed read six of
+// them, so the 3GPP half held 1 781 acronym rows while the ETSI half — mined from
+// every deliverable — held 28 154. The miner existed on one arm only, which is the
+// same shape as ingest-glossary being built and run by no step.
+//
+// The heading test is EqualFold on the trimmed heading, matching readSpec exactly.
+// A LIKE '%abbreviation%' would also match "Definitions, symbols and
+// abbreviations", the PARENT clause, whose body is a sentence of introduction —
+// the same over-wide anchor that made the ETSI extractor read 8 % of its archive.
+func (s *Store) SpecsWithAbbreviations(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT spec_id FROM clauses
+		  WHERE lower(trim(heading)) = 'abbreviations'
+		  ORDER BY spec_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CountAcronyms(ctx context.Context) (int, error) {
 	return s.count(ctx, "acronyms")
 }
