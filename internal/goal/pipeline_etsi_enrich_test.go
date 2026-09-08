@@ -37,7 +37,7 @@ func TestBothHalvesAreEnriched(t *testing.T) {
 	}
 }
 
-// The ETSI enrich reads what corpus-etsi produced, with the binary build-rust
+// The ETSI enrich reads what ingest-etsi produced, with the binary build-rust
 // produced. Both have to be in the graph or the step can run against a tree that
 // is not there yet, or with a binary that predates its own source.
 func TestETSIEnrichWaitsForItsCorpusAndItsBinary(t *testing.T) {
@@ -45,7 +45,7 @@ func TestETSIEnrichWaitsForItsCorpusAndItsBinary(t *testing.T) {
 	if e.Name != "enrich-etsi" {
 		t.Fatalf("the ETSI arm is named %q, not %q", e.Name, "enrich-etsi")
 	}
-	for _, want := range []string{"corpus-etsi", "build-rust"} {
+	for _, want := range []string{"ingest-etsi", "build-rust"} {
 		if !contains(e.Deps, want) {
 			t.Errorf("enrich-etsi depends on %v, which does not include %q", e.Deps, want)
 		}

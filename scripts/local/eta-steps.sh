@@ -10,7 +10,7 @@
 #
 #   (declin)  la derniere execution a DECLINE — elle n'a rien fait. Sa duree
 #             mesure un refus, pas le travail. `paragraphs` affiche 0,4 s et
-#             `corpus-etsi` 4,4 s pour cette seule raison.
+#             `ingest-etsi` 4,4 s pour cette seule raison.
 #   RUN?      l'etape sera RE-DECIDEE contre l'etat reel quand sa dependance
 #             aura fini, et sautee si celle-ci n'a rien change. Son ETA est un
 #             plafond, pas une prevision.

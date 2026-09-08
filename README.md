@@ -266,7 +266,7 @@ Le corpus complet est construit, indexé, embarqué et **prouvé en JSON-RPC ré
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
 | 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
 | 9 — Reranker cross-encoder | ✅ actif par défaut | `internal/rerank` |
-| 10 — Moitié ETSI fédérée | ✅ 3 169 614 clauses | `cmd/goal` (`corpus-etsi`) |
+| 10 — Moitié ETSI fédérée | ✅ 3 169 614 clauses | `cmd/goal` (`ingest-etsi`) |
 
 **Un écart assumé avec l'archi figée (à régulariser en MR `arch-change`) :**
 

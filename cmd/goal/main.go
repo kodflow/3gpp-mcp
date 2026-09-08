@@ -100,15 +100,16 @@ func run() error {
 		Local:   local,
 		Data:    data,
 		Config: map[string]string{
-			"floor":          *floor,
-			"scope":          *scope,
-			"jobs":           *jobs,
-			"embed_floor":    *embedFloor,
-			"etsi_scope":     *etsiScope,
-			"model_dir":      filepath.Join(data, "models", "bge-m3"),
-			"contract_flags": dataContractFlags(root),
-			"full":           boolStr(*full),
-			"repair":         boolStr(*repair),
+			"floor":               *floor,
+			"scope":               *scope,
+			"jobs":                *jobs,
+			"embed_floor":         *embedFloor,
+			"etsi_scope":          *etsiScope,
+			"model_dir":           filepath.Join(data, "models", "bge-m3"),
+			"contract_flags":      dataContractFlags(root, arm3GPP),
+			"contract_flags_etsi": dataContractFlags(root, armETSI),
+			"full":                boolStr(*full),
+			"repair":              boolStr(*repair),
 		},
 	}
 
@@ -418,9 +419,24 @@ func gitState(root string) (string, string) {
 	return commit, dirty
 }
 
+// The two arms of the contract. They are the argument scripts/data-contract.sh
+// takes, and they are named here so a typo is a compile error rather than a
+// silently weaker gate: "3gp" makes the script exit 2, which sends
+// dataContractFlags down its fallback path and past the very check it applies.
+const (
+	arm3GPP = "3gpp"
+	armETSI = "etsi"
+)
+
 // dataContractFlags asks scripts/data-contract.sh, which the ADR designates as
 // the single source of the completeness contract. Duplicating its logic here is
 // exactly the drift the ADR exists to prevent.
+//
+// IT IS ASKED TWICE, ONCE PER CORPUS. `validate` and `validate-etsi` hold the
+// two halves of the product to the SAME contract, and the flag string that
+// expresses it comes from ONE file for both of them. The arms differ by exactly
+// one flag -- --require-etsi, the only check about the PAIR rather than about a
+// corpus -- and the script is what decides that, not this function.
 //
 // DATA_ETSI_DB IS SUPPLIED BECAUSE THE LAYOUTS DIFFER. --require-etsi takes the
 // second corpus's PATH, and the script's default is the IMAGE's (/data/mcp-3gpp).
@@ -449,9 +465,9 @@ func gitState(root string) (string, string) {
 // DIFFERENT corpus than the script would have, and only in the branch that already
 // means something went wrong — the hardest case to notice and the worst one to be
 // wrong in.
-func dataContractFlags(root string) string {
+func dataContractFlags(root, arm string) string {
 	etsi := filepath.Join(root, "data", "etsi.duckdb")
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"))
+	cmd := exec.Command("bash", filepath.Join(root, "scripts", "data-contract.sh"), arm)
 	cmd.Env = os.Environ()
 	if v, set := os.LookupEnv("DATA_ETSI_DB"); set && v != "" {
 		etsi = v
@@ -463,10 +479,18 @@ func dataContractFlags(root string) string {
 	out, err := cmd.Output()
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
-			"goal: scripts/data-contract.sh failed (%v) -- falling back to the strong contract; stderr: %s\n",
-			err, strings.TrimSpace(stderr.String()))
-		return "--require-fts --require-hnsw --require-embed-complete " +
-			"--require-sparse --require-etsi " + etsi
+			"goal: scripts/data-contract.sh %s failed (%v) -- falling back to the strong contract; stderr: %s\n",
+			arm, err, strings.TrimSpace(stderr.String()))
+		// THE FALLBACK IS PER ARM TOO, for the reason the strong fallback exists at
+		// all: a fallback that says something different from what the script would
+		// have said decides the publish gate on a contract nobody wrote, and it does
+		// so only in the branch that already means something is wrong. The ETSI arm
+		// drops --require-etsi here for the reason the script drops it there.
+		strong := "--require-fts --require-hnsw --require-embed-complete --require-sparse"
+		if arm == armETSI {
+			return strong
+		}
+		return strong + " --require-etsi " + etsi
 	}
 	return strings.TrimSpace(string(out))
 }

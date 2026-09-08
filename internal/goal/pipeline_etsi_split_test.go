@@ -8,10 +8,10 @@ import (
 
 // THE SPLIT IS ONLY WORTH ANYTHING IF THE TWO HALVES STOP INVALIDATING EACH OTHER.
 //
-// `fetch-etsi` and `corpus-etsi` were one step until 2026-09-07, so one Impl list
+// `fetch-etsi` and `ingest-etsi` were one step until 2026-09-07, so one Impl list
 // covered both the downloader and the Rust parser. Build 24 paid for it:
 //
-//	STEP corpus-etsi
+//	STEP ingest-etsi
 //	  reason  implementation changed: rust/store/src/lib.rs
 //
 // rust/store/src/lib.rs cannot alter one downloaded byte. The reverse was true at
@@ -21,7 +21,7 @@ import (
 // for its OWN sources — narrowing too far turns a loud waste into a corpus that is
 // silently stale, which is the worse failure of the two.
 func TestTheETSIFetchAndIngestNoLongerInvalidateEachOther(t *testing.T) {
-	fetch, ingest := stepFetchETSI(), stepCorpusETSI()
+	fetch, ingest := stepFetchETSI(), stepIngestETSI()
 
 	for _, tc := range []struct {
 		name    string
@@ -104,16 +104,16 @@ func TestTheETSIFetchAndIngestNoLongerInvalidateEachOther(t *testing.T) {
 // fact, and a deliverable that failed to convert is exactly the difference.
 func TestTheIngestTakesTheConvertedTreeAsItsInput(t *testing.T) {
 	c := &Ctx{Root: t.TempDir()}
-	in, err := stepCorpusETSI().Inputs(c)
+	in, err := stepIngestETSI().Inputs(c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(in, string(filepath.ListSeparator))
 	if !strings.Contains(joined, filepath.FromSlash("sources/convert-etsi")) {
-		t.Errorf("corpus-etsi does not take the converted tree as input: %v", in)
+		t.Errorf("ingest-etsi does not take the converted tree as input: %v", in)
 	}
 	if strings.Contains(joined, "etsi-worklist") {
-		t.Errorf("corpus-etsi still keys on the work list, which is what SHOULD have been "+
+		t.Errorf("ingest-etsi still keys on the work list, which is what SHOULD have been "+
 			"fetched rather than what was: %v", in)
 	}
 }
@@ -126,27 +126,27 @@ func TestOnlyTheIngestProducesTheETSICorpus(t *testing.T) {
 	if out := stepFetchETSI().Outputs(c); len(out) != 0 {
 		t.Errorf("fetch-etsi declares outputs (%v); `fetch` declares none, for the same reason", out)
 	}
-	out := stepCorpusETSI().Outputs(c)
+	out := stepIngestETSI().Outputs(c)
 	if len(out) != 1 || !strings.HasSuffix(out[0], "etsi.duckdb") {
-		t.Errorf("corpus-etsi should produce exactly data/etsi.duckdb, got %v", out)
+		t.Errorf("ingest-etsi should produce exactly data/etsi.duckdb, got %v", out)
 	}
 }
 
 // The DAG must actually run the fetch first. A dependency that is merely implied
 // by the file layout is not a dependency.
 func TestTheIngestDependsOnTheFetch(t *testing.T) {
-	deps := stepCorpusETSI().Deps
+	deps := stepIngestETSI().Deps
 	var found bool
 	for _, d := range deps {
 		if d == "fetch-etsi" {
 			found = true
 		}
 		if d == "discover-etsi" {
-			t.Errorf("corpus-etsi still depends on discover-etsi directly; that is the fetch's "+
+			t.Errorf("ingest-etsi still depends on discover-etsi directly; that is the fetch's "+
 				"dependency now, and keeping it here re-couples the two halves: %v", deps)
 		}
 	}
 	if !found {
-		t.Fatalf("corpus-etsi does not depend on fetch-etsi: %v", deps)
+		t.Fatalf("ingest-etsi does not depend on fetch-etsi: %v", deps)
 	}
 }

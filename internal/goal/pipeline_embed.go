@@ -515,7 +515,7 @@ func stepEnrich(t corpusTarget) *Step {
 		// ingest_glossary.rs lives in the same directory and this step never runs
 		// it — so editing the ETSI glossary miner would replay the 3GPP catalogue
 		// overlay, and paragraphs, sparse, compact, index and publish behind it.
-		// That is the shape corpus-etsi paid ~1 h and 18.8 GiB to learn on
+		// That is the shape ingest-etsi paid ~1 h and 18.8 GiB to learn on
 		// 2026-09-06, in the opposite direction.
 		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		Inputs: func(c *Ctx) ([]string, error) {
@@ -662,8 +662,8 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		Name:    "enrich" + t.Suffix,
 		Version: 1,
 		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary",
-		Deps:    []string{"corpus-etsi", "build-rust"},
-		// NAMED FILES, NOT THE CRATE — the declaration corpus-etsi carries, for the
+		Deps:    []string{"ingest-etsi", "build-rust"},
+		// NAMED FILES, NOT THE CRATE — the declaration ingest-etsi carries, for the
 		// reason measured on 2026-09-06: naming rust/ingest/src/bin made a fix to
 		// ingest_li.rs invalidate the whole ETSI half (~1 h of rework, 18.8 GiB
 		// re-pushed) over a binary that half never runs. This step runs exactly
@@ -695,9 +695,9 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		//
 		// What actually determines this step's work is its DATA dependency, which is
 		// what stepParagraphs says in the same situation and for the same reason:
-		// corpus-etsi declares data/etsi.duckdb as its output, so a fetch that
+		// ingest-etsi declares data/etsi.duckdb as its output, so a fetch that
 		// brought new deliverables shows up here as "dependency output changed", and
-		// a corpus-etsi that declined leaves this correctly skipped.
+		// an ingest-etsi that declined leaves this correctly skipped.
 		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Heavy:  true,
 		Validate: func(c *Ctx) error {
@@ -895,42 +895,61 @@ func envOr(key, def string) string {
 
 // ------------------------------------------------------------------ validate
 
-// stepValidate runs the data-completeness contract.
+// stepValidate runs the data-completeness contract against ONE corpus.
 //
-// IT DEPENDS ON index-etsi, AND THAT IS NOT COSMETIC ORDERING. The contract now
-// carries --require-etsi, which asserts the ETSI half's HNSW is FROZEN — and the
-// step that freezes it is index-etsi. With only "index" declared, validate ran
-// between the 3GPP index and the ETSI one and failed on a corpus that was
+// IT IS PER CORPUS NOW, AND THAT IS THE HOLE IT CLOSES. There used to be a single
+// `validate` step: it ran the whole contract on data/3gpp.duckdb and judged the
+// ETSI half by one composite flag, --require-etsi. So the 3GPP corpus answered for
+// --require-fts, --require-hnsw, --require-embed-complete and --require-sparse,
+// and the ETSI corpus -- the same writers, the same freeze, a corpus of comparable
+// size -- answered for none of them. An ETSI FTS index that failed to build, or a
+// sparse layer that came out empty, could not fail a gate, because no gate looked
+// at it. That is the same shape as the ETSI half having no enrich step: the
+// tooling existed and nothing was on the path that runs.
+//
+// THE TWO ARMS ASK ONE FILE FOR THEIR FLAGS. scripts/data-contract.sh takes the
+// arm as an argument and answers with the same checks either way, minus the one
+// flag that is about the PAIR rather than about a corpus. A second copy of the
+// contract would be a second contract.
+//
+// THE 3GPP ARM DEPENDS ON index-etsi, AND THAT IS NOT COSMETIC ORDERING. Its
+// contract carries --require-etsi, which asserts the ETSI half's HNSW is FROZEN --
+// and the step that freezes it is index-etsi. With only "index" declared, validate
+// ran between the 3GPP index and the ETSI one and failed on a corpus that was
 // perfectly fine:
 //
 //	[FAIL] require-etsi: … hnsw_state="building"
 //	       the server would REFUSE the ETSI index: hnsw not frozen
 //
 // Measured on build 24 (2026-09-07), the first run of the strengthened contract.
-// The ordering defect was always there; the weak contract never looked at the
-// ETSI half, so nothing could see it. A gate that is not on the path proves
-// nothing — and this is the same lesson one level down, found by fixing it.
+// The ordering defect was always there; the weak contract never looked at the ETSI
+// half, so nothing could see it. A gate that is not on the path proves nothing.
+//
+// The ETSI arm does NOT name `index` in return. It reads one corpus and compares
+// it against nothing else, so declaring the other half's freeze would be an
+// over-broad declaration -- the defect this file names eleven times -- and would
+// replay the ETSI gate every time the 3GPP index moved.
 //
 // validate is the LAST gate before smoke and publish, so it must come after
 // everything it inspects. Declaring the dependency rather than relying on list
 // order is what makes that true of the DAG and not just of this file.
-func stepValidate() *Step {
+func stepValidate(t corpusTarget) *Step {
 	return &Step{
-		Name:    "validate",
-		Version: 1,
+		Name:    "validate" + t.Suffix,
+		Version: 2,
 		Doc:     "run the data-completeness contract against the finished corpus",
-		Deps:    []string{"index", "index-etsi"},
+		Deps:    t.validateDeps(),
 		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{c.dataPath("3gpp.duckdb")}, nil
+			return []string{t.dbPath(c)}, nil
 		},
 		Run: func(c *Ctx) error {
-			args := validateArgs(c)
-			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg("contract_flags"), corpus3GPP().Floor(c))
+			args := validateArgs(c, t)
+			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg(t.ContractKey), t.Floor(c))
 			// SELECT THE SPARSE-CAPABLE REGISTRY ENTRY when the contract asks about
 			// the sparse layer, exactly as runSparse does to resolve the identity it
 			// stamps. cmd/validate compares schema_meta.sparse_model against
-			// embed.SparseModelID(), which reads the ACTIVE model — and the default
+			// embed.SparseModelID(), which reads the ACTIVE model -- and the default
 			// entry (bge-m3) is dense-only, so it resolves nothing and the comparison
 			// cannot happen. Leaving that to the operator's environment is a footgun:
 			// the same flag would check the layer on one machine and refuse to on
@@ -938,34 +957,51 @@ func stepValidate() *Step {
 			// (38067f8c6efe under both), so this changes what is CHECKED, never what
 			// is expected of the corpus.
 			var env []string
-			if hasFlag(strings.Fields(c.Cfg("contract_flags")), "--require-sparse") {
+			if hasFlag(strings.Fields(c.Cfg(t.ContractKey)), "--require-sparse") {
 				env = append(env, "EMBED_MODEL="+sparseModelName)
 			}
 			if err := c.Run(Cmd{Name: c.bin("validate"), Args: args, Env: env, Echo: true}); err != nil {
 				return err
+			}
+			// THE ANCHOR IS A 3GPP ARTEFACT, and this is not the ETSI arm being
+			// treated as second class. The delta anchor is .local/corpus-index.json,
+			// which `merge` writes out of the 3GPP shards; the ETSI ingest produces
+			// one database directly and there is no anchor to check against. Running
+			// anchorcheck here would point it at the 3GPP corpus from the ETSI gate,
+			// which is the same check twice under a name that says otherwise.
+			if t.Suffix != "" {
+				return nil
 			}
 			return validateAnchor(c)
 		},
 	}
 }
 
-// validateArgs builds the contract command line.
+// validateArgs builds the contract command line for one corpus.
 //
 // --require-embed-complete is FLOOR-AWARE, and the only floor that makes it mean
 // anything is the one `embed` actually ran with: clauses below it are deliberately
 // left NULL (cmd/validate: "Below-floor/legacy clauses are intentionally NULL and
 // never counted"). Leaving the floor out made the contract demand vectors for a
 // population embed was never asked to cover, and it failed a corpus that was in
-// fact complete — 413 pre-Rel-99 LCS clauses (GSM-era 03.71) against
+// fact complete -- 413 pre-Rel-99 LCS clauses (GSM-era 03.71) against
 // embed_floor="Rel-99", while validate counted at floor "".
 //
-// An explicit --embed-floor in contract_flags still wins: an operator overriding
-// the contract by hand is a decision, not an accident.
-func validateArgs(c *Ctx) []string {
-	args := []string{"--db", c.dataPath("3gpp.duckdb"), "--report", "text"}
-	flags := strings.Fields(c.Cfg("contract_flags"))
+// THE FLOOR COMES FROM THE TARGET, not from corpus3GPP(). corpusETSI().Floor is
+// deliberately empty, because clauses_needing_embedding skips any clause whose
+// release has no ordinal once a floor is set and an ETSI release is the constant
+// "ETSI" -- so a floor on this arm would select ZERO clauses and the strongest
+// check in the contract would report [ok] over an unvectorised corpus. Reading the
+// 3GPP floor here would have reintroduced exactly that, one gate later than the
+// place it is already documented.
+//
+// An explicit --embed-floor in the contract flags still wins: an operator
+// overriding the contract by hand is a decision, not an accident.
+func validateArgs(c *Ctx, t corpusTarget) []string {
+	args := []string{"--db", t.dbPath(c), "--report", "text"}
+	flags := strings.Fields(c.Cfg(t.ContractKey))
 	args = append(args, flags...)
-	if floor := corpus3GPP().Floor(c); floor != "" && !hasFlag(flags, "--embed-floor") {
+	if floor := t.Floor(c); floor != "" && !hasFlag(flags, "--embed-floor") {
 		args = append(args, "--embed-floor", floor)
 	}
 	return args
@@ -996,8 +1032,11 @@ func stepSmoke() *Step {
 		Name:    "smoke",
 		Version: 2,
 		Doc:     "start the real server over stdio and prove vector search stays enabled",
-		Deps:    []string{"validate"},
-		Impl:    []string{"cmd/server", "internal/mcp", "internal/search"},
+		// BOTH GATES, because there are two now. Naming only "validate" would let
+		// the smoke -- and `publish` behind it -- run while the ETSI contract had
+		// not been applied, which is the state this whole split ends.
+		Deps: []string{"validate", "validate-etsi"},
+		Impl: []string{"cmd/server", "internal/mcp", "internal/search"},
 		Inputs: func(c *Ctx) ([]string, error) {
 			in := []string{c.dataPath("3gpp.duckdb")}
 			// The ETSI corpus is served ALONGSIDE, so a change to it changes what
@@ -1246,21 +1285,19 @@ func runSmoke(c *Ctx) error {
 // untouched — compact writes only the copy until it verifies it — and a
 // .pre-compact present at this point backs up a corpus the live one has already
 // superseded. There is no instant at which nothing good exists.
-func rotateCompactionArtefacts(c *Ctx) {
-	for _, name := range []string{"3gpp.duckdb", "etsi.duckdb"} {
-		for _, suffix := range []string{".compact", ".pre-compact"} {
-			p := c.dataPath(name + suffix)
-			st, err := os.Stat(p)
-			if err != nil {
-				continue
-			}
-			if err := os.Remove(p); err != nil {
-				c.Log.Printf("WARNING: %s is in the way and could not be removed: %v", p, err)
-				continue
-			}
-			c.Log.Printf("rotated %s (%.1f GiB) — superseded by the live corpus",
-				p, float64(st.Size())/(1<<30))
+func rotateCompactionArtefacts(c *Ctx, t corpusTarget) {
+	for _, suffix := range []string{".compact", ".pre-compact"} {
+		p := c.dataPath(t.DB + suffix)
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
 		}
+		if err := os.Remove(p); err != nil {
+			c.Log.Printf("WARNING: %s is in the way and could not be removed: %v", p, err)
+			continue
+		}
+		c.Log.Printf("rotated %s (%.1f GiB) — superseded by the live corpus",
+			p, float64(st.Size())/(1<<30))
 	}
 }
 
@@ -1412,27 +1449,35 @@ type corpusTarget struct {
 	// None — so any non-empty floor would silently select ZERO ETSI clauses and the
 	// step would report success over an unvectorised corpus.
 	Floor func(c *Ctx) string
+	// ContractKey names the Ctx config entry holding this corpus's
+	// data-completeness contract flags, as scripts/data-contract.sh emits them
+	// for this arm. cmd/goal asks the script once per arm and puts both answers
+	// in the config, so `validate` and `validate-etsi` are held to one contract
+	// expressed in one file rather than to two that drift.
+	ContractKey string
 	// Producer names the step that writes DB (for AnyDeps / Deps).
 	Producers []string
 }
 
 func corpus3GPP() corpusTarget {
 	return corpusTarget{
-		Suffix:    "",
-		DB:        "3gpp.duckdb",
-		Ledger:    "ledger.jsonl",
-		Floor:     func(c *Ctx) string { return c.Cfg("embed_floor") },
-		Producers: []string{"merge", "seed"},
+		Suffix:      "",
+		DB:          "3gpp.duckdb",
+		Ledger:      "ledger.jsonl",
+		Floor:       func(c *Ctx) string { return c.Cfg("embed_floor") },
+		ContractKey: "contract_flags",
+		Producers:   []string{"merge", "seed"},
 	}
 }
 
 func corpusETSI() corpusTarget {
 	return corpusTarget{
-		Suffix:    "-etsi",
-		DB:        "etsi.duckdb",
-		Ledger:    "etsi-ledger.jsonl",
-		Floor:     func(c *Ctx) string { return "" },
-		Producers: []string{"corpus-etsi"},
+		Suffix:      "-etsi",
+		DB:          "etsi.duckdb",
+		Ledger:      "etsi-ledger.jsonl",
+		Floor:       func(c *Ctx) string { return "" },
+		ContractKey: "contract_flags_etsi",
+		Producers:   []string{"ingest-etsi"},
 	}
 }
 
@@ -1460,27 +1505,56 @@ func (t corpusTarget) multiProducer() []string {
 }
 
 // indexDeps: the vector index needs the vectors, and for 3GPP it also waits on
-// `enrich` — the catalogue overlay rewrites rows, and rebuilding the index before
+// `enrich` -- the catalogue overlay rewrites rows, and rebuilding the index before
 // it would index a corpus that is about to change.
 //
 // The ETSI arm names its own enrich TRANSITIVELY, through paragraphs-etsi: that
-// step now depends on enrich-etsi (see paragraphsDeps), and enrich-etsi writes
-// only `acronyms`, a table no vector index reads. Listing it again here would be
-// a dependency that documents nothing the DAG does not already enforce.
+// step depends on enrich-etsi (see paragraphsDeps), and enrich-etsi writes only
+// `acronyms`, a table no vector index reads. Listing it again here would be a
+// dependency that documents nothing the DAG does not already enforce.
+//
+// BOTH ARMS NAME THEIR OWN COMPACTION. `COPY FROM DATABASE` does not carry custom
+// indexes and the bin therefore resets hnsw_state to "building", so an index
+// frozen BEFORE its corpus is compacted is thrown away by the compaction while
+// schema_meta still claims the graph is frozen. That constraint is per corpus, and
+// it used to be expressed by both arms naming the SAME `compact` step -- which
+// worked, and coupled the ETSI freeze to the 3GPP conversion for no reason.
 func (t corpusTarget) indexDeps() []string {
+	deps := []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact" + t.Suffix, "build-go"}
 	if t.Suffix == "" {
 		// The 3GPP index is built AFTER the corpus is content-addressed: the
 		// vectors move to `bodies` in that step, and an index built before it
 		// would index the table the step is about to drop.
 		// build-go because the index is now built by cmd/freeze-hnsw.
-		return []string{"embed", "enrich", "paragraphs", "compact", "build-go"}
+		deps = append(deps, "enrich")
 	}
-	// compact, for the ETSI index too. COPY FROM DATABASE does not carry custom
-	// indexes and the bin therefore resets hnsw_state to "building", so an ETSI
-	// index frozen BEFORE compaction would be thrown away by it while schema_meta
-	// still claimed the graph was frozen — the same ordering constraint the 3GPP
-	// side already encodes, and the reason compact sits before both freezes.
-	return []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact", "build-go"}
+	return deps
+}
+
+// compactDeps: after every writer that leaves dead blocks behind in THIS corpus.
+//
+// THE 3GPP ARM WAS MISSING `sparse`, AND THE ETSI ARM WAS NOT. The single shared
+// step declared paragraphs, paragraphs-etsi and sparse-etsi -- so the ETSI sparse
+// import made the compaction dirty and the 3GPP one, which writes the same kind of
+// rows into the same kind of table, did not. Nothing detected it because the step
+// rewrote both files whenever it ran for any reason. Splitting the step by corpus
+// makes each arm's determinants exactly the writers of its own corpus, and the
+// omission cannot be spelled any more.
+func (t corpusTarget) compactDeps() []string {
+	return []string{"build-rust", "build-go", "paragraphs" + t.Suffix, "sparse" + t.Suffix}
+}
+
+// validateDeps: the gate comes after the last thing it inspects.
+//
+// The 3GPP arm inspects BOTH corpora, because its contract carries --require-etsi
+// -- the one check about the pair -- so it names the ETSI freeze as well as its
+// own. The ETSI arm inspects one corpus and names one freeze. See stepValidate for
+// the build that measured the missing edge.
+func (t corpusTarget) validateDeps() []string {
+	if t.Suffix == "" {
+		return []string{"index", "index-etsi"}
+	}
+	return []string{"index" + t.Suffix}
 }
 
 // refreshOverlays reports whether the operator asked for the external overlays
@@ -1886,130 +1960,126 @@ func kvInt(out, key string) (int64, bool) {
 	return 0, false
 }
 
-// stepCompact rewrites the corpus without its dead space, BEFORE the index.
+// stepCompact rewrites ONE corpus without its dead space, BEFORE its index.
 //
-// IT DECLINES WHEN THERE IS NOTHING TO RECLAIM. `COPY FROM DATABASE` costs
-// thirty minutes on this corpus and doubles its disk while it runs; it is worth
-// exactly the dead space it removes, and on a finished corpus that is 512 KiB.
-// See nothingToReclaim for the measurement and the thresholds.
+// IT IS PER CORPUS NOW. There used to be a single `compact` that looped over both
+// files, and the loop was not the problem -- the DECLARATION was. It named
+// `paragraphs`, `paragraphs-etsi` and `sparse-etsi`, so the ETSI sparse import made
+// the compaction dirty and the 3GPP sparse import, which writes the same kind of
+// rows into the same kind of table, did not. Nothing ever detected the omission,
+// because the step rewrote both files whenever it ran for any reason at all. Split
+// by corpus, each arm's determinants are exactly the writers of its own corpus
+// (see compactDeps) and the gap cannot be spelled.
+//
+// It also uncouples the two freezes. `index-etsi` used to wait on a step that
+// depended on the 3GPP paragraph conversion, so a 3GPP-only change replayed the
+// ETSI compaction and the ETSI freeze behind it -- half an hour and a rebuilt HNSW
+// for a file nothing had touched.
+//
+// IT DECLINES WHEN THERE IS NOTHING TO RECLAIM. `COPY FROM DATABASE` costs thirty
+// minutes on this corpus and doubles its disk while it runs; it is worth exactly
+// the dead space it removes, and on a finished corpus that is 512 KiB. See
+// nothingToReclaim for the measurement and the thresholds. Declining is now per
+// corpus as well, which is what it always meant: the shared step declined only when
+// NEITHER file was worth rewriting, so a build that needed to compact one of them
+// reported success over the other having been examined and skipped.
 //
 // DuckDB never returns free blocks to the filesystem: a CHECKPOINT reclaims them
 // for reuse INSIDE the file. Measured on the 2026-08-30 corpus, 46 947 of 229 166
-// blocks were in use — 12.3 GB of data in a 55.9 GB file, and DROP TABLE plus
+// blocks were in use -- 12.3 GB of data in a 55.9 GB file, and DROP TABLE plus
 // CHECKPOINT moved it by zero bytes. Only a full rewrite compacts, and the result
 // was 10.9 GB.
 //
 // ORDERING IS NOT A PREFERENCE HERE. `COPY FROM DATABASE` does not carry custom
-// indexes, so this must run BEFORE `index` — which is exactly why `index` lists it
-// as a dependency rather than the other way round. Running it after would leave a
-// corpus whose schema_meta says "frozen" about an index that stayed behind.
-func stepCompact() *Step {
+// indexes, so this must run BEFORE `index`+suffix -- which is exactly why that step
+// lists this one as a dependency rather than the other way round. Running it after
+// would leave a corpus whose schema_meta says "frozen" about an index that stayed
+// behind.
+func stepCompact(t corpusTarget) *Step {
 	return &Step{
-		Name:    "compact",
-		Version: 5,
+		Name:    "compact" + t.Suffix,
+		Version: 6,
 		Doc:     "rewrite the corpus without its dead space (COPY FROM DATABASE)",
-		// After every writer: the dense import, the sparse import and the
-		// content-addressed conversion all leave dead blocks behind.
-		// embed-etsi joins the dependencies because this step now compacts the ETSI
-		// corpus too: compacting it before its vectors are written would rewrite a
-		// file that is about to grow again, which is the one thing a compaction
-		// must not do.
+		// After every writer of THIS corpus: the dense import, the sparse import and
+		// the content-addressed conversion all leave dead blocks behind.
+		//
 		// build-go is an AVAILABILITY constraint, not a provenance one: this step
 		// launches dbcount, both to decide whether a rewrite is worth doing and to
 		// validate the one it did. build-go is a Tool step, so declaring it orders
 		// and force-builds the binary without folding anything into this
-		// fingerprint. It was already launched from Validate without being declared;
+		// fingerprint. It was once launched from Validate without being declared;
 		// the gate is what makes an out-of-date dbcount able to FAIL the step rather
 		// than merely mis-validate it.
-		Deps:  []string{"build-rust", "build-go", "paragraphs", "paragraphs-etsi", "sparse-etsi"},
+		Deps:  t.compactDeps(),
 		Impl:  []string{"rust/store/src/bin/compact.rs"},
 		Heavy: true,
-		// Not even compact may fingerprint the corpora, though it looked like the
+		// Not even compact may fingerprint the corpus, though it looked like the
 		// one step that safely could.
 		//
-		// It is the last step to REWRITE them, so the file it records ought to be
-		// the file it is judged against — that was the reasoning, and it was wrong
-		// by one step. `index` and `index-etsi` freeze the HNSW into those same
-		// files afterwards. So compact recorded a corpus without an index and was
-		// re-decided against a corpus with one, and planned a 30-minute rewrite on
-		// every build for ever.
+		// It is the last step to REWRITE it, so the file it records ought to be the
+		// file it is judged against -- that was the reasoning, and it was wrong by
+		// one step. `index`+suffix freezes the HNSW into that same file afterwards.
+		// So compact recorded a corpus without an index and was re-decided against a
+		// corpus with one, and planned a 30-minute rewrite on every build for ever.
 		//
 		// It is the eleventh instance of one defect, found only by sweeping the DAG
 		// instead of fixing the step in front of me. What decides compact's work is
-		// its data dependencies — paragraphs, paragraphs-etsi and sparse-etsi — and
-		// those already say, through provenance, whether anything was written that
-		// leaves dead space behind.
+		// its data dependencies -- the conversion and the sparse import of its own
+		// corpus -- and those already say, through provenance, whether anything was
+		// written that leaves dead space behind.
 		Inputs: func(c *Ctx) ([]string, error) { return nil, nil },
 		Validate: func(c *Ctx) error {
 			// The copy is only believable if the corpus still answers. compact
 			// itself refuses to swap on a clause-count mismatch; this re-asks
 			// afterwards so a swap that somehow landed wrong cannot pass silently.
-			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
+			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", t.dbPath(c)}})
 			if err != nil {
-				return stillOpenElsewhere("3gpp.duckdb", err)
+				return stillOpenElsewhere(t.DB, err)
 			}
 			if !strings.Contains(out, "clauses_with_vectors=") {
-				return fmt.Errorf("dbcount reports no vectorised clauses after compaction")
+				return fmt.Errorf("dbcount reports no vectorised clauses in %s after compaction", t.DB)
 			}
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			rotateCompactionArtefacts(c)
-			// ONE LOOP FOR BOTH CORPORA, and a MEASUREMENT BEFORE EACH.
+			rotateCompactionArtefacts(c, t)
+			db := t.dbPath(c)
+			// A MEASUREMENT BEFORE THE REWRITE.
 			//
-			// This step used to rewrite both files unconditionally, on the theory
-			// that whatever had just written to them left dead space behind. On a
-			// finished corpus that theory is simply false, and the cost of being
-			// wrong is not small: measured 2026-09-04, thirty minutes to take
-			// data/3gpp.duckdb from 18.2 GiB to 18.2 GiB, with a second copy of
-			// the corpus on the same volume for the duration.
+			// This step used to rewrite the file unconditionally, on the theory that
+			// whatever had just written to it left dead space behind. On a finished
+			// corpus that theory is simply false, and the cost of being wrong is not
+			// small: measured 2026-09-04, thirty minutes to take data/3gpp.duckdb
+			// from 18.2 GiB to 18.2 GiB, with a second copy of the corpus on the
+			// same volume for the duration.
 			//
 			// `dbcount --blocks` asks DuckDB's own block accounting instead. Both
-			// corpora answered TWO free blocks — 512 KiB of the ~21 GiB and
-			// ~18 GiB they occupy — because the writers before this step append
-			// rather than delete, and the one that does delete (the paragraph
-			// conversion) is followed by a compaction that already reclaimed it.
-			rewrote := 0
-			for _, corpus := range []struct {
-				name string
-				// The ETSI half may legitimately be absent; the 3GPP corpus may
-				// not, and a missing one must fail loudly rather than quietly
-				// become "nothing to do".
-				optional bool
-			}{{"3gpp.duckdb", false}, {"etsi.duckdb", true}} {
-				db := c.dataPath(corpus.name)
-				if corpus.optional && !fileNonEmpty(db) {
-					continue
-				}
-				out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{
-					"--db", db, "--blocks",
-				}})
-				if err != nil {
-					return err
-				}
-				if skip, why := nothingToReclaim(out); skip {
-					c.Log.Printf("%s: %s — not rewriting it", corpus.name, why)
-					continue
-				}
-				before, _ := os.Stat(db)
-				if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
-					"--db", db,
-				}, Echo: true}); err != nil {
-					return err
-				}
-				rewrote++
-				// The original is kept as <db>.pre-compact by the bin; the
-				// pipeline does not delete it. A corpus is not something to drop
-				// on the strength of a copy verified seconds ago — `validate` and
-				// `smoke` still have to run, and releasePreCompact runs after them.
-				if after, serr := os.Stat(db); serr == nil && before != nil {
-					c.Log.Printf("%s %.2f GiB -> %.2f GiB", corpus.name,
-						float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
-				}
+			// corpora answered TWO free blocks -- 512 KiB of the ~21 GiB and ~18 GiB
+			// they occupy -- because the writers before this step append rather than
+			// delete, and the one that does delete (the paragraph conversion) is
+			// followed by a compaction that already reclaimed it.
+			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{
+				"--db", db, "--blocks",
+			}})
+			if err != nil {
+				return err
 			}
-			if rewrote == 0 {
-				return fmt.Errorf(
-					"%w: neither corpus carries enough dead space to be worth a rewrite", ErrDeclined)
+			if skip, why := nothingToReclaim(out); skip {
+				return fmt.Errorf("%w: %s: %s", ErrDeclined, t.DB, why)
+			}
+			before, _ := os.Stat(db)
+			if err := c.Run(Cmd{Name: c.rbin("compact"), Args: []string{
+				"--db", db,
+			}, Echo: true}); err != nil {
+				return err
+			}
+			// The original is kept as <db>.pre-compact by the bin; the pipeline does
+			// not delete it. A corpus is not something to drop on the strength of a
+			// copy verified seconds ago -- `validate` and `smoke` still have to run,
+			// and releasePreCompact runs after them.
+			if after, serr := os.Stat(db); serr == nil && before != nil {
+				c.Log.Printf("%s %.2f GiB -> %.2f GiB", t.DB,
+					float64(before.Size())/(1<<30), float64(after.Size())/(1<<30))
 			}
 			return nil
 		},

@@ -72,6 +72,33 @@ func (c *Ctx) statePath(parts ...string) string {
 }
 
 // Pipeline returns the ordered step list.
+//
+// THE TWO ARMS ARE THE SAME LIST TWICE. Every data step of the 3GPP arm has a
+// same-named `-etsi` twin, in the same position, with the same contract:
+//
+//	discover  fetch  ingest  embed  enrich  paragraphs  sparse  compact  index  validate
+//
+// That is not tidiness. Each place the two arms differed was a place the ETSI half
+// silently went without something the 3GPP half had, and every one of them was
+// found by reading this list rather than by anything failing: no enrich (the
+// glossary miner was built by `build-rust` and run by no step), no contract of its
+// own (`validate` ran on 3gpp.duckdb and judged the ETSI half by one composite
+// flag), a shared compaction whose declaration named the ETSI sparse import and not
+// the 3GPP one, and a name -- `corpus-etsi` -- that did not pair with anything. A
+// missing twin is invisible; a hole in a column is not.
+//
+// `seed` and `merge` have no twin, and that is structural rather than an omission.
+// `merge` folds the 3GPP shards, and the ETSI ingest writes one database directly;
+// `seed` applies the two curated 3GPP seeds, and the ETSI vocabulary is MINED, by
+// `enrich-etsi`, which is where that work belongs. TestTheTwoArmsRunTheSameSteps
+// pins both the pairing and this exception list.
+//
+// # Ordering note
+//
+// The runner topologically sorts this list (see topoSort) and the declaration order
+// only breaks ties, so a step may be written here before something it depends on --
+// `validate` names index-etsi, which is declared below it. What the order buys is
+// legibility: the two arms read as two columns.
 func Pipeline() []*Step {
 	return []*Step{
 		stepToolchain(),
@@ -81,6 +108,8 @@ func Pipeline() []*Step {
 		stepBuildEmbedder(),
 		stepBuildSparse(),
 		stepBuildServe(),
+
+		// ------------------------------------------------------------- the 3GPP arm
 		stepSeed(),
 		stepDiscover(),
 		stepFetch(),
@@ -93,27 +122,27 @@ func Pipeline() []*Step {
 		// does not carry custom indexes), so both sit between the conversion and the
 		// freeze rather than after it.
 		stepSparse(corpus3GPP()),
-		stepCompact(),
+		stepCompact(corpus3GPP()),
 		stepIndex(corpus3GPP()),
-		stepValidate(),
-		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment: not
-		// just ingest + FTS, but vectors and an HNSW index too. An opt-in — or a
-		// lexical-only ETSI — would let one corpus fall silently behind, which is
-		// precisely the state the tooling was in.
+		stepValidate(corpus3GPP()),
+
+		// ------------------------------------------------------------- the ETSI arm
+		//
+		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment, step for
+		// step. An opt-in — or a lexical-only ETSI — would let one corpus fall
+		// silently behind, which is precisely the state the tooling was in.
 		stepDiscoverETSI(),
-		// fetch-etsi and corpus-etsi are the ETSI analogues of fetch and ingest.
-		// They were one step until 2026-09-07, which meant a change to the Rust
-		// parser re-ran the downloads and a change to the download script re-ran the
-		// parse.
+		// fetch-etsi and ingest-etsi were ONE step until 2026-09-07, which meant a
+		// change to the Rust parser re-ran the downloads and a change to the download
+		// script re-ran the parse.
 		stepFetchETSI(),
-		stepCorpusETSI(),
+		stepIngestETSI(),
 		stepEmbed(corpusETSI()),
-		// The ETSI half gets an enrichment pass too, in the same position its 3GPP
-		// twin holds: after the vectors, before the conversion. Its content is not
-		// the same — ETSI publishes no DynaReport catalogue, no 5GC OpenAPI corpus
-		// and no LI ASN.1 registry — but it HAS a vocabulary, one Abbreviations
-		// clause per deliverable, and ingest-glossary was written to mine it and
-		// then wired to nothing. See stepEnrich.
+		// The ETSI enrichment is not the same WORK as the 3GPP one — ETSI publishes no
+		// DynaReport catalogue, no 5GC OpenAPI corpus and no LI ASN.1 registry — but it
+		// HAS a vocabulary, one Abbreviations clause per deliverable, and
+		// ingest-glossary was written to mine it and then wired to nothing. What the
+		// two share is the name, the contract and the position. See stepEnrich.
 		stepEnrich(corpusETSI()),
 		// The ETSI half gets the content-addressed conversion too. Without it
 		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
@@ -123,13 +152,22 @@ func Pipeline() []*Step {
 		// dozen versions, and the deliverable that answers never in it.
 		stepParagraphs(corpusETSI()),
 		stepSparse(corpusETSI()),
+		stepCompact(corpusETSI()),
 		stepIndex(corpusETSI()),
+		stepValidate(corpusETSI()),
+
+		// ------------------------------------------------------------- the product
+		//
+		// smoke and publish are not per corpus, and they are the only data steps that
+		// are not: one server is started, over both stores, and one image is pushed
+		// carrying both. Splitting them would prove each half serves and leave the
+		// federation — which is the product — proven by neither.
 		stepSmoke(),
-		// The image is the LAST step, and it is a step rather than a separate
-		// entry point because it was the only output of this repository with no
-		// determinants: nothing could say whether what consumers pull was the
-		// corpus this machine had built. See pipeline_publish.go for the two
-		// failures that cost.
+		// The image is the LAST step, and it is a step rather than a separate entry
+		// point because it was the only output of this repository with no
+		// determinants: nothing could say whether what consumers pull was the corpus
+		// this machine had built. See pipeline_publish.go for the two failures that
+		// cost.
 		stepPublish(),
 	}
 }
