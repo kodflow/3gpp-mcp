@@ -41,8 +41,21 @@ func stepDiscoverETSI() *Step {
 		// holds these deliverables is work this step must not re-enumerate.
 		Deps: []string{"build-go", "seed-etsi"},
 		Impl: []string{"cmd/discover-etsi", "internal/etsicat"},
+		// THE RESOLVED SCOPE, NOT THE KNOB. Recording c.Cfg("etsi_scope") records
+		// what the operator TYPED, and the empty string is the value almost every
+		// run carries — so the day the empty string stopped meaning "the fourteen
+		// built-in LI deliverables" and started meaning "the whole archive, every
+		// version", the recorded determinant did not move and this step SKIPPED.
+		// The fix shipped, every gate stayed green, and the ETSI half went on being
+		// discovered exactly as narrowly as before. Measured 2026-09-08 21:11.
+		//
+		// A determinant has to name what the step will DO. etsiScopeArgs is that,
+		// and it is the same function the Run below hands to the binary, so the two
+		// cannot drift.
 		Extra: func(c *Ctx) (map[string]string, error) {
-			return map[string]string{"etsi_scope": c.Cfg("etsi_scope")}, nil
+			return map[string]string{
+				"etsi_scope": strings.Join(etsiScopeArgs(c.Cfg("etsi_scope")), " "),
+			}, nil
 		},
 		Outputs: func(c *Ctx) []string { return []string{c.statePath("etsi-worklist.tsv")} },
 		// The Run below writes this file and nothing else. An ETSI catalogue that
@@ -107,6 +120,17 @@ func stepFetchETSI() *Step {
 		// build-go, not build-rust: this step runs cmd/discover-etsi and never
 		// touches the Rust ingest. That asymmetry IS the split.
 		Deps: []string{"discover-etsi", "build-go"},
+		// THIS STEP RE-DERIVES THE SCOPE and must therefore record it. It does not
+		// read discover-etsi's work list: scripts/etsi-fetch.sh runs the enumerator
+		// again from ETSI_ALL/ETSI_ALL_VERSIONS/ETSI_SPECS. Leaning on the dependency
+		// edge alone would be leaning on the claim that the two always agree, which
+		// is exactly what went wrong when the narrow scope left those variables to
+		// the ambient environment.
+		Extra: func(c *Ctx) (map[string]string, error) {
+			return map[string]string{
+				"etsi_scope": strings.Join(etsiScopeEnv(c.Cfg("etsi_scope")), " "),
+			}, nil
+		},
 		Impl: []string{
 			"scripts/etsi-fetch.sh",
 			"scripts/lib/etsi-common.sh",

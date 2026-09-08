@@ -89,3 +89,49 @@ func TestEveryScopeSpeaksForEveryFetchVariable(t *testing.T) {
 		}
 	}
 }
+
+// A DETERMINANT MUST NAME WHAT THE STEP WILL DO, NOT WHAT THE OPERATOR TYPED.
+//
+// discover-etsi recorded c.Cfg("etsi_scope"), and the empty string is the value
+// almost every run carries. So the day the empty string stopped meaning "the
+// fourteen built-in LI deliverables" and started meaning "the whole archive, every
+// version", the recorded determinant did not move: the step SKIPPED, the fix
+// shipped inert, and every gate stayed green over an ETSI half discovered exactly
+// as narrowly as before.
+//
+// The test is the two scopes that differ in MEANING while sharing a knob value's
+// shape: an unset scope and the named narrow one must record different things.
+func TestTheRecordedScopeIsWhatTheStepWillDo(t *testing.T) {
+	byName := map[string]*Step{}
+	for _, s := range Pipeline() {
+		byName[s.Name] = s
+	}
+	for _, name := range []string{"discover-etsi", "fetch-etsi"} {
+		s := byName[name]
+		if s == nil || s.Extra == nil {
+			t.Errorf("%s records no scope determinant, so a change of scope cannot replay it", name)
+			continue
+		}
+		c, _ := newTestCtx(t)
+
+		c.Config["etsi_scope"] = ""
+		wide, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Config["etsi_scope"] = ScopeLISuite
+		narrow, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wide["etsi_scope"] == narrow["etsi_scope"] {
+			t.Errorf("%s records %q for BOTH the whole archive and the LI suite: a change "+
+				"between them cannot move the fingerprint, so the step would skip",
+				name, wide["etsi_scope"])
+		}
+		if wide["etsi_scope"] == "" {
+			t.Errorf("%s records the empty string for the whole archive — the knob's value, "+
+				"not the work", name)
+		}
+	}
+}
