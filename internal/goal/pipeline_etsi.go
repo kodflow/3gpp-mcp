@@ -390,7 +390,7 @@ func etsiScopeEnv(scope string) []string {
 	// Modelling them instead would mean a knob nobody asked for. Clearing says the
 	// pipeline's scope is the WHOLE scope, which is the property the fingerprint
 	// needs to be true.
-	unmodelled := []string{"ETSI_INCLUDE_3GPP=", "ETSI_TYPE_DIRS="}
+	unmodelled := []string{"ETSI_INCLUDE_3GPP=", "ETSI_TYPE_DIRS=", "ETSI_INDEX="}
 	with := func(scoped ...string) []string { return append(scoped, unmodelled...) }
 	switch scope {
 	case "", ScopeAllVersions:
