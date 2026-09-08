@@ -246,8 +246,9 @@ chemin autorisé pour étendre la surface. Aujourd'hui : 10 + `li_events` = **11
 ## 6. Pipeline d'ingestion
 
 Depuis le 2026-08-23, tout passe par **une machine** et une seule commande :
-`cmd/goal` + `internal/goal`, une machine à états de **31 étapes** reprenable
-(deux bras de 10 étapes de données chacun, plus les builds et le produit).
+`cmd/goal` + `internal/goal`, une machine à états de **32 étapes** reprenable
+(**11 paires** d'étapes de données — 12 côté 3GPP, 11 côté ETSI, `merge` n'ayant
+pas de jumelle — plus les builds et le produit).
 Runbook complet : `docs/local-pipeline.md`. Décision : `docs/adr/0003`.
 
 ```
@@ -257,7 +258,7 @@ toolchain ─┬─ build-go ── test
                                │  │
   3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
                                                                                                                      ├─ smoke ─ publish
-  ETSI       discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
+  ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
 
 **Les deux bras sont la même liste, deux fois.** Chaque étape de données du bras
@@ -372,7 +373,7 @@ oublie de transmettre ce plancher recale un corpus complet.
 ```
 3gpp-mcp/
 ├── cmd/
-│   ├── goal/            # LE point d'entrée : la machine à états 31 étapes
+│   ├── goal/            # LE point d'entrée : la machine à états 32 étapes
 │   ├── server/          # MCP server (stdio + HTTP) + bootstrap subcommand
 │   ├── validate/        # contrat de complétude des données
 │   ├── anchorcheck/     # l'ancre ne doit pas revendiquer du texte absent

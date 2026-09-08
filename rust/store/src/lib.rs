@@ -1706,19 +1706,26 @@ impl Store {
                     [],
                 )
                 .context("purge the previously mined vocabulary")?;
-            // ONE upsert. The staged rows are unique on (term, expansion, domain) by
-            // construction — Tally keys a BTreeMap on exactly that pair and domain is
-            // always "" — so no row can conflict with another row of this batch, and
-            // DO UPDATE is left to do the only job it ever had: yield to a 3GPP row
-            // that already declares the same pair.
+            // ONE upsert, and it YIELDS. The staged rows are unique on
+            // (term, expansion, domain) by construction — Tally keys a BTreeMap on
+            // exactly that pair and domain is always "" — so no row can conflict with
+            // another row of this batch. The DELETE above has already removed every
+            // mined row. So the only row a conflict can now name is one this pass does
+            // not own: a curated 3GPP entry declaring the same pair.
+            //
+            // DO UPDATE claimed to yield and did the opposite — `source_series =
+            // excluded.source_series` overwrites the 3GPP provenance with an ETSI one,
+            // which is how a curated entry would come to cite a deliverable that did
+            // not declare it. Unreachable in the corpus that ships (etsi.duckdb holds
+            // 28 154 mined rows and nothing else, measured), because the two halves are
+            // separate databases — but the guard costs nothing and the comment was
+            // already describing DO NOTHING.
             self.conn
                 .execute(
                     "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
                      SELECT term, expansion, domain, first_release, last_release, source_series, declared_by
                        FROM mined_acronyms
-                     ON CONFLICT (term, expansion, domain) DO UPDATE SET
-                       first_release = excluded.first_release, last_release = excluded.last_release,
-                       source_series = excluded.source_series, declared_by = excluded.declared_by",
+                     ON CONFLICT (term, expansion, domain) DO NOTHING",
                     [],
                 )
                 .context("write the mined vocabulary")?;

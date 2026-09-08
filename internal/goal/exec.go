@@ -212,7 +212,21 @@ func (c *Ctx) Output(cmd Cmd) (string, error) {
 		if ee, ok := err.(*exec.ExitError); ok {
 			code = ee.ExitCode()
 		}
-		return "", &ExecError{Cmd: full, Dir: ex.Dir, ExitCode: code, Tail: errBuf.String(), Err: err}
+		// RETURN WHAT THE COMMAND SAID, EVEN THOUGH IT FAILED.
+		//
+		// Discarding stdout here made a tool's own report unreadable by the code
+		// that asked for it, and it has now cost twice. Both times the tool was
+		// anchorcheck, which exits 1 to REPORT holes and prints one line per
+		// violation: reportAnchorHoles read an empty string and logged that the
+		// check was UNVERIFIED while the answer sat in the discarded buffer, and
+		// validateAnchor tried to separate "the binary never started" from "the
+		// corpus really is missing text" by asking whether anything was printed —
+		// a distinction this line made impossible, collapsing both onto the first.
+		//
+		// No caller is harmed: every one of the twenty-four checks the error first,
+		// so a non-empty string alongside a non-nil error reaches only the two that
+		// want it. An exit code is a summary; the output is the finding.
+		return strings.TrimSpace(string(out)), &ExecError{Cmd: full, Dir: ex.Dir, ExitCode: code, Tail: errBuf.String(), Err: err}
 	}
 	return strings.TrimSpace(string(out)), nil
 }
