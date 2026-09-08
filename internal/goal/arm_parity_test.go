@@ -18,10 +18,10 @@ var armShared = map[string]string{
 	"build-sparse":    "builds the binaries both arms run",
 	"build-serve":     "builds the binaries both arms run",
 	"test":            "runs the suite, not a corpus",
-	"seed":            "applies the two curated 3GPP seeds; the ETSI vocabulary is MINED, by enrich-etsi",
 	"merge":           "folds the 3GPP shards; the ETSI ingest writes one database directly",
 	"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither",
 	"publish":         "pushes ONE image carrying both corpora",
+	"seed-etsi":       "twin of seed",
 	"discover-etsi":   "twin of discover",
 	"fetch-etsi":      "twin of fetch",
 	"ingest-etsi":     "twin of ingest",
@@ -288,5 +288,38 @@ func TestTheETSIIngestIsCalledIngestETSI(t *testing.T) {
 	if names["corpus-etsi"] {
 		t.Error("`corpus-etsi` is back: the step is the ETSI arm's INGEST, and calling it " +
 			"something else is what made the two arms impossible to line up")
+	}
+}
+
+// EACH ARM BOOTSTRAPS FROM ITS OWN PUBLISHED PACKAGE. `seed` used to name
+// bootstrap.Corpus3GPP directly, so there was no way for the ETSI arm to have a
+// snapshot at all — and bootstrap.CorpusETSI, which exists and which cmd/server
+// calls, was reachable from no pipeline step. The cost was not an error anywhere:
+// a fresh clone pulled 3GPP in minutes and rebuilt ETSI from etsi.org over hours,
+// for a package sitting on the registry the whole time.
+//
+// Pointing both arms at one image is the failure this pins: it would seed the ETSI
+// database with 3GPP bytes, and `validate-etsi` would then check a corpus that is
+// not the one the arm is supposed to hold.
+func TestEachArmSeedsFromItsOwnSnapshot(t *testing.T) {
+	three, etsi := corpus3GPP(), corpusETSI()
+	if three.Snapshot == nil || etsi.Snapshot == nil {
+		t.Fatal("an arm has no snapshot source, so `seed` cannot be asked which package to pull")
+	}
+	got3, gotE := three.Snapshot(), etsi.Snapshot()
+	if got3.Image != "3gpp-corpus" {
+		t.Errorf("the 3GPP arm seeds from %q", got3.Image)
+	}
+	if gotE.Image != "etsi-corpus" {
+		t.Errorf("the ETSI arm seeds from %q", gotE.Image)
+	}
+	if got3.Image == gotE.Image {
+		t.Error("both arms seed from one package: one corpus would be filled with the other's bytes")
+	}
+	// And each must extract the member that IS its own database, or the seed
+	// writes a file whose name promises a corpus it does not contain.
+	if got3.Member != three.DB || gotE.Member != etsi.DB {
+		t.Errorf("member/DB mismatch: 3gpp %q vs %q, etsi %q vs %q",
+			got3.Member, three.DB, gotE.Member, etsi.DB)
 	}
 }

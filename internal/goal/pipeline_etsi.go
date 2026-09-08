@@ -37,8 +37,10 @@ func stepDiscoverETSI() *Step {
 		Name:    "discover-etsi",
 		Version: 1,
 		Doc:     "resolve the ETSI deliverable work list from the /deliver archive",
-		Deps:    []string{"build-go"},
-		Impl:    []string{"cmd/discover-etsi", "internal/etsicat"},
+		// seed-etsi, for the reason discover names seed: a snapshot that already
+		// holds these deliverables is work this step must not re-enumerate.
+		Deps: []string{"build-go", "seed-etsi"},
+		Impl: []string{"cmd/discover-etsi", "internal/etsicat"},
 		Extra: func(c *Ctx) (map[string]string, error) {
 			return map[string]string{"etsi_scope": c.Cfg("etsi_scope")}, nil
 		},

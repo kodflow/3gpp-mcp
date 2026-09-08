@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 )
 
@@ -1476,6 +1477,17 @@ type corpusTarget struct {
 	// in the config, so `validate` and `validate-etsi` are held to one contract
 	// expressed in one file rather than to two that drift.
 	ContractKey string
+	// Snapshot names the published GHCR package this arm bootstraps from.
+	//
+	// BOTH ARMS HAVE ONE, and for two months only one of them used it.
+	// bootstrap.CorpusETSI was written, exported, covered by its own test and
+	// called by cmd/server — and by NO pipeline step, because `seed` named
+	// bootstrap.Corpus3GPP directly instead of asking the arm. So a fresh clone
+	// pulled the 3GPP corpus from a snapshot in minutes and rebuilt the ETSI half
+	// from etsi.org over many hours of download and GPU, for a package that was
+	// sitting on the registry the whole time. Same shape as ingest-glossary: the
+	// capability existed, the wiring did not.
+	Snapshot func() bootstrap.CorpusSource
 	// Producer names the step that writes DB (for AnyDeps / Deps).
 	Producers []string
 }
@@ -1487,7 +1499,10 @@ func corpus3GPP() corpusTarget {
 		Ledger:      "ledger.jsonl",
 		Floor:       func(c *Ctx) string { return c.Cfg("embed_floor") },
 		ContractKey: "contract_flags",
-		Producers:   []string{"merge", "seed"},
+		Snapshot: func() bootstrap.CorpusSource {
+			return bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+		},
+		Producers: []string{"merge", "seed"},
 	}
 }
 
@@ -1498,7 +1513,12 @@ func corpusETSI() corpusTarget {
 		Ledger:      "etsi-ledger.jsonl",
 		Floor:       func(c *Ctx) string { return "" },
 		ContractKey: "contract_flags_etsi",
-		Producers:   []string{"ingest-etsi"},
+		Snapshot: func() bootstrap.CorpusSource {
+			return bootstrap.CorpusETSI(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+		},
+		// seed-etsi joins ingest-etsi exactly as seed joins merge on the other arm:
+		// two producers, so they land in AnyDeps and either one moving is enough.
+		Producers: []string{"ingest-etsi", "seed-etsi"},
 	}
 }
 

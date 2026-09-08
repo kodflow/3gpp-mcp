@@ -110,7 +110,7 @@ func Pipeline() []*Step {
 		stepBuildServe(),
 
 		// ------------------------------------------------------------- the 3GPP arm
-		stepSeed(),
+		stepSeed(corpus3GPP()),
 		stepDiscover(),
 		stepFetch(),
 		stepIngest(),
@@ -131,6 +131,7 @@ func Pipeline() []*Step {
 		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment, step for
 		// step. An opt-in — or a lexical-only ETSI — would let one corpus fall
 		// silently behind, which is precisely the state the tooling was in.
+		stepSeed(corpusETSI()),
 		stepDiscoverETSI(),
 		// fetch-etsi and ingest-etsi were ONE step until 2026-09-07, which meant a
 		// change to the Rust parser re-ran the downloads and a change to the download
@@ -341,23 +342,32 @@ func stepBuildRust() *Step {
 // Seeding is an OPTIMISATION, never a requirement: with no credential the step
 // leaves the corpus absent and says so, and the pipeline builds it from 3gpp.org
 // the licit way — slower, and the path that has to keep working regardless.
-func stepSeed() *Step {
+// stepSeed bootstraps ONE arm's corpus from its published GHCR snapshot.
+//
+// PARAMETERISED BECAUSE BOTH ARMS HAVE A SNAPSHOT. Until 2026-09-08 this step was
+// hardcoded to data/3gpp.duckdb and bootstrap.Corpus3GPP, so `seed` was recorded
+// in armShared as legitimately shared — with a reason that described the CURATED
+// seeds in `enrich` rather than what this step actually does. The reason was
+// wrong and the exception with it: ghcr.io/kodflow/etsi-corpus exists and is
+// served by cmd/server, so the ETSI half was rebuilt from etsi.org every time for
+// want of a caller.
+func stepSeed(t corpusTarget) *Step {
 	return &Step{
-		Name:    "seed",
+		Name:    "seed" + t.Suffix,
 		Version: 2, // bumped: the source changed, so a cached success must not carry over
 		Doc:     "seed the corpus from the published snapshot on the private GHCR package (skipped when a local corpus already exists, or when no credential is available)",
 		Deps:    []string{"build-go"},
 		Impl:    []string{"internal/goal/pipeline.go"},
 		Heavy:   true,
-		Outputs: func(c *Ctx) []string { return []string{c.dataPath("3gpp.duckdb")} },
+		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
 			// Proof that the file is a usable DuckDB, not just bytes on disk.
-			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
+			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", t.dbPath(c)}})
 			if err != nil {
 				// THE ONE THAT MATTERS MOST. The Run below downloads and REPLACES
 				// the corpus, so "cannot open" must never be allowed to mean
 				// "re-acquire 21 GB" on the strength of a stale file handle.
-				return stillOpenElsewhere("3gpp.duckdb",
+				return stillOpenElsewhere(t.DB,
 					fmt.Errorf("the seeded DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
@@ -366,7 +376,7 @@ func stepSeed() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			db := c.dataPath("3gpp.duckdb")
+			db := t.dbPath(c)
 			// seededNow records whether THIS run produced the corpus from the
 			// published package. It is what lets seedAnchor adopt the published
 			// anchor without hashing 12.36 GB to re-derive a fact we already know.
@@ -384,10 +394,9 @@ func stepSeed() *Step {
 				// merge and every vector step behind them were scheduled to replay a
 				// finished 22 GB corpus. A decline says "nothing to do" and carries
 				// the previous provenance forward, which is the truth here.
-				if err := seedAnchor(c, db, false); err != nil {
+				if err := t.seedAnchorIfAny(c, db, false); err != nil {
 					return err
 				}
-				reportAnchorHoles(c, db)
 				return fmt.Errorf("%w: a local corpus is already present, seeding would add nothing", ErrDeclined)
 			} else {
 				if err := os.MkdirAll(c.Data, 0o755); err != nil {
@@ -400,20 +409,34 @@ func stepSeed() *Step {
 						db)
 					return fmt.Errorf("%w: no GHCR credential for the corpus package", ErrDeclined)
 				}
-				src := bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+				src := t.Snapshot()
 				c.Log.Printf("seeding from %s (credential from %s) — large, and it resumes if interrupted", src, origin)
 				if err := bootstrap.FetchCorpus(c.Context, src, pat, db, c.Log.Printf); err != nil {
 					return fmt.Errorf("seed from %s: %w", src, err)
 				}
 				seededNow = true
 			}
-			if err := seedAnchor(c, db, seededNow); err != nil {
-				return err
-			}
-			reportAnchorHoles(c, db)
-			return nil
+			return t.seedAnchorIfAny(c, db, seededNow)
 		},
 	}
+}
+
+// seedAnchorIfAny installs the delta anchor, and does nothing on the ETSI arm.
+//
+// THE ANCHOR IS A 3GPP ARTEFACT and this is not the ETSI half being treated as
+// second class — it is .local/corpus-index.json, which `merge` derives from the
+// 3GPP shards. ETSI has no shards and no anchor: its ingest writes one database
+// directly. Running it here would point a 3GPP-shaped check at the ETSI corpus,
+// which is the same mistake stepValidate documents one gate later.
+func (t corpusTarget) seedAnchorIfAny(c *Ctx, db string, seededNow bool) error {
+	if t.Suffix != "" {
+		return nil
+	}
+	if err := seedAnchor(c, db, seededNow); err != nil {
+		return err
+	}
+	reportAnchorHoles(c, db)
+	return nil
 }
 
 // reportAnchorHoles makes the anchor's over-claims visible at the moment the
