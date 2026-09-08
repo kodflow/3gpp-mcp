@@ -17,7 +17,16 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 		wantArgs []string
 		wantEnv  []string
 	}{
-		{"empty keeps the built-in LI suite", "", nil, nil},
+		// EMPTY IS THE WHOLE ARCHIVE since 2026-09-08. It used to be the LI suite,
+		// and `make build` passes no scope — so the command that publishes resolved
+		// fourteen deliverables while `discover` diffed 20 163 3GPP versions.
+		{
+			"empty is the whole archive, every version — this is what `make build` uses",
+			"",
+			[]string{"--all", "--all-versions"},
+			[]string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"},
+		},
+		{"the LI suite is still reachable, by name", ScopeLISuite, nil, nil},
 		{"all widens to the whole deliver archive", "all", []string{"--all"}, []string{"ETSI_ALL=1"}},
 		{
 			// The ETSI analogue of keeping every 3GPP release: --all plus every

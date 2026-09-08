@@ -72,3 +72,50 @@ func splitCSV(s string) []string {
 	}
 	return append(out, cur)
 }
+
+// THE PREFERRED SPECS MUST BE READ LAST, and this test is here because getting it
+// backwards changes nothing measurable.
+//
+// store.UpsertAcronyms keeps the LAST row it sees for a (term, expansion, domain)
+// key. Reading the preferred specs first — which is what reads naturally, and what
+// this code did when the sweep was written — makes them the rows that get
+// overwritten: the count is identical, every gate passes, and the glossary quietly
+// cites an obscure spec where citing TS 23.501 was the entire purpose.
+func TestPreferredSpecsAreReadLastSoTheyWinTheKey(t *testing.T) {
+	sweep := []string{"21.905", "23.401", "23.501", "38.331", "99.999"}
+	preferred := map[string]bool{"23.501": true, "23.401": true}
+
+	got := readOrder(sweep, preferred)
+	if len(got) != len(sweep) {
+		t.Fatalf("readOrder dropped specs: %v", got)
+	}
+	seen := map[string]bool{}
+	for _, id := range got {
+		seen[id] = true
+	}
+	for _, id := range sweep {
+		if !seen[id] {
+			t.Errorf("readOrder lost %q — every spec in the corpus must be read", id)
+		}
+	}
+	// The last two must be the preferred ones, in any order between themselves.
+	for _, id := range got[len(got)-2:] {
+		if !preferred[id] {
+			t.Errorf("%q is read after a preferred spec, so it would overwrite it", id)
+		}
+	}
+	for _, id := range got[:len(got)-2] {
+		if preferred[id] {
+			t.Errorf("preferred spec %q is read early and would be overwritten", id)
+		}
+	}
+}
+
+// A sweep with no preference is still the whole corpus, in corpus order.
+func TestReadOrderWithNoPreferenceKeepsEverySpec(t *testing.T) {
+	sweep := []string{"a", "b", "c"}
+	got := readOrder(sweep, map[string]bool{})
+	if len(got) != 3 || got[0] != "a" || got[2] != "c" {
+		t.Errorf("readOrder(%v, {}) = %v", sweep, got)
+	}
+}

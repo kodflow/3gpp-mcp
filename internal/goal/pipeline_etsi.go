@@ -290,6 +290,28 @@ const ScopeAll = "all"
 // rather than the default, because that cost is a decision.
 const ScopeAllVersions = "all-versions"
 
+// ScopeLISuite pins the ETSI half to the fourteen built-in Lawful-Interception
+// deliverables. It is the value the EMPTY knob used to mean, and it now has a
+// name because it stopped being the default.
+//
+// WHY THE DEFAULT MOVED. `make build` runs `goal run` with no -etsi-scope and
+// nothing sets GOAL_ETSI_SCOPE, so the command that PUBLISHES resolved a work
+// list of fourteen deliverables while `discover` diffed 20 163 3GPP versions on
+// the other arm. The corpus did not shrink — ingest-etsi reads the converted
+// tree, which holds 11 822 files from a campaign run by hand — so nothing looked
+// wrong. But no ETSI deliverable published after that campaign could ever be
+// discovered, and the half was frozen in time with no gate able to say so.
+//
+// This is the same defect as the one ScopeAll was introduced for, one layer up:
+// there, the knob existed and nothing could set it; here, the knob can be set and
+// the command that matters does not set it. A capability reachable only by an
+// operator who remembers is not reachable.
+//
+// The narrow scope stays available, by name, because a first build on a machine
+// that only wants the LI suite is a real use. Narrowing is now a decision someone
+// types, which is the direction that costs a surprise rather than a corpus.
+const ScopeLISuite = "li-suite"
+
 // etsiScopeArgs turns the scope knob into cmd/discover-etsi flags.
 //
 // The value is trimmed ONCE and the trimmed value is what travels. Trimming only
@@ -299,12 +321,13 @@ const ScopeAllVersions = "all-versions"
 func etsiScopeArgs(scope string) []string {
 	scope = strings.TrimSpace(scope)
 	switch scope {
-	case "":
+	case "", ScopeAllVersions:
+		// EMPTY IS THE WHOLE ARCHIVE, EVERY VERSION. See ScopeLISuite.
+		return []string{"--all", "--all-versions"}
+	case ScopeLISuite:
 		return nil // the built-in LI suite
 	case ScopeAll:
 		return []string{"--all"}
-	case ScopeAllVersions:
-		return []string{"--all", "--all-versions"}
 	default:
 		return []string{"--specs", scope}
 	}
@@ -316,12 +339,12 @@ func etsiScopeArgs(scope string) []string {
 func etsiScopeEnv(scope string) []string {
 	scope = strings.TrimSpace(scope)
 	switch scope {
-	case "":
+	case "", ScopeAllVersions:
+		return []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
+	case ScopeLISuite:
 		return nil
 	case ScopeAll:
 		return []string{"ETSI_ALL=1"}
-	case ScopeAllVersions:
-		return []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
 	default:
 		return []string{"ETSI_SPECS=" + scope}
 	}
