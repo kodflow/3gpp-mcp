@@ -1,7 +1,11 @@
 package goal
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -25,9 +29,13 @@ func TestTheDefaultETSIScopeIsTheWholeArchiveEveryVersion(t *testing.T) {
 	if got := etsiScopeArgs("   "); !slices.Equal(got, want) {
 		t.Errorf("a whitespace scope resolves to %v, want %v", got, want)
 	}
-	wantEnv := []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1", "ETSI_SPECS="}
-	if got := etsiScopeEnv(""); !slices.Equal(got, wantEnv) {
-		t.Errorf("the script environment for an unset scope is %v, want %v", got, wantEnv)
+	// MEMBERSHIP, NOT EQUALITY: the list also carries the variables the pipeline
+	// clears because it models no knob for them, and asserting the whole list here
+	// would make adding one of those a test failure instead of a safeguard.
+	for _, want := range []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"} {
+		if got := etsiScopeEnv(""); !slices.Contains(got, want) {
+			t.Errorf("the script environment for an unset scope is %v, missing %q", got, want)
+		}
 	}
 }
 
@@ -61,17 +69,31 @@ func TestTheLISuiteIsStillReachableByName(t *testing.T) {
 	// would resolve fourteen deliverables from FLAGS while the fetch downloaded the
 	// whole archive — one arm, two corpora, and the only symptom a fetch that runs
 	// all night when fourteen specs were asked for.
-	wantCleared := []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}
-	if got := etsiScopeEnv(ScopeLISuite); !slices.Equal(got, wantCleared) {
-		t.Errorf("li-suite passes env %v, want %v", got, wantCleared)
+	for _, want := range []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="} {
+		if got := etsiScopeEnv(ScopeLISuite); !slices.Contains(got, want) {
+			t.Errorf("li-suite passes env %v, which does not clear %q", got, want)
+		}
 	}
 }
 
-// NO SCOPE MAY LEAVE A VARIABLE TO THE AMBIENT ENVIRONMENT. Every scope must say
-// something about every variable the fetch script reads, or the operator's shell
-// decides what the pipeline downloads.
-func TestEveryScopeSpeaksForEveryFetchVariable(t *testing.T) {
-	read := []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}
+// NO SCOPE MAY LEAVE A WORK-LIST VARIABLE TO THE AMBIENT ENVIRONMENT.
+//
+// THE LIST IS READ OUT OF THE SCRIPT, not typed here, because typing it is how
+// this defect keeps coming back. The first version of this test named the three
+// scope variables and passed while scripts/etsi-fetch.sh went on reading
+// ETSI_INCLUDE_3GPP — which adds ETSI's republications of 3GPP specs — and
+// ETSI_TYPE_DIRS, which decides which archives are scanned at all. Two runs with
+// the same etsi_scope downloaded different corpora behind the same determinant,
+// and the second would skip on a corpus the first never built.
+//
+// Reading the script means the next variable someone adds to the enumeration
+// fails here on the day it is added, rather than the day someone exports it.
+func TestEveryScopeSpeaksForEveryWorkListVariable(t *testing.T) {
+	read := workListVarsOf(t, "scripts/etsi-fetch.sh")
+	if len(read) < 3 {
+		t.Fatalf("only %d work-list variable(s) found in the script — the reader is broken, "+
+			"and a broken reader makes this test pass for the wrong reason: %v", len(read), read)
+	}
 	for _, scope := range []string{"", ScopeAll, ScopeAllVersions, ScopeLISuite, "103 221-1"} {
 		env := etsiScopeEnv(scope)
 		for _, want := range read {
@@ -134,4 +156,38 @@ func TestTheRecordedScopeIsWhatTheStepWillDo(t *testing.T) {
 				"not the work", name)
 		}
 	}
+}
+
+// workListVarsOf returns every ETSI_* variable the script feeds into the
+// enumeration that builds the work list — the lines that append to disc_args.
+//
+// Deliberately NOT every ETSI_* in the file: ETSI_JOBS sets the worker count and
+// ETSI_CONVERT the output directory, and neither changes WHICH deliverables are
+// fetched. A determinant covers what would make the step produce something
+// different, not everything it reads.
+func workListVarsOf(t *testing.T, rel string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", rel))
+	if err != nil {
+		t.Fatalf("cannot read %s, so this test cannot know what the script reads: %v", rel, err)
+	}
+	// ANY expansion form, not only ${VAR:-}. The repository also writes
+	// ${VAR:-default}, and a reader that matched one style would silently miss a
+	// knob written in the other — the same shape of gap this test exists to close.
+	re := regexp.MustCompile(`\$\{(ETSI_[A-Z0-9_]+)(?::-[^}]*)?\}`)
+	seen := map[string]bool{}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.Contains(line, "disc_args+=") {
+			continue
+		}
+		for _, m := range re.FindAllStringSubmatch(line, -1) {
+			if !seen[m[1]] {
+				seen[m[1]] = true
+				out = append(out, m[1]+"=")
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
