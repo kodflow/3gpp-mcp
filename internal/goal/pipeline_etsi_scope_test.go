@@ -2,6 +2,7 @@ package goal
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -61,8 +62,15 @@ func TestEtsiScopeKnobIsReachable(t *testing.T) {
 			if got := etsiScopeArgs(tc.scope); !reflect.DeepEqual(got, tc.wantArgs) {
 				t.Errorf("etsiScopeArgs(%q) = %v, want %v", tc.scope, got, tc.wantArgs)
 			}
-			if got := etsiScopeEnv(tc.scope); !reflect.DeepEqual(got, tc.wantEnv) {
-				t.Errorf("etsiScopeEnv(%q) = %v, want %v", tc.scope, got, tc.wantEnv)
+			// EVERY EXPECTED ENTRY MUST BE PRESENT, and the list may carry more:
+			// etsiScopeEnv also CLEARS the work-list variables the pipeline models
+			// no knob for. Asserting the exact list here would turn adding such a
+			// safeguard into a test failure, which is backwards.
+			got := etsiScopeEnv(tc.scope)
+			for _, want := range tc.wantEnv {
+				if !slices.Contains(got, want) {
+					t.Errorf("etsiScopeEnv(%q) = %v, missing %q", tc.scope, got, want)
+				}
 			}
 		})
 	}

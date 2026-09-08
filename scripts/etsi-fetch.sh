@@ -55,7 +55,7 @@ JOBS="${ETSI_JOBS:-8}"
 echo "[etsi] discovering work-list…"
 wl="$(mktemp)"
 disc_args=(--emit-worklist)
-[ -n "$INDEX" ] && disc_args+=(--index "$INDEX")
+[ -n "${ETSI_INDEX:-}" ] && disc_args+=(--index "$ETSI_INDEX")
 [ -n "${ETSI_SPECS:-}" ] && disc_args+=(--specs "$ETSI_SPECS")
 # ETSI_ALL=1 → enumerate the WHOLE /deliver corpus (etsi_ts+tr+en), not just the LI
 # suite (3GPP-parity completeness). Mutually exclusive with ETSI_SPECS in practice.
