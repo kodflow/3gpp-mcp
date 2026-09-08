@@ -246,33 +246,55 @@ chemin autorisé pour étendre la surface. Aujourd'hui : 10 + `li_events` = **11
 ## 6. Pipeline d'ingestion
 
 Depuis le 2026-08-23, tout passe par **une machine** et une seule commande :
-`cmd/goal` + `internal/goal`, une machine à états de **20 étapes** reprenable.
+`cmd/goal` + `internal/goal`, une machine à états de **32 étapes** reprenable
+(**11 paires** d'étapes de données — 12 côté 3GPP, 11 côté ETSI, `merge` n'ayant
+pas de jumelle — plus les builds et le produit).
 Runbook complet : `docs/local-pipeline.md`. Décision : `docs/adr/0003`.
 
 ```
-toolchain ─┬─ build-go ─┬─ test
-           │            └──────────────────────┐
-           ├─ build-rust ─────────┐            │
-           └─ build-embedder ──┐  │            │
-                               │  │            │
-             seed ── discover ─┼──┴── fetch ── ingest ── merge ─┬─ embed ─┐
-                                                                └─ enrich ┴─ paragraphs ─┬─ index
-                                                                                         │
-                                                                          validate ── smoke
+toolchain ─┬─ build-go ── test
+           ├─ build-rust ─────────┐
+           └─ build-embedder ──┐  │
+                               │  │
+  3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
+                                                                                                                     ├─ smoke ─ publish
+  ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
+
+**Les deux bras sont la même liste, deux fois.** Chaque étape de données du bras
+3GPP a une jumelle `-etsi` de même nom, au même endroit, sous le même contrat.
+Ce n'est pas de la cosmétique : chaque endroit où les deux bras différaient était
+un endroit où la moitié ETSI se passait silencieusement de quelque chose que la
+moitié 3GPP avait, et **aucun** n'a été trouvé par un échec — tous en lisant la
+liste et en voyant un trou dans une colonne (glossaire jamais miné, contrat jamais
+appliqué, compaction dont la déclaration nommait l'import sparse ETSI et pas le
+3GPP). `TestTheTwoArmsRunTheSameSteps` verrouille l'appariement.
+
+`seed` et `merge` n'ont pas de jumelle, et c'est structurel : `merge` plie les
+shards 3GPP alors que l'ingest ETSI écrit une base directement, et `seed` applique
+les deux seeds 3GPP curées alors que le vocabulaire ETSI est **miné**, par
+`enrich-etsi`. `smoke` et `publish` ne sont pas par corpus non plus : un seul
+serveur est démarré au-dessus des deux stores, une seule image est poussée.
 
 | Étape | Fait quoi | Coût mesuré |
 |---|---|---|
-| `discover` | diffe le status report 3GPP vivant contre l'ancre locale | ~3 s |
-| `fetch` | télécharge le delta et **convertit via LibreOffice → HTML** | 4m10, CPU-bound |
-| `ingest` | parse le HTML en shards DuckDB par série (Rust) | minutes/série |
-| `merge` | plie les shards dans le corpus, réécrit l'ancre, construit le FTS | ~6 min |
-| `embed` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
+| `seed` / `seed-etsi` | adopte l'instantané publié sur GHCR (`3gpp-corpus` / `etsi-corpus`) — **décline** si un corpus local existe | une fois |
+| `discover` | diffe le catalogue DynaReport vivant contre l'ancre locale | ~3 s |
+| `discover-etsi` | ré-énumère `/deliver` et compare à `etsi-index.json` — **il n'y a pas d'ancre ETSI** | ~3 s |
+| `fetch` | télécharge le delta 3GPP et convertit (LibreOffice → HTML) | 4m10 |
+| `fetch-etsi` | télécharge la work-list et convertit (pdftotext) — une work-list, pas un delta | ~1 h |
+| `ingest` / `ingest-etsi` | parse le HTML en DuckDB (Rust) | minutes/série ; ~15 min ETSI |
+| `merge` | plie les shards 3GPP, réécrit l'ancre, construit le FTS | ~6 min |
+| `embed` / `embed-etsi` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
-| `paragraphs` | stocke chaque paragraphe une fois et pointe dessus (ADR 0004) | ~9 min |
-| `index` | construit et **gèle** le HNSW cosine | 1m46 |
-| `validate` | contrat de complétude + `anchorcheck` | ~30 s |
-| `smoke` | démarre le vrai serveur et prouve que le vectoriel est resté actif | ~30 s |
+| `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | ~35 min (le parse ; l'écriture est passée de 2 h 29 à 16 s) |
+| `paragraphs` / `paragraphs-etsi` | stocke chaque paragraphe une fois et pointe dessus (ADR 0004) | ~9 min |
+| `sparse` / `sparse-etsi` | postings lexicaux appris (couche additive) | ~30 min |
+| `compact` / `compact-etsi` | réécrit le corpus sans son espace mort — **décline** s'il n'y a rien à récupérer | ~30 min, ou 0 |
+| `index` / `index-etsi` | construit et **gèle** le HNSW cosine | 1m46 |
+| `validate` / `validate-etsi` | contrat de complétude (+ `anchorcheck` côté 3GPP) | ~30 s |
+| `smoke` | démarre le vrai serveur au-dessus des deux stores | ~30 s |
+| `publish` | compose l'image OCI et la pousse | ~25 min |
 
 Points qui ne se devinent pas en lisant le code :
 
@@ -354,7 +376,7 @@ oublie de transmettre ce plancher recale un corpus complet.
 ```
 3gpp-mcp/
 ├── cmd/
-│   ├── goal/            # LE point d'entrée : la machine à états 20 étapes
+│   ├── goal/            # LE point d'entrée : la machine à états 32 étapes
 │   ├── server/          # MCP server (stdio + HTTP) + bootstrap subcommand
 │   ├── validate/        # contrat de complétude des données
 │   ├── anchorcheck/     # l'ancre ne doit pas revendiquer du texte absent

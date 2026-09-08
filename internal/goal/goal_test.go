@@ -784,7 +784,7 @@ func TestValidateInheritsTheFloorEmbedRanWith(t *testing.T) {
 	ctx.Config["contract_flags"] = "--require-fts --require-hnsw --require-embed-complete"
 	ctx.Config["embed_floor"] = "Rel-99"
 
-	args := validateArgs(ctx)
+	args := validateArgs(ctx, corpus3GPP())
 	if !hasFlag(args, "--embed-floor") {
 		t.Fatalf("validate must pass the embed floor, got %v", args)
 	}
@@ -804,7 +804,7 @@ func TestValidateOmitsTheFloorWhenEmbedHasNone(t *testing.T) {
 	ctx, _ := newTestCtx(t)
 	ctx.Config["contract_flags"] = "--require-embed-complete"
 
-	if args := validateArgs(ctx); hasFlag(args, "--embed-floor") {
+	if args := validateArgs(ctx, corpus3GPP()); hasFlag(args, "--embed-floor") {
 		t.Fatalf("no embed_floor configured, so none should be passed, got %v", args)
 	}
 }
@@ -816,7 +816,7 @@ func TestAnExplicitContractFloorIsNotOverridden(t *testing.T) {
 	ctx.Config["contract_flags"] = "--require-embed-complete --embed-floor=Rel-15"
 	ctx.Config["embed_floor"] = "Rel-99"
 
-	args := validateArgs(ctx)
+	args := validateArgs(ctx, corpus3GPP())
 	n := 0
 	for _, a := range args {
 		if strings.HasPrefix(strings.TrimLeft(a, "-"), "embed-floor") {

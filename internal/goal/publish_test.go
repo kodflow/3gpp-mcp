@@ -107,7 +107,7 @@ func TestPublishRunsAfterBothHalvesAreFrozen(t *testing.T) {
 		t.Errorf("publish does not depend on smoke — it can ship a corpus nothing exercised (deps: %v)",
 			steps["publish"].Deps)
 	}
-	for _, want := range []string{"index", "index-etsi", "validate"} {
+	for _, want := range []string{"index", "index-etsi", "validate", "validate-etsi"} {
 		if !reachFrom("publish", "")[want] {
 			t.Errorf("publish can run before %s — it would ship a half nothing finished", want)
 		}

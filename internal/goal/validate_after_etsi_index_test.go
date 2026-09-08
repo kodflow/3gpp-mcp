@@ -37,10 +37,18 @@ func TestValidateCannotRunBeforeTheETSIIndex(t *testing.T) {
 // And the gates must precede what they gate: an unchecked corpus must never be
 // smoke-tested as if it had passed, nor published.
 func TestSmokeAndPublishDependOnValidate(t *testing.T) {
+	// BOTH GATES. `validate-etsi` was added on 2026-09-08 and is the first thing
+	// ever to hold the ETSI corpus to --require-fts, --require-hnsw,
+	// --require-embed-complete and --require-sparse. A smoke or a publish that can
+	// run without it ships a half no contract has accepted, which is the state this
+	// arm was in for its whole existence.
 	for _, name := range []string{"smoke", "publish"} {
-		if !transitiveDeps(t, name)["validate"] {
-			t.Errorf("%s does not depend on validate — it would run on a corpus no gate has "+
-				"accepted", name)
+		closure := transitiveDeps(t, name)
+		for _, gate := range []string{"validate", "validate-etsi"} {
+			if !closure[gate] {
+				t.Errorf("%s does not depend on %s — it would run on a corpus no gate has "+
+					"accepted", name, gate)
+			}
 		}
 	}
 }

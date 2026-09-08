@@ -264,7 +264,10 @@ func TestTheCorpusIsNobodysInput(t *testing.T) {
 	// corpus afterwards. Fingerprinting them is the entire point of the step —
 	// it is what makes a published image notice a corpus that moved.
 	allowed := map[string]bool{
-		"index": true, "index-etsi": true, "validate": true, "smoke": true,
+		"index": true, "index-etsi": true,
+		// validate and validate-etsi each read the corpus their own arm froze,
+		// and nothing rewrites either one after its index step.
+		"validate": true, "validate-etsi": true, "smoke": true,
 		"publish": true,
 	}
 	for _, s := range Pipeline() {
@@ -371,7 +374,8 @@ func TestNothingAPreviousCompactionLeftBehindCanBlockTheNextOne(t *testing.T) {
 		write(t, c.dataPath(n), "left behind")
 	}
 
-	rotateCompactionArtefacts(c)
+	rotateCompactionArtefacts(c, corpus3GPP())
+	rotateCompactionArtefacts(c, corpusETSI())
 
 	for _, n := range []string{
 		"3gpp.duckdb.compact", "3gpp.duckdb.pre-compact",
@@ -404,7 +408,8 @@ func TestAnInterruptedCompactionDoesNotBlockTheNextOne(t *testing.T) {
 	write(t, c.dataPath("3gpp.duckdb.compact"), "a half-finished copy")
 	write(t, c.dataPath("etsi.duckdb.compact"), "a half-finished copy")
 
-	rotateCompactionArtefacts(c)
+	rotateCompactionArtefacts(c, corpus3GPP())
+	rotateCompactionArtefacts(c, corpusETSI())
 
 	for _, n := range []string{"3gpp.duckdb.compact", "etsi.duckdb.compact"} {
 		if _, err := os.Stat(c.dataPath(n)); !os.IsNotExist(err) {
@@ -499,16 +504,24 @@ func TestCompactStillRunsBeforeTheIndex(t *testing.T) {
 	for _, s := range Pipeline() {
 		steps[s.Name] = s
 	}
+	// PER ARM, since 2026-09-08. There used to be one `compact` that rewrote both
+	// files, and both indexes named it — which held the invariant and coupled the
+	// ETSI freeze to the 3GPP paragraph conversion, so a 3GPP-only change replayed
+	// the ETSI compaction and rebuilt an HNSW nothing had touched.
 	for _, name := range []string{"index", "index-etsi"} {
 		s, ok := steps[name]
 		if !ok {
 			t.Fatalf("%s is not in the pipeline any more", name)
 		}
-		if !slices.Contains(s.Deps, "compact") {
-			t.Errorf("%s no longer depends on compact: a compaction after the index leaves the frozen index behind and the server refuses to serve it (deps: %v)", name, s.Deps)
+		own := "compact" + strings.TrimPrefix(name, "index")
+		if _, ok := steps[own]; !ok {
+			t.Fatalf("%s is not in the pipeline any more", own)
 		}
-	}
-	if slices.Contains(steps["compact"].Deps, "index") {
-		t.Error("compact depends on index — the invariant is inverted")
+		if !slices.Contains(s.Deps, own) {
+			t.Errorf("%s no longer depends on %s: a compaction after the index leaves the frozen index behind and the server refuses to serve it (deps: %v)", name, own, s.Deps)
+		}
+		if slices.Contains(steps[own].Deps, name) {
+			t.Errorf("%s depends on %s — the invariant is inverted", own, name)
+		}
 	}
 }

@@ -152,6 +152,10 @@ fn initials_match(term: &str, expansion: &str) -> bool {
 /// dropped entirely.
 const MIN_FILE_CONSISTENCY: f64 = 0.6;
 
+/// How long one deliverable may take before it names itself in the log. See the
+/// loop in main() for the two stalls that made a per-file signal necessary.
+const SLOW_FILE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn collect_html(root: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(root)];
@@ -249,17 +253,51 @@ fn main() -> Result<()> {
     let (mut specs, mut rows) = (0usize, 0usize);
     let (mut candidates, mut dropped_files, mut dropped_rows) = (0usize, 0usize, 0usize);
     let mut tally = Tally::default();
+    let trace = std::env::var("GLOSSARY_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     for (i, f) in files.iter().enumerate() {
+        // NAME THE FILE, AND SAY WHERE THE TIME WENT.
+        //
+        // This pass stalled twice on the same deliverable — 2026-09-07 21:53 and
+        // 2026-09-08 06:59, both after "5000/5142 file(s)" and then nothing for
+        // hours. Measured live on the second: 145 % of one core, ZERO read and ZERO
+        // write operations over 20 s, so it was neither the corpus write nor the
+        // disk. It was CPU inside ONE file that had already been read, and the
+        // 500-file counter could not say which — it names a position in a list
+        // nobody has, and only every five hundredth one.
+        //
+        // So the counter is no longer the only thing that speaks. A file that takes
+        // longer than a person would wait names ITSELF, with the phase that spent
+        // the time, whether or not anyone thought to set a trace variable first.
+        // The threshold is far above anything healthy: the fast phase of this same
+        // run averages about 24 ms per file.
+        if trace {
+            eprintln!("ingest-glossary: [{}/{}] {f}", i + 1, files.len());
+        }
+        let t_read = std::time::Instant::now();
         let html = parse3gpp::html_bytes::read_html(f).with_context(|| format!("read {f}"))?;
+        let read_el = t_read.elapsed();
         let Some(meta) = parse3gpp::etsi::parse_etsi_meta(&html) else {
             continue; // not an ETSI deliverable: no provenance header
         };
+        let t_parse = std::time::Instant::now();
         let (clauses, _, _) =
             parse3gpp::parse_html_clauses(&html, &meta.spec_id, &meta.release, &meta.version);
+        let parse_el = t_parse.elapsed();
         // first/last carry the VERSION, not meta.release: an ETSI deliverable's
         // release is the constant "ETSI", so stamping it would put zero information
         // in a field the caller reads to know when a term applied.
+        let t_ex = std::time::Instant::now();
         let acs = parse3gpp::glossary::extract_acronyms(&clauses, &meta.version);
+        let ex_el = t_ex.elapsed();
+        if read_el + parse_el + ex_el >= SLOW_FILE {
+            eprintln!(
+                "ingest-glossary: SLOW {f} — read {:.1}s, parse {:.1}s ({} clause(s)), extract {:.1}s",
+                read_el.as_secs_f64(),
+                parse_el.as_secs_f64(),
+                clauses.len(),
+                ex_el.as_secs_f64()
+            );
+        }
         if acs.is_empty() {
             continue;
         }
@@ -312,6 +350,18 @@ fn main() -> Result<()> {
             declared_by: c.declared_by,
         })
         .collect();
+    // SAY WHAT IS ABOUT TO BE WRITTEN, BEFORE WRITING IT.
+    //
+    // Between the last "N/5142 file(s)" line and the end of the pass there was NO
+    // output at all, so when the write hung — twice, for two and a half hours each
+    // — the log's final word was a file counter, and every reading of the stall
+    // started from the wrong half of the program. Two nights were spent on the
+    // parser and on the 49.6 GB corpus before a live measurement showed the loop
+    // had finished minutes earlier. A phase that can take time announces itself.
+    eprintln!(
+        "ingest-glossary: mined {} distinct (term, expansion) pair(s); writing them",
+        mined.len()
+    );
     let written = store.replace_mined_acronyms(&mined)?;
 
     let agreed = tally.rows.values().filter(|c| c.declared_by > 1).count();

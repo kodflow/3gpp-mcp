@@ -196,3 +196,55 @@ fn a_failed_replace_leaves_the_previous_vocabulary_intact() {
         "the delete committed without its inserts: the glossary would have been          emptied by a batch that failed"
     );
 }
+
+/// A CURATED 3GPP ROW IS NOT THE MINED PASS'S TO REWRITE.
+///
+/// The purge is scoped by provenance, so a 3GPP entry survives it — and then the
+/// insert meets it on the (term, expansion, domain) key. `DO UPDATE SET
+/// source_series = excluded.source_series` overwrote it, which turns a curated
+/// entry into one that cites a deliverable that never declared it: the exact
+/// failure `resolve_term` was repaired for, arriving from the other side.
+///
+/// The comment on that statement already said the intent was to YIELD. The
+/// statement did the opposite; DO NOTHING is what the comment described.
+#[test]
+fn a_mined_row_yields_to_a_curated_row_that_declares_the_same_pair() {
+    let t = Tmp::new("yield");
+    let store = store_rs::Store::open_rw(&t.db()).unwrap();
+
+    // A curated 3GPP entry: same term AND same expansion the ETSI archive also
+    // declares, which is what makes the conflict reachable at all.
+    store
+        .upsert_acronym(
+            "AMF",
+            "Access and Mobility Management Function",
+            "",
+            "Rel-19",
+            "Rel-19",
+            "23",
+            7,
+        )
+        .unwrap();
+
+    store
+        .replace_mined_acronyms(&[mined(
+            "AMF",
+            "Access and Mobility Management Function",
+            "ETSI TS 123 501",
+            3,
+        )])
+        .unwrap();
+
+    let got = rows(&store);
+    assert_eq!(got.len(), 1, "the pair must still be one row: {got:?}");
+    assert_eq!(
+        got[0],
+        (
+            "AMF".to_string(),
+            "Access and Mobility Management Function".to_string(),
+            "23".to_string(),
+            7
+        ),
+        "the mined pass overwrote a curated 3GPP row's provenance"
+    );
+}
