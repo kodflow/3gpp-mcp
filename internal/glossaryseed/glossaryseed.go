@@ -41,10 +41,23 @@ import (
 //	23.548  edge computing     — EASDF and the edge terms, defined nowhere above
 //	23.682  exposure / MTC     — SCEF, which nothing else in this list declares
 //
-// It is not "every spec". A corpus-wide sweep would read 3 568 Abbreviations
-// clauses and let an obscure study item outrank an architecture spec on a term
-// they spell differently — the same class of defect being repaired here, just
-// with a different loser. These six are where the vocabulary is DECLARED.
+// IT USED TO BE THE SCOPE, AND THAT WAS THE DEFECT. The comment here read: "a
+// corpus-wide sweep would let an obscure study item outrank an architecture spec
+// on a term they spell differently". That was true when it was written, and it
+// stopped being true when declared_by arrived on the ETSI arm: ranking by HOW
+// MANY specs declare an expansion settles exactly that disagreement.
+//
+// Measured 2026-09-08 on the shipped corpus, sweeping all 3 497 specs that carry
+// an Abbreviations clause and ranking by declared_by: AMF, SMF, UPF, NWDAF, PCF,
+// UDM, AUSF, NRF, NSSF, SMSF, NEF and UDR all resolve to the architecture answer
+// — 12 of 12 — with the wrong spellings sitting far below on one or two
+// declarations. The narrow scope was costing coverage (1 781 rows against the
+// ETSI half's 28 154) to buy a ranking that declared_by already provides.
+//
+// So these six are no longer the scope. They are the PROVENANCE PREFERENCE: when
+// several specs declare the same expansion, the row cites one of these if one of
+// them is among the declarers, because that is what makes the precedence in
+// Store.ResolveTerm auditable to a reader.
 //
 // TS 23.502 is deliberately ABSENT even though it is a core 5GC spec. Its
 // Abbreviations clause is 282 characters of introduction and nothing else — it
@@ -77,11 +90,15 @@ type SpecReport struct {
 
 // Report is the outcome of a run, and the shape of --report json.
 type Report struct {
-	Specs   []SpecReport `json:"specs"`
-	Parsed  int          `json:"parsed_total"`
-	Written int          `json:"written_total"`
-	Min     int          `json:"min_required"`
-	Applied bool         `json:"applied"`
+	Specs  []SpecReport `json:"specs"`
+	Parsed int          `json:"parsed_total"`
+	// Floor is what the aggregate floor is measured on: the contribution of the
+	// PREFERRED specs alone. Parsed counts the whole sweep, which is hundreds of
+	// times larger and would make any usable floor meaningless.
+	Floor   int  `json:"floor_total"`
+	Written int  `json:"written_total"`
+	Min     int  `json:"min_required"`
+	Applied bool `json:"applied"`
 	// Changed says whether the corpus actually MOVED. Applied only says a write
 	// was attempted; on a corpus already carrying this glossary nothing is
 	// written, and that difference is what decides whether the published image
@@ -114,18 +131,42 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		sr      SpecReport
 		entries []abbrev.Entry
 	}
-	var todo []pending
+	// THE SCOPE IS THE WHOLE CORPUS. specIDs names the specs whose contribution
+	// the FLOOR below is measured on, and whose id is preferred as provenance —
+	// not the specs that are read. See DefaultSpecs.
+	sweep, err := s.SpecsWithAbbreviations(ctx)
+	if err != nil {
+		return rep, err
+	}
+	preferred := map[string]bool{}
 	for _, id := range specIDs {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
+		if id = strings.TrimSpace(id); id != "" {
+			preferred[id] = true
 		}
+	}
+	// Every spec is read, the preferred ones LAST — because UpsertAcronyms keeps
+	// the LAST row it sees for a key. Reading them first would have made them the
+	// ones overwritten, which is the opposite of the intent and would not have
+	// shown up as an error anywhere: the count would be identical and only the
+	// cited document would differ.
+	order := readOrder(sweep, preferred)
+
+	var todo []pending
+	for _, id := range order {
 		sr, entries, err := readSpec(ctx, s, id)
 		if err != nil {
 			return rep, err
 		}
 		todo = append(todo, pending{sr, entries})
 		rep.Parsed += sr.Parsed
+		// THE FLOOR IS MEASURED ON THE PREFERRED SPECS ONLY. A sweep parses
+		// hundreds of thousands of lines, so any floor low enough to be safe over
+		// the whole corpus is far too low to catch a broken read of 23.501 — the
+		// failure this floor exists for. Measuring the six keeps the check exactly
+		// as sharp as it was when they were the whole scope.
+		if preferred[id] {
+			rep.Floor += sr.Parsed
+		}
 	}
 
 	// THE FLOOR. Every failure this package exists to prevent is silent: the
@@ -140,10 +181,12 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 	// 220 (23.501), and 23.502 legitimately declares NONE — its clause defers
 	// wholly to 23.501. Any per-spec threshold high enough to catch a broken
 	// read of 23.501 fails on the small specs that are working correctly.
-	if rep.Parsed < min {
+	if rep.Floor < min {
 		return rep, fmt.Errorf("parsed only %d abbreviations across %s, expected at least %d — "+
-			"the Abbreviations clause was probably not found or not recognised",
-			rep.Parsed, strings.Join(specIDs, ","), min)
+			"the Abbreviations clause was probably not found or not recognised "+
+			"(the corpus-wide sweep read %d specs for %d entries; the floor is measured "+
+			"on the named specs so a broken read of one of them cannot hide behind the rest)",
+			rep.Floor, strings.Join(specIDs, ","), min, len(todo), rep.Parsed)
 	}
 
 	if !checkOnly {
@@ -151,12 +194,33 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		// the partial write a failed FLOOR would leave; it does nothing about a
 		// failure on row 400 of 679, which would leave 399 high-precedence rows
 		// behind just the same. All of them land or none do.
+		// TALLY FIRST: declared_by is HOW MANY specs declare this exact expansion,
+		// and it is what lets a corpus-wide sweep rank correctly. Counting specs,
+		// not rows: a spec present at a dozen releases declares its vocabulary
+		// once, and counting rows would let a long-lived spec outvote a dozen.
+		type pair struct{ term, expansion string }
+		declarers := map[pair]map[string]bool{}
+		for i := range todo {
+			for _, e := range todo[i].entries {
+				k := pair{e.Term, e.Expansion}
+				if declarers[k] == nil {
+					declarers[k] = map[string]bool{}
+				}
+				declarers[k][todo[i].sr.Spec] = true
+			}
+		}
+
 		var rows []model.Acronym
 		for i := range todo {
 			for _, e := range todo[i].entries {
 				rows = append(rows, model.Acronym{
 					Term:      e.Term,
 					Expansion: e.Expansion,
+					// HOW MANY specs declare exactly this expansion. UpsertAcronyms
+					// keeps the LAST row for a key and the preferred specs are read
+					// LAST, so the row that survives cites a preferred spec whenever
+					// one declares the pair — while the count covers all of them.
+					DeclaredBy: len(declarers[pair{e.Term, e.Expansion}]),
 					// Domain stays empty on purpose. The clause declares an
 					// abbreviation, not which architecture owns it, and stamping
 					// "5GC" on all 221 rows of 23.501 §3.2 would assert something
@@ -190,6 +254,30 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 	}
 	rep.OK = true
 	return rep, nil
+}
+
+// readOrder puts the preferred specs LAST.
+//
+// It is a function, and tested, because getting it backwards is invisible.
+// UpsertAcronyms keeps the LAST row it sees for a (term, expansion, domain) key,
+// so reading the preferred specs FIRST — which is what reads naturally, and what
+// this code did when it was written — makes them the ones overwritten. The row
+// count would be identical, every gate would pass, and the only difference would
+// be which document the glossary cites: an obscure spec instead of TS 23.501,
+// for the terms where citing 23.501 is the whole point.
+func readOrder(sweep []string, preferred map[string]bool) []string {
+	order := make([]string, 0, len(sweep))
+	for _, id := range sweep {
+		if !preferred[id] {
+			order = append(order, id)
+		}
+	}
+	for _, id := range sweep {
+		if preferred[id] {
+			order = append(order, id)
+		}
+	}
+	return order
 }
 
 // readSpec finds a spec's newest version, locates its Abbreviations clause and
