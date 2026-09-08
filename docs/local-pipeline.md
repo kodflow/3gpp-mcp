@@ -73,14 +73,17 @@ half — `embed-etsi` and `sparse-etsi` — declines against the restored vector
 | `test` | `go test ./...` | ~1 min |
 | `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
-| `seed` | adopt the published lexical snapshot **and its delta anchor** | one-off |
-| `discover` / `discover-etsi` | diff the live catalogue against the local anchor | ~3 s |
-| `fetch` / `fetch-etsi` | download + convert the delta (LibreOffice; pdftotext on the ETSI side) | hours, CPU-bound |
+| `seed` | adopt the published 3GPP snapshot **and its delta anchor** | one-off |
+| `seed-etsi` | adopt the published `etsi-corpus` snapshot. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off |
+| `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
+| `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
+| `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
+| `fetch-etsi` | download + convert the resulting work list (pdftotext) — a work list, not a delta | hours, CPU-bound |
 | `ingest` / `ingest-etsi` | parse HTML into DuckDB | minutes/series; ~15 min ETSI |
 | `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
 | `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
-| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | ~2 h |
+| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | ~35 min (the parse; the write went from 2 h 29 to 16 s) |
 | `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
 | `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
 | `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |

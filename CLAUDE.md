@@ -278,13 +278,16 @@ serveur est démarré au-dessus des deux stores, une seule image est poussée.
 
 | Étape | Fait quoi | Coût mesuré |
 |---|---|---|
-| `discover` / `discover-etsi` | diffe le catalogue vivant contre l'ancre locale | ~3 s |
-| `fetch` / `fetch-etsi` | télécharge le delta et convertit (LibreOffice → HTML ; pdftotext côté ETSI) | 4m10 / ~1 h |
+| `seed` / `seed-etsi` | adopte l'instantané publié sur GHCR (`3gpp-corpus` / `etsi-corpus`) — **décline** si un corpus local existe | une fois |
+| `discover` | diffe le catalogue DynaReport vivant contre l'ancre locale | ~3 s |
+| `discover-etsi` | ré-énumère `/deliver` et compare à `etsi-index.json` — **il n'y a pas d'ancre ETSI** | ~3 s |
+| `fetch` | télécharge le delta 3GPP et convertit (LibreOffice → HTML) | 4m10 |
+| `fetch-etsi` | télécharge la work-list et convertit (pdftotext) — une work-list, pas un delta | ~1 h |
 | `ingest` / `ingest-etsi` | parse le HTML en DuckDB (Rust) | minutes/série ; ~15 min ETSI |
 | `merge` | plie les shards 3GPP, réécrit l'ancre, construit le FTS | ~6 min |
 | `embed` / `embed-etsi` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
-| `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | ~2 h |
+| `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | ~35 min (le parse ; l'écriture est passée de 2 h 29 à 16 s) |
 | `paragraphs` / `paragraphs-etsi` | stocke chaque paragraphe une fois et pointe dessus (ADR 0004) | ~9 min |
 | `sparse` / `sparse-etsi` | postings lexicaux appris (couche additive) | ~30 min |
 | `compact` / `compact-etsi` | réécrit le corpus sans son espace mort — **décline** s'il n'y a rien à récupérer | ~30 min, ou 0 |
