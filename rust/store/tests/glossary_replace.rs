@@ -215,7 +215,15 @@ fn a_mined_row_yields_to_a_curated_row_that_declares_the_same_pair() {
     // A curated 3GPP entry: same term AND same expansion the ETSI archive also
     // declares, which is what makes the conflict reachable at all.
     store
-        .upsert_acronym("AMF", "Access and Mobility Management Function", "", "Rel-19", "Rel-19", "23", 7)
+        .upsert_acronym(
+            "AMF",
+            "Access and Mobility Management Function",
+            "",
+            "Rel-19",
+            "Rel-19",
+            "23",
+            7,
+        )
         .unwrap();
 
     store
