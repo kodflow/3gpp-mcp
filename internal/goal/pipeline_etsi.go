@@ -337,16 +337,34 @@ func etsiScopeArgs(scope string) []string {
 // reads. The script passes these straight through to the same binary, so the two
 // helpers must agree — which is why they sit next to each other.
 func etsiScopeEnv(scope string) []string {
+	// EVERY BRANCH SETS ALL THREE, EMPTY WHERE IT MEANS "NOT THIS".
+	//
+	// Ctx.Run passes cmd.Env as append(os.Environ(), ...), so a variable this
+	// function does not mention is INHERITED from whatever the operator's shell
+	// carries. Returning nil for the narrow scope therefore did not select the
+	// narrow scope: `discover-etsi` took its scope from FLAGS and resolved the
+	// fourteen built-in deliverables, while scripts/etsi-fetch.sh rebuilt its own
+	// work list from an ambient ETSI_ALL and downloaded the whole archive. The two
+	// steps of one arm would have been running on different corpora, and the only
+	// symptom is a fetch that takes all night when fourteen specs were asked for.
+	//
+	// The script tests with [ -n "${VAR:-}" ], so an explicit empty value disarms
+	// an inherited one — which is why clearing is expressible at all.
 	scope = strings.TrimSpace(scope)
+	const (
+		all  = "ETSI_ALL="
+		vers = "ETSI_ALL_VERSIONS="
+		spec = "ETSI_SPECS="
+	)
 	switch scope {
 	case "", ScopeAllVersions:
-		return []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
+		return []string{all + "1", vers + "1", spec}
 	case ScopeLISuite:
-		return nil
+		return []string{all, vers, spec}
 	case ScopeAll:
-		return []string{"ETSI_ALL=1"}
+		return []string{all + "1", vers, spec}
 	default:
-		return []string{"ETSI_SPECS=" + scope}
+		return []string{all, vers, spec + scope}
 	}
 }
 
