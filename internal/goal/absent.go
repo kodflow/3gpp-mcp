@@ -89,7 +89,6 @@ func decodeVerCode(code string) (string, bool) {
 	return b.String(), true
 }
 
-
 // worklistReleases maps each archive URL to the release the work list asked for
 // it under. The release cannot be recovered from the URL — the archive tree is
 // laid out by series, not by release — and a ledger key without it would name a

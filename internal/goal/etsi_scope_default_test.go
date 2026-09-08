@@ -2,6 +2,7 @@ package goal
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -24,7 +25,7 @@ func TestTheDefaultETSIScopeIsTheWholeArchiveEveryVersion(t *testing.T) {
 	if got := etsiScopeArgs("   "); !slices.Equal(got, want) {
 		t.Errorf("a whitespace scope resolves to %v, want %v", got, want)
 	}
-	wantEnv := []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1"}
+	wantEnv := []string{"ETSI_ALL=1", "ETSI_ALL_VERSIONS=1", "ETSI_SPECS="}
 	if got := etsiScopeEnv(""); !slices.Equal(got, wantEnv) {
 		t.Errorf("the script environment for an unset scope is %v, want %v", got, wantEnv)
 	}
@@ -53,7 +54,38 @@ func TestTheLISuiteIsStillReachableByName(t *testing.T) {
 	if got := etsiScopeArgs(ScopeLISuite); got != nil {
 		t.Errorf("li-suite passes %v, want no scope flags (the binary's built-in list)", got)
 	}
-	if got := etsiScopeEnv(ScopeLISuite); got != nil {
-		t.Errorf("li-suite passes env %v, want none", got)
+	// AND IT MUST CLEAR, not merely stay silent. Ctx.Run passes cmd.Env as
+	// append(os.Environ(), ...), so a variable this function does not mention is
+	// inherited: returning nil here let an ambient ETSI_ALL reach
+	// scripts/etsi-fetch.sh, which rebuilds its own work list from it. Discovery
+	// would resolve fourteen deliverables from FLAGS while the fetch downloaded the
+	// whole archive — one arm, two corpora, and the only symptom a fetch that runs
+	// all night when fourteen specs were asked for.
+	wantCleared := []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}
+	if got := etsiScopeEnv(ScopeLISuite); !slices.Equal(got, wantCleared) {
+		t.Errorf("li-suite passes env %v, want %v", got, wantCleared)
+	}
+}
+
+// NO SCOPE MAY LEAVE A VARIABLE TO THE AMBIENT ENVIRONMENT. Every scope must say
+// something about every variable the fetch script reads, or the operator's shell
+// decides what the pipeline downloads.
+func TestEveryScopeSpeaksForEveryFetchVariable(t *testing.T) {
+	read := []string{"ETSI_ALL=", "ETSI_ALL_VERSIONS=", "ETSI_SPECS="}
+	for _, scope := range []string{"", ScopeAll, ScopeAllVersions, ScopeLISuite, "103 221-1"} {
+		env := etsiScopeEnv(scope)
+		for _, want := range read {
+			found := false
+			for _, e := range env {
+				if strings.HasPrefix(e, want) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("scope %q says nothing about %s, so the shell decides it: %v",
+					scope, strings.TrimSuffix(want, "="), env)
+			}
+		}
 	}
 }
