@@ -380,15 +380,27 @@ func etsiScopeEnv(scope string) []string {
 		vers = "ETSI_ALL_VERSIONS="
 		spec = "ETSI_SPECS="
 	)
+	// The variables the script feeds into its enumeration that this pipeline models
+	// no knob for. They are CLEARED, not merely unmentioned: an exported
+	// ETSI_INCLUDE_3GPP adds ETSI's republications of 3GPP specs to the work list,
+	// and ETSI_TYPE_DIRS changes which archives are scanned at all — so two runs
+	// with the same etsi_scope would download different corpora behind the same
+	// determinant, and the second would skip on a corpus the first never built.
+	//
+	// Modelling them instead would mean a knob nobody asked for. Clearing says the
+	// pipeline's scope is the WHOLE scope, which is the property the fingerprint
+	// needs to be true.
+	unmodelled := []string{"ETSI_INCLUDE_3GPP=", "ETSI_TYPE_DIRS="}
+	with := func(scoped ...string) []string { return append(scoped, unmodelled...) }
 	switch scope {
 	case "", ScopeAllVersions:
-		return []string{all + "1", vers + "1", spec}
+		return with(all+"1", vers+"1", spec)
 	case ScopeLISuite:
-		return []string{all, vers, spec}
+		return with(all, vers, spec)
 	case ScopeAll:
-		return []string{all + "1", vers, spec}
+		return with(all+"1", vers, spec)
 	default:
-		return []string{all, vers, spec + scope}
+		return with(all, vers, spec+scope)
 	}
 }
 
