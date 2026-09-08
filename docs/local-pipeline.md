@@ -83,7 +83,7 @@ half — `embed-etsi` and `sparse-etsi` — declines against the restored vector
 | `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
 | `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
-| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | ~35 min (the parse; the write went from 2 h 29 to 16 s) |
+| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | **21.5 s** (measured 2026-09-08 over all 5 142 deliverables; it was 2 h 29 before the quadratic fix) |
 | `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
 | `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
 | `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
