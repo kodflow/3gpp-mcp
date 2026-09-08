@@ -171,7 +171,10 @@ func workListVarsOf(t *testing.T, rel string) []string {
 	if err != nil {
 		t.Fatalf("cannot read %s, so this test cannot know what the script reads: %v", rel, err)
 	}
-	re := regexp.MustCompile(`\$\{(ETSI_[A-Z0-9_]+):-\}`)
+	// ANY expansion form, not only ${VAR:-}. The repository also writes
+	// ${VAR:-default}, and a reader that matched one style would silently miss a
+	// knob written in the other — the same shape of gap this test exists to close.
+	re := regexp.MustCompile(`\$\{(ETSI_[A-Z0-9_]+)(?::-[^}]*)?\}`)
 	seen := map[string]bool{}
 	var out []string
 	for _, line := range strings.Split(string(b), "\n") {
