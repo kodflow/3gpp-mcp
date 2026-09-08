@@ -35,31 +35,49 @@ toolchain ─┬─ build-go ── test
            ├─ build-rust ─────────┐
            └─ build-embedder ──┐  │
                                │  │
-             seed ── discover ─┼──┴── fetch ── ingest ── merge ─┬─ embed ─┐
-                                                                └─ enrich ┴─ index
-                                                                             │
-                                                              validate ── smoke
-                                                                             │
-                                                            index-etsi ── publish
+  3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
+                                                                                                                     ├─ smoke ─ publish
+  ETSI       discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
+
+**The two arms are the same list twice.** Every data step of the 3GPP arm has a
+same-named `-etsi` twin, in the same position, under the same contract. That is
+not tidiness: every place the two arms differed was a place the ETSI half silently
+went without something the 3GPP half had, and not one of them was found by
+something failing — they were found by reading this list and seeing a gap in a
+column. The glossary miner was built by `build-rust` and run by no step; the
+contract ran on `3gpp.duckdb` and judged the ETSI half by one composite flag; one
+shared `compact` declared the ETSI sparse import and not the 3GPP one.
+`TestTheTwoArmsRunTheSameSteps` pins the pairing, and its `shared` map is the only
+place an exception can be recorded.
+
+`seed` and `merge` have no twin, structurally: `merge` folds the 3GPP shards while
+the ETSI ingest writes one database directly, and `seed` applies the two curated
+3GPP seeds while the ETSI vocabulary is MINED, by `enrich-etsi`. `smoke` and
+`publish` are not per corpus either — one server is started over both stores, one
+image is pushed carrying both.
 
 | Step | Does | Cost |
 |---|---|---|
 | `toolchain` | records the compiler identity | instant |
 | `build-go` | server + offline tools | ~25 s |
 | `test` | `go test ./...` | ~1 min |
-| `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, discover | ~15 min cold |
+| `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
 | `seed` | adopt the published lexical snapshot **and its delta anchor** | one-off |
-| `discover` | diff the live 3GPP status report against the local anchor | ~3 s |
-| `fetch` | download + LibreOffice-convert the delta | hours, CPU-bound |
-| `ingest` | parse HTML into per-series DuckDB shards | minutes/series |
-| `merge` | fold shards into the corpus, rewrite the anchor | minutes |
-| `embed` | vectorise on the GPU, reusing every known content hash | **the long pole** |
+| `discover` / `discover-etsi` | diff the live catalogue against the local anchor | ~3 s |
+| `fetch` / `fetch-etsi` | download + convert the delta (LibreOffice; pdftotext on the ETSI side) | hours, CPU-bound |
+| `ingest` / `ingest-etsi` | parse HTML into DuckDB | minutes/series; ~15 min ETSI |
+| `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
+| `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
-| `index` | build and freeze the HNSW cosine index | RAM-bound |
-| `validate` | the data-completeness contract | seconds |
-| `smoke` | start the real server, call real tools, assert vector search stays on | seconds |
+| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | ~2 h |
+| `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
+| `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
+| `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
+| `index` / `index-etsi` | build and freeze the HNSW cosine index | RAM-bound |
+| `validate` / `validate-etsi` | the data-completeness contract (+ `anchorcheck` on the 3GPP arm) | seconds |
+| `smoke` | start the real server over both stores, call real tools, assert vector search stays on | seconds |
 | `publish` | compose the OCI image and push it — declines without a registry credential | ~25 min |
 
 `publish` is a STEP, not a separate entry point. The image was the only output of

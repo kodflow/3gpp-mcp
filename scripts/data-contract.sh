@@ -10,6 +10,27 @@
 # tightening the contract is a one-variable change here — no workflow edits, no drift
 # between the two gates (the "half-baked image" failure mode this exists to prevent).
 #
+# Usage:
+#   scripts/data-contract.sh [3gpp|etsi]      (default: 3gpp)
+#
+# THE ARM ARGUMENT EXISTS BECAUSE BOTH CORPORA ARE NOW GATED, NOT ONE.
+#
+# `validate` used to be a single step that ran the whole contract on
+# data/3gpp.duckdb and judged the ETSI half by ONE composite flag, --require-etsi.
+# So the 3GPP corpus was held to --require-fts, --require-hnsw,
+# --require-embed-complete and --require-sparse, and the ETSI corpus — the same
+# size, the same writers, the same freeze — was held to none of them. An ETSI FTS
+# index that failed to build, or a sparse layer that came out empty, could not fail
+# a gate, because no gate looked. `validate-etsi` now runs the SAME contract on
+# data/etsi.duckdb, and it asks this file for its flags rather than carrying a copy
+# of them, because a second copy of the contract is a second contract.
+#
+# WHAT THE ETSI ARM DROPS, AND WHY IT IS THE ONLY DIFFERENCE. --require-etsi is not
+# a check about a corpus; it is a check about the PAIR — it opens the peer and
+# asserts its embedding identity equals this one's. Emitting it on both arms would
+# run the same comparison twice and, on the ETSI arm, point the corpus at itself.
+# It stays on the 3GPP arm, once, and that is the whole of the asymmetry.
+#
 # Env (CI repo variables / job env):
 #   DATA_CONTRACT     dense | dense+sparse | dense+sparse+etsi   (default: dense+sparse+etsi)
 #   DATA_EMBED_FLOOR  release floor for dense convergence, e.g. Rel-99 (default: all)
@@ -37,9 +58,26 @@ set -euo pipefail
 
 level="${DATA_CONTRACT:-dense+sparse+etsi}"
 floor="${DATA_EMBED_FLOOR:-}"
+arm="${1:-3gpp}"
+
+case "$arm" in
+3gpp | etsi) ;;
+*)
+	echo "data-contract: unknown arm '$arm' (want: 3gpp | etsi)" >&2
+	exit 2
+	;;
+esac
 
 flags="--require-fts --require-hnsw --require-embed-complete"
-if [ -n "$floor" ]; then
+# THE FLOOR IS A 3GPP CONCEPT AND MUST NOT REACH THE ETSI ARM.
+#
+# --require-embed-complete counts clauses at or above --embed-floor, and
+# clauses_needing_embedding skips any clause whose release has no ordinal once a
+# floor is set. An ETSI release is the constant "ETSI", which has no ordinal, so a
+# floor here would select ZERO clauses and the strongest check in the contract
+# would pass over an entirely unvectorised corpus. That is the same trap
+# corpusETSI().Floor already documents on the embed side, one gate later.
+if [ -n "$floor" ] && [ "$arm" = 3gpp ]; then
 	flags="$flags --embed-floor $floor"
 fi
 
@@ -61,7 +99,15 @@ dense+sparse+etsi)
 	# anywhere.
 	#
 	# DATA_ETSI_DB overrides the path for a layout that is not the image's.
-	flags="$flags --require-sparse --require-etsi ${DATA_ETSI_DB:-/data/mcp-3gpp/etsi.duckdb}"
+	#
+	# ONLY ON THE 3GPP ARM. See the header: this is the one check about the pair
+	# rather than about a corpus, and the ETSI arm would be pointing it at itself.
+	# The ETSI arm still gets --require-sparse, which is a check about a corpus and
+	# which nothing used to ask of it.
+	flags="$flags --require-sparse"
+	if [ "$arm" = 3gpp ]; then
+		flags="$flags --require-etsi ${DATA_ETSI_DB:-/data/mcp-3gpp/etsi.duckdb}"
+	fi
 	;;
 *)
 	echo "data-contract: unknown DATA_CONTRACT=$level (want: dense | dense+sparse | dense+sparse+etsi)" >&2

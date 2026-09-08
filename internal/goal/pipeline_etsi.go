@@ -29,7 +29,9 @@ import (
 // cmd/server serves them side by side and routes by id shape; merging them would
 // blur provenance, and provenance is the product.
 
-// stepDiscoverETSI resolves the ETSI deliverable work list.
+// stepDiscoverETSI resolves the ETSI deliverable work list. It is the ETSI
+// analogue of `discover`.
+
 func stepDiscoverETSI() *Step {
 	return &Step{
 		Name:    "discover-etsi",
@@ -42,7 +44,7 @@ func stepDiscoverETSI() *Step {
 		},
 		Outputs: func(c *Ctx) []string { return []string{c.statePath("etsi-worklist.tsv")} },
 		// The Run below writes this file and nothing else. An ETSI catalogue that
-		// enumerates to the same deliverables must not replay corpus-etsi, which is
+		// enumerates to the same deliverables must not replay ingest-etsi, which is
 		// hours of download and PDF conversion over a corpus that has since been
 		// content-addressed and compacted.
 		OutputsComplete: true,
@@ -83,7 +85,7 @@ func stepDiscoverETSI() *Step {
 // And the gain is provenance. One step declaring both the downloader and the
 // Rust parser means either invalidates both. Measured on build 24 (2026-09-07):
 //
-//	STEP corpus-etsi
+//	STEP ingest-etsi
 //	  reason  implementation changed: rust/store/src/lib.rs
 //
 // rust/store/src/lib.rs cannot alter one downloaded byte, and this is the same
@@ -117,7 +119,7 @@ func stepFetchETSI() *Step {
 		Heavy: true,
 		// No Outputs, exactly as `fetch` declares none. What this step produces is a
 		// tree of converted HTML whose per-file enumeration would make the
-		// fingerprint enormous; `corpus-etsi` takes that tree as its INPUT instead,
+		// fingerprint enormous; `ingest-etsi` takes that tree as its INPUT instead,
 		// which is where the signal is actually needed.
 		Outputs: func(c *Ctx) []string { return nil },
 		Run: func(c *Ctx) error {
@@ -143,7 +145,7 @@ func stepFetchETSI() *Step {
 			c.Checkpoint("etsi_converted", strconv.Itoa(n))
 			// ZERO CONVERTED FILES IS A FAILURE, NOT AN EMPTY RESULT. The ingest would
 			// otherwise run on nothing and leave a schema-only DB that serves as an
-			// empty corpus without complaining — the failure mode corpus-etsi's own
+			// empty corpus without complaining — the failure mode ingest-etsi's own
 			// Validate was written to catch, caught one step earlier and named.
 			if n == 0 {
 				return fmt.Errorf("the ETSI fetch converted no deliverable at all under %s",
@@ -158,9 +160,17 @@ func stepFetchETSI() *Step {
 //
 // Acquisition is `fetch-etsi`; this step is the ETSI analogue of `ingest`, and it
 // declares the Rust chain and nothing else.
-func stepCorpusETSI() *Step {
+//
+// IT IS CALLED `ingest-etsi`, AND THE NAME IS THE POINT. It was `corpus-etsi`,
+// which is the only step in either arm that did not share its twin's name: the
+// pipeline pairs `fetch`/`fetch-etsi`, `embed`/`embed-etsi`, `enrich`/`enrich-etsi`
+// and six more, and then called the ETSI ingest something else. A name that does
+// not pair is a step nobody looks for when they check whether both halves get the
+// same treatment -- which is how this arm went without an enrich, a sparse-aware
+// compaction and a contract of its own for as long as it did.
+func stepIngestETSI() *Step {
 	return &Step{
-		Name:    "corpus-etsi",
+		Name:    "ingest-etsi",
 		Version: 3,
 		Doc:     "ingest the converted ETSI deliverables into data/etsi.duckdb",
 		Deps:    []string{"fetch-etsi", "build-rust"},
@@ -244,7 +254,7 @@ func stepCorpusETSI() *Step {
 			//
 			// The 3GPP half has always called this before folding; the ETSI half was
 			// written before its corpus was ever converted, and the requirement was
-			// never carried across. It surfaced the first time corpus-etsi ran after
+			// never carried across. It surfaced the first time the ETSI ingest ran after
 			// paragraphs-etsi (2026-09-03), not because either step changed.
 			if err := ensureWriteShape(c, c.dataPath("etsi.duckdb")); err != nil {
 				return fmt.Errorf("the ETSI corpus could not be put back into write shape: %w", err)

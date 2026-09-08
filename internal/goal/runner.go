@@ -365,7 +365,7 @@ func summarise(keys []string) string {
 //
 // The distinction pays for itself on the small, regenerated artefacts: a work
 // list, a series list, a state JSON. `discover-etsi` rewrites its work list on
-// every run, so mtime always moves, so `corpus-etsi` — hours of download and PDF
+// every run, so mtime always moves, so `ingest-etsi` — hours of download and PDF
 // conversion — was replayed by a file that came back byte-for-byte identical.
 // Hashing 64 MiB costs a fraction of a second; the corpus and the ledgers are
 // orders of magnitude above it and keep the cheap identity.
