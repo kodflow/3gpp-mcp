@@ -35,31 +35,61 @@ toolchain ─┬─ build-go ── test
            ├─ build-rust ─────────┐
            └─ build-embedder ──┐  │
                                │  │
-             seed ── discover ─┼──┴── fetch ── ingest ── merge ─┬─ embed ─┐
-                                                                └─ enrich ┴─ index
-                                                                             │
-                                                              validate ── smoke
-                                                                             │
-                                                            index-etsi ── publish
+  3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
+                                                                                                                     ├─ smoke ─ publish
+  ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
+
+**The two arms are the same list twice.** Every data step of the 3GPP arm has a
+same-named `-etsi` twin, in the same position, under the same contract. That is
+not tidiness: every place the two arms differed was a place the ETSI half silently
+went without something the 3GPP half had, and not one of them was found by
+something failing — they were found by reading this list and seeing a gap in a
+column. The glossary miner was built by `build-rust` and run by no step; the
+contract ran on `3gpp.duckdb` and judged the ETSI half by one composite flag; one
+shared `compact` declared the ETSI sparse import and not the 3GPP one.
+`TestTheTwoArmsRunTheSameSteps` pins the pairing, and its `shared` map is the only
+place an exception can be recorded.
+
+`merge` has no twin, structurally: it folds the 3GPP shards, while the ETSI ingest
+writes one database directly, so there is nothing to fold. `smoke` and `publish`
+are not per corpus either — one server is started over both stores, one image is
+pushed carrying both.
+
+`seed` DID appear in that list, with a reason that described the curated seeds in
+`enrich` rather than what the step does. `bootstrap.CorpusETSI` existed, was
+exported, was tested and was called by `cmd/server` — and by no pipeline step, so
+a fresh clone pulled 3GPP from a published snapshot in minutes and rebuilt ETSI
+from etsi.org over hours. The exception was the defect, which is why
+`TestNoArmExceptionOutlivesItsStep` now reads that map instead of only trusting
+it. What `seed-etsi` does NOT yet close: ETSI has no delta anchor, so
+`discover-etsi` and `fetch-etsi` still re-enumerate the archive. The expensive
+half — `embed-etsi` and `sparse-etsi` — declines against the restored vectors.
 
 | Step | Does | Cost |
 |---|---|---|
 | `toolchain` | records the compiler identity | instant |
 | `build-go` | server + offline tools | ~25 s |
 | `test` | `go test ./...` | ~1 min |
-| `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, discover | ~15 min cold |
+| `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
-| `seed` | adopt the published lexical snapshot **and its delta anchor** | one-off |
-| `discover` | diff the live 3GPP status report against the local anchor | ~3 s |
-| `fetch` | download + LibreOffice-convert the delta | hours, CPU-bound |
-| `ingest` | parse HTML into per-series DuckDB shards | minutes/series |
-| `merge` | fold shards into the corpus, rewrite the anchor | minutes |
-| `embed` | vectorise on the GPU, reusing every known content hash | **the long pole** |
+| `seed` | adopt the published 3GPP snapshot **and its delta anchor** | one-off |
+| `seed-etsi` | adopt the published `etsi-corpus` snapshot. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off |
+| `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
+| `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
+| `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
+| `fetch-etsi` | download + convert the resulting work list (pdftotext) — a work list, not a delta | hours, CPU-bound |
+| `ingest` / `ingest-etsi` | parse HTML into DuckDB | minutes/series; ~15 min ETSI |
+| `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
+| `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
-| `index` | build and freeze the HNSW cosine index | RAM-bound |
-| `validate` | the data-completeness contract | seconds |
-| `smoke` | start the real server, call real tools, assert vector search stays on | seconds |
+| `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | ~35 min (the parse; the write went from 2 h 29 to 16 s) |
+| `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
+| `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
+| `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
+| `index` / `index-etsi` | build and freeze the HNSW cosine index | RAM-bound |
+| `validate` / `validate-etsi` | the data-completeness contract (+ `anchorcheck` on the 3GPP arm) | seconds |
+| `smoke` | start the real server over both stores, call real tools, assert vector search stays on | seconds |
 | `publish` | compose the OCI image and push it — declines without a registry credential | ~25 min |
 
 `publish` is a STEP, not a separate entry point. The image was the only output of

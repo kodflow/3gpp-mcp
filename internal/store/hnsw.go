@@ -68,6 +68,35 @@ func OpenReadOnly(path string) (*Store, error) {
 		return nil, fmt.Errorf("open duckdb read-only %q: %w", path, err)
 	}
 	db.SetMaxOpenConns(1)
+	// A READER MUST NOT CLAIM 80 % OF THE MACHINE.
+	//
+	// DuckDB's default memory_limit is a share of physical RAM, and this package
+	// exists to say that a share-of-machine default is the bug rather than the
+	// policy (see memory.go). BoundMemory was written for exactly that — and was
+	// called by ONE binary, cmd/migrate-paragraphs. Every reader — cmd/validate,
+	// cmd/anchorcheck, cmd/dbcount, cmd/server — came through here and got the
+	// default: ~22 GB of a 28 GB machine, for tools that count rows.
+	//
+	// Measured 2026-09-08: cmd/validate reached a 16.3 GB working set reading
+	// counters, and the process launched immediately behind it — anchorcheck — died
+	// with 0xC0000142, a CreateProcess that could not initialise under the commit
+	// still charged to the reader. Four builds died that way in one morning, on
+	// three different binaries, always the one launched behind a heavy step, and
+	// the corpus was intact every time.
+	//
+	// IT GOES HERE AND NOT IN THE CALLERS, because the whole failure is a fix that
+	// existed and was not on the path. Three call sites is the fourth one
+	// forgotten; this is the door all of them come through.
+	//
+	// BEST EFFORT, NEVER FATAL. A cap that will not apply must not stop a corpus
+	// from being read — the worst case without it is the behaviour that shipped
+	// until today. It is reported, because a silent failure is how the original
+	// omission survived this long.
+	if err := BoundMemory(db, path); err != nil {
+		fmt.Fprintf(os.Stderr, "[store] WARNING: could not bound the reader's memory for %s (%v) — "+
+			"DuckDB keeps its share-of-RAM default, and a process launched behind this one may "+
+			"fail to start\n", path, err)
+	}
 	s := &Store{db: db}
 	ctx := context.Background()
 	// Read-only: schema already exists; just detect FTS presence like Open does.

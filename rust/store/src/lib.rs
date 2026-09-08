@@ -1615,7 +1615,87 @@ impl Store {
     /// ONE TRANSACTION, because a delete that commits without its insert is an
     /// empty glossary — and `enrich-etsi`'s Validate would then be the only thing
     /// standing between that and a published corpus.
+    ///
+    /// IT STAGES AND THEN SWAPS, AND THAT IS A BUG FIX, NOT A TIDY-UP.
+    ///
+    /// This used to run one `INSERT … ON CONFLICT` per row inside the transaction.
+    /// At the fourteen deliverables the ETSI half held when it was written, that is
+    /// a few hundred statements and nobody could tell. At the whole /deliver
+    /// archive it is ~100 000 of them, and DuckDB checks each one's conflict key
+    /// against the transaction's own uncommitted rows — so the cost is quadratic in
+    /// the batch, and the batch had grown by three orders of magnitude.
+    ///
+    /// It did not fail. It ran for 2 h 31 on 2026-09-07 and 2 h 29 on 2026-09-08,
+    /// both times killed rather than finished, and both times it LOOKED like the
+    /// corpus: the last thing the log said was "5000/5142 file(s)", the file being
+    /// written was 49.6 GB, and the obvious reading was a checkpoint on a huge
+    /// database. Measured live on the second stall: 145 % of one core, and ZERO
+    /// read and ZERO write operations over twenty seconds. Not the disk, not the
+    /// corpus — CPU, in memory. Re-run against an EMPTY 12 KB database it stalled
+    /// exactly the same way, which is what finally named it: the size of the corpus
+    /// never mattered, only the size of the batch.
+    ///
+    /// So the rows land first in a TEMP table that has no constraint and no index —
+    /// nothing to check them against — and the swap is then two set-based
+    /// statements. Same transaction, same ON CONFLICT semantics against the 3GPP
+    /// rows that stay, one conflict check instead of a hundred thousand.
+    ///
+    /// THE VALIDATION MOVED IN FRONT OF EVERYTHING. It used to sit inside the write
+    /// loop, and its comment said that was what made the rollback path reachable by
+    /// a test. Refusing a bad batch BEFORE the delete is strictly stronger — the
+    /// glossary is never even briefly at risk — and the transaction still covers the
+    /// delete and the insert together, so a failure in either still rolls back.
     pub fn replace_mined_acronyms(&self, rows: &[MinedAcronym]) -> Result<usize> {
+        // A row with no term or no expansion is not a glossary entry, and it would
+        // be INVISIBLE afterwards: the primary key accepts it, and resolve_term
+        // matches on lower(term), so an empty one answers nothing and can never be
+        // found again to be removed. Rejected before anything is staged or deleted.
+        for r in rows {
+            if r.term.trim().is_empty() || r.expansion.trim().is_empty() {
+                anyhow::bail!(
+                    "refusing to write a glossary row with an empty term or expansion (source {})",
+                    r.source
+                );
+            }
+        }
+
+        self.conn
+            .execute_batch(
+                "CREATE OR REPLACE TEMP TABLE mined_acronyms (
+                     term VARCHAR, expansion VARCHAR, domain VARCHAR,
+                     first_release VARCHAR, last_release VARCHAR,
+                     source_series VARCHAR, declared_by BIGINT);",
+            )
+            .context("stage the mined vocabulary")?;
+
+        // Multi-row VALUES, because the cost being removed is PER STATEMENT: DuckDB
+        // parses, plans and optimises each one. The chunk is small enough that the
+        // bound-parameter list stays modest and large enough that the per-statement
+        // cost is amortised a thousand times over.
+        for chunk in rows.chunks(1000) {
+            let mut sql = String::from(
+                "INSERT INTO mined_acronyms(term, expansion, domain, first_release, \
+                 last_release, source_series, declared_by) VALUES ",
+            );
+            let mut vals: Vec<duckdb::types::Value> = Vec::with_capacity(chunk.len() * 7);
+            for (i, r) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?,?,?,?,?,?,?)");
+                vals.push(r.term.clone().into());
+                vals.push(r.expansion.clone().into());
+                vals.push(String::new().into());
+                vals.push(r.version.clone().into());
+                vals.push(r.version.clone().into());
+                vals.push(r.source.clone().into());
+                vals.push(r.declared_by.into());
+            }
+            self.conn
+                .execute(&sql, duckdb::params_from_iter(vals))
+                .context("stage a batch of mined acronyms")?;
+        }
+
         self.conn
             .execute_batch("BEGIN;")
             .context("begin acronym replace")?;
@@ -1626,44 +1706,32 @@ impl Store {
                     [],
                 )
                 .context("purge the previously mined vocabulary")?;
-            let mut n = 0usize;
-            for r in rows {
-                // A row with no term or no expansion is not a glossary entry, and it
-                // would be INVISIBLE afterwards: the primary key accepts it, and
-                // resolve_term matches on lower(term), so an empty one answers
-                // nothing and can never be found again to be removed. Rejecting it
-                // here is also what makes the transaction observable — the rollback
-                // path has to be reachable by a test, or "one transaction" is a
-                // claim rather than a behaviour.
-                if r.term.trim().is_empty() || r.expansion.trim().is_empty() {
-                    anyhow::bail!(
-                        "refusing to write a glossary row with an empty term or expansion (source {})",
-                        r.source
-                    );
-                }
-                self.conn
-                    .execute(
-                        "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (term, expansion, domain) DO UPDATE SET
-                           first_release = excluded.first_release, last_release = excluded.last_release,
-                           source_series = excluded.source_series, declared_by = excluded.declared_by",
-                        duckdb::params![
-                            r.term,
-                            r.expansion,
-                            "",
-                            r.version,
-                            r.version,
-                            r.source,
-                            r.declared_by
-                        ],
-                    )
-                    .with_context(|| format!("insert acronym {}", r.term))?;
-                n += 1;
-            }
-            Ok(n)
+            // ONE upsert, and it YIELDS. The staged rows are unique on
+            // (term, expansion, domain) by construction — Tally keys a BTreeMap on
+            // exactly that pair and domain is always "" — so no row can conflict with
+            // another row of this batch. The DELETE above has already removed every
+            // mined row. So the only row a conflict can now name is one this pass does
+            // not own: a curated 3GPP entry declaring the same pair.
+            //
+            // DO UPDATE claimed to yield and did the opposite — `source_series =
+            // excluded.source_series` overwrites the 3GPP provenance with an ETSI one,
+            // which is how a curated entry would come to cite a deliverable that did
+            // not declare it. Unreachable in the corpus that ships (etsi.duckdb holds
+            // 28 154 mined rows and nothing else, measured), because the two halves are
+            // separate databases — but the guard costs nothing and the comment was
+            // already describing DO NOTHING.
+            self.conn
+                .execute(
+                    "INSERT INTO acronyms(term, expansion, domain, first_release, last_release, source_series, declared_by)
+                     SELECT term, expansion, domain, first_release, last_release, source_series, declared_by
+                       FROM mined_acronyms
+                     ON CONFLICT (term, expansion, domain) DO NOTHING",
+                    [],
+                )
+                .context("write the mined vocabulary")?;
+            Ok(rows.len())
         })();
-        match res {
+        let out = match res {
             Ok(n) => {
                 self.conn
                     .execute_batch("COMMIT;")
@@ -1674,7 +1742,13 @@ impl Store {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(e)
             }
-        }
+        };
+        // The staging table is temporary and dies with the connection anyway;
+        // dropping it keeps a long-lived writer from carrying it between passes.
+        let _ = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS mined_acronyms;");
+        out
     }
 }
 

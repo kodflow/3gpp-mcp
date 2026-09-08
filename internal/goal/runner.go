@@ -365,7 +365,7 @@ func summarise(keys []string) string {
 //
 // The distinction pays for itself on the small, regenerated artefacts: a work
 // list, a series list, a state JSON. `discover-etsi` rewrites its work list on
-// every run, so mtime always moves, so `corpus-etsi` — hours of download and PDF
+// every run, so mtime always moves, so `ingest-etsi` — hours of download and PDF
 // conversion — was replayed by a file that came back byte-for-byte identical.
 // Hashing 64 MiB costs a fraction of a second; the corpus and the ledgers are
 // orders of magnitude above it and keep the cheap identity.
@@ -770,6 +770,30 @@ func (r *Runner) checkPreconditions(s *Step) error {
 	return r.checkAnyDeps(s)
 }
 
+// declinedWithoutArtefact names the first declared output an alternative producer
+// that DECLINED did not leave behind, or "" if it left them all (or did not
+// decline at all).
+//
+// Scoped to declines on purpose. A step that ran to completion and whose output
+// then vanished is a different fault, and a louder one — it belongs to whatever
+// removed the file, not to this gate, which exists to answer "may the dependant
+// start?" and must not grow into a corpus checker.
+func (r *Runner) declinedWithoutArtefact(name string, rec *Record) string {
+	if rec == nil || !rec.Declined {
+		return ""
+	}
+	s := r.byName[name]
+	if s == nil || s.Outputs == nil || r.ctx == nil {
+		return ""
+	}
+	for _, p := range s.Outputs(r.ctx) {
+		if !fileNonEmpty(p) {
+			return p
+		}
+	}
+	return ""
+}
+
 // checkAnyDeps enforces the satisfaction half of AnyDeps: at least one of the
 // alternative producers must have SUCCEEDED. It is checked at execution time
 // rather than at planning time on purpose — `--only` bypasses the plan, and this
@@ -785,6 +809,19 @@ func (r *Runner) checkAnyDeps(s *Step) error {
 		case prev == nil:
 			states = append(states, name+"=never run")
 		case prev.Status == StatusSuccess:
+			// A DECLINE IS RECORDED AS A SUCCESS, and this gate's own message
+			// promises the alternative "produced its artefact". Those two facts
+			// disagreed: `seed` declines when it finds no credential, and it
+			// declines BEFORE creating the database — so `--only embed-etsi` on a
+			// machine that has never built passed this check and reached the
+			// embedder with no corpus, to fail somewhere deeper with a message
+			// about the file rather than about the missing producer. The
+			// already-present decline, which is the common one, still satisfies
+			// the gate: it declined precisely because the artefact is there.
+			if missing := r.declinedWithoutArtefact(name, prev); missing != "" {
+				states = append(states, name+"=declined without producing "+missing)
+				continue
+			}
 			return nil
 		default:
 			states = append(states, name+"="+string(prev.Status))
