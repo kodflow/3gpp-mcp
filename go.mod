@@ -3,9 +3,9 @@ module github.com/kodflow/3gpp-mcp
 go 1.26.3
 
 require (
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
-	github.com/mark3labs/mcp-go v0.58.0
+	github.com/mark3labs/mcp-go v1.0.0
 	github.com/sugarme/tokenizer v0.3.0
 	github.com/yalue/onnxruntime_go v1.30.1
 	golang.org/x/net v0.58.0
