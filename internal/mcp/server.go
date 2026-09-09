@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -517,6 +518,14 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
 	}
+	// THE NOTE SPEAKS FOR THE SPEC, SO IT READS THE SPEC'S RECORDS.
+	//
+	// `changes` is about to be narrowed to one clause, and changelogNote describes
+	// the whole change history: fed the narrowed slice it would answer "this corpus
+	// holds no citable records for 23.501" whenever the clause simply has none, on
+	// a spec with plenty — the same false zero this release exists to remove, one
+	// level down. Keep the unfiltered set for it.
+	all := append([]model.Change(nil), changes...)
 	clause := r.GetString("clause", "")
 	if clause != "" {
 		filtered := changes[:0]
@@ -555,8 +564,73 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 			"and the change-history table does not survive text extraction well enough to cite. " +
 			"Use trace_clause with from_release/to_release (they accept two VERSIONS here) to diff a " +
 			"clause between two published versions from the text itself."
+	} else if !isETSISpecID(specID) {
+		out["note"] = changelogNote(ctx, h.specStore(specID), specID, all)
+	}
+	if out["note"] == "" {
+		delete(out, "note")
 	}
 	return jsonResult(out)
+}
+
+// changelogNote applies to the 3GPP half the standard the ETSI half was already
+// held to one branch above: say what the number means.
+//
+// TWO DIFFERENT SILENCES USED TO LOOK THE SAME HERE, and one of them was not
+// silence at all — it was a wrong answer. Measured on the published corpus
+// (2026-09-09), over 3 568 specs:
+//
+//   - 3 352 records name no CR and no version transition. They are the HEADER row
+//     of the change-history table, read positionally like a body row: 3 026 of
+//     them are summarised "Date", the rest "TSG SA#" or "SMG No.". They are now
+//     dropped in store.GetChangelog (model.Change.Citable), so get_changelog no
+//     longer answers TS 23.501 with count 1 and summary "Date".
+//   - dropping them leaves 311 specs with any change history at all. The other
+//     3 257 answer 0 — and a bare 0 reads as "this spec never changed", which is
+//     false of every one of them.
+//   - the table is a FOSSIL. Its writer was deleted when the Go HTML-ingest
+//     write-side moved to Rust (Phase 11b, commit c635038) and the Rust ingest
+//     never reimplemented the change-history parser. 3 326 of the 3 452 specs
+//     that have records hold a published version NEWER than their newest recorded
+//     change.
+//
+// So the note distinguishes "no records" from "records that stop here", and in
+// both cases names trace_clause — which answers the same question from the clause
+// text and is not fossilised — exactly as the ETSI branch does.
+func changelogNote(ctx context.Context, st store.Reader, specID string, changes []model.Change) string {
+	const useTraceClause = "Use trace_clause with from_release/to_release to diff a clause between two " +
+		"versions from the text itself, which is derived from the corpus rather than from this table."
+	if len(changes) == 0 {
+		// NO CORPUS COUNTS IN THE SERVED TEXT. An earlier draft carried "covers 311
+		// of the 3 568 specs": true of the snapshot it was measured on and silently
+		// false of every later one, which is the failure mode of a note whose whole
+		// job is to stop a number from being read as more than it is.
+		return "this corpus holds no citable change-request records for " + specID + ". The " +
+			"change-request table has had no writer since the ingest write-side moved to Rust, so it " +
+			"covers a minority of the specs indexed here and stops at whatever each one held then. A " +
+			"count of 0 means \"not recorded here\", not \"never changed\". " + useTraceClause
+	}
+	// GetChangelog orders by to_version ASC through versionOrderSQL, so the newest
+	// recorded transition is the last row that names one. Scanning backwards uses
+	// that order instead of re-deriving it — and a plain string max would not do:
+	// "9.0.0" sorts above "18.0.0".
+	newest := ""
+	for i := len(changes) - 1; i >= 0; i-- {
+		if changes[i].ToVersion != "" {
+			newest = changes[i].ToVersion
+			break
+		}
+	}
+	if newest == "" {
+		return ""
+	}
+	_, latest, ok, err := st.LatestVersion(ctx, specID)
+	if err != nil || !ok || compareVersions(latest, newest) <= 0 {
+		return ""
+	}
+	return "this change history stops at " + newest + ", and the corpus holds " + latest +
+		". The change-request table has had no writer since the ingest write-side moved to Rust, so " +
+		"anything after " + newest + " is absent rather than empty. " + useTraceClause
 }
 
 // isETSISpecID is storeFor's routing predicate, named so a caller can ask the
@@ -1082,4 +1156,40 @@ func rerankReason(enabled bool) string {
 		return ""
 	}
 	return rerank.Reason()
+}
+
+// compareVersions orders two dotted versions numerically, field by field, and is
+// the Go twin of store.versionOrderSQL: split on ".", a field that is not an
+// integer counts as 0, a missing field counts as 0. Returns -1, 0 or +1.
+//
+// It exists because the obvious string comparison is wrong on exactly the specs
+// that matter: "9.0.0" > "18.0.0" lexically, so a changelog that stopped at 9.0.0
+// would be reported as ahead of a corpus holding 18.0.0 — the staleness note
+// would then be silent precisely where the gap is largest.
+func compareVersions(a, b string) int {
+	af, bf := strings.Split(a, "."), strings.Split(b, ".")
+	n := len(af)
+	if len(bf) > n {
+		n = len(bf)
+	}
+	at := func(f []string, i int) int {
+		if i >= len(f) {
+			return 0
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(f[i]))
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+	for i := 0; i < n; i++ {
+		x, y := at(af, i), at(bf, i)
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }
