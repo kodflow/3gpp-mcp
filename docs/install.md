@@ -26,7 +26,7 @@ Two things to know:
   [`DATA_NOTICE.md`](../DATA_NOTICE.md)). `docker login ghcr.io` with a token
   carrying `read:packages` before pulling.
 - **No `VOLUME` is declared, deliberately.** `serve` reads the baked corpus in
-  place, read-only; a volume would make Docker copy ~36 GB into a fresh one on
+  place, read-only; a volume would make Docker copy ~50 GB into a fresh one on
   every `--rm` run.
 
 `docker run --rm ghcr.io/kodflow/3gpp-mcp:latest version` prints the build, and
@@ -54,8 +54,8 @@ It needs data it does not ship, downloaded once into a per-user cache
 
 | Artifact | Size | Source | Needed for |
 |---|---|---|---|
-| `3gpp.duckdb` (indexed corpus) | **21.2 GB** (15.9 GiB gzipped in the image) | **private GHCR package** | always |
-| `etsi.duckdb` (ETSI: 5 117 TS/TR/EN deliverables, not just the LI suite) | **8.0 GB** | private GHCR package | ETSI deliverables (`--etsi`) |
+| `3gpp.duckdb` (indexed corpus) | **24.1 GiB** | **private GHCR package** | always |
+| `etsi.duckdb` (ETSI: 5 142 TS/TR/EN deliverables in 11 822 published versions, not just the LI suite) | **18.4 GiB** | private GHCR package | ETSI deliverables (`--etsi-db`) |
 | BGE-M3 (dense + sparse heads) + reranker + ONNX Runtime | **6.4 GB** (4.0 GiB gzipped) | HuggingFace + ORT release | semantic search only |
 
 ## Why the corpus needs a credential
@@ -142,23 +142,50 @@ export MCP3GPP_CORPUS_TAG=2026-08-26    # default: latest
 }
 ```
 
-With a locally built corpus, point at it directly and skip the cache:
+With a locally built corpus, point at it directly and skip the cache — and set
+**both** ONNX variables:
 
 ```json
 {
   "mcpServers": {
-    "3gpp": { "command": "mcp-3gpp",
-      "args": ["serve", "--db", "data/3gpp.duckdb", "--etsi-db", "data/etsi.duckdb"] }
+    "3gpp": {
+      "command": "mcp-3gpp",
+      "args": ["serve", "--db", "data/3gpp.duckdb", "--etsi-db", "data/etsi.duckdb"],
+      "env": {
+        "EMBED_MODEL": "bge-m3-sparse",
+        "EMBED_MODEL_DIR": "data/models/bge-m3-sparse",
+        "ORT_DYLIB_PATH": ".local/toolchain/ort/onnxruntime-win-x64-gpu-1.20.1/lib/onnxruntime.dll",
+        "ONNXRUNTIME_SHARED_LIBRARY_PATH": "data/models/onnxruntime/lib/onnxruntime.dll"
+      }
+    }
   }
 }
 ```
+
+**TWO BINDINGS, TWO RUNTIMES, AND THEY ARE NOT INTERCHANGEABLE.**
+`ORT_DYLIB_PATH` is the RUST crate's variable — `rust/embed-core`, the query
+embedder — pinned to the build it was compiled against. `ONNXRUNTIME_SHARED_LIBRARY_PATH`
+is the GO binding's, used by the cross-encoder reranker, on a different pin. One
+file cannot satisfy both.
+
+Setting only the first does not fail. The server starts, answers every query, and
+serves with one of the four retrieval arms missing:
+
+```text
+The requested API version [25] is not available, only API versions [1, 20]
+are supported in this build. Current ORT Version is: 1.20.1
+… embedder=true reranker=false
+```
+
+`server_info` is the only place that says so — ask it after wiring, before
+concluding the install is good.
 
 `serve` auto-detects cached models after `bootstrap --semantic`; the flags are
 otherwise identical. To pin a baseline release, add `"--release", "Rel-19"`.
 
 `serve` provisions the cache itself when it is empty, and keeps serving a cached
 corpus when no token is present or the registry is unreachable — it degrades
-rather than refusing to start. It never re-hashes 21.2 GB to decide whether an
+rather than refusing to start. It never re-hashes 24 GiB to decide whether an
 update exists: the published layer digests are recorded beside the DB, so the
 check is one manifest request.
 
@@ -195,12 +222,48 @@ Check it took: `server_info` must report `semantic: true` **and**
 query vector was produced by the same model as the corpus; different ids mean
 the vectors cannot be compared and the server refuses rather than pretending.
 
-## 6. Verify
+## 6. Verify, and then use it
 
 ```sh
 mcp-3gpp version
 mcp-3gpp serve            # prints: serving MCP on stdio (db=…, fts=true, hnsw=…)
 ```
 
+**The startup line is not the verification.** It says the server came up; it does
+not say every retrieval arm did. Ask the server:
+
+```jsonc
+// through your MCP client, or piped into `serve` over stdio
+{"jsonrpc":"2.0","id":1,"method":"tools/call",
+ "params":{"name":"server_info","arguments":{}}}
+```
+
+A healthy install answers:
+
+```json
+{"lexical": true, "semantic": true, "sparse": true, "reranker": true,
+ "hnsw": true, "fts": true,
+ "etsi": {"attached": true, "embedding_model_ok": true, "fts": true,
+          "hnsw": true, "sparse": true}}
+```
+
+Any `false` comes with a `reason` / `reranker_reason` / `sparse_reason` naming
+what to fix. The one that is easy to miss: `reranker: false` on a local wiring
+almost always means `ONNXRUNTIME_SHARED_LIBRARY_PATH` is unset — see §4.
+
+### Then: `help`
+
+`help` counts inside the database actually being served rather than repeating
+this document, and returns the question → tool map. It is the right first call in
+a session, and the right call whenever a number here looks stale.
+
+### The one rule that shapes every answer
+
 Every answer carries an exact citation `{spec_id, release, version, clause, url}`.
-If the server can't cite, it doesn't answer.
+**If the server cannot cite, it does not answer** — it says what it does not
+hold instead. A `count` of 0 from `get_changelog` means "not recorded here", and
+the response says so in a `note`; it never means "this never changed".
+
+For evolution questions, reach for `trace_clause` rather than `get_changelog`:
+it diffs the clause TEXT paragraph by paragraph, out of the corpus itself, so it
+works on both halves and cannot go stale against a table nothing writes any more.
