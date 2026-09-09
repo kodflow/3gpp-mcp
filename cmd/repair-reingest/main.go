@@ -40,11 +40,6 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
-type group struct {
-	specID, release, version string
-	copies, held             int
-}
-
 func main() {
 	db := flag.String("db", "", "corpus DuckDB to repair (required)")
 	apply := flag.Bool("apply", false, "actually delete; without it this only reports")
@@ -66,7 +61,7 @@ func run(dbPath string, apply bool) error {
 	}
 	defer func() { _ = st.Close() }()
 	ctx := context.Background()
-	groups, err := findGroups(ctx, st.DB())
+	groups, err := st.ReingestedOccurrences(ctx)
 	if err != nil {
 		return err
 	}
@@ -77,22 +72,22 @@ func run(dbPath string, apply bool) error {
 
 	var totalDel, skipped int
 	for _, g := range groups {
-		keep := g.held / g.copies
-		if g.held%g.copies != 0 {
+		keep := g.Held / g.Copies
+		if g.Held%g.Copies != 0 {
 			fmt.Printf("  SKIP %s %s v%s: %d rows is not a multiple of %d copies — the block model does not hold here\n",
-				g.specID, g.release, g.version, g.held, g.copies)
+				g.SpecID, g.Release, g.Version, g.Held, g.Copies)
 			skipped++
 			continue
 		}
-		del := g.held - keep
+		del := g.Held - keep
 		totalDel += del
 		fmt.Printf("  %s %s v%s: %d copies, %d rows → keep %d, delete %d\n",
-			g.specID, g.release, g.version, g.copies, g.held, keep, del)
+			g.SpecID, g.Release, g.Version, g.Copies, g.Held, keep, del)
 		if !apply {
 			continue
 		}
 		if err := repairOne(ctx, st.DB(), g, keep); err != nil {
-			return fmt.Errorf("repair %s %s v%s: %w", g.specID, g.release, g.version, err)
+			return fmt.Errorf("repair %s %s v%s: %w", g.SpecID, g.Release, g.Version, err)
 		}
 	}
 	verb := "would delete"
@@ -107,38 +102,9 @@ func run(dbPath string, apply bool) error {
 	return nil
 }
 
-// findGroups selects the deliverables whose EVERY distinct occurrence is stored
-// more than once, which is a whole document written again. It is the same
-// predicate as `validate --require-no-reingest`, expressed over clause_occ
-// because that is the table being repaired: body_id stands in for (heading,
-// text), which is exactly what it is.
-func findGroups(ctx context.Context, db *sql.DB) ([]group, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT spec_id, release, version, min(c) AS copies, sum(c) AS held
-		FROM (
-			SELECT spec_id, release, version, clause_path, is_normative, body_id, count(*) AS c
-			FROM clause_occ GROUP BY 1, 2, 3, 4, 5, 6
-		)
-		GROUP BY 1, 2, 3 HAVING min(c) > 1
-		ORDER BY sum(c) DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("scan for re-ingested deliverables: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []group
-	for rows.Next() {
-		var g group
-		if err := rows.Scan(&g.specID, &g.release, &g.version, &g.copies, &g.held); err != nil {
-			return nil, err
-		}
-		out = append(out, g)
-	}
-	return out, rows.Err()
-}
-
 // repairOne deletes everything past the first block, sparse postings first so no
 // posting is ever left pointing at an occurrence that is gone.
-func repairOne(ctx context.Context, db *sql.DB, g group, keep int) error {
+func repairOne(ctx context.Context, db *sql.DB, g store.Reingested, keep int) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -155,17 +121,17 @@ func repairOne(ctx context.Context, db *sql.DB, g group, keep int) error {
 	// table is not a failure to repair the occurrences.
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM clause_sparse WHERE chunk_id IN (`+doomed+`)`,
-		g.specID, g.release, g.version, keep); err != nil {
+		g.SpecID, g.Release, g.Version, keep); err != nil {
 		fmt.Printf("    (no sparse postings removed: %v)\n", err)
 	}
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM clause_occ WHERE chunk_id IN (`+doomed+`)`,
-		g.specID, g.release, g.version, keep)
+		g.SpecID, g.Release, g.Version, keep)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
-	if want := int64(g.held - keep); n != want {
+	if want := int64(g.Held - keep); n != want {
 		return fmt.Errorf("deleted %d occurrence(s), expected %d — refusing to commit", n, want)
 	}
 	return tx.Commit()

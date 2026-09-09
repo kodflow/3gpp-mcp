@@ -159,7 +159,7 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 		checkWorklist(ctx, db, &res, cfg)
 	}
 	if cfg.noReingest {
-		checkNoReingest(ctx, sqldb, &res)
+		checkNoReingest(ctx, db, &res)
 	}
 
 	// clause count + min-clauses
@@ -662,62 +662,25 @@ func readWorklist(path string) (map[string]bool, error) {
 // THE GATE THAT WAS MISSING, and its absence is the point. require-worklist asks
 // whether anything is MISSING from the corpus; nothing was, so it stayed green
 // while the ETSI half gained 566 clauses on every build from a converted tree
-// that never changed. A corpus can be wrong by having too MUCH, and no check
+// that never changed. A corpus can be wrong by holding too MUCH, and no check
 // looked in that direction.
 //
-// THE PREDICATE, and why it has no false positives. A document may legitimately
-// repeat a clause row: ETSI EN 300 607-1 is a GSM test spec whose tables restate
-// the same numbered step, and the published corpus holds 831 192 such repeats
-// across 3.1 M rows. What cannot happen legitimately is EVERY distinct row of one
-// (spec_id, version) appearing at least twice — that is the whole document
-// written again. Measured over the published ETSI corpus, 11 826 versions: the
-// test selects exactly two, TR 104 066 v1.1.1 and TS 103 634 v1.1.1, both at
-// min=15, and nothing else.
-//
-// It reports the multiplicity, because that number is the diagnosis: 15 means
-// fifteen ingests, which dates the defect rather than merely naming it.
-func checkNoReingest(ctx context.Context, sqldb *sql.DB, res *result) {
-	// RELEASE IS PART OF THE IDENTITY, and leaving it out made this gate accuse a
-	// healthy corpus. A 3GPP TR is catalogued under every release it spans:
-	// 30.531 v1.62.0 exists under NINE, so grouping by (spec_id, version) alone
-	// reported "9 copies" for one document legitimately held nine times. Measured
-	// before this flag was wired anywhere — it would have failed every 3GPP build
-	// on nothing. The ETSI half never showed it because its release is the
-	// constant "ETSI".
-	rows, err := sqldb.QueryContext(ctx, `
-		SELECT spec_id, release, version, min(c) AS copies, sum(c) AS rows_held
-		FROM (
-			SELECT spec_id, release, version, clause_path, heading, text, count(*) AS c
-			FROM clauses GROUP BY 1, 2, 3, 4, 5, 6
-		)
-		GROUP BY 1, 2, 3 HAVING min(c) > 1
-		ORDER BY sum(c) DESC`)
+// The rule itself lives in internal/store, because two gates and one repair tool
+// ask it and three copies of a predicate drift.
+func checkNoReingest(ctx context.Context, db *store.Store, res *result) {
+	rs, err := db.ReingestedDeliverables(ctx)
 	if err != nil {
-		res.add("require-no-reingest", false, "cannot scan for re-ingested deliverables: %v", err)
+		// A FAILED READ IS NOT A PASS. Reporting green here would say the corpus
+		// was checked when it was not.
+		res.add("require-no-reingest", false, "%v", err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-	var offenders []string
-	var excess int
-	for rows.Next() {
-		var id, rel, ver string
-		var copies, held int
-		if err := rows.Scan(&id, &rel, &ver, &copies, &held); err != nil {
-			continue
-		}
-		// The excess is what the extra writes added, which is held - held/copies.
-		// Counting distinct ROWS instead would over-report on a document that
-		// legitimately repeats a clause: those repeats are part of one write.
-		excess += held - held/copies
-		if len(offenders) < 10 {
-			offenders = append(offenders, fmt.Sprintf("%s %s v%s (%d copies, %d rows)", id, rel, ver, copies, held))
-		}
-	}
-	if len(offenders) == 0 {
+	if len(rs) == 0 {
 		res.add("require-no-reingest", true, "no deliverable is stored more than once")
 		return
 	}
+	groups, excess, named := store.SummariseReingested(rs, 10)
 	res.add("require-no-reingest", false,
 		"%d deliverable(s) were written by more than one ingest, %d excess row(s): %s",
-		len(offenders), excess, strings.Join(offenders, ", "))
+		groups, excess, named)
 }
