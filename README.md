@@ -26,11 +26,11 @@ portant `read:packages` avant le premier `pull`.
 
 ### Ce que l'image contient
 
-Chiffres **mesurés** dans les bases servies le 2026-09-04, pas des ordres de
+Chiffres **mesurés** dans les bases servies le 2026-09-09, pas des ordres de
 grandeur. Ils portent sur un digest précis, pas sur le tag mouvant :
 
 ```text
-ghcr.io/kodflow/3gpp-mcp@sha256:f2aa17e695871ddf33acb2e419f1250b602ac8b720cea9c329add374ce796642
+ghcr.io/kodflow/3gpp-mcp@sha256:0349248311a48073f8eb4b2252914e326b67f9d27b9434926cb13751cb2e3ec6
 ```
 
 `:latest` pointe sur ce digest à cette date ; épinglez le digest si vous voulez
@@ -39,36 +39,62 @@ que ces chiffres restent vrais. Pour les relire sur VOTRE copie, appelez l'outil
 
 | | 3GPP | ETSI |
 |---|---|---|
-| Clauses indexées | **2 752 688** | **3 169 614** |
+| Clauses indexées | **2 751 918** | **3 168 482** |
 | Specs / deliverables | 3 568 | 5 142 |
 | Versions | 20 163 | 11 822 |
 | Vecteurs denses (1024d) | 821 387 | 902 159 |
-| Postings sparse | 194 111 501 | 127 375 760 |
+| Postings sparse | 194 051 110 | 127 308 329 |
+| Glossaire (acronymes) | 14 126 | 28 154 |
 | Index HNSW cosinus | gelé | gelé |
 | BM25 / FTS | oui | oui |
 | Clause sans vecteur dû | **0** | **0** |
-| Taille sur disque | 21,4 GiB | 18,4 GiB |
+| Taille sur disque | 24,1 GiB | 18,4 GiB |
 | Axe d'évolution | **release** (Rel-99 → dernière) | **version** (toutes les versions de chaque deliverable) |
 
 Les vecteurs portent sur des **corps de paragraphe dédupliqués** (ADR 0004), pas
-sur les clauses : 821 387 corps distincts couvrent les 2 752 688 occurrences de
+sur les clauses : 821 387 corps distincts couvrent les 2 751 918 occurrences de
 clause côté 3GPP. Un paragraphe identique répété dans quarante versions est
 vectorisé une fois — c'est ce qui rend le corpus complet tenable, et non un trou
 de couverture (`missing_content=0`, `unaccounted=0`).
 
-S'ajoutent au texte des clauses, côté 3GPP : **61 321 CR**, **8 562 opérations**
-et **27 889 schémas** OpenAPI 5GC, **1 131 événements** d'interception légale,
-1 300 acronymes, 18 releases.
+S'ajoutent au texte des clauses, côté 3GPP : **8 562 opérations** et **27 889
+schémas** OpenAPI 5GC, **1 131 événements** d'interception légale, 18 releases.
+
+**L'historique des change requests est incomplet, et le serveur le dit.** La
+table `changes` porte 61 321 lignes mais n'a plus d'écrivain depuis que
+l'ingest HTML est passé côté Rust : elle couvre **311 des 3 568 specs** et
+s'arrête à ce que chacune tenait ce jour-là. `get_changelog` écarte désormais les
+lignes incitables — l'en-tête de la table de change history était lu comme une
+ligne de données et TS 23.501 répondait « une modification, intitulée *Date* » —
+et il nomme la version où l'historique s'arrête quand le corpus en tient une plus
+récente. Pour diffuser l'évolution d'une clause entre deux versions, utilisez
+`trace_clause` : il compare le texte du corpus, pas cette table.
 
 Plus : le modèle d'embedding **bi-tête** BGE-M3 (dense + lexical appris,
 identité `38067f8c6efe`), le modèle sparse `b13103bce7ae`, le reranker
-cross-encoder, ONNX Runtime et les extensions DuckDB `fts`/`vss`. Total ~48 GiB
+cross-encoder, ONNX Runtime et les extensions DuckDB `fts`/`vss`. Total ~50 GiB
 de couches.
 
 Les deux moitiés sont **fédérées, jamais fusionnées** : un `spec_id` commençant
 par `ETSI ` part sur la base ETSI, le reste sur la base 3GPP, et une recherche
 fédérée interroge les deux. C'est ce qui permet de garder deux axes d'évolution
 distincts sans que l'un écrase l'autre.
+
+### Ce que le corpus n'a pas, et pourquoi
+
+Un index qui tait ses trous est un index qui ment. Les trois connus :
+
+- **Aucun change request côté ETSI.** Un historique 3GPP survit à la conversion
+  `.doc → HTML` sous forme de TABLE ; ETSI publie des PDF, et `pdftotext -layout`
+  aplatit cette table en colonnes désalignées. Une ligne reconstruite de travers
+  citerait la mauvaise transition de version, ce qui est pire que rien.
+  `get_changelog` le dit et renvoie vers `trace_clause`.
+- **4 livrables ETSI sur 11 826 ne sont pas convertibles** (PDF sans couche
+  texte). Ils sont **nommés** dans `.local/state/etsi-absences.tsv`, et
+  `validate --require-worklist` réconcilie liste de travail / corpus / registre
+  à chaque build : un livrable absent sans raison enregistrée fait échouer le
+  build.
+- **`evolutions` ne couvre que le 3GPP** (seed curaté NE→NF, EPC↔5GC).
 
 ### Les quatre armes de recherche
 
@@ -261,12 +287,13 @@ Le corpus complet est construit, indexé, embarqué et **prouvé en JSON-RPC ré
 | 2 — Parsing HTML → clauses | ✅ | `internal/htmlparse` |
 | 3 — Indexation FTS BM25 + filtres | ✅ | `internal/store` |
 | 4 — Embeddings BGE-M3 dense + sparse appris | ✅ gelés sur les deux moitiés | `internal/embed`, `rust/embedcore` |
-| 5 — Glossaire (21.905) | ✅ 1 300 acronymes | `internal/ingest` |
-| 6 — Changelog (Change History) | ✅ 61 321 CR | `internal/htmlparse` |
+| 5 — Glossaire | ✅ 14 126 acronymes (3GPP) + 28 154 (ETSI) | `internal/abbrev`, `cmd/seed-glossary`, `rust/ingest` |
+| 6 — Changelog (Change History) | ⚠️ **figé** : 311 specs sur 3 568, plus d'écrivain depuis le passage de l'ingest en Rust — `get_changelog` le dit et renvoie vers `trace_clause` | `internal/store`, `internal/mcp` |
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
 | 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
 | 9 — Reranker cross-encoder | ✅ actif par défaut | `internal/rerank` |
-| 10 — Moitié ETSI fédérée | ✅ 3 169 614 clauses | `cmd/goal` (`ingest-etsi`) |
+| 10 — Moitié ETSI fédérée | ✅ 3 168 482 clauses, 11 826 versions | `cmd/goal` (`ingest-etsi`) |
+| 11 — Contrat de complétude sur les DEUX moitiés | ✅ 8 vérifications, dont réconciliation liste de travail et non-réingestion | `cmd/validate`, `scripts/data-contract.sh` |
 
 **Un écart assumé avec l'archi figée (à régulariser en MR `arch-change`) :**
 

@@ -62,9 +62,19 @@ exported, was tested and was called by `cmd/server` — and by no pipeline step,
 a fresh clone pulled 3GPP from a published snapshot in minutes and rebuilt ETSI
 from etsi.org over hours. The exception was the defect, which is why
 `TestNoArmExceptionOutlivesItsStep` now reads that map instead of only trusting
-it. What `seed-etsi` does NOT yet close: ETSI has no delta anchor, so
-`discover-etsi` and `fetch-etsi` still re-enumerate the archive. The expensive
-half — `embed-etsi` and `sparse-etsi` — declines against the restored vectors.
+it. What `seed-etsi` does NOT close: ETSI has no delta anchor, so `discover-etsi`
+and `fetch-etsi` still re-enumerate the archive. The expensive half —
+`embed-etsi` and `sparse-etsi` — declines against the restored vectors.
+
+**DO NOT BUILD AN ETSI ANCHOR.** Measured on build F (2026-09-09): `discover-etsi`
+39.6 s + `fetch-etsi` 3m54 = **4m34 of a 1h45 build, 4 %** — and those 3m54 are
+not downloads (11 822 deliverables in 234 s is impossible); it is the on-disk skip
+pass, which IS the delta detection. An anchor would replace a check that cannot
+lie with a recorded claim that can, which is exactly what produced the 56
+permanent holes on the 3GPP side that `anchorcheck` exists to report. The half
+that was genuinely missing is hole DETECTION, and it is now
+`validate --require-worklist`: work list = corpus + the absence register
+`fetch-etsi` writes, and anything left over fails the build.
 
 | Step | Does | Cost |
 |---|---|---|
@@ -78,8 +88,8 @@ half — `embed-etsi` and `sparse-etsi` — declines against the restored vector
 | `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
 | `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
 | `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
-| `fetch-etsi` | download + convert the resulting work list (pdftotext) — a work list, not a delta | hours, CPU-bound |
-| `ingest` / `ingest-etsi` | parse HTML into DuckDB | minutes/series; ~15 min ETSI |
+| `fetch-etsi` | download + convert the work list (pdftotext), and **record which deliverables it could not convert** into `.local/state/etsi-absences.tsv` | hours cold; **3m54 warm** (skip pass over 11 822) |
+| `ingest` / `ingest-etsi` | parse HTML into DuckDB. The ETSI resume key must be read with the SAME reader as the ingest (`html_bytes::read_html`, windows-1252 fallback): reading it as strict UTF-8 re-ingested the two non-UTF-8 files of 11 822 on **every** build, +566 clauses each time, for fifteen builds | minutes/series; ~10 min ETSI |
 | `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
 | `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
