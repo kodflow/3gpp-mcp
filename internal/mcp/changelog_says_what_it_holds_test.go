@@ -77,6 +77,22 @@ func TestChangelogNoteTellsTheTwoSilencesApart(t *testing.T) {
 	if note := changelogNote(ctx, st, "24.501", changes); note != "" {
 		t.Errorf("a current changelog must carry no staleness note; got %q", note)
 	}
+
+	// 4. THE NOTE SPEAKS FOR THE SPEC, NOT FOR THE CLAUSE FILTER. get_changelog
+	//    narrows its result to a clause when one is given; feeding that narrowed
+	//    slice to the note made it answer "this corpus holds no citable records for
+	//    23.501" whenever the CLAUSE had none — on a spec that has plenty. That is
+	//    the same false zero this release removes, one level down.
+	//
+	//    Simulated here the way the handler produces it: a filter that matches
+	//    nothing, against the spec's real records.
+	if note := changelogNote(ctx, st, "23.501", nil); !strings.Contains(note, "no citable") {
+		t.Errorf("an EMPTY record set must produce the no-records note; got %q", note)
+	}
+	all, _ := st.GetChangelog(ctx, "23.501", "", "")
+	if note := changelogNote(ctx, st, "23.501", all); strings.Contains(note, "no citable") {
+		t.Errorf("the spec HAS records, so the note must not claim it has none; got %q", note)
+	}
 }
 
 // TestCompareVersionsIsNumeric pins the trap the staleness check would otherwise
