@@ -107,8 +107,31 @@ func TestTheETSIArmStillGuardsItsGlossary(t *testing.T) {
 	}
 	// The file-level consistency gate is the second half of the same guard: a whole
 	// file whose columns shifted produces rows that individually pass by coincidence.
-	if !strings.Contains(s, "MIN_FILE_CONSISTENCY") {
-		t.Error("the per-file consistency gate is gone; row-level plausibility alone does not " +
+	//
+	// DECLARED IS NOT ENFORCED. Looking only for the identifier would accept a
+	// tree where the constant survives and the comparison that uses it is gone —
+	// the same dead-code shape the initials_match assertion above guards against,
+	// which is exactly how a "no functional change" cleanup removes a gate. So
+	// require BOTH the declaration and a use that is a comparison.
+	if !strings.Contains(s, "const MIN_FILE_CONSISTENCY") {
+		t.Error("the per-file consistency threshold is gone; row-level plausibility alone does not " +
 			"catch a file whose every pairing is shifted by one")
 	}
+	var compared bool
+	for _, line := range strings.Split(s, lineBreak) {
+		if !strings.Contains(line, "MIN_FILE_CONSISTENCY") || strings.Contains(line, "const ") {
+			continue
+		}
+		if strings.ContainsAny(line, "<>") {
+			compared = true
+		}
+	}
+	if !compared {
+		t.Error("MIN_FILE_CONSISTENCY is declared but never compared against anything — the " +
+			"per-file gate is dead code, and a shifted file is accepted whole")
+	}
 }
+
+// lineBreak is the newline this file splits Rust source on, named rather than
+// inlined so the escape survives every tool that rewrites this file.
+const lineBreak = "\n"
