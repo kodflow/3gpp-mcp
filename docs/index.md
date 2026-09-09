@@ -14,13 +14,23 @@ Measured on the built corpus, not estimated — see [`local-pipeline.md`](./loca
 
 | | |
 |---|---:|
-| Clause occurrences | 2 752 688 |
+| Clause occurrences | 2 751 918 |
 | Distinct specs / versions | 3 568 / 20 163 |
 | Series / releases | 31 / Rel-4 → Rel-20 (plus Phase 1–2 on the old series) |
 | 5GC API operations | 8 562 (+27 889 schemas) |
-| LI events (Rel-19) | 405 |
-| ETSI deliverables (separate DB) | 5 142 (11 822 versions, 3 169 614 clauses) |
+| LI events | 1 131 (5 148 fields, 2 919 ASN.1 types) |
+| Glossary | 14 126 acronyms (3GPP) + 28 154 (ETSI) |
+| ETSI deliverables (separate DB) | 5 142 (11 822 versions, 3 168 482 clauses) |
 | MCP tools | 13 |
+
+Published and verified 2026-09-09:
+`ghcr.io/kodflow/3gpp-mcp@sha256:0349248311a48073f8eb4b2252914e326b67f9d27b9434926cb13751cb2e3ec6`.
+
+Two things the corpus does NOT have, said here rather than discovered later:
+no ETSI change requests (ETSI ships PDFs and the change-history table does not
+survive text extraction well enough to cite), and a 3GPP `changes` table that has
+had no writer since the ingest write-side moved to Rust — it covers 311 of the
+3 568 specs. `get_changelog` names both silences and points at `trace_clause`.
 
 ## Start here
 

@@ -2,6 +2,76 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased] — the corpus stops growing on its own (2026-09-09)
+
+Published and verified: `ghcr.io/kodflow/3gpp-mcp@sha256:0349248311a48073f8eb4b2252914e326b67f9d27b9434926cb13751cb2e3ec6`
+(digest re-read from GHCR, `make prove` → `PROVE OK`).
+
+Measured on the served corpora: 3GPP **2 751 918 clauses** / 20 163 versions,
+ETSI **3 168 482 clauses** / 11 822 versions; glossary 14 126 + 28 154.
+
+### Fixed
+
+- **The ETSI corpus gained 566 clauses on every build, from a converted tree
+  that never changed** (3 175 274 → 3 175 840 → 3 176 406 across three builds).
+  The resume check read each file with `std::fs::read_to_string` — strict UTF-8,
+  `Err` on anything else — while the ingest read the SAME file through
+  `html_bytes::read_html`, which falls back to windows-1252. A deliverable that
+  is not valid UTF-8 could therefore be INGESTED but never RECOGNISED as already
+  ingested. Exactly two files of 11 822 are not UTF-8, and both had been written
+  **fifteen times**: 1 155 rows for 77 clauses, 7 335 for 489 — 77 + 489 = 566.
+  `ingest: ETSI → 21 spec(s), 566 clause(s)` is now `19 spec(s), 0 clause(s)`.
+- **`get_changelog` served the change-history table's HEADER row as a change
+  record.** TS 23.501 answered `count 1, summary "Date"`. 3 352 such rows exist
+  (3 026 summarised "Date"), and 3 163 of the 3 452 specs with any record had
+  nothing else. `model.Change.Citable` drops records that name no CR and no
+  version transition — deliberately the weakest rule that catches the header,
+  because 1 047 rows are MCC editorial updates with a real transition and no CR.
+- **`get_changelog` answered a bare 0 for the 3GPP half.** The `changes` table
+  has had no writer since the Go HTML-ingest write-side was deleted (Phase 11b),
+  so it covers 311 of 3 568 specs; 3 326 of the specs that do have records hold
+  a version newer than their newest recorded change. Both silences now say what
+  they are, and neither half borrows the other's reason.
+- **Two over-declared provenances**, each measured. A shell variable used only by
+  the ETSI fetch sat in the shared prelude, so `ingest-etsi` inherited it and
+  replayed the whole ETSI arm plus a 42 GB image re-push. And `enrich` named Go
+  package DIRECTORIES, so adding one `_test.go` replayed a data step.
+
+### Added
+
+- **`validate --require-no-reingest`** — the gate that was missing.
+  `--require-worklist` asks whether anything is MISSING; nothing was, so it
+  stayed green for fifteen builds. A corpus can be wrong by holding too MUCH. It
+  reports any `(spec_id, release, version)` whose EVERY distinct clause row is
+  stored more than once. Release is part of the identity: without it the
+  predicate accused `30.531 v1.62.0` of nine copies, when it is legitimately
+  catalogued under nine releases. Declared by BOTH gate binaries, because the
+  image's entrypoint runs the same flag list.
+- **`cmd/repair-reingest`** (dry run by default). ETSI 3 176 406 → 3 168 482,
+  3GPP 2 752 688 → 2 751 918. Safe because `bodies`/`paragraphs` are
+  deduplicated by `(heading, text)`: fifteen copies share one set of bodies, so
+  the damage is confined to `clause_occ`/`clause_sparse`. It keeps the first
+  block of chunk_ids rather than one row per distinct clause — a document may
+  legitimately repeat a clause — and refuses a group that is not an exact
+  multiple.
+- **`fetch-etsi` records WHICH deliverables it could not convert**, not just how
+  many. It counted failures into empty marker files, so "failed=4" was a number
+  and not a fact. `validate --require-worklist` now reconciles work list, corpus
+  and register: 11 826 versions, 4 excused, and the four are named.
+- **`TestNoStepCountsTestFilesByAccident`** — no pipeline step may count test
+  files in its fingerprint without excluding them or recording why, with the
+  measured cost of fixing it. It immediately found two steps a hand enumeration
+  had missed.
+- The divergence between the two glossary plausibility rules is **recorded and
+  measured in both directions**: adopting ETSI's rule on the 3GPP arm destroys
+  4 270 of 14 126 correct rows (30.2 %), and the reverse destroys 1 377 of
+  28 154 (4.9 %). Neither rule is the better one; they guard different sources.
+
+### Changed
+
+- `mcp-go` 0.58.0 → **1.0.0**, verified by the full suite plus `make prove`
+  before merging rather than on the strength of the commit gate.
+
 ## [Unreleased] — the corpus is built on one machine (2026-08-26)
 
 Indexing moved off Kaggle GPU + five GitHub workflows and onto a single
