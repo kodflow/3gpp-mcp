@@ -97,6 +97,13 @@ func TestEveryRecordedExceptionStillNeedsToBe(t *testing.T) {
 		byName[s.Name] = s
 	}
 	for name, why := range countsTestFiles {
+		// AN ENTRY WITH NO REASON IS WORSE THAN NO ENTRY. The map is consulted only
+		// for the NAME, so `"merge": ""` would suppress the guard while recording
+		// nothing — the exact silence the map exists to break.
+		if strings.TrimSpace(why) == "" {
+			t.Errorf("countsTestFiles excuses %q with an empty reason; the reason IS the entry", name)
+			continue
+		}
 		s, ok := byName[name]
 		if !ok {
 			t.Errorf("countsTestFiles excuses %q (%s), and no such step is in the pipeline", name, why)
@@ -120,14 +127,22 @@ func TestEveryRecordedExceptionStillNeedsToBe(t *testing.T) {
 	}
 }
 
-// holdsTestArtefacts reports whether an Impl entry is a directory containing
-// anything isTestArtefact would filter. A single FILE never does: naming
-// rust/parse/src/glossary.rs cannot drag a test in, which is precisely why the
-// ETSI arm names files.
+// holdsTestArtefacts reports whether an Impl entry brings test material into a
+// fingerprint — either because it IS a test file, or because it is a directory
+// containing one.
+//
+// The first case is not hypothetical padding: the original version answered only
+// the directory question, so a step that named `cmd/foo/main_test.go` outright
+// passed both guards. Naming a file is the RECOMMENDED escape from this defect
+// (stepEnrichETSI names .rs files precisely to avoid a directory), which makes an
+// unchecked file path the likeliest way to reintroduce it.
 func holdsTestArtefacts(path string) bool {
 	fi, err := os.Stat(path)
-	if err != nil || !fi.IsDir() {
+	if err != nil {
 		return false
+	}
+	if !fi.IsDir() {
+		return isTestArtefact(path)
 	}
 	found := false
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
