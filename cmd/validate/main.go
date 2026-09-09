@@ -55,6 +55,7 @@ func main() {
 		repoVis       = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
 		forbidFull    = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
 		maxEmptyMeta  = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
+		noReingest    = flag.Bool("require-no-reingest", false, "fail if any (spec_id, version) has EVERY distinct clause row stored more than once — the signature of a deliverable written by more than one ingest")
 		worklist      = flag.String("require-worklist", "", "path to the ETSI work list (id	url	version	type); fail unless every version it names is either IN --db or recorded in --absences")
 		absences      = flag.String("absences", "", "register of deliverables the fetch could not convert (id	version	type	reason); consulted by --require-worklist")
 		report        = flag.String("report", "text", "text | json")
@@ -69,7 +70,7 @@ func main() {
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
 		emptyMetaGuard: *maxEmptyMeta >= 0, maxEmptyMeta: *maxEmptyMeta,
-		worklist:       *worklist, absences: *absences,
+		worklist:       *worklist, absences: *absences, noReingest: *noReingest,
 	})
 
 	if *report == "json" {
@@ -108,6 +109,8 @@ type checkCfg struct {
 	// worklist/absences drive require-worklist, the ETSI arm's answer to the
 	// question anchorcheck answers on the 3GPP arm. See checkWorklist.
 	worklist, absences string
+	// noReingest drives require-no-reingest. See checkNoReingest.
+	noReingest bool
 }
 
 type check struct {
@@ -154,6 +157,9 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	// about vectors, so it stays readable next to the counts it belongs with.
 	if cfg.worklist != "" {
 		checkWorklist(ctx, db, &res, cfg)
+	}
+	if cfg.noReingest {
+		checkNoReingest(ctx, sqldb, &res)
 	}
 
 	// clause count + min-clauses
@@ -649,4 +655,59 @@ func readWorklist(path string) (map[string]bool, error) {
 		out["ETSI "+c[3]+" "+c[0]+"	"+c[2]] = true
 	}
 	return out, sc.Err()
+}
+
+// checkNoReingest fails when a deliverable was written by more than one ingest.
+//
+// THE GATE THAT WAS MISSING, and its absence is the point. require-worklist asks
+// whether anything is MISSING from the corpus; nothing was, so it stayed green
+// while the ETSI half gained 566 clauses on every build from a converted tree
+// that never changed. A corpus can be wrong by having too MUCH, and no check
+// looked in that direction.
+//
+// THE PREDICATE, and why it has no false positives. A document may legitimately
+// repeat a clause row: ETSI EN 300 607-1 is a GSM test spec whose tables restate
+// the same numbered step, and the published corpus holds 831 192 such repeats
+// across 3.1 M rows. What cannot happen legitimately is EVERY distinct row of one
+// (spec_id, version) appearing at least twice — that is the whole document
+// written again. Measured over the published ETSI corpus, 11 826 versions: the
+// test selects exactly two, TR 104 066 v1.1.1 and TS 103 634 v1.1.1, both at
+// min=15, and nothing else.
+//
+// It reports the multiplicity, because that number is the diagnosis: 15 means
+// fifteen ingests, which dates the defect rather than merely naming it.
+func checkNoReingest(ctx context.Context, sqldb *sql.DB, res *result) {
+	rows, err := sqldb.QueryContext(ctx, `
+		SELECT spec_id, version, min(c) AS copies, sum(c) AS rows_held, count(*) AS distinct_rows
+		FROM (
+			SELECT spec_id, version, clause_path, heading, text, count(*) AS c
+			FROM clauses GROUP BY 1, 2, 3, 4, 5
+		)
+		GROUP BY 1, 2 HAVING min(c) > 1
+		ORDER BY sum(c) DESC`)
+	if err != nil {
+		res.add("require-no-reingest", false, "cannot scan for re-ingested deliverables: %v", err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	var offenders []string
+	var excess int
+	for rows.Next() {
+		var id, ver string
+		var copies, held, distinct int
+		if err := rows.Scan(&id, &ver, &copies, &held, &distinct); err != nil {
+			continue
+		}
+		excess += held - distinct
+		if len(offenders) < 10 {
+			offenders = append(offenders, fmt.Sprintf("%s v%s (%d copies, %d rows)", id, ver, copies, held))
+		}
+	}
+	if len(offenders) == 0 {
+		res.add("require-no-reingest", true, "no deliverable is stored more than once")
+		return
+	}
+	res.add("require-no-reingest", false,
+		"%d deliverable(s) were written by more than one ingest, %d excess row(s): %s",
+		len(offenders), excess, strings.Join(offenders, ", "))
 }
