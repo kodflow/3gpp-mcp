@@ -207,22 +207,121 @@ fini, et sauté si celle-ci n'a rien changé.
 
 ## Brancher sur Claude Code
 
-`mcp.json` est **gitignoré** (peut contenir des PAT ou chemins sensibles).
-Créer un fichier local — soit `~/.claude/mcp.json`, soit `mcp.json` à la
-racine du repo si tu utilises le devcontainer — avec :
+Trois façons, de la plus simple à la plus impliquée. Dans tous les cas : Claude
+Code redémarre, le serveur apparaît, **13 outils** sont disponibles.
 
-```json
+### A. L'image (recommandé — rien à installer)
+
+```jsonc
+// .mcp.json à la racine de VOTRE projet
 {
   "mcpServers": {
     "3gpp": {
-      "command": "/workspace/bin/mcp-3gpp",
-      "args": ["serve"]
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/kodflow/3gpp-mcp:latest"]
     }
   }
 }
 ```
 
-Claude Code redémarre, le serveur apparaît, les 13 outils sont disponibles.
+Le paquet est **privé** : `docker login ghcr.io` avec un token `read:packages`
+avant le premier `pull`. L'image porte les deux corpus, les modèles et les
+runtimes — aucun accès réseau à l'exécution, rien à télécharger au démarrage.
+
+### B. Depuis ce dépôt, avec le corpus local
+
+Le `.mcp.json` du dépôt est **déjà écrit et suivi dans git** : ouvrir ce dossier
+avec Claude Code suffit. Ce qu'il contient, et pourquoi :
+
+```jsonc
+{
+  "mcpServers": {
+    "3gpp": {
+      "type": "stdio",
+      // Windows. Sous Linux/macOS : ".local/bin/server-full" et les .so/.dylib
+      // correspondants dans les deux chemins ONNX ci-dessous.
+      "command": ".local/bin/server-full.exe",
+      "args": ["serve", "--db", "data/3gpp.duckdb", "--etsi-db", "data/etsi.duckdb"],
+      "env": {
+        "EMBED_MODEL": "bge-m3-sparse",
+        "EMBED_MODEL_DIR": "data/models/bge-m3-sparse",
+
+        // DEUX BINDINGS, DEUX RUNTIMES — ne pas en omettre un.
+        // ORT_DYLIB_PATH : le crate RUST (rust/embed-core), qui fait l'embedding
+        // de la requête. Épinglé sur la version contre laquelle il a été compilé.
+        "ORT_DYLIB_PATH": ".local/toolchain/ort/onnxruntime-win-x64-gpu-1.20.1/lib/onnxruntime.dll",
+        // ONNXRUNTIME_SHARED_LIBRARY_PATH : le binding GO, qui fait le reranker
+        // cross-encoder. Épingle DIFFÉRENTE. Un seul fichier ne peut pas servir
+        // les deux.
+        "ONNXRUNTIME_SHARED_LIBRARY_PATH": "data/models/onnxruntime/lib/onnxruntime.dll"
+      }
+    }
+  }
+}
+```
+
+**Omettre la seconde variable ne fait pas échouer le démarrage** — le serveur
+sert quand même, avec le reranker éteint :
+
+```text
+The requested API version [25] is not available, only API versions [1, 20]
+are supported in this build. Current ORT Version is: 1.20.1
+… embedder=true reranker=false
+```
+
+C'est exactement le genre de panne que ce projet traque : ça marche, ça répond,
+et une arme sur quatre manque. `server_info` est le seul endroit qui le dit — et
+il le dit précisément :
+
+```json
+{"reranker": false,
+ "reranker_reason": "the ONNX runtime would not initialise: Platform-specific
+                     initialization failed: Error setting ORT API base: 2"}
+```
+
+`TestMCPJsonWiresBothONNXRuntimes` lit ce fichier et échoue si une variable
+manque ou si les deux pointent le même runtime.
+
+### C. Le binaire seul
+
+Voir [`docs/install.md`](./docs/install.md) : token, cache, et quelles variantes
+de build savent faire du sémantique.
+
+## Une fois lancé : les deux premiers appels
+
+**`help` d'abord.** Il compte dans la base réellement servie plutôt que de
+répéter une doc, et rend la carte question → outil :
+
+```text
+> utilise l'outil help du serveur 3gpp
+```
+
+**`server_info` ensuite**, pour savoir quelles armes tournent *à cet instant* —
+et, quand l'une est éteinte, **pourquoi**. Une installation **sémantique
+complète, avec les deux corpus** (A ou B ci-dessus) répond :
+
+```json
+{"lexical": true, "semantic": true, "sparse": true, "reranker": true,
+ "hnsw": true, "fts": true,
+ "etsi": {"attached": true, "embedding_model_ok": true}}
+```
+
+Tous les `false` ne sont pas des pannes. Une build lexicale seule répond
+légitimement `semantic: false` et `reranker: false` ; sans `--etsi-db`,
+`etsi.attached` est `false` et c'est normal. Ce qui compte est le motif : chaque
+capacité éteinte porte un `reason` / `reranker_reason` / `sparse_reason` qui dit
+si c'est un choix de build ou une installation à réparer.
+
+Ensuite, posez vos questions en français ou en anglais : `search_spec` est
+l'entrée principale et Claude choisit les autres outils tout seul.
+
+**Les outils qui rendent du contenu de spécification refusent de répondre sans
+citation** — `search_spec`, `get_spec`, `search_api`, `trace_clause`,
+`find_cross_references`, `resolve_term`, `li_events`, `trace_evolution` portent
+tous `citations: [{spec_id, release, version, clause, url}]`. `help`,
+`server_info`, `list_specs` et `list_releases` décrivent le serveur ou son
+catalogue, pas le corpus : ils n'ont rien à citer et ne prétendent pas le faire.
 
 ## Surface MCP
 
