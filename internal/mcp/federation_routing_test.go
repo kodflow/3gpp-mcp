@@ -34,6 +34,16 @@ func federatedClient(t *testing.T) (*client.Client, context.Context) {
 		{ChunkID: 1, SpecID: "33.128", Release: "Rel-19", Version: "19.6.0", ClausePath: "2",
 			Heading: "References", Text: "profiling ETSI TS 103 221-1 and TS 103 280"},
 	})
+	// One real change record, so a clause filter that matches nothing can be told
+	// apart from a spec that has no history — see TestTheClauseFilterDoesNotSpeak.
+	_ = st.InsertChanges([]model.Change{
+		{CRNumber: "0042", SpecID: "33.128", FromVersion: "19.5.0", ToVersion: "19.6.0",
+			Clauses: []string{"7.1"}, Summary: "Add the AKMA xIRI"},
+	})
+	// A spec with versions and NO change record: the majority case on the published
+	// corpus (3 257 of 3 568 specs) and the one the 3GPP note exists for.
+	_ = st.UpsertSpec(model.Spec{SpecID: "23.501", Series: "23", DocType: "TS"})
+	_ = st.UpsertVersion(model.SpecVersion{SpecID: "23.501", Release: "Rel-18", Version: "18.5.0"})
 
 	etsi := open()
 	_ = etsi.UpsertSpec(model.Spec{SpecID: "ETSI TS 102 221", DocType: "TS"})
@@ -173,7 +183,11 @@ func TestChangelogSaysWhyEachHalfHasNone(t *testing.T) {
 		t.Errorf("the ETSI note must give the ETSI reason (PDFs): %q", note)
 	}
 
-	out = call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "33.128"})
+	// 23.501 here rather than 33.128: 33.128 carries a change record in this
+	// harness, and a spec whose history is CURRENT must stay silent (asserted in
+	// TestChangelogNoteTellsTheTwoSilencesApart). The half that needs a reason is
+	// the one with nothing recorded.
+	out = call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "23.501"})
 	note3, _ := out["note"].(string)
 	if note3 == "" {
 		t.Fatal("an empty 3GPP changelog must say why too: 0 here means 'not recorded', not 'never changed'")
@@ -183,5 +197,25 @@ func TestChangelogSaysWhyEachHalfHasNone(t *testing.T) {
 	}
 	if !contains(note3, "trace_clause") {
 		t.Errorf("the 3GPP note must name the tool that DOES answer it: %q", note3)
+	}
+}
+
+// TestTheClauseFilterDoesNotSpeakForTheSpec pins the wiring, not the helper.
+//
+// get_changelog narrows its result to a clause when one is given. Handing THAT
+// slice to the note made it answer "this corpus holds no citable change-request
+// records for 33.128" whenever the clause had none — on a spec that has some. It
+// is the same false zero this release removes, one level down, and a unit test on
+// the note alone cannot see it: the defect is which slice the handler passes.
+func TestTheClauseFilterDoesNotSpeakForTheSpec(t *testing.T) {
+	c, ctx := federatedClient(t)
+
+	out := call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "33.128", "clause": "99.9"})
+	if n, _ := out["count"].(float64); n != 0 {
+		t.Fatalf("the clause filter matched something it should not have: count=%v", out["count"])
+	}
+	note, _ := out["note"].(string)
+	if contains(note, "no citable") {
+		t.Errorf("a clause with no changes made the note deny the SPEC has any: %q", note)
 	}
 }

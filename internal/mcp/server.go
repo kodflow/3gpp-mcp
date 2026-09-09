@@ -518,6 +518,14 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
 	}
+	// THE NOTE SPEAKS FOR THE SPEC, SO IT READS THE SPEC'S RECORDS.
+	//
+	// `changes` is about to be narrowed to one clause, and changelogNote describes
+	// the whole change history: fed the narrowed slice it would answer "this corpus
+	// holds no citable records for 23.501" whenever the clause simply has none, on
+	// a spec with plenty — the same false zero this release exists to remove, one
+	// level down. Keep the unfiltered set for it.
+	all := append([]model.Change(nil), changes...)
 	clause := r.GetString("clause", "")
 	if clause != "" {
 		filtered := changes[:0]
@@ -557,7 +565,7 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 			"Use trace_clause with from_release/to_release (they accept two VERSIONS here) to diff a " +
 			"clause between two published versions from the text itself."
 	} else if !isETSISpecID(specID) {
-		out["note"] = changelogNote(ctx, h.specStore(specID), specID, changes)
+		out["note"] = changelogNote(ctx, h.specStore(specID), specID, all)
 	}
 	if out["note"] == "" {
 		delete(out, "note")
@@ -593,10 +601,14 @@ func changelogNote(ctx context.Context, st store.Reader, specID string, changes 
 	const useTraceClause = "Use trace_clause with from_release/to_release to diff a clause between two " +
 		"versions from the text itself, which is derived from the corpus rather than from this table."
 	if len(changes) == 0 {
-		return "this corpus holds no citable change-request records for " + specID + ". The change-request " +
-			"table has had no writer since the ingest write-side moved to Rust, so it covers 311 of the " +
-			"3 568 specs indexed here and stops at whatever each one held then. A count of 0 means \"not " +
-			"recorded here\", not \"never changed\". " + useTraceClause
+		// NO CORPUS COUNTS IN THE SERVED TEXT. An earlier draft carried "covers 311
+		// of the 3 568 specs": true of the snapshot it was measured on and silently
+		// false of every later one, which is the failure mode of a note whose whole
+		// job is to stop a number from being read as more than it is.
+		return "this corpus holds no citable change-request records for " + specID + ". The " +
+			"change-request table has had no writer since the ingest write-side moved to Rust, so it " +
+			"covers a minority of the specs indexed here and stops at whatever each one held then. A " +
+			"count of 0 means \"not recorded here\", not \"never changed\". " + useTraceClause
 	}
 	// GetChangelog orders by to_version ASC through versionOrderSQL, so the newest
 	// recorded transition is the last row that names one. Scanning backwards uses
