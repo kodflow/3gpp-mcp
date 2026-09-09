@@ -144,8 +144,21 @@ func contains(s, sub string) bool {
 // does not allow them), so the fix is to SAY that and name the tool that answers
 // the question from the text.
 //
-// The 3GPP half must NOT gain the note: there, count 0 means what it says.
-func TestChangelogSaysWhyTheEtsiHalfHasNone(t *testing.T) {
+// THIS TEST USED TO ASSERT THE OPPOSITE OF ITS OWN DOCTRINE for the 3GPP half:
+// "the 3GPP half must NOT gain the note: there, count 0 means what it says."
+// Measured on the published corpus (2026-09-09), it does not. The changes table
+// has had no writer since the ingest write-side moved to Rust (Phase 11b, commit
+// c635038) and the Rust ingest never reimplemented the change-history parser, so
+// it covers 311 of 3 568 specs; the other 3 257 answer 0 for the same reason the
+// ETSI half does — nothing wrote them — and 3 326 of the specs that DO have
+// records hold a version newer than their newest recorded change.
+//
+// So both halves carry a note, and the invariant worth pinning is the one that
+// was actually at stake: neither half may borrow the OTHER's reason. An ETSI
+// deliverable is silent because ETSI ships PDFs; a 3GPP spec is silent because
+// the writer was deleted. Answering either with the other's explanation is a
+// confident lie in the same family as the header row this release drops.
+func TestChangelogSaysWhyEachHalfHasNone(t *testing.T) {
 	c, ctx := federatedClient(t)
 
 	out := call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "ETSI TS 102 221"})
@@ -156,9 +169,19 @@ func TestChangelogSaysWhyTheEtsiHalfHasNone(t *testing.T) {
 	if !contains(note, "trace_clause") {
 		t.Errorf("the note must name the tool that DOES answer it: %q", note)
 	}
+	if !contains(note, "PDF") {
+		t.Errorf("the ETSI note must give the ETSI reason (PDFs): %q", note)
+	}
 
 	out = call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "33.128"})
-	if _, ok := out["note"]; ok {
-		t.Errorf("the 3GPP half must not gain the note: %v", out["note"])
+	note3, _ := out["note"].(string)
+	if note3 == "" {
+		t.Fatal("an empty 3GPP changelog must say why too: 0 here means 'not recorded', not 'never changed'")
+	}
+	if contains(note3, "PDF") {
+		t.Errorf("the 3GPP half must not borrow the ETSI reason: %q", note3)
+	}
+	if !contains(note3, "trace_clause") {
+		t.Errorf("the 3GPP note must name the tool that DOES answer it: %q", note3)
 	}
 }

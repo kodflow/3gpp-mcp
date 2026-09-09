@@ -1645,6 +1645,12 @@ func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, 
 
 // GetChangelog lists change records for a spec between two releases (inclusive),
 // ordered by target version.
+//
+// It drops records that name nothing citable — see model.Change.Citable. The
+// filter is applied HERE, in the one place every reader goes through, and it
+// reuses the model predicate rather than restating it as SQL: a WHERE clause
+// here and a method there is the same rule written twice, and the two would
+// drift the first time either was touched.
 func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string) ([]model.Change, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT cr_number, cr_revision, spec_id, from_version, to_version,
@@ -1666,6 +1672,9 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 			if sv, ok := v.(string); ok {
 				c.Clauses = append(c.Clauses, sv)
 			}
+		}
+		if !c.Citable() {
+			continue
 		}
 		out = append(out, c)
 	}

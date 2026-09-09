@@ -53,6 +53,31 @@ type Change struct {
 	TDocURL     string   `json:"tdoc_url"`
 }
 
+// Citable reports whether this record names something a caller can check.
+//
+// A 3GPP change history survives .doc conversion as an HTML TABLE, and the
+// ingest that read it paired a row's cells positionally. That is right for a
+// body row and wrong for the HEADER row, which parses into a Change whose
+// summary is the column title — literally "Date", "TSG SA#" or "SMG No." — and
+// whose every other field is empty. Measured on the published corpus: 3 352 such
+// rows, 3 026 of them summarised "Date".
+//
+// They are not merely useless. get_changelog answered TS 23.501 — the central 5G
+// architecture spec — with count 1 and summary "Date", which reads as "this spec
+// changed once, and the change was called Date". A record that names no CR and no
+// version transition is a citation that looks authoritative and is false, which
+// is the standard this corpus already applies to the ETSI half in
+// handlers.getChangelog.
+//
+// The test is deliberately the weakest one that catches the header: a record must
+// name at least ONE of cr_number, from_version or to_version. It is NOT "must
+// have a CR number" — 1 047 rows are MCC editorial updates ("Update to Rel-11
+// version (MCC)") that carry a real version transition and no CR, and demanding a
+// CR would discard them, taking the citable spec count from 311 down to 289.
+func (c Change) Citable() bool {
+	return c.CRNumber != "" || c.FromVersion != "" || c.ToVersion != ""
+}
+
 // Acronym is a glossary entry (table: acronyms). Acronyms are contextual:
 // the same term can expand differently per domain/release (CLAUDE.md §8.5),
 // hence the (Term, Domain) composite key.
