@@ -56,6 +56,11 @@
 # corpus that genuinely has no sparse layer yet.
 set -euo pipefail
 
+# ROOT is derived, not assumed: this script is called from the repository root by
+# the pipeline and from an arbitrary cwd by hand, and the two work-list defaults
+# below are the first paths in here that are relative to anything.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 level="${DATA_CONTRACT:-dense+sparse+etsi}"
 floor="${DATA_EMBED_FLOOR:-}"
 arm="${1:-3gpp}"
@@ -107,6 +112,31 @@ dense+sparse+etsi)
 	flags="$flags --require-sparse"
 	if [ "$arm" = 3gpp ]; then
 		flags="$flags --require-etsi ${DATA_ETSI_DB:-/data/mcp-3gpp/etsi.duckdb}"
+	fi
+	# --require-worklist — the ETSI arm's completeness reconciliation, and the
+	# answer to "the ETSI half has no anchorcheck".
+	#
+	# It is not a port of anchorcheck: the 3GPP delta anchor comes out of the
+	# shards `merge` folds, and the ETSI ingest has no shards. What ports is the
+	# QUESTION — does the corpus hold what the pipeline decided it held — which on
+	# this arm is answered by reconciling three sets: the work list discover-etsi
+	# emitted, the versions the corpus holds, and the register of deliverables the
+	# fetch could not convert. Anything in the first and neither of the others is a
+	# hole nobody decided on, and no later step can see it because they all trust
+	# the same decision.
+	#
+	# ONLY WHEN THE WORK LIST IS ON DISK. Both files are BUILD artefacts under
+	# .local/state and are deliberately not shipped in the image, so the same
+	# contract run by `mcp-3gpp check-data` inside the container would otherwise
+	# fail on a file that is correctly absent. A gate that cannot run is not a
+	# finding about the corpus.
+	if [ "$arm" = etsi ]; then
+		# cmd/goal supplies both as OS paths; the $ROOT fallback is for a human
+		# running this script by hand, where an MSYS path is what bash can test.
+		wl="${DATA_ETSI_WORKLIST:-$ROOT/.local/state/etsi-worklist.tsv}"
+		if [ -s "$wl" ]; then
+			flags="$flags --require-worklist $wl --absences ${DATA_ETSI_ABSENCES:-$ROOT/.local/state/etsi-absences.tsv}"
+		fi
 	fi
 	;;
 *)

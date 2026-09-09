@@ -45,6 +45,14 @@ if [ -z "$FETCH_ONE" ]; then
 	exit 1
 fi
 
+# fail_record is lifted from the shipped script for the same reason fetch_one is:
+# a local copy would pass this test while the pipeline wrote something else.
+FAIL_RECORD="$(extract_fn fail_record "$HERE/etsi-fetch.sh")"
+if [ -z "$FAIL_RECORD" ]; then
+	fail "fail_record could not be extracted from $HERE/etsi-fetch.sh"
+	exit 1
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export BUCKET="$WORK/bucket"
@@ -70,6 +78,7 @@ tmpfile_ext() { local f; f="$(mktemp)"; mv "$f" "$f.$1"; printf '%s\n' "$f.$1"; 
 convert_pdf() { printf 'BODY\n' >"$2"; }
 export -f curl retry tmpfile_ext convert_pdf
 
+eval "$FAIL_RECORD"
 eval "$FETCH_ONE"
 
 # --- 1. an id with a space survives ------------------------------------------
@@ -197,6 +206,52 @@ if [ "$(sort -u "$WORK/urls" 2>/dev/null | wc -l | tr -dc '0-9')" = "3" ]; then
 	pass "the pool fetched exactly the 3 URLs the work list named"
 else
 	fail "the pool fetched the wrong URL set: $(sort -u "$WORK/urls" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# --- 7. a failure NAMES the deliverable --------------------------------------
+#
+# A count is not a fact. The register used to be empty marker files
+# ("$$.$RANDOM"), so a run printed "converted=11822 failed=4" and nothing
+# anywhere could say WHICH four. That is why validate-etsi had nothing to
+# reconcile the work list against: the ETSI half had no equivalent of
+# contracts/accepted-absences.txt.
+#
+# The two reasons are also not interchangeable. A download failure may be retried;
+# a PDF with no text layer never will be. Collapsing them into one marker is what
+# made "failed=4" unusable even to a human reading the log.
+rm -rf "$TALLY/fail"
+mkdir -p "$TALLY/fail"
+
+convert_pdf() { return 1; }
+export -f convert_pdf
+fetch_one "$(printf '199 999	https://example.invalid/ts_199999.pdf	9.9.9	TS')" >/dev/null 2>&1
+row="$(find "$TALLY/fail" -type f -exec cat {} + 2>/dev/null)"
+if [ "$row" = "$(printf '199 999	9.9.9	TS	no-text-layer')" ]; then
+	pass "an unconvertible deliverable is named, with its version, type and reason"
+else
+	fail "the failure record does not name the deliverable: got '$row'"
+fi
+
+convert_pdf() { printf 'BODY
+' >"$2"; }
+curl() { return 22; }
+export -f convert_pdf curl
+fetch_one "$(printf '188 888	https://example.invalid/ts_188888.pdf	1.0.0	TS')" >/dev/null 2>&1
+# NO PIPE INTO grep -q HERE. `set -o pipefail` is on, and `grep -q` exits the
+# moment it matches: find/cat then take a SIGPIPE, the pipeline reports THAT, and
+# the assertion fails on a register that is in fact correct. Match on the captured
+# text instead — the bug this test would otherwise report is the test's own.
+rows="$(find "$TALLY/fail" -type f -exec cat {} + 2>/dev/null)"
+case "$rows" in
+*download-failed*)
+	pass "a download failure is recorded under its own reason, not merged with the rest" ;;
+*)
+	fail "the download failure did not record a distinct reason: $rows" ;;
+esac
+if [ "$(find "$TALLY/fail" -type f | wc -l | tr -dc '0-9')" = "2" ]; then
+	pass "one record per failed deliverable, countable across worker processes"
+else
+	fail "the failure register lost a record across processes"
 fi
 
 [ "$fails" -eq 0 ] && echo "all good" || echo "$fails failure(s)"
