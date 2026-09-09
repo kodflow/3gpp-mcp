@@ -239,6 +239,8 @@ avec Claude Code suffit. Ce qu'il contient, et pourquoi :
   "mcpServers": {
     "3gpp": {
       "type": "stdio",
+      // Windows. Sous Linux/macOS : ".local/bin/server-full" et les .so/.dylib
+      // correspondants dans les deux chemins ONNX ci-dessous.
       "command": ".local/bin/server-full.exe",
       "args": ["serve", "--db", "data/3gpp.duckdb", "--etsi-db", "data/etsi.duckdb"],
       "env": {
@@ -269,7 +271,15 @@ are supported in this build. Current ORT Version is: 1.20.1
 ```
 
 C'est exactement le genre de panne que ce projet traque : ça marche, ça répond,
-et une arme sur quatre manque. `server_info` est le seul endroit qui le dit.
+et une arme sur quatre manque. `server_info` est le seul endroit qui le dit — et
+il le dit précisément :
+
+```json
+{"reranker": false,
+ "reranker_reason": "the ONNX runtime would not initialise: Platform-specific
+                     initialization failed: Error setting ORT API base: 2"}
+```
+
 `TestMCPJsonWiresBothONNXRuntimes` lit ce fichier et échoue si une variable
 manque ou si les deux pointent le même runtime.
 
@@ -288,7 +298,8 @@ répéter une doc, et rend la carte question → outil :
 ```
 
 **`server_info` ensuite**, pour savoir quelles armes tournent *à cet instant* —
-et, quand l'une est éteinte, **pourquoi**. Une installation saine répond :
+et, quand l'une est éteinte, **pourquoi**. Une installation **sémantique
+complète, avec les deux corpus** (A ou B ci-dessus) répond :
 
 ```json
 {"lexical": true, "semantic": true, "sparse": true, "reranker": true,
@@ -296,14 +307,21 @@ et, quand l'une est éteinte, **pourquoi**. Une installation saine répond :
  "etsi": {"attached": true, "embedding_model_ok": true}}
 ```
 
-Un `false` avec un `reason` non vide vous dit quoi réparer. Un `reranker: false`
-avec `reranker_reason` vide sur l'installation B = la seconde variable ONNX
-manque.
+Tous les `false` ne sont pas des pannes. Une build lexicale seule répond
+légitimement `semantic: false` et `reranker: false` ; sans `--etsi-db`,
+`etsi.attached` est `false` et c'est normal. Ce qui compte est le motif : chaque
+capacité éteinte porte un `reason` / `reranker_reason` / `sparse_reason` qui dit
+si c'est un choix de build ou une installation à réparer.
 
 Ensuite, posez vos questions en français ou en anglais : `search_spec` est
-l'entrée principale et Claude choisit les autres outils tout seul. Le serveur
-**refuse de répondre sans citation** — chaque réponse porte
-`citations: [{spec_id, release, version, clause, url}]`.
+l'entrée principale et Claude choisit les autres outils tout seul.
+
+**Les outils qui rendent du contenu de spécification refusent de répondre sans
+citation** — `search_spec`, `get_spec`, `search_api`, `trace_clause`,
+`find_cross_references`, `resolve_term`, `li_events`, `trace_evolution` portent
+tous `citations: [{spec_id, release, version, clause, url}]`. `help`,
+`server_info`, `list_specs` et `list_releases` décrivent le serveur ou son
+catalogue, pas le corpus : ils n'ont rien à citer et ne prétendent pas le faire.
 
 ## Surface MCP
 
