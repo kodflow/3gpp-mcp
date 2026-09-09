@@ -74,13 +74,44 @@ func TestRustIngestEtsiDoesNotReingestNonUTF8(t *testing.T) {
 		return n
 	}
 
+	// COUNT THE FIXTURE THIS TEST IS ABOUT, not the total.
+	//
+	// Asserting only that the total is non-zero let the ADJACENT UTF-8 file satisfy
+	// it on its own: if a regression stopped cp1252.html from producing clauses at
+	// all, write_spec would leave its slot open, the second pass would also produce
+	// nothing for it, and first == second would hold. The test would then report
+	// green on the exact deliverable it exists for.
+	countOf := func(specID string) int {
+		s, err := OpenReadOnly(db)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+		var n int
+		if err := s.DB().QueryRowContext(ctx,
+			"SELECT count(*) FROM clauses WHERE spec_id = ?", specID).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", specID, err)
+		}
+		return n
+	}
+
 	run("first")
 	first := count()
 	if first == 0 {
 		t.Fatal("the first ingest wrote nothing; the fixture never reached the parser")
 	}
+	// The windows-1252 deliverable must actually be IN there after pass one.
+	if n := countOf("ETSI TS 104 066"); n == 0 {
+		t.Fatal("the windows-1252 deliverable produced no clause — the fixture is not exercising " +
+			"the encoding path this test exists for, so a green result would mean nothing")
+	}
 
+	before := countOf("ETSI TS 104 066")
 	run("second")
+	if n := countOf("ETSI TS 104 066"); n != before {
+		t.Errorf("the windows-1252 deliverable grew from %d to %d clause(s) on a second ingest of "+
+			"an UNCHANGED tree — the resume check cannot read what the ingest can", before, n)
+	}
 	second := count()
 	if second != first {
 		t.Errorf("a second ingest of an UNCHANGED tree grew the corpus from %d to %d clause(s) "+

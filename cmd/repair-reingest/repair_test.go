@@ -147,7 +147,7 @@ func TestRepairIsIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = ck.Close() }()
-		g, err := findGroups(ctx, ck.DB())
+		g, err := ck.ReingestedOccurrences(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -73,7 +73,7 @@ func TestRequireNoReingestFindsTheWholeDocumentWrittenTwice(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	res := result{OK: true}
-	checkNoReingest(ctx, db.DB(), &res)
+	checkNoReingest(ctx, db, &res)
 	if len(res.Checks) != 1 {
 		t.Fatalf("want one check, got %d", len(res.Checks))
 	}
@@ -127,7 +127,7 @@ func TestRequireNoReingestPassesOnACleanCorpus(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	res := result{OK: true}
-	checkNoReingest(ctx, db.DB(), &res)
+	checkNoReingest(ctx, db, &res)
 	if !res.Checks[0].Pass {
 		t.Errorf("a clean corpus that merely repeats a row must pass: %s", res.Checks[0].Detail)
 	}

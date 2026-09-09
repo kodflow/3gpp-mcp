@@ -19,7 +19,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -142,14 +141,15 @@ func checkData(args []string) error {
 	// only one of them knows makes fs.Parse fail inside the container, on a corpus
 	// that is fine.
 	if *noReingest {
-		offenders, excess, err := reingestedDeliverables(ctx, st)
+		rs, err := st.ReingestedDeliverables(ctx)
 		if err != nil {
-			return fmt.Errorf("scan for re-ingested deliverables: %w", err)
+			return err
 		}
-		if len(offenders) > 0 {
+		if len(rs) > 0 {
+			groups, excess, named := store.SummariseReingested(rs, 10)
 			return fmt.Errorf("%d deliverable(s) were written by more than one ingest, %d excess "+
-				"occurrence(s): %s — the corpus holds copies of whole documents; run repair-reingest",
-				len(offenders), excess, strings.Join(offenders, ", "))
+				"row(s): %s — the corpus holds copies of whole documents; run repair-reingest",
+				groups, excess, named)
 		}
 	}
 	if *requireSparse && !sparseOK {
@@ -223,39 +223,3 @@ func checkData(args []string) error {
 	return nil
 }
 
-// reingestedDeliverables finds the deliverables whose EVERY distinct clause row is
-// stored more than once — a whole document written again, rather than a document
-// that repeats a clause.
-//
-// RELEASE IS PART OF THE IDENTITY. A 3GPP TR is catalogued under every release it
-// spans (30.531 v1.62.0 exists under nine), so keying on (spec_id, version) alone
-// reports one legitimate document as nine copies. Measured on the published
-// corpus before this check was wired anywhere.
-func reingestedDeliverables(ctx context.Context, st *store.Store) ([]string, int, error) {
-	rows, err := st.DB().QueryContext(ctx, `
-		SELECT spec_id, release, version, min(c) AS copies, sum(c) AS held
-		FROM (
-			SELECT spec_id, release, version, clause_path, heading, text, count(*) AS c
-			FROM clauses GROUP BY 1, 2, 3, 4, 5, 6
-		)
-		GROUP BY 1, 2, 3 HAVING min(c) > 1
-		ORDER BY sum(c) DESC`)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	var excess int
-	for rows.Next() {
-		var id, rel, ver string
-		var copies, held int
-		if err := rows.Scan(&id, &rel, &ver, &copies, &held); err != nil {
-			return nil, 0, err
-		}
-		excess += held - held/copies
-		if len(out) < 10 {
-			out = append(out, fmt.Sprintf("%s %s v%s (%d copies)", id, rel, ver, copies))
-		}
-	}
-	return out, excess, rows.Err()
-}
