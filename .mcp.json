@@ -11,7 +11,9 @@
       "env": {
         "EMBED_MODEL": "bge-m3-sparse",
         "EMBED_MODEL_DIR": "data/models/bge-m3-sparse",
-        "ORT_DYLIB_PATH": ".local/bin/onnxruntime.dll"
+
+        "ORT_DYLIB_PATH": ".local/toolchain/ort/onnxruntime-win-x64-gpu-1.20.1/lib/onnxruntime.dll",
+        "ONNXRUNTIME_SHARED_LIBRARY_PATH": "data/models/onnxruntime/lib/onnxruntime.dll"
       }
     }
   }
