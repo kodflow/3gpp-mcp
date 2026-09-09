@@ -73,7 +73,23 @@ case "$arm" in
 	;;
 esac
 
-flags="--require-fts --require-hnsw --require-embed-complete"
+# --require-no-reingest is on BOTH arms and at EVERY level, because it is about
+# whether the corpus holds copies of whole documents and that question does not
+# depend on which optional layer is present.
+#
+# It exists because nothing asked it. The ETSI half gained 566 clauses on every
+# build for fifteen builds — the resume check read files as strict UTF-8 while the
+# ingest read them with a windows-1252 fallback, so the two non-UTF-8 files in
+# 11 822 were never recognised as already ingested — and every gate stayed green
+# throughout, including the work-list reconciliation added the same day. That one
+# asks whether anything is MISSING. Nothing was. A corpus can be wrong by holding
+# too MUCH.
+#
+# Both gate binaries declare it (cmd/validate and `mcp-3gpp check-data`), which is
+# the rule this file already states for --require-etsi: the image's entrypoint
+# runs this same flag list, and a flag only one of them knows makes fs.Parse fail
+# inside the container on a corpus that is fine.
+flags="--require-fts --require-hnsw --require-embed-complete --require-no-reingest"
 # THE FLOOR IS A 3GPP CONCEPT AND MUST NOT REACH THE ETSI ARM.
 #
 # --require-embed-complete counts clauses at or above --embed-floor, and

@@ -19,6 +19,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/embed"
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -39,6 +40,7 @@ func checkData(args []string) error {
 	requireEmbed := fs.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence)")
 	embedFloor := fs.String("embed-floor", "", "release floor for --require-embed-complete; empty = all releases")
 	requireSparse := fs.Bool("require-sparse", false, "fail unless clause_sparse is populated and sparse_model matches this build's sparse identity")
+	noReingest := fs.Bool("require-no-reingest", false, "fail if any (spec_id, release, version) has EVERY distinct clause row stored more than once — a whole deliverable written by more than one ingest")
 	requireETSI := fs.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, every one of them carries a vector, and its embedding identity equals --db's")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -133,6 +135,23 @@ func checkData(args []string) error {
 		return fmt.Errorf("dense incomplete: %d clause(s) at/above floor %q still lack a vector — "+
 			"the embed campaign has not converged; do not promote this data layer", nullAtFloor, *embedFloor)
 	}
+	// BOTH GATE BINARIES MUST DECLARE THE FLAG, which is the rule this file's own
+	// contract states about --require-etsi ("add +etsi once both gate binaries gain
+	// it"). scripts/data-contract.sh emits one flag list, and it is run HERE by the
+	// image's entrypoint as well as by cmd/validate on the build machine: a flag
+	// only one of them knows makes fs.Parse fail inside the container, on a corpus
+	// that is fine.
+	if *noReingest {
+		offenders, excess, err := reingestedDeliverables(ctx, st)
+		if err != nil {
+			return fmt.Errorf("scan for re-ingested deliverables: %w", err)
+		}
+		if len(offenders) > 0 {
+			return fmt.Errorf("%d deliverable(s) were written by more than one ingest, %d excess "+
+				"occurrence(s): %s — the corpus holds copies of whole documents; run repair-reingest",
+				len(offenders), excess, strings.Join(offenders, ", "))
+		}
+	}
 	if *requireSparse && !sparseOK {
 		if wantSparse == "" {
 			return fmt.Errorf("--require-sparse was asked of a build that resolves NO sparse identity "+
@@ -202,4 +221,41 @@ func checkData(args []string) error {
 	}
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil
+}
+
+// reingestedDeliverables finds the deliverables whose EVERY distinct clause row is
+// stored more than once — a whole document written again, rather than a document
+// that repeats a clause.
+//
+// RELEASE IS PART OF THE IDENTITY. A 3GPP TR is catalogued under every release it
+// spans (30.531 v1.62.0 exists under nine), so keying on (spec_id, version) alone
+// reports one legitimate document as nine copies. Measured on the published
+// corpus before this check was wired anywhere.
+func reingestedDeliverables(ctx context.Context, st *store.Store) ([]string, int, error) {
+	rows, err := st.DB().QueryContext(ctx, `
+		SELECT spec_id, release, version, min(c) AS copies, sum(c) AS held
+		FROM (
+			SELECT spec_id, release, version, clause_path, heading, text, count(*) AS c
+			FROM clauses GROUP BY 1, 2, 3, 4, 5, 6
+		)
+		GROUP BY 1, 2, 3 HAVING min(c) > 1
+		ORDER BY sum(c) DESC`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	var excess int
+	for rows.Next() {
+		var id, rel, ver string
+		var copies, held int
+		if err := rows.Scan(&id, &rel, &ver, &copies, &held); err != nil {
+			return nil, 0, err
+		}
+		excess += held - held/copies
+		if len(out) < 10 {
+			out = append(out, fmt.Sprintf("%s %s v%s (%d copies)", id, rel, ver, copies))
+		}
+	}
+	return out, excess, rows.Err()
 }
