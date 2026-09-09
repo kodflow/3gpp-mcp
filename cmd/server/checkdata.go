@@ -39,6 +39,7 @@ func checkData(args []string) error {
 	requireEmbed := fs.Bool("require-embed-complete", false, "fail unless NO clause at/above --embed-floor still lacks a vector (dense convergence)")
 	embedFloor := fs.String("embed-floor", "", "release floor for --require-embed-complete; empty = all releases")
 	requireSparse := fs.Bool("require-sparse", false, "fail unless clause_sparse is populated and sparse_model matches this build's sparse identity")
+	noReingest := fs.Bool("require-no-reingest", false, "fail if any (spec_id, release, version) has EVERY distinct clause row stored more than once — a whole deliverable written by more than one ingest")
 	requireETSI := fs.String("require-etsi", "", "path to etsi.duckdb; fail unless it holds clauses, every one of them carries a vector, and its embedding identity equals --db's")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -133,6 +134,24 @@ func checkData(args []string) error {
 		return fmt.Errorf("dense incomplete: %d clause(s) at/above floor %q still lack a vector — "+
 			"the embed campaign has not converged; do not promote this data layer", nullAtFloor, *embedFloor)
 	}
+	// BOTH GATE BINARIES MUST DECLARE THE FLAG, which is the rule this file's own
+	// contract states about --require-etsi ("add +etsi once both gate binaries gain
+	// it"). scripts/data-contract.sh emits one flag list, and it is run HERE by the
+	// image's entrypoint as well as by cmd/validate on the build machine: a flag
+	// only one of them knows makes fs.Parse fail inside the container, on a corpus
+	// that is fine.
+	if *noReingest {
+		rs, err := st.ReingestedDeliverables(ctx)
+		if err != nil {
+			return err
+		}
+		if len(rs) > 0 {
+			groups, excess, named := store.SummariseReingested(rs, 10)
+			return fmt.Errorf("%d deliverable(s) were written by more than one ingest, %d excess "+
+				"row(s): %s — the corpus holds copies of whole documents; run repair-reingest",
+				groups, excess, named)
+		}
+	}
 	if *requireSparse && !sparseOK {
 		if wantSparse == "" {
 			return fmt.Errorf("--require-sparse was asked of a build that resolves NO sparse identity "+
@@ -203,3 +222,4 @@ func checkData(args []string) error {
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil
 }
+

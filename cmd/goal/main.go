@@ -519,7 +519,11 @@ func dataContractFlags(root, arm string) string {
 		// have said decides the publish gate on a contract nobody wrote, and it does
 		// so only in the branch that already means something is wrong. The ETSI arm
 		// drops --require-etsi here for the reason the script drops it there.
-		strong := "--require-fts --require-hnsw --require-embed-complete --require-sparse"
+		// --require-no-reingest is in the fallback because it is in the script. A
+		// fallback that omits a check decides the publish gate on a weaker contract
+		// than the one anybody wrote, and only in the branch that already means
+		// something went wrong.
+		strong := "--require-fts --require-hnsw --require-embed-complete --require-no-reingest --require-sparse"
 		if arm == armETSI {
 			return strong
 		}

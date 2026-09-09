@@ -55,6 +55,7 @@ func main() {
 		repoVis       = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
 		forbidFull    = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
 		maxEmptyMeta  = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
+		noReingest    = flag.Bool("require-no-reingest", false, "fail if any (spec_id, version) has EVERY distinct clause row stored more than once — the signature of a deliverable written by more than one ingest")
 		worklist      = flag.String("require-worklist", "", "path to the ETSI work list (id	url	version	type); fail unless every version it names is either IN --db or recorded in --absences")
 		absences      = flag.String("absences", "", "register of deliverables the fetch could not convert (id	version	type	reason); consulted by --require-worklist")
 		report        = flag.String("report", "text", "text | json")
@@ -69,7 +70,7 @@ func main() {
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
 		emptyMetaGuard: *maxEmptyMeta >= 0, maxEmptyMeta: *maxEmptyMeta,
-		worklist:       *worklist, absences: *absences,
+		worklist:       *worklist, absences: *absences, noReingest: *noReingest,
 	})
 
 	if *report == "json" {
@@ -108,6 +109,8 @@ type checkCfg struct {
 	// worklist/absences drive require-worklist, the ETSI arm's answer to the
 	// question anchorcheck answers on the 3GPP arm. See checkWorklist.
 	worklist, absences string
+	// noReingest drives require-no-reingest. See checkNoReingest.
+	noReingest bool
 }
 
 type check struct {
@@ -154,6 +157,9 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	// about vectors, so it stays readable next to the counts it belongs with.
 	if cfg.worklist != "" {
 		checkWorklist(ctx, db, &res, cfg)
+	}
+	if cfg.noReingest {
+		checkNoReingest(ctx, db, &res)
 	}
 
 	// clause count + min-clauses
@@ -649,4 +655,32 @@ func readWorklist(path string) (map[string]bool, error) {
 		out["ETSI "+c[3]+" "+c[0]+"	"+c[2]] = true
 	}
 	return out, sc.Err()
+}
+
+// checkNoReingest fails when a deliverable was written by more than one ingest.
+//
+// THE GATE THAT WAS MISSING, and its absence is the point. require-worklist asks
+// whether anything is MISSING from the corpus; nothing was, so it stayed green
+// while the ETSI half gained 566 clauses on every build from a converted tree
+// that never changed. A corpus can be wrong by holding too MUCH, and no check
+// looked in that direction.
+//
+// The rule itself lives in internal/store, because two gates and one repair tool
+// ask it and three copies of a predicate drift.
+func checkNoReingest(ctx context.Context, db *store.Store, res *result) {
+	rs, err := db.ReingestedDeliverables(ctx)
+	if err != nil {
+		// A FAILED READ IS NOT A PASS. Reporting green here would say the corpus
+		// was checked when it was not.
+		res.add("require-no-reingest", false, "%v", err)
+		return
+	}
+	if len(rs) == 0 {
+		res.add("require-no-reingest", true, "no deliverable is stored more than once")
+		return
+	}
+	groups, excess, named := store.SummariseReingested(rs, 10)
+	res.add("require-no-reingest", false,
+		"%d deliverable(s) were written by more than one ingest, %d excess row(s): %s",
+		groups, excess, named)
 }
