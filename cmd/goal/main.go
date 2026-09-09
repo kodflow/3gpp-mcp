@@ -486,9 +486,22 @@ func dataContractFlags(root, arm string) string {
 	//
 	// Defaults, not overrides, exactly like DATA_ETSI_DB: an operator who set
 	// either variable keeps it.
+	//
+	// ONE FILE, ONE KEY. The register has a WRITER (scripts/etsi-fetch.sh, which
+	// reads ETSI_ABSENCES) and a READER (scripts/data-contract.sh, which reads
+	// DATA_ETSI_ABSENCES). An operator who set only the writer's key would have the
+	// fetch record its absences in one file while the gate looked for them in
+	// another — and the gate does not fail on a register it cannot find, it reports
+	// UNVERIFIED, so the divergence would read as "this corpus predates the
+	// register" rather than as a misconfiguration. The writer's key therefore wins
+	// here when it is set, which makes the two names one setting.
+	absences := filepath.Join(root, ".local", "state", "etsi-absences.tsv")
+	if v, set := os.LookupEnv("ETSI_ABSENCES"); set && v != "" {
+		absences = v
+	}
 	for k, v := range map[string]string{
 		"DATA_ETSI_WORKLIST": filepath.Join(root, ".local", "state", "etsi-worklist.tsv"),
-		"DATA_ETSI_ABSENCES": filepath.Join(root, ".local", "state", "etsi-absences.tsv"),
+		"DATA_ETSI_ABSENCES": absences,
 	} {
 		if got, set := os.LookupEnv(k); !set || got == "" {
 			cmd.Env = append(cmd.Env, k+"="+v)

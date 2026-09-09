@@ -52,6 +52,28 @@ etsi_resolve_bins discover
 # because the right number on another machine is a different number.
 JOBS="${ETSI_JOBS:-8}"
 
+# ABSENCES — the register of deliverables this script could NOT convert.
+#
+# IT LIVES HERE, NOT IN THE SHARED PRELUDE, and that is the whole point of the
+# fetch/ingest split. Only this script writes it; etsi-ingest.sh never reads it.
+# Declared in scripts/lib/etsi-common.sh it landed in the INGEST step's provenance
+# too, and adding a variable the ingest never uses replayed it — measured on build
+# E (2026-09-09): ingest-etsi 9m31, then embed-etsi 8m53, enrich-etsi, paragraphs-etsi
+# 8m07, sparse-etsi, compact-etsi 11m05, index-etsi 10m07, and a 42 GB image
+# re-push, over a shell variable.
+#
+# The prelude says exactly this about convert.sh, three lines from where the
+# variable was: "Only the fetch calls convert_pdf, and sourcing it from the shared
+# prelude would make the ingest depend on it — which would recreate exactly the
+# false positive this split removes." Same file, same trap, one commit later.
+#
+# One line per unconverted deliverable: id, version, doctype, reason. It exists so
+# validate-etsi can tell "this PDF has no text layer, permanently" from "this
+# deliverable was silently dropped" — the fetch used to count its failures and
+# forget which they were.
+ABSENCES="${ETSI_ABSENCES:-$ROOT/.local/state/etsi-absences.tsv}"
+mkdir -p "$(dirname "$ABSENCES")"
+
 echo "[etsi] discovering work-list…"
 wl="$(mktemp)"
 disc_args=(--emit-worklist)
