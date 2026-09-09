@@ -89,10 +89,13 @@ Un index qui tait ses trous est un index qui ment. Les trois connus :
   aplatit cette table en colonnes désalignées. Une ligne reconstruite de travers
   citerait la mauvaise transition de version, ce qui est pire que rien.
   `get_changelog` le dit et renvoie vers `trace_clause`.
-- **4 livrables ETSI sur 11 826 ne sont pas convertibles** (PDF sans couche
-  texte). Ils sont **nommés** dans `.local/state/etsi-absences.tsv`, et
+- **4 VERSIONS sur les 11 826 de la liste de travail ne sont pas convertibles**
+  (PDF sans couche texte) — quatre versions, pas quatre livrables ; deux
+  livrables disparaissent avec elles parce qu'ils n'en avaient qu'une. D'où
+  5 142 livrables / 11 822 versions tenus contre 5 144 / 11 826 listés. Les
+  quatre sont **nommées** dans `.local/state/etsi-absences.tsv`, et
   `validate --require-worklist` réconcilie liste de travail / corpus / registre
-  à chaque build : un livrable absent sans raison enregistrée fait échouer le
+  à chaque build : une version absente sans raison enregistrée fait échouer le
   build.
 - **`evolutions` ne couvre que le 3GPP** (seed curaté NE→NF, EPC↔5GC).
 
@@ -292,7 +295,7 @@ Le corpus complet est construit, indexé, embarqué et **prouvé en JSON-RPC ré
 | 7 — Router + RRF + ordre versions | ✅ | `internal/search` |
 | 8 — Serveur MCP + 13 outils | ✅ | `internal/mcp`, `cmd/server` |
 | 9 — Reranker cross-encoder | ✅ actif par défaut | `internal/rerank` |
-| 10 — Moitié ETSI fédérée | ✅ 3 168 482 clauses, 11 826 versions | `cmd/goal` (`ingest-etsi`) |
+| 10 — Moitié ETSI fédérée | ✅ 3 168 482 clauses, 11 822 versions tenues (11 826 listées, 4 PDF sans couche texte) | `cmd/goal` (`ingest-etsi`) |
 | 11 — Contrat de complétude sur les DEUX moitiés | ✅ 8 vérifications, dont réconciliation liste de travail et non-réingestion | `cmd/validate`, `scripts/data-contract.sh` |
 
 **Un écart assumé avec l'archi figée (à régulariser en MR `arch-change`) :**
