@@ -49,7 +49,7 @@ que ces chiffres restent vrais. Pour les relire sur VOTRE copie, appelez l'outil
 | BM25 / FTS | oui | oui |
 | Clause sans vecteur dû | **0** | **0** |
 | Taille sur disque | 24,1 GiB | 18,4 GiB |
-| Axe d'évolution | **release** (Rel-99 → dernière) | **version** (toutes les versions de chaque deliverable) |
+| Axe d'évolution | **release** (Rel-4 → Rel-21, plus un bucket `GSM`) | **version** (toutes les versions de chaque deliverable) |
 
 Les vecteurs portent sur des **corps de paragraphe dédupliqués** (ADR 0004), pas
 sur les clauses : 821 387 corps distincts couvrent les 2 751 918 occurrences de
@@ -58,7 +58,9 @@ vectorisé une fois — c'est ce qui rend le corpus complet tenable, et non un t
 de couverture (`missing_content=0`, `unaccounted=0`).
 
 S'ajoutent au texte des clauses, côté 3GPP : **8 562 opérations** et **27 889
-schémas** OpenAPI 5GC, **1 131 événements** d'interception légale, 18 releases.
+schémas** OpenAPI 5GC, **1 131 événements** d'interception légale, et un
+catalogue de **18 releases** (les clauses, elles, se répartissent sur 19 buckets :
+ces 18 plus `GSM`, 491 clauses des vieilles séries).
 
 **L'historique des change requests est incomplet, et le serveur le dit.** La
 table `changes` porte 61 321 lignes mais n'a plus d'écrivain depuis que
