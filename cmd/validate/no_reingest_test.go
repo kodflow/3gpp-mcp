@@ -52,6 +52,15 @@ func TestRequireNoReingestFindsTheWholeDocumentWrittenTwice(t *testing.T) {
 		{ChunkID: 7, SpecID: "30.531", Release: "Rel-17", Version: "1.62.0", ClausePath: "2", Text: "b"},
 		{ChunkID: 8, SpecID: "30.531", Release: "Rel-17", Version: "1.62.0", ClausePath: "1", Text: "a"},
 		{ChunkID: 9, SpecID: "30.531", Release: "Rel-17", Version: "1.62.0", ClausePath: "2", Text: "b"},
+		// THE FALSE POSITIVE THIS GATE ALREADY HAD, pinned so it cannot come back.
+		// A 3GPP TR is catalogued under every release it spans, so the SAME version
+		// legitimately exists more than once with identical text. Grouping by
+		// (spec_id, version) alone reported 30.531 v1.62.0 as "9 copies" on the
+		// published corpus — it exists under NINE releases — and would have failed
+		// every 3GPP build on nothing. Release is part of the identity.
+		{ChunkID: 10, SpecID: "22.890", Release: "Rel-15", Version: "0.7.0", ClausePath: "1", Text: "spans"},
+		{ChunkID: 11, SpecID: "22.890", Release: "Rel-16", Version: "0.7.0", ClausePath: "1", Text: "spans"},
+		{ChunkID: 12, SpecID: "22.890", Release: "Rel-17", Version: "0.7.0", ClausePath: "1", Text: "spans"},
 	}
 	if err := st.InsertClauses(rows); err != nil {
 		t.Fatal(err)
@@ -72,14 +81,18 @@ func TestRequireNoReingestFindsTheWholeDocumentWrittenTwice(t *testing.T) {
 	if got.Pass {
 		t.Fatalf("a deliverable written twice must fail the gate: %s", got.Detail)
 	}
-	if !strings.Contains(got.Detail, "30.531 v1.62.0") {
-		t.Errorf("the failure must name the offender: %s", got.Detail)
+	if !strings.Contains(got.Detail, "30.531 Rel-17 v1.62.0") {
+		t.Errorf("the failure must name the offender WITH its release: %s", got.Detail)
 	}
 	if !strings.Contains(got.Detail, "2 copies") {
 		t.Errorf("the multiplicity IS the diagnosis — 2 here, 15 on the real corpus: %s", got.Detail)
 	}
 	if strings.Contains(got.Detail, "23.501") {
 		t.Errorf("a document that legitimately repeats one row was reported: %s", got.Detail)
+	}
+	if strings.Contains(got.Detail, "22.890") {
+		t.Errorf("a version catalogued under several releases was reported as re-ingested — "+
+			"release is part of the identity: %s", got.Detail)
 	}
 	if !strings.Contains(got.Detail, "2 excess row(s)") {
 		t.Errorf("the excess must be counted, not just the group: %s", got.Detail)
