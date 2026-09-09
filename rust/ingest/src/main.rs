@@ -274,7 +274,30 @@ fn main() -> Result<()> {
 
         for f in collect_html_recursive(convert)? {
             if args.resume {
-                if let Some(m) = std::fs::read_to_string(&f)
+                // THE SAME READER THE INGEST USES, and that is the whole fix.
+                //
+                // This asked std::fs::read_to_string, which is STRICT UTF-8 and returns
+                // Err on anything else. ingest_etsi_one reads the same file through
+                // parse3gpp::html_bytes::read_html, which falls back to windows-1252.
+                // So a deliverable that is not valid UTF-8 could be INGESTED but never
+                // RECOGNISED as already ingested: `.ok()` turned the read error into
+                // None, the `if let` did not match, and the file was written again.
+                //
+                // Every build. Measured on the published corpus 2026-09-09: exactly two
+                // files in 11 822 are not UTF-8 —
+                //   data/sources/convert-etsi/ETSI/TR_104_066_v1.1.1.html
+                //   data/sources/convert-etsi/ETSI/TS_103_634_v1.1.1.html
+                // — and both had been written FIFTEEN times: 1 155 rows for 77 clauses,
+                // 7 335 rows for 489. Together 566 clauses per build, which is precisely
+                // the +566 the ETSI clause count gained between builds D, E and F on a
+                // converted tree that never changed. Every gate stayed green throughout,
+                // including the work-list reconciliation added the same day: it asks
+                // whether anything is MISSING, and nothing was.
+                //
+                // The two paths must read bytes the same way or the resume key is not
+                // the ingest key. read_html is the one that decides what a deliverable
+                // IS, so it is the one that decides whether we have seen it.
+                if let Some(m) = parse3gpp::html_bytes::read_html(&f)
                     .ok()
                     .and_then(|h| parse3gpp::etsi::parse_etsi_meta(&h))
                 {
