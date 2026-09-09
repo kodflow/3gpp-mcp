@@ -677,13 +677,20 @@ func readWorklist(path string) (map[string]bool, error) {
 // It reports the multiplicity, because that number is the diagnosis: 15 means
 // fifteen ingests, which dates the defect rather than merely naming it.
 func checkNoReingest(ctx context.Context, sqldb *sql.DB, res *result) {
+	// RELEASE IS PART OF THE IDENTITY, and leaving it out made this gate accuse a
+	// healthy corpus. A 3GPP TR is catalogued under every release it spans:
+	// 30.531 v1.62.0 exists under NINE, so grouping by (spec_id, version) alone
+	// reported "9 copies" for one document legitimately held nine times. Measured
+	// before this flag was wired anywhere — it would have failed every 3GPP build
+	// on nothing. The ETSI half never showed it because its release is the
+	// constant "ETSI".
 	rows, err := sqldb.QueryContext(ctx, `
-		SELECT spec_id, version, min(c) AS copies, sum(c) AS rows_held, count(*) AS distinct_rows
+		SELECT spec_id, release, version, min(c) AS copies, sum(c) AS rows_held
 		FROM (
-			SELECT spec_id, version, clause_path, heading, text, count(*) AS c
-			FROM clauses GROUP BY 1, 2, 3, 4, 5
+			SELECT spec_id, release, version, clause_path, heading, text, count(*) AS c
+			FROM clauses GROUP BY 1, 2, 3, 4, 5, 6
 		)
-		GROUP BY 1, 2 HAVING min(c) > 1
+		GROUP BY 1, 2, 3 HAVING min(c) > 1
 		ORDER BY sum(c) DESC`)
 	if err != nil {
 		res.add("require-no-reingest", false, "cannot scan for re-ingested deliverables: %v", err)
@@ -693,14 +700,17 @@ func checkNoReingest(ctx context.Context, sqldb *sql.DB, res *result) {
 	var offenders []string
 	var excess int
 	for rows.Next() {
-		var id, ver string
-		var copies, held, distinct int
-		if err := rows.Scan(&id, &ver, &copies, &held, &distinct); err != nil {
+		var id, rel, ver string
+		var copies, held int
+		if err := rows.Scan(&id, &rel, &ver, &copies, &held); err != nil {
 			continue
 		}
-		excess += held - distinct
+		// The excess is what the extra writes added, which is held - held/copies.
+		// Counting distinct ROWS instead would over-report on a document that
+		// legitimately repeats a clause: those repeats are part of one write.
+		excess += held - held/copies
 		if len(offenders) < 10 {
-			offenders = append(offenders, fmt.Sprintf("%s v%s (%d copies, %d rows)", id, ver, copies, held))
+			offenders = append(offenders, fmt.Sprintf("%s %s v%s (%d copies, %d rows)", id, rel, ver, copies, held))
 		}
 	}
 	if len(offenders) == 0 {
