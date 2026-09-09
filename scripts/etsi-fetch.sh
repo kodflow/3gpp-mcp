@@ -83,6 +83,18 @@ TALLY="$(mktemp -d)"
 mkdir -p "$TALLY/ok" "$TALLY/fail"
 export TALLY BUCKET ROOT
 
+# fail_record <id> <version> <doctype> <reason> — the failing half of the tally.
+#
+# The ok side needs no identity: a converted deliverable is IN the corpus, which
+# is where its name already is. A failure is the opposite — it leaves no trace
+# anywhere else, so if the marker file does not carry the name, the name is gone.
+# Same one-file-per-outcome mechanism as before (workers are separate processes);
+# the file now has CONTENT.
+fail_record() {
+	printf '%s	%s	%s	%s
+' "$1" "$2" "$3" "$4" >"$TALLY/fail/$$.$RANDOM"
+}
+
 fetch_one() {
 	local line="$1" id url version doctype safe target legacy pdf tmp_html
 	IFS=$'\t' read -r id url version doctype <<<"$line"
@@ -114,7 +126,7 @@ fetch_one() {
 		return 0
 	fi
 	printf '[etsi] %s v%s (%s)\n' "$id" "$version" "$doctype"
-	pdf="$(tmpfile_ext pdf)" || { : >"$TALLY/fail/$$.$RANDOM"; return 0; }
+	pdf="$(tmpfile_ext pdf)" || { fail_record "$id" "$version" "$doctype" "no-temp-file"; return 0; }
 	# ETSI's /deliver CDN WAF 403s a bare curl User-Agent from datacenter IPs (GitHub
 	# Actions): discover-etsi works on the same runner ONLY because it sends a browser
 	# UA. Mirror that here (+ Accept/timeout) or every PDF download fails in CI.
@@ -124,10 +136,10 @@ fetch_one() {
 		-o "$pdf" "$url"; then
 		echo "::warning::download failed: $url"
 		rm -f "$pdf"
-		: >"$TALLY/fail/$$.$RANDOM"
+		fail_record "$id" "$version" "$doctype" "download-failed"
 		return 0
 	fi
-	tmp_html="$(tmpfile_ext html)" || { rm -f "$pdf"; : >"$TALLY/fail/$$.$RANDOM"; return 0; }
+	tmp_html="$(tmpfile_ext html)" || { rm -f "$pdf"; fail_record "$id" "$version" "$doctype" "no-temp-file"; return 0; }
 	if convert_pdf "$pdf" "$tmp_html" "$id v$version"; then
 		# WRITE THEN RENAME. The old loop wrote the provenance header and the body
 		# straight into $target, so a kill between the two left a header-only file
@@ -144,11 +156,11 @@ fetch_one() {
 		: >"$TALLY/ok/$$.$RANDOM"
 	else
 		echo "::warning::convert failed (no text layer?): $id v$version"
-		: >"$TALLY/fail/$$.$RANDOM"
+		fail_record "$id" "$version" "$doctype" "no-text-layer"
 	fi
 	rm -f "$pdf" "$tmp_html"
 }
-export -f fetch_one retry tmpfile_ext
+export -f fetch_one retry tmpfile_ext fail_record
 
 # NUL-delimited, because an ETSI id CONTAINS A SPACE ("103 221-1"). Splitting the
 # work list on whitespace would hand xargs two arguments for one deliverable and
@@ -158,6 +170,17 @@ tr '\n' '\0' <"$wl" | xargs -0 -P "$JOBS" -n1 bash -c 'fetch_one "$0"' || true
 rm -f "$wl"
 
 ok=$(find "$TALLY/ok" -type f 2>/dev/null | wc -l | tr -dc '0-9')
-fail=$(find "$TALLY/fail" -type f 2>/dev/null | wc -l | tr -dc '0-9')
+
+# PUBLISH THE REGISTER, and publish it EMPTY when nothing failed. A missing file
+# and a file with no rows are different claims: "the fetch never ran" versus "the
+# fetch ran and nothing was left out". validate-etsi reads the difference, so the
+# write is unconditional.
+: >"$ABSENCES"
+find "$TALLY/fail" -type f -exec cat {} + 2>/dev/null | LC_ALL=C sort -u >>"$ABSENCES"
+fail=$(wc -l <"$ABSENCES" | tr -dc '0-9')
 rm -rf "$TALLY"
-echo "[etsi] converted=${ok:-0} failed=${fail:-0}"
+echo "[etsi] converted=${ok:-0} failed=${fail:-0} (register: $ABSENCES)"
+if [ "${fail:-0}" -gt 0 ]; then
+	echo "[etsi] deliverables left out, by reason:"
+	cut -f4 "$ABSENCES" | LC_ALL=C sort | uniq -c | sed 's/^/  /'
+fi

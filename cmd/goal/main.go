@@ -474,6 +474,26 @@ func dataContractFlags(root, arm string) string {
 	} else {
 		cmd.Env = append(cmd.Env, "DATA_ETSI_DB="+etsi)
 	}
+	// THE WORK-LIST PATHS COME FROM HERE FOR THE SAME REASON DATA_ETSI_DB DOES,
+	// and for one more: they must be OS paths, not the shell's.
+	//
+	// --require-worklist is read by cmd/validate, a Windows binary. Left to derive
+	// its own default, the script computes it with `cd … && pwd` under the
+	// toolchain's bash and emits "/c/Users/Public/3gpp-mcp/.local/state/…", which
+	// no Windows process can open — the gate would fail on a file that is present,
+	// which is the most confusing way for a check to be wrong. Passing
+	// filepath.Join's result makes the path the same one every other step uses.
+	//
+	// Defaults, not overrides, exactly like DATA_ETSI_DB: an operator who set
+	// either variable keeps it.
+	for k, v := range map[string]string{
+		"DATA_ETSI_WORKLIST": filepath.Join(root, ".local", "state", "etsi-worklist.tsv"),
+		"DATA_ETSI_ABSENCES": filepath.Join(root, ".local", "state", "etsi-absences.tsv"),
+	} {
+		if got, set := os.LookupEnv(k); !set || got == "" {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()

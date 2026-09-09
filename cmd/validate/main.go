@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"bufio"
 	"os"
 	"sort"
 	"strings"
@@ -54,6 +55,8 @@ func main() {
 		repoVis       = flag.String("repo-visibility", "", "public|private — drives the anti-leak guard")
 		forbidFull    = flag.Bool("forbid-fulltext-artifacts", false, "with --repo-visibility public: fail if the DB carries verbatim clause text (anti-leak)")
 		maxEmptyMeta  = flag.Int("max-empty-meta", -1, "if >=0, fail unless the count of clause-bearing specs missing catalog title/WG is <= this (catalog coverage guard)")
+		worklist      = flag.String("require-worklist", "", "path to the ETSI work list (id	url	version	type); fail unless every version it names is either IN --db or recorded in --absences")
+		absences      = flag.String("absences", "", "register of deliverables the fetch could not convert (id	version	type	reason); consulted by --require-worklist")
 		report        = flag.String("report", "text", "text | json")
 	)
 	flag.Parse()
@@ -66,6 +69,7 @@ func main() {
 		expectedIdentity: *expIdentity, zst: *zstPath, sha: *shaPath,
 		repoVisibility: *repoVis, forbidFulltext: *forbidFull,
 		emptyMetaGuard: *maxEmptyMeta >= 0, maxEmptyMeta: *maxEmptyMeta,
+		worklist:       *worklist, absences: *absences,
 	})
 
 	if *report == "json" {
@@ -101,6 +105,9 @@ type checkCfg struct {
 	// strict threshold here, so it cannot double as "disabled".
 	emptyMetaGuard bool
 	maxEmptyMeta   int
+	// worklist/absences drive require-worklist, the ETSI arm's answer to the
+	// question anchorcheck answers on the 3GPP arm. See checkWorklist.
+	worklist, absences string
 }
 
 type check struct {
@@ -141,6 +148,13 @@ func runChecks(ctx context.Context, cfg checkCfg) result {
 	defer func() { _ = db.Close() }()
 	res.add("db-openable", true, "%s", cfg.db)
 	sqldb := db.DB()
+
+	// require-worklist — the ETSI arm's completeness reconciliation. Placed right
+	// after the DB opens because it reads only spec_versions and says nothing
+	// about vectors, so it stays readable next to the counts it belongs with.
+	if cfg.worklist != "" {
+		checkWorklist(ctx, db, &res, cfg)
+	}
 
 	// clause count + min-clauses
 	var clauses int
@@ -519,4 +533,120 @@ func short(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// checkWorklist is the ETSI arm's answer to the question anchorcheck answers on
+// the 3GPP arm: does the corpus actually hold what the pipeline decided it held?
+//
+// WHY IT IS NOT anchorcheck. The 3GPP delta anchor is .local/corpus-index.json,
+// which `merge` derives from the 3GPP shards; the ETSI ingest writes one database
+// directly and has no shards and no anchor. Pointing a 3GPP-shaped check at the
+// ETSI corpus is the mistake stepValidate documents. But the FAILURE the anchor
+// exists to catch is not 3GPP-specific: a deliverable the fetch decided was done
+// whose rows never reached the corpus leaves a hole that no later step can see,
+// because every later step trusts the same decision. anchorcheck found 56 of
+// those on the 3GPP side.
+//
+// THE REGISTER IS WHAT MAKES THIS ANSWERABLE. The fetch used to COUNT its
+// failures and forget which they were ("converted=11822 failed=4"), so a missing
+// deliverable and a deliberately-skipped one were the same observation. With
+// scripts/etsi-fetch.sh writing one row per unconverted deliverable, the three
+// sets finally line up: work list = corpus + register, and anything left over is
+// a hole nobody decided on.
+//
+// IT REPORTS "unverified" RATHER THAN FAILING WHEN THE REGISTER IS ABSENT. A
+// corpus built before the register existed cannot produce one retroactively, and
+// failing the gate there would block the supported path for a defect the operator
+// cannot fix — the same call reportAnchorHoles makes about the 56 known 3GPP
+// holes. Once the register exists, an unexplained hole is a real failure.
+func checkWorklist(ctx context.Context, db *store.Store, res *result, cfg checkCfg) {
+	want, err := readWorklist(cfg.worklist)
+	if err != nil {
+		res.add("require-worklist", false, "cannot read the work list %s: %v", cfg.worklist, err)
+		return
+	}
+	if len(want) == 0 {
+		res.add("require-worklist", false, "the work list %s names no deliverable", cfg.worklist)
+		return
+	}
+	held := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `SELECT spec_id, version FROM spec_versions`)
+	if err != nil {
+		res.add("require-worklist", false, "cannot list the corpus versions: %v", err)
+		return
+	}
+	for rows.Next() {
+		var id, v string
+		if err := rows.Scan(&id, &v); err != nil {
+			continue
+		}
+		held[id+"	"+v] = true
+	}
+	_ = rows.Close()
+
+	excused, register := map[string]bool{}, true
+	if cfg.absences == "" {
+		register = false
+	} else if f, err := os.Open(cfg.absences); err != nil {
+		register = false
+	} else {
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			// id 	 version 	 doctype 	 reason
+			f := strings.Split(sc.Text(), "	")
+			if len(f) < 3 {
+				continue
+			}
+			excused["ETSI "+f[2]+" "+f[0]+"	"+f[1]] = true
+		}
+		_ = f.Close()
+	}
+
+	var holes []string
+	for k := range want {
+		if !held[k] && !excused[k] {
+			holes = append(holes, strings.ReplaceAll(k, "	", " v"))
+		}
+	}
+	sort.Strings(holes)
+	switch {
+	case len(holes) == 0:
+		res.add("require-worklist", true, "%d work-list version(s), all held by the corpus or recorded in the register (%d excused)",
+			len(want), len(excused))
+	case !register:
+		// Not a pass dressed up as one: the detail says the number and says the
+		// register is missing, so a reader sees an unverified gate, not a green one.
+		res.add("require-worklist", true, "UNVERIFIED: %d of %d work-list version(s) are not in the corpus and there is no absence register (%q) to explain them — re-run fetch-etsi to write one. First: %s",
+			len(holes), len(want), cfg.absences, strings.Join(holes[:min(5, len(holes))], ", "))
+	default:
+		res.add("require-worklist", false, "%d of %d work-list version(s) are in neither the corpus nor the absence register — the corpus is silently short. First: %s",
+			len(holes), len(want), strings.Join(holes[:min(10, len(holes))], ", "))
+	}
+}
+
+// readWorklist reads "<id>	<url>	<version>	<type>" into the corpus's own key
+// shape, "ETSI <type> <id>	<version>".
+//
+// THE TYPE IS PART OF THE KEY. A TS and a TR can share a number — 103 101 is a TR
+// and the TS tree 404s on it — so keying on the id alone would let a TR excuse a
+// missing TS. scripts/etsi-fetch.sh makes the same distinction in the filename,
+// for the same reason.
+func readWorklist(path string) (map[string]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	out := map[string]bool{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		c := strings.Split(sc.Text(), "	")
+		if len(c) < 4 || c[0] == "" {
+			continue
+		}
+		out["ETSI "+c[3]+" "+c[0]+"	"+c[2]] = true
+	}
+	return out, sc.Err()
 }
