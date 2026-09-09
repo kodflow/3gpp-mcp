@@ -942,7 +942,31 @@ func stepValidate(t corpusTarget) *Step {
 		Deps:    t.validateDeps(),
 		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
 		Inputs: func(c *Ctx) ([]string, error) {
-			return []string{t.dbPath(c)}, nil
+			in := []string{t.dbPath(c)}
+			// THE ETSI GATE READS TWO MORE FILES, SO IT WATCHES THEM.
+			//
+			// --require-worklist reconciles the work list and the absence register
+			// against the corpus. Declaring only the DB would record the BUTTON and
+			// not the work: excusing a deliverable in the register, or a re-discovery
+			// that changes the work list, would leave this step's fingerprint
+			// untouched, the gate would SKIP, and the change would land inert with
+			// every gate green. That is the defect this pipeline posed on 2026-09-08
+			// with etsi_scope, one step to the left.
+			//
+			// Absent files are skipped rather than erroring: on the 3GPP arm neither
+			// exists, and on a first ETSI build the register is written by the fetch
+			// that runs later in the same pipeline.
+			if t.Suffix != "" {
+				for _, f := range []string{
+					c.statePath("etsi-worklist.tsv"),
+					c.statePath("etsi-absences.tsv"),
+				} {
+					if fileNonEmpty(f) {
+						in = append(in, f)
+					}
+				}
+			}
+			return in, nil
 		},
 		Run: func(c *Ctx) error {
 			args := validateArgs(c, t)

@@ -21,6 +21,22 @@ INDEX="${ETSI_INDEX:-}"
 BUCKET="$CONVERT/ETSI" # ingest globs <convert>/*/*.html
 mkdir -p "$BUCKET" "$ORIGIN"
 
+# ABSENCES — the register of deliverables the fetch could NOT convert.
+#
+# It exists because the fetch used to COUNT its failures and forget WHICH they
+# were: each worker touched an empty file named "$$.$RANDOM" and the parent
+# printed "converted=11822 failed=4". Four is a number, not a fact. Nothing
+# downstream could tell "this deliverable's PDF has no text layer, permanently"
+# from "this deliverable was silently dropped", so validate-etsi could not
+# reconcile the work list against the corpus at all — the ETSI half had no
+# equivalent of contracts/accepted-absences.txt, which is exactly the shape of
+# defect #8 in the 3GPP arm's own history ("the register of accepted absences was
+# a DEAD feature").
+#
+# One line per unconverted deliverable: id, version, doctype, reason.
+ABSENCES="${ETSI_ABSENCES:-$ROOT/.local/state/etsi-absences.tsv}"
+mkdir -p "$(dirname "$ABSENCES")"
+
 retry() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 5 ] && return 1; sleep $((n * 3)); done; }
 
 # tmpfile_ext <ext> — a temp file that actually ends in ".<ext>".
