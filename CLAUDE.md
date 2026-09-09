@@ -333,17 +333,34 @@ Points qui ne se devinent pas en lisant le code :
 ## 7. Périmètre réel du corpus
 
 Le cadrage MVP « Rel-17/18/19, séries 23/24/29/33/38, ~150 specs » est **dépassé**.
-Ce que le corpus contient au 2026-08-26, mesuré :
+Ce que le corpus contient au 2026-09-09, mesuré :
 
 | | |
 |---|---|
-| Clauses | **2 752 688** |
+| Clauses | **2 751 918** |
 | Specs distinctes / versions | **3 568** / **20 163** |
 | Séries | **31** — 03, 21 à 38, 41 à 52, 55 |
 | Releases | **19** — Rel-4 à Rel-20 (plus Phase 1/2 sur les vieilles séries) |
 | Opérations API 5GC | **8 562** (+ 27 889 schémas) |
-| Événements LI | **405** (Rel-19), 1 697 champs, 1 039 types ASN.1 |
-| ETSI | **14** livrables Lawful Interception, base séparée |
+| Événements LI | **1 131**, 5 148 champs, 2 919 types ASN.1 |
+| Glossaire | **14 126** acronymes |
+| ETSI | **5 142** livrables, **11 822** versions, **3 168 482** clauses, base séparée |
+
+**L'ETSI n'est plus la suite Lawful Interception seule.** `discover-etsi` énumère
+tout `/deliver` (7 502 identifiants, ts+tr+en), écarte les 2 208 republications
+de specs 3GPP que la moitié 3GPP tient déjà dans toutes leurs releases, et retient
+5 144 livrables en **toutes leurs versions publiées** — d'où 11 826 versions
+contre 14 livrables auparavant. Quatre ne sont pas convertibles (PDF sans couche
+texte) et sont **nommés** dans `.local/state/etsi-absences.tsv` ; le contrat
+échoue si un livrable manque sans raison enregistrée.
+
+**Ce que le corpus n'a PAS, et qui se dit plutôt que se cache :** aucun change
+request côté ETSI (une table de change history 3GPP survit à `.doc → HTML`, un
+PDF ETSI passé à `pdftotext -layout` ne survit pas — reconstruire citerait la
+mauvaise transition) ; côté 3GPP la table `changes` n'a plus d'écrivain depuis
+que l'ingest HTML est passé en Rust et ne couvre que **311 specs sur 3 568**.
+`get_changelog` nomme ces deux silences séparément et renvoie vers `trace_clause`,
+qui répond depuis le texte du corpus.
 
 | Capacité | État |
 |---|---|

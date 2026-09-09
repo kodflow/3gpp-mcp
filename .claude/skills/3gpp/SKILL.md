@@ -49,6 +49,14 @@ the clause actually SAYS differently, paragraph by paragraph: which releases
 carry each statement, when it was introduced, and whether it is gone from the
 newest release.
 
+**PREFER `trace_clause`, and treat `get_changelog` as a bonus.** The change-request
+table has had no writer since the ingest write-side moved to Rust: it covers
+**311 of the 3 568 3GPP specs** and **none of the ETSI half** (ETSI ships PDFs,
+and the change-history table does not survive text extraction well enough to
+cite). A count of 0 there means "not recorded here", never "never changed" — and
+the tool says so in a `note` rather than leaving you to guess. `trace_clause`
+answers the same question from the corpus text, so it is never stale.
+
 Use it whenever the question is about evolution rather than about current state:
 
 - *"when did X appear / is X still true in Rel-19?"* — `trace_clause` with

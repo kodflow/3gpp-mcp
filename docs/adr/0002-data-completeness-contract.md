@@ -90,3 +90,32 @@ Code change → 3gpp-mcp:edge only (lenient guard); :latest untouched.
   guard pre-check would only save wasted compute.
 - Making the data actually converge (running the sparse campaign, ingesting ETSI
   B/C) is the data work these gates **certify** — separate from this CI change.
+
+## Amendment, 2026-09-09 — the contract asks about EXCESS too
+
+Every level now also carries **`--require-no-reingest`**, and it is at every level
+rather than under one because the question it asks does not depend on which
+optional layer is present.
+
+It exists because nothing asked it. Between 2026-08-26 and 2026-09-09 the ETSI
+half gained **566 clauses on every build** from a converted tree that never
+changed — the resume check read files as strict UTF-8 while the ingest read them
+with a windows-1252 fallback, so the two non-UTF-8 files of 11 822 were never
+recognised as already ingested and were written fifteen times. **Every gate in
+this ADR stayed green throughout**, including the work-list reconciliation added
+the same week: those all ask whether something is MISSING, and nothing was.
+
+A corpus can be wrong by holding too much. The new check reports any
+`(spec_id, release, version)` whose EVERY distinct clause row is stored more than
+once — a whole document written again, as opposed to a document that legitimately
+repeats a clause (the corpus holds 831 192 such repeats). Release is part of the
+identity: without it the predicate accused `30.531 v1.62.0` of nine copies, when
+it is legitimately catalogued under nine releases.
+
+**Both gates declare it**, per §1 of this ADR. That is not a formality: the
+image's own entrypoint runs the flag list this script emits, so a flag only
+`cmd/validate` understood would make `fs.Parse` fail inside the container on a
+corpus that is fine.
+
+Repair for a corpus that already carries copies: `cmd/repair-reingest` (dry run
+by default).

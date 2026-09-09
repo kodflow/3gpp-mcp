@@ -37,8 +37,12 @@ ambiguous: `list_specs` / `list_releases` to pin `(release, version)`.
 3. one reformulation from a different angle (synonym, the procedure name instead
    of the NF, the EN canonical term instead of the user's wording).
 Add the domain tools when they apply: `search_api` (5GC SBI/OpenAPI, TS 29.5xx),
-`li_events` (LI, TS 33.128), `get_changelog` (diff/évolution between releases),
+`li_events` (LI, TS 33.128), `trace_clause` (what a clause SAYS differently
+between two releases or versions — the reliable way to diff),
 `trace_evolution` (NE↔NF lineage, e.g. MME → AMF+SMF).
+`get_changelog` is a bonus, not a diff tool: its table covers 311 of 3 568 3GPP
+specs and nothing on the ETSI half, and it returns a `note` saying which of those
+two silences you hit.
 
 **C — Read, don't skim.** For the top 2–3 hits: `get_spec` the FULL clause (and
 its parent when the snippet looks truncated) — never quote from a search snippet
