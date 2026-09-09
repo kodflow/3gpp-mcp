@@ -519,6 +519,20 @@ func stepEnrich(t corpusTarget) *Step {
 		// That is the shape ingest-etsi paid ~1 h and 18.8 GiB to learn on
 		// 2026-09-06, in the opposite direction.
 		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		// A _test.go CANNOT CHANGE WHAT THIS STEP DOES. The four Go packages above
+		// are named as DIRECTORIES, so every test file in them counted toward this
+		// step's fingerprint — and this step runs binaries, it does not compile
+		// them. Measured on build E (2026-09-09): adding one test to
+		// internal/abbrev replayed enrich (1m05), then paragraphs, sparse (138.6 s)
+		// and index, on a commit whose PR body said "tests only, no production code
+		// changes"; the corpus it rewrote then had to be re-pushed.
+		//
+		// The flag and its reasoning already exist for the build steps
+		// (fingerprint.go, isTestArtefact). What was missing is that the same
+		// reasoning applies to a step that RUNS a binary, not only to one that
+		// links it. `test` is the only step that must count test files, and it
+		// deliberately does not set this.
+		ExcludeTests: true,
 		Inputs: func(c *Ctx) ([]string, error) {
 			// data/sources/asn joins the inputs for the same reason 5g-apis is
 			// already here: acquiring the LI registry must make the overlay dirty,
@@ -2194,13 +2208,19 @@ func ldflagsWith(dir string) string {
 // export here would work in every test and fail the moment a real client started it.
 func stepBuildServe() *Step {
 	return &Step{
-		Name:      "build-serve",
-		Version:   1,
-		Doc:       "build the semantic server (onnx + embed_ffi) and stage its DLLs",
-		Deps:      []string{"toolchain", "build-go"},
-		Impl:      []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
-		Toolchain: true,
-		Tool:      true,
+		Name:    "build-serve",
+		Version: 1,
+		Doc:     "build the semantic server (onnx + embed_ffi) and stage its DLLs",
+		Deps:    []string{"toolchain", "build-go"},
+		Impl:    []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
+		// It LINKS a binary, which is the case ExcludeTests was written for and the
+		// one build-go and build-rust already set. It names `internal` whole, so
+		// every test under it counted — and `go build` compiles none of them. The
+		// one-time replay this costs is 10.7 s (build E) and touches only
+		// 60-bin.tar; the corpus layers are not this step's to move.
+		ExcludeTests: true,
+		Toolchain:    true,
+		Tool:         true,
 		// A box with no ONNX Runtime still completes every other step; it just gets
 		// the lexical server. Failing the whole pipeline over the optional half of
 		// the search stack would be the wrong trade.
