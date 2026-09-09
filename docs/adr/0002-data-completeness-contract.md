@@ -113,9 +113,10 @@ identity: without it the predicate accused `30.531 v1.62.0` of nine copies, when
 it is legitimately catalogued under nine releases.
 
 **Both gates declare it**, per §1 of this ADR. That is not a formality: the
-image's own entrypoint runs the flag list this script emits, so a flag only
-`cmd/validate` understood would make `fs.Parse` fail inside the container on a
-corpus that is fine.
+Dockerfile's full-stage guard runs `mcp-3gpp check-data` over the flag list this
+script emits, so a flag only `cmd/validate` understood would make `fs.Parse` fail
+during the image build on a corpus that is fine. (The runtime
+`docker-entrypoint.sh` starts `serve`; it does not run this list.)
 
 Repair for a corpus that already carries copies: `cmd/repair-reingest` (dry run
 by default).

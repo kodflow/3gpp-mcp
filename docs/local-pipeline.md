@@ -76,6 +76,14 @@ that was genuinely missing is hole DETECTION, and it is now
 `validate --require-worklist`: work list = corpus + the absence register
 `fetch-etsi` writes, and anything left over fails the build.
 
+**One reservation, deliberate.** A hole fails the build only when the register is
+THERE. With no register the check reports `UNVERIFIED` — it names the holes and
+counts them, but passes — because a corpus built before the register existed
+cannot produce one retroactively, and failing there would block the supported
+path for something the operator cannot fix in that run. It is the same call
+`reportAnchorHoles` makes about the 56 known 3GPP anchor holes. Once `fetch-etsi`
+has run once, the register exists and the check is a real gate.
+
 | Step | Does | Cost |
 |---|---|---|
 | `toolchain` | records the compiler identity | instant |
