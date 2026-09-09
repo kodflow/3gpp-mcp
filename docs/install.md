@@ -162,6 +162,10 @@ With a locally built corpus, point at it directly and skip the cache — and set
 }
 ```
 
+Those are Windows paths. On Linux/macOS point both at the matching
+`libonnxruntime.so` / `.dylib`: the two **pins** still differ, only the file
+extension changes.
+
 **TWO BINDINGS, TWO RUNTIMES, AND THEY ARE NOT INTERCHANGEABLE.**
 `ORT_DYLIB_PATH` is the RUST crate's variable — `rust/embed-core`, the query
 embedder — pinned to the build it was compiled against. `ONNXRUNTIME_SHARED_LIBRARY_PATH`
@@ -177,8 +181,14 @@ are supported in this build. Current ORT Version is: 1.20.1
 … embedder=true reranker=false
 ```
 
-`server_info` is the only place that says so — ask it after wiring, before
-concluding the install is good.
+`server_info` is the only place that says so, and it names the cause:
+
+```json
+{"reranker": false,
+ "reranker_reason": "the ONNX runtime would not initialise: Platform-specific initialization failed: Error setting ORT API base: 2"}
+```
+
+Ask it after wiring, before concluding the install is good.
 
 `serve` auto-detects cached models after `bootstrap --semantic`; the flags are
 otherwise identical. To pin a baseline release, add `"--release", "Rel-19"`.
@@ -230,15 +240,17 @@ mcp-3gpp serve            # prints: serving MCP on stdio (db=…, fts=true, hnsw
 ```
 
 **The startup line is not the verification.** It says the server came up; it does
-not say every retrieval arm did. Ask the server:
+not say every retrieval arm did. Ask the server.
 
-```jsonc
-// through your MCP client, or piped into `serve` over stdio
-{"jsonrpc":"2.0","id":1,"method":"tools/call",
- "params":{"name":"server_info","arguments":{}}}
+`serve` speaks newline-delimited JSON-RPC on stdio, so each frame is ONE line and
+`initialize` comes first — a bare `tools/call` gets nothing:
+
+```sh
+printf '%s
+'   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1"}}}'   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"server_info","arguments":{}}}'   | mcp-3gpp serve --db data/3gpp.duckdb --etsi-db data/etsi.duckdb
 ```
 
-A healthy install answers:
+A **full semantic install carrying both corpora** answers:
 
 ```json
 {"lexical": true, "semantic": true, "sparse": true, "reranker": true,
@@ -247,9 +259,13 @@ A healthy install answers:
           "hnsw": true, "sparse": true}}
 ```
 
-Any `false` comes with a `reason` / `reranker_reason` / `sparse_reason` naming
-what to fix. The one that is easy to miss: `reranker: false` on a local wiring
-almost always means `ONNXRUNTIME_SHARED_LIBRARY_PATH` is unset — see §4.
+**Not every `false` is a fault**, and §5 says which build gives which. A lexical
+archive legitimately reports `semantic: false` and `reranker: false`; started
+without `--etsi-db`, `etsi.attached` is `false` by choice. What decides is the
+motive: every disabled capability carries a `reason` / `reranker_reason` /
+`sparse_reason`. The one that is easy to misread is a build that SHOULD do
+semantic reporting `reranker: false` with `Error setting ORT API base` — that is
+`ONNXRUNTIME_SHARED_LIBRARY_PATH` unset, see §4.
 
 ### Then: `help`
 
@@ -259,10 +275,19 @@ a session, and the right call whenever a number here looks stale.
 
 ### The one rule that shapes every answer
 
-Every answer carries an exact citation `{spec_id, release, version, clause, url}`.
-**If the server cannot cite, it does not answer** — it says what it does not
-hold instead. A `count` of 0 from `get_changelog` means "not recorded here", and
-the response says so in a `note`; it never means "this never changed".
+Every answer that returns specification CONTENT carries an exact citation
+`{spec_id, release, version, clause, url}` — `search_spec`, `get_spec`,
+`search_api`, `trace_clause`, `find_cross_references`, `resolve_term`,
+`li_events`, `trace_evolution`. **If the server cannot cite, it does not answer**
+— it says what it does not hold instead. `help`, `server_info`, `list_specs` and
+`list_releases` describe the server or its catalogue rather than the corpus, so
+they carry no citations and do not pretend to.
+
+A `count` of 0 from `get_changelog` means "not recorded here", never "this never
+changed". It carries a `note` saying which silence you hit — with one gap worth
+knowing: the ETSI explanation is only attached when an ETSI store is actually
+attached, so asking for an ETSI deliverable on a server started without
+`--etsi-db` gets the bare 0.
 
 For evolution questions, reach for `trace_clause` rather than `get_changelog`:
 it diffs the clause TEXT paragraph by paragraph, out of the corpus itself, so it
