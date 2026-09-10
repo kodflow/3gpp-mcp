@@ -49,6 +49,38 @@ func LoadBaseline(path string) (Baseline, error) {
 	if err := json.Unmarshal(b, &bl); err != nil {
 		return nil, err
 	}
+	// AN ABSENT METRIC IS NOT A ZERO BAR, THOUGH JSON DECODES IT AS ONE.
+	//
+	// Metrics is a struct of float64s, so `{"lexical":{}}` unmarshals into an entry
+	// whose every tracked metric is 0 — and a baseline of zeros is a bar no ranking
+	// can fall below. Judge already refused a system with no entry at all; an entry
+	// with no numbers in it was the same hole one level down, found by review of
+	// #324. So every tracked metric must be PRESENT and a number. An explicit 0 is
+	// kept, and must be: success@1 is legitimately 0 on the committed baseline.
+	// `null` is refused for the same reason an absent key is — it decodes to 0.
+	var raw map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("baseline %s: each system must map to an object of metrics: %w", path, err)
+	}
+	var incomplete []string
+	for sys, fields := range raw {
+		var missing []string
+		for _, tm := range Tracked {
+			v, ok := fields[tm.Name]
+			if !ok || strings.TrimSpace(string(v)) == "null" {
+				missing = append(missing, tm.Name)
+			}
+		}
+		if len(missing) > 0 {
+			incomplete = append(incomplete, fmt.Sprintf("%s (no %s)", sys, strings.Join(missing, ", ")))
+		}
+	}
+	if len(incomplete) > 0 {
+		sort.Strings(incomplete)
+		return nil, fmt.Errorf("baseline %s is incomplete: %s — a missing metric decodes as 0, a bar "+
+			"nothing can fall below, so the gate would pass on any ranking",
+			path, strings.Join(incomplete, "; "))
+	}
 	return bl, nil
 }
 

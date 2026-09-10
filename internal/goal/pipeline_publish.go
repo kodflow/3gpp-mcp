@@ -140,6 +140,26 @@ func stepPublish() *Step {
 			"scripts/local/imgtar",
 			"scripts/local/zigcc",
 			"docker-entrypoint.sh",
+			// EVERY SCRIPT build-image.sh READS, NOT THE TWO THAT WERE REMEMBERED.
+			//
+			// Review of #324 found the pin table missing: build-image.sh now reads
+			// the ORT sha256 out of fetch-model.sh, so correcting a checksum without
+			// changing the version moved nothing here and a published image kept
+			// the runtime the old pin let through. Checking the rest of the script
+			// found four more it reads and this step did not declare: the contract
+			// it gates the corpus with, the loader check, the toolchain fetch that
+			// decides which libstdc++ the binary links, and the environment it
+			// builds under. TestPublishDeclaresEveryScriptTheImageBuildReads holds
+			// the list to the script instead of to this comment.
+			"scripts/fetch-model.sh",
+			"scripts/data-contract.sh",
+			"scripts/local/elfneeded",
+			"scripts/local/fetch-linux-toolchain.sh",
+			"scripts/local/toolchain-env.sh",
+			// The image's server binary is compiled INSIDE this step, by zig, from
+			// the module graph — so a dependency bump (DuckDB above all) changes
+			// what ships without touching a line of the packages named below.
+			"go.mod", "go.sum",
 		}, serverImplPackages()...),
 		// The shipped binary is `go build`, which does not compile _test.go. Editing
 		// a server test must not re-push an image, for the same reason it must not

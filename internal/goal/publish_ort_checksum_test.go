@@ -46,12 +46,22 @@ func TestImageVerifiesTheORTItBakes(t *testing.T) {
 		t.Fatalf("build-image.sh has no line that %s (pattern %q)", what, re)
 		return -1
 	}
+	// THE VERSION IS VALIDATED BEFORE IT REACHES A sed PROGRAM. ORT_VERSION is an
+	// operator override and the pin lookup interpolates it into a sed script, so an
+	// unchecked value like `x//;e id;#` runs `id` on the build host (GNU sed's `e`)
+	// before any pin check can refuse it. Found by review of #324.
+	validated := find("rejects an ORT_VERSION that is not a dotted number",
+		regexp.MustCompile(`^\s*''\|\*\[!0-9\.\]\*.*die "ORT_VERSION=`))
 	download := find("downloads the ORT tarball", regexp.MustCompile(`curl .*-o "\$STAGE/ort\.tgz"`))
 	pinRead := find("reads the ORT pin from fetch-model.sh", regexp.MustCompile(`ORT_SHA=.*scripts/fetch-model\.sh`))
 	hash := find("hashes the downloaded tarball", regexp.MustCompile(`sha256sum "\$STAGE/ort\.tgz"`))
 	compare := find("compares it to the pin and dies otherwise", regexp.MustCompile(`\[ "\$ORT_GOT" = "\$ORT_SHA" \]`))
 	unpack := find("unpacks the tarball into the image", regexp.MustCompile(`untar --in "\$STAGE/ort\.tgz"`))
 
+	if validated > pinRead {
+		t.Errorf("build-image.sh validates ORT_VERSION at line %d, after the sed pin lookup at "+
+			"line %d interpolates it — the injection is already possible", validated+1, pinRead+1)
+	}
 	if !(pinRead < download && download < hash && hash < compare && compare < unpack) {
 		t.Errorf("build-image.sh must read the pin, download, hash, compare and only then unpack; "+
 			"got pin=%d download=%d hash=%d compare=%d unpack=%d (0-based lines)",

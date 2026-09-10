@@ -1197,6 +1197,12 @@ func stepSmoke() *Step {
 			// code it cannot run.
 			"cmd/bench", "internal/eval", "internal/store", "internal/model",
 			retrievalQuerySet, retrievalBaseline,
+			// THE MODULE GRAPH, because build-go is a Tool dep and a dirty Tool dep
+			// deliberately invalidates no consumer. A DuckDB bump in go.mod rebuilds
+			// server.exe and bench.exe with a different engine — a different ranking
+			// — and without these two lines this step kept the verdict the old
+			// engine earned. Found by review of #324.
+			"go.mod", "go.sum",
 		},
 		// The step RUNS binaries; a _test.go cannot change what either of them does.
 		// It counted them until now, recorded in countsTestFiles as cheap to replay
