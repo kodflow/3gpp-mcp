@@ -326,17 +326,15 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (SpecReport, [
 	// only visible effect was that a 23 GB corpus moved, so its image layer got a
 	// new digest and the whole thing was pushed again.
 	//
-	// So the tie is broken HERE, on stored identity, and the choice is deliberately
-	// arbitrary: among rows the corpus says are the same clause of the same spec at
-	// the same version, there is no principled "better text" to prefer, and
-	// inventing one would be a claim about the data rather than a property of it.
-	// What matters is that the same corpus yields the same answer twice.
+	// So the tie is broken HERE, by what each candidate YIELDS — see the paragraph
+	// below for the rule and the two measured cases that chose it.
 	//
 	// It is fixed HERE rather than in GetClauses' ORDER BY because `enrich` declares
 	// internal/glossaryseed and does NOT declare internal/store: a fix in the store
 	// would change what enrich produces without enrich replaying, which is the same
 	// provenance hole #322 closed when it found enrich declaring four Rust binaries
 	// and none of their manifests.
+	//
 	// WHAT IS COMPARED IS WHAT EACH CANDIDATE YIELDS, not where it sits.
 	//
 	// Ranking tied clauses by chunk id alone is deterministic and demonstrably
