@@ -1133,14 +1133,49 @@ func hasFlag(args []string, name string) bool {
 
 func stepSmoke() *Step {
 	return &Step{
-		Name:    "smoke",
-		Version: 2,
-		Doc:     "start the real server over stdio and prove vector search stays enabled",
+		Name: "smoke",
+		// 3: the smoke now FAILS a tool that answers isError, an empty answer to a
+		// probe that must find something, and a probe the server does not expose —
+		// all judged in internal/goal, which smoke's fingerprint does not cover, so
+		// only the version can say the step's meaning moved.
+		Version: 3,
+		Doc:     "start the real server over stdio, prove every probe answers, and hold retrieval to the committed baseline",
 		// BOTH GATES, because there are two now. Naming only "validate" would let
 		// the smoke -- and `publish` behind it -- run while the ETSI contract had
 		// not been applied, which is the state this whole split ends.
-		Deps: []string{"validate", "validate-etsi"},
-		Impl: []string{"cmd/server", "internal/mcp", "internal/search"},
+		//
+		// build-go is an AVAILABILITY constraint, the one index and compact already
+		// declare: this step launches server.exe and bench.exe, and `--only smoke`
+		// force-builds a step's Tool deps and nothing else. Without it that command
+		// judged the corpus with yesterday's bench — the "a fix that was not built
+		// is inert" trap, reached through the gate. A Tool dep adds nothing to the
+		// fingerprint, so declaring it replays nothing.
+		Deps: []string{"validate", "validate-etsi", "build-go"},
+		Impl: []string{
+			"cmd/server", "internal/mcp", "internal/search",
+			// THE RETRIEVAL GATE'S DETERMINANTS (see smoke_gate.go). The instrument,
+			// the verdict, the lexical ranking it measures (Store.SearchClauses) and
+			// the shape a hit is read from; then the judged queries and the bar. bench
+			// also links internal/embed and internal/rerank, which -systems lexical
+			// never reaches, so they are left out rather than replaying the gate for
+			// code it cannot run.
+			"cmd/bench", "internal/eval", "internal/store", "internal/model",
+			retrievalQuerySet, retrievalBaseline,
+		},
+		// The step RUNS binaries; a _test.go cannot change what either of them does.
+		// It counted them until now, recorded in countsTestFiles as cheap to replay
+		// at 23.9 s — which understated it: smoke has no outputs, so every replay
+		// hands publish a new provenance and re-composes the image. Naming
+		// internal/store, whose 43 test files are more than any other package
+		// holds, would have made every store test edit do that. This change replays
+		// smoke once anyway, so switching now costs nothing extra.
+		ExcludeTests: true,
+		Extra: func(c *Ctx) (map[string]string, error) {
+			return map[string]string{
+				"retrieval_systems": retrievalSystems,
+				"retrieval_tol":     retrievalTol,
+			}, nil
+		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			in := []string{c.dataPath("3gpp.duckdb")}
 			// The ETSI corpus is served ALONGSIDE, so a change to it changes what
@@ -1151,7 +1186,31 @@ func stepSmoke() *Step {
 			}
 			return in, nil
 		},
-		Run: func(c *Ctx) error { return runSmoke(c) },
+		Run: func(c *Ctx) error {
+			if err := runSmoke(c); err != nil {
+				return err
+			}
+			if err := runRetrievalGate(c); err != nil {
+				return err
+			}
+			// THIS is the moment compact's own instruction points at: "once served
+			// and verified, remove <db>.pre-compact". Until now nothing did, and the
+			// consequence was not merely wasted disk — compact REFUSES to overwrite
+			// an existing .pre-compact, so the backup left by one build blocked the
+			// next one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB,
+			// 3 169 614 clauses) and then failed on the in-place swap because of a
+			// backup from the 2nd. A step that cannot run twice without someone
+			// deleting a file by hand is a step the pipeline cannot converge through.
+			//
+			// Removing it HERE, and nowhere earlier, is the point: the smoke has just
+			// started the shipped binary against this corpus and had it answer, and
+			// the retrieval gate has just held its ranking to the committed bar.
+			// Before both, the backup is the only way back — and a compaction that
+			// lost rows would show up in the second before it showed up anywhere
+			// else, so the release waits for it.
+			releasePreCompact(c)
+			return nil
+		},
 	}
 }
 
@@ -1254,18 +1313,18 @@ func runSmoke(c *Ctx) error {
 		return fmt.Errorf("the server exposes no tool")
 	}
 
-	// One representative call per retrieval path that the corpus can actually
-	// answer today, so the smoke exercises the real search code, not a stub.
-	queries := []struct{ tool, arg, val string }{
-		{"search_spec", "query", "AMF registration procedure"},
-		{"list_specs", "series", "23"},
-		{"resolve_term", "term", "AMF"},
+	// Every probe must be offered before any is made: an absent tool used to be
+	// skipped, and a skipped probe passes. See missingProbes.
+	if missing := missingProbes(names); len(missing) > 0 {
+		return fmt.Errorf("the server does not expose %s — the smoke cannot probe what is not there, and "+
+			"all of them are registered unconditionally by internal/mcp", strings.Join(missing, ", "))
 	}
+
+	// The probes and the verdict on each answer live in smoke_gate.go:
+	// judgeToolAnswer refuses an isError result and an empty one, which the
+	// `m["error"]` check this replaces let through as "answered".
 	id := 3
-	for _, q := range queries {
-		if !contains(names, q.tool) {
-			continue
-		}
+	for _, q := range smokeProbes {
 		if err := send(map[string]any{
 			"jsonrpc": "2.0", "id": id, "method": "tools/call",
 			"params": map[string]any{"name": q.tool, "arguments": map[string]any{q.arg: q.val}},
@@ -1276,10 +1335,11 @@ func runSmoke(c *Ctx) error {
 		if err != nil {
 			return fmt.Errorf("%s failed: %w", q.tool, err)
 		}
-		if _, bad := m["error"]; bad {
-			return fmt.Errorf("%s returned an error: %v", q.tool, m["error"])
+		_, count, err := judgeToolAnswer(q.tool, m, true)
+		if err != nil {
+			return err
 		}
-		c.Log.Printf("%s(%s=%q) answered", q.tool, q.arg, q.val)
+		c.Log.Printf("%s(%s=%q) answered with %d result(s)", q.tool, q.arg, q.val, count)
 		id++
 	}
 
@@ -1302,37 +1362,41 @@ func runSmoke(c *Ctx) error {
 	// correct corpus for want of an env var is worse than no gate — it teaches the
 	// operator to skip it. `.local/resume/prove.sh` drives server-full.exe with
 	// that environment set and asserts `semantic` there.
-	if contains(names, "server_info") {
-		if err := send(map[string]any{
-			"jsonrpc": "2.0", "id": id, "method": "tools/call",
-			"params": map[string]any{"name": "server_info", "arguments": map[string]any{}},
-		}); err != nil {
-			return err
-		}
-		info, err := readOne()
-		if err != nil {
-			return fmt.Errorf("server_info failed: %w", err)
-		}
-		// server_info nests the payload as a JSON STRING inside an MCP content
-		// block, so the keys arrive with their quotes: `"fts":true`, not `fts:true`.
-		body := strings.ReplaceAll(fmt.Sprintf("%v", info), " ", "")
-		// AND COUNT THEM. The ETSI half reports its own `"fts"`/`"hnsw"` in the same
-		// payload, so a bare Contains would be satisfied by either half alone — a
-		// 3GPP corpus serving without its index would pass on the strength of the
-		// ETSI one. When both halves are attached, both must say true.
-		wantEach := 1
-		if etsiAttached {
-			wantEach = 2
-		}
-		for _, arm := range []string{`"fts":true`, `"hnsw":true`} {
-			if n := strings.Count(body, arm); n < wantEach {
-				return fmt.Errorf("server_info reports %s %d time(s), want %d (halves attached: %d) — "+
-					"a corpus carries the index and the server will not use it:\n%s",
-					arm, n, wantEach, wantEach, tailString(body, 4))
-			}
-		}
-		c.Log.Printf("server_info: fts and hnsw live on %d served corpus half/halves", wantEach)
+	if err := send(map[string]any{
+		"jsonrpc": "2.0", "id": id, "method": "tools/call",
+		"params": map[string]any{"name": "server_info", "arguments": map[string]any{}},
+	}); err != nil {
+		return err
 	}
+	info, err := readOne()
+	if err != nil {
+		return fmt.Errorf("server_info failed: %w", err)
+	}
+	// A server_info that FAILED would otherwise be reported below as `"fts":true
+	// 0 time(s)` — a true statement about the wrong thing. Say what the tool
+	// said. It carries no count, so nothing more is asked of it here.
+	if _, _, err := judgeToolAnswer("server_info", info, false); err != nil {
+		return err
+	}
+	// server_info nests the payload as a JSON STRING inside an MCP content
+	// block, so the keys arrive with their quotes: `"fts":true`, not `fts:true`.
+	body := strings.ReplaceAll(fmt.Sprintf("%v", info), " ", "")
+	// AND COUNT THEM. The ETSI half reports its own `"fts"`/`"hnsw"` in the same
+	// payload, so a bare Contains would be satisfied by either half alone — a
+	// 3GPP corpus serving without its index would pass on the strength of the
+	// ETSI one. When both halves are attached, both must say true.
+	wantEach := 1
+	if etsiAttached {
+		wantEach = 2
+	}
+	for _, arm := range []string{`"fts":true`, `"hnsw":true`} {
+		if n := strings.Count(body, arm); n < wantEach {
+			return fmt.Errorf("server_info reports %s %d time(s), want %d (halves attached: %d) — "+
+				"a corpus carries the index and the server will not use it:\n%s",
+				arm, n, wantEach, wantEach, tailString(body, 4))
+		}
+	}
+	c.Log.Printf("server_info: fts and hnsw live on %d served corpus half/halves", wantEach)
 
 	// THE assertion. The guard prints this exact prefix when it disables vector
 	// search, and a corpus with vectors that is served lexically is a failed goal.
@@ -1348,20 +1412,9 @@ func runSmoke(c *Ctx) error {
 	}
 	c.Checkpoint("tools", strconv.Itoa(len(names)))
 	c.Log.Printf("the server did not disable vector search at startup (see prove.sh for the semantic proof)")
-
-	// THIS is the moment compact's own instruction points at: "once served and
-	// verified, remove <db>.pre-compact". Until now nothing did, and the
-	// consequence was not merely wasted disk — compact REFUSES to overwrite an
-	// existing .pre-compact, so the backup left by one build blocked the next
-	// one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB, 3 169 614
-	// clauses) and then failed on the in-place swap because of a backup from the
-	// 2nd. A step that cannot run twice without someone deleting a file by hand is
-	// a step the pipeline cannot converge through.
-	//
-	// Removing it HERE, and nowhere earlier, is the point: the smoke has just
-	// started the shipped binary against this corpus and had it answer. Before
-	// that the backup is the only way back.
-	releasePreCompact(c)
+	// The pre-compact backups are released by the step, AFTER the retrieval gate:
+	// see stepSmoke. The server is killed when this returns, so bench never
+	// shares the corpus with it.
 	return nil
 }
 

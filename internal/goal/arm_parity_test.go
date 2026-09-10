@@ -19,7 +19,7 @@ var armShared = map[string]string{
 	"build-serve":     "builds the binaries both arms run",
 	"test":            "runs the suite, not a corpus",
 	"merge":           "folds the 3GPP shards; the ETSI ingest writes one database directly",
-	"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither",
+	"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither. Its retrieval gate is 3GPP-ONLY: every judged query is TS 33.128, and the ETSI half has no judged set, so its ranking is guarded by nothing (smoke_gate.go)",
 	"publish":         "pushes ONE image carrying both corpora",
 	"seed-etsi":       "twin of seed",
 	"discover-etsi":   "twin of discover",
