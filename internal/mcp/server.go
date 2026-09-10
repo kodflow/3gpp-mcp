@@ -576,39 +576,45 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 // changelogNote applies to the 3GPP half the standard the ETSI half was already
 // held to one branch above: say what the number means.
 //
-// TWO DIFFERENT SILENCES USED TO LOOK THE SAME HERE, and one of them was not
-// silence at all — it was a wrong answer. Measured on the published corpus
-// (2026-09-09), over 3 568 specs:
+// THE TABLE HAD NO WRITER, AND NOW IT HAS ONE. Measured on the corpus published
+// 2026-09-09, over 3 568 specs: 3 352 records named no CR and no version
+// transition — the HEADER row of the change-history table, read positionally like
+// a body row, 3 026 of them summarised "Date" — and dropping those left 311 specs
+// with any change history at all. The writer had been deleted with the Go
+// HTML-ingest write side (Phase 11b, c635038) and never reimplemented in Rust.
+// `ingest-crs` now rewrites the table from the 3GPP Change Request database, the
+// authority the printed change-history tables are rendered from.
 //
-//   - 3 352 records name no CR and no version transition. They are the HEADER row
-//     of the change-history table, read positionally like a body row: 3 026 of
-//     them are summarised "Date", the rest "TSG SA#" or "SMG No.". They are now
-//     dropped in store.GetChangelog (model.Change.Citable), so get_changelog no
-//     longer answers TS 23.501 with count 1 and summary "Date".
-//   - dropping them leaves 311 specs with any change history at all. The other
-//     3 257 answer 0 — and a bare 0 reads as "this spec never changed", which is
-//     false of every one of them.
-//   - the table is a FOSSIL. Its writer was deleted when the Go HTML-ingest
-//     write-side moved to Rust (Phase 11b, commit c635038) and the Rust ingest
-//     never reimplemented the change-history parser. 3 326 of the 3 452 specs
-//     that have records hold a published version NEWER than their newest recorded
-//     change.
+// WHAT STILL HAS TO BE SAID, because it is a different silence rather than none:
 //
-// So the note distinguishes "no records" from "records that stop here", and in
-// both cases names trace_clause — which answers the same question from the clause
-// text and is not fossilised — exactly as the ETSI branch does.
+//   - The CR database records CHANGE REQUESTS. An MCC editorial republication
+//     carries no CR and is not in it, so a spec can have moved version without
+//     gaining a record here.
+//   - It is a periodic export. Anything approved after the export the corpus was
+//     built from is absent rather than empty, and `changes_source` names which
+//     export that was so the two can be told apart.
+//
+// Both branches name trace_clause, which answers the same question from the clause
+// text rather than from this table, exactly as the ETSI branch does.
 func changelogNote(ctx context.Context, st store.Reader, specID string, changes []model.Change) string {
 	const useTraceClause = "Use trace_clause with from_release/to_release to diff a clause between two " +
 		"versions from the text itself, which is derived from the corpus rather than from this table."
+	// NO CORPUS COUNTS IN THE SERVED TEXT. An earlier draft carried "covers 311 of
+	// the 3 568 specs": true of the snapshot it was measured on and silently false
+	// of every later one, which is the failure mode of a note whose whole job is to
+	// stop a number from being read as more than it is. The export STAMP is not a
+	// count — it is read from the corpus being served, so it cannot go stale
+	// against it.
+	source := strings.TrimSpace(st.GetMeta(ctx, "changes_source"))
+	from := " from the 3GPP change-request database"
+	if source != "" {
+		from += " (" + source + ")"
+	}
 	if len(changes) == 0 {
-		// NO CORPUS COUNTS IN THE SERVED TEXT. An earlier draft carried "covers 311
-		// of the 3 568 specs": true of the snapshot it was measured on and silently
-		// false of every later one, which is the failure mode of a note whose whole
-		// job is to stop a number from being read as more than it is.
-		return "this corpus holds no citable change-request records for " + specID + ". The " +
-			"change-request table has had no writer since the ingest write-side moved to Rust, so it " +
-			"covers a minority of the specs indexed here and stops at whatever each one held then. A " +
-			"count of 0 means \"not recorded here\", not \"never changed\". " + useTraceClause
+		return "this corpus holds no citable change-request records for " + specID +
+			". The table is built" + from + ", which records change requests — not " +
+			"editorial republications, and not anything approved after that export. A count of 0 " +
+			"means \"no change request recorded here\", not \"never changed\". " + useTraceClause
 	}
 	// GetChangelog orders by to_version ASC through versionOrderSQL, so the newest
 	// recorded transition is the last row that names one. Scanning backwards uses
@@ -629,8 +635,9 @@ func changelogNote(ctx context.Context, st store.Reader, specID string, changes 
 		return ""
 	}
 	return "this change history stops at " + newest + ", and the corpus holds " + latest +
-		". The change-request table has had no writer since the ingest write-side moved to Rust, so " +
-		"anything after " + newest + " is absent rather than empty. " + useTraceClause
+		". The table is built" + from + ", so anything approved after that export — or " +
+		"republished editorially, which raises no change request — is absent rather than empty. " +
+		useTraceClause
 }
 
 // isETSISpecID is storeFor's routing predicate, named so a caller can ask the

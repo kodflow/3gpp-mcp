@@ -518,7 +518,26 @@ func stepEnrich(t corpusTarget) *Step {
 		// overlay, and paragraphs, sparse, compact, index and publish behind it.
 		// That is the shape ingest-etsi paid ~1 h and 18.8 GiB to learn on
 		// 2026-09-06, in the opposite direction.
-		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		// rust/store/src/changes.rs is named HERE and nowhere else, which is the
+		// whole reason it is a file of its own. The changelog writer links the
+		// store library, and `merge` declares rust/store/src/lib.rs — so leaving
+		// replace_changes in lib.rs would have made every edit to the changelog
+		// replay merge (34m15), then paragraphs (20m32), compact (19m22) and index
+		// (8m06), and re-push 42 GB, to rewrite a table none of them read. Split
+		// out, an edit to the changelog costs one replay of this step. See
+		// changes.rs for why the narrow declaration is correct rather than merely
+		// cheap, and TestEnrichDeclaresTheChangelogWriter for what holds it there.
+		//
+		// THE MANIFESTS AND THE LOCKFILE ARE PART OF THE IMPLEMENTATION, and their
+		// absence here was a gap the ETSI arm did not have — stepEnrichETSI has
+		// declared them since it was written. This step runs four Rust binaries and
+		// declared only their sources: `cargo update` alone, or a feature change in
+		// a manifest, produces a different binary from identical sources, and
+		// `build-rust` is a Step.Tool that never replays a data step. The corpus
+		// would then carry a catalogue, an API surface, an LI registry and a
+		// changelog written by a binary that no longer exists, with nothing to show
+		// it. rust/parse's manifest is already covered by the directory below.
+		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/ingest/src/bin/ingest_crs.rs", "rust/ingest/Cargo.toml", "rust/store/src/changes.rs", "rust/store/src/lib.rs", "rust/store/Cargo.toml", "rust/Cargo.toml", "rust/Cargo.lock", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "scripts/fetch-crdb.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		// A _test.go CANNOT CHANGE WHAT THIS STEP DOES. The four Go packages above
 		// are named as DIRECTORIES, so every test file in them counted toward this
 		// step's fingerprint — and this step runs binaries, it does not compile
@@ -548,7 +567,7 @@ func stepEnrich(t corpusTarget) *Step {
 			// itself, that one moved on every single run. So this step was
 			// simultaneously blind to what it watched and dirty for what it did not.
 			in := []string{c.statePath("status-report.htm")}
-			for _, d := range []string{"5g-apis", "asn"} {
+			for _, d := range []string{"5g-apis", "asn", "crdb"} {
 				files, err := filesUnder(c.dataPath("sources", d))
 				if err != nil {
 					return nil, err
@@ -585,6 +604,36 @@ func stepEnrich(t corpusTarget) *Step {
 			c.Log.Printf("catalogue overlay (doc_type, working_group, freeze_date)")
 			if err := c.Run(Cmd{Name: c.rbin("ingest-catalog"), Args: args, Echo: true}); err != nil {
 				return err
+			}
+
+			// THE CHANGELOG. `changes` had no writer between Phase 11b (c635038),
+			// which deleted the Go HTML-ingest write side, and this step: the
+			// table sat as a fossil of 61 321 rows over 3 452 specs, only 311 of
+			// them citable and 3 026 of them the literal string "Date" — the
+			// change-history table's column header, read positionally as a body
+			// row. PR #311 stopped get_changelog serving that header; it could
+			// not give the table a source.
+			//
+			// The source is the CR database, not the change-history table printed
+			// in each spec. The printed table is a RENDERING of that database, and
+			// parsing the documents would cover only the third of the archive that
+			// happens to be on disk after a delta fetch — 1 038 specs of 3 568 on
+			// this machine — and in fact none of it, because ingest --resume skips
+			// a (spec, version) the corpus already holds whatever the parser
+			// version says. See parse3gpp::crdb.
+			if crdb := findCRDB(c); crdb == "" || refreshOverlays() {
+				c.Log.Printf("no 3GPP CR database — acquiring it (scripts/fetch-crdb.sh)")
+				if err := c.Run(Cmd{Name: "bash", Args: []string{"scripts/fetch-crdb.sh"}, Echo: true}); err != nil {
+					c.Log.Printf("the CR database fetch failed (%v) — continuing with what is on disk", err)
+				}
+			}
+			if crdb := findCRDB(c); crdb != "" {
+				c.Log.Printf("change-request overlay from %s", filepath.Base(crdb))
+				if err := c.Run(Cmd{Name: c.rbin("ingest-crs"), Args: []string{"--db", db, "--crdb", crdb}, Echo: true}); err != nil {
+					return err
+				}
+			} else {
+				c.Log.Printf("no CRDB_*.zip and none could be fetched — get_changelog keeps whatever it holds")
 			}
 
 			// The two external overlays acquire themselves when absent.
@@ -800,6 +849,22 @@ func findASN(c *Ctx) string {
 		})
 	}
 	return best
+}
+
+// findCRDB returns the newest CR-database export on disk, or "".
+//
+// Newest by NAME, because the name IS the export date (CRDB_20260715.zip) and 3GPP
+// republishes under a new one rather than overwriting. Sorting by mtime instead
+// would rank a re-downloaded old export above a newer one, which is exactly what
+// happens when a fetch is retried — and the changelog would then quietly regress to
+// an earlier state of the database with nothing to show for it.
+func findCRDB(c *Ctx) string {
+	matches, err := filepath.Glob(filepath.Join(c.dataPath("sources", "crdb"), "CRDB_*.zip"))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	return matches[len(matches)-1]
 }
 
 // releaseNumber pulls NN out of a "Rel-NN" path element, or -1 when there is none.
