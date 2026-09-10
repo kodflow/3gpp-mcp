@@ -25,6 +25,7 @@
 
 use super::*;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 /// A change-request row for the CR-database overlay (== Go model.Change, minus
 /// `clauses`).
@@ -45,10 +46,77 @@ pub struct ChangeRow {
     pub tdoc: String,
 }
 
+/// put length-prefixes one field into the digest.
+///
+/// A SEPARATOR WOULD HAVE TO BE A BYTE THE DATA CANNOT CONTAIN, and CR summaries
+/// are free text out of a spreadsheet — there is no such byte. Length prefixes make
+/// ("ab","c") and ("a","bc") different by construction instead of by hope.
+fn put(h: &mut Sha256, b: &[u8]) {
+    h.update((b.len() as u64).to_le_bytes());
+    h.update(b);
+}
+
+/// changes_digest names the OUTPUT of a run: the exact rows that would be written,
+/// in order, under the export they came from.
+///
+/// KEYED ON THE OUTPUT, NOT THE INPUT, which is the whole point of it existing.
+/// Keying on the export name — "have I already loaded CRDB_20260715?" — is cheaper
+/// and wrong: a fix to `rust/parse/src/crdb.rs` makes different rows out of the same
+/// zip, and a run that skipped on the name would leave the corpus holding what the
+/// OLD parser made of it while `changes_source` insisted it was current. That is the
+/// mistake `ingest-li` (#286) and `ingest-etsi` (#316) each paid for separately.
+///
+/// The scheme tag is part of the hash so that changing WHAT is hashed cannot collide
+/// with a digest written by the previous scheme.
+fn changes_digest(rows: &[&ChangeRow], source: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"changes-v1");
+    put(&mut h, source.as_bytes());
+    h.update((rows.len() as u64).to_le_bytes());
+    for r in rows {
+        put(&mut h, r.spec_id.as_bytes());
+        put(&mut h, r.cr_number.as_bytes());
+        // Some(0) and None are different facts about a CR and must not hash alike.
+        match r.cr_revision {
+            Some(v) => {
+                h.update([1u8]);
+                h.update(v.to_le_bytes());
+            }
+            None => h.update([0u8]),
+        }
+        put(&mut h, r.summary.as_bytes());
+        put(&mut h, r.meeting.as_bytes());
+        put(&mut h, r.category.as_bytes());
+        put(&mut h, r.from_version.as_bytes());
+        put(&mut h, r.to_version.as_bytes());
+        put(&mut h, r.tdoc.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
 impl Store {
     /// replace_changes rewrites the whole `changes` table from the CR database and
-    /// answers (written, skipped) — skipped being rows for specs this corpus does
-    /// not hold.
+    /// answers `(written, skipped, changed)` — skipped being rows for specs this
+    /// corpus does not hold.
+    ///
+    /// A TUPLE AND NOT A STRUCT, deliberately. A named type would have to be reached
+    /// through `lib.rs`, and `mod changes` is private precisely so that `merge` —
+    /// which declares `lib.rs` in full — is not dragged into every edit of this
+    /// file. Naming the outcome would have cost 34m15 of merge plus a 42 GB re-push
+    /// to make one return value prettier. `changed` is last and is the only
+    /// non-`usize`, so the two counts cannot be silently swapped with it.
+    ///
+    /// WHAT `changed` BUYS, and why "the table is idempotent" was not enough. The
+    /// table always was: run the overlay twice and it holds the same rows, which is
+    /// what the paragraph below means. The FILE was not. A DELETE of 256 471 rows
+    /// followed by an INSERT of the same 256 471 rows leaves DuckDB blocks that are
+    /// not the blocks it started with; the corpus is ONE image layer per half and
+    /// layers are addressed by content, so an overlay that changed nothing still
+    /// bought a full re-push of the 3GPP corpus. Measured 2026-09-10: `enrich`
+    /// replayed because `discover` refreshed `status-report.htm` — a live page whose
+    /// bytes move on their own — `ingest-catalog` reported `0 spec(s) overlaid`, and
+    /// the corpus still moved. `changed` is how `ingest-crs` can say "corpus
+    /// untouched" and mean the file, not just the rows.
     ///
     /// REPLACE, NOT APPEND. The CR database is the complete authority for 3GPP
     /// change requests, so whatever is already in the table is a previous
@@ -75,7 +143,11 @@ impl Store {
     /// matters: a DELETE that committed without its INSERT would leave the corpus
     /// with no changelog at all, which is strictly worse than the fossil it
     /// replaces.
-    pub fn replace_changes(&self, rows: &[ChangeRow], source: &str) -> Result<(usize, usize)> {
+    pub fn replace_changes(
+        &self,
+        rows: &[ChangeRow],
+        source: &str,
+    ) -> Result<(usize, usize, bool)> {
         // A DISCARDED SCAN ERROR IS A SHORTER SPEC LIST, AND A SHORTER SPEC LIST IS
         // SILENTLY FEWER CHANGES.
         //
@@ -95,12 +167,37 @@ impl Store {
             set
         };
 
+        // The filter that used to live inside the insert loop, hoisted so the digest
+        // can be taken over exactly the rows that will be written and nothing else.
+        let keep: Vec<&ChangeRow> = rows.iter().filter(|r| held.contains(&r.spec_id)).collect();
+        let skipped = rows.len() - keep.len();
+        let written = keep.len();
+        let digest = changes_digest(&keep, source);
+
+        // THE GUARD ASKS THE CORPUS, NOT ONLY THE LEDGER.
+        //
+        // A recorded digest on its own is a CLAIM: it says what some earlier run
+        // meant to leave behind, not what is there now. `changes` could have been
+        // emptied by a restore, a hand-run repair, or a build that died between the
+        // two. Counting the rows is the cheap half of the answer that cannot be
+        // asserted, so both halves must agree before a rewrite is skipped — the same
+        // reason `TestNoArmExceptionOutlivesItsStep` reads the exception map instead
+        // of trusting it.
+        let held_digest = self.get_meta("changes_digest")?;
+        if held_digest == digest {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT count(*) FROM changes", [], |r| r.get(0))
+                .context("count the changelog the digest claims to describe")?;
+            if n as usize == written {
+                return Ok((written, skipped, false));
+            }
+        }
+
         self.conn
             .execute_batch("BEGIN; DELETE FROM changes;")
             .context("replace_changes: clear")?;
 
-        let mut written = 0usize;
-        let mut skipped = 0usize;
         let res = (|| -> Result<()> {
             // `clauses` is left out of the column list so it defaults to NULL — see
             // ChangeRow for why the CR database cannot fill it.
@@ -110,11 +207,7 @@ impl Store {
                     meeting, category, summary, tdoc_url)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
-            for r in rows {
-                if !held.contains(&r.spec_id) {
-                    skipped += 1;
-                    continue;
-                }
+            for r in &keep {
                 st.execute(duckdb::params![
                     r.cr_number,
                     r.cr_revision,
@@ -127,7 +220,6 @@ impl Store {
                     r.tdoc,
                 ])
                 .with_context(|| format!("insert change {} {}", r.spec_id, r.cr_number))?;
-                written += 1;
             }
             // THE STAMP RIDES WITH THE DATA IT DESCRIBES.
             //
@@ -142,6 +234,18 @@ impl Store {
                     duckdb::params![source],
                 )
                 .context("stamp changes_source")?;
+            // THE DIGEST RIDES WITH THE DATA FOR THE SAME REASON THE SOURCE DOES,
+            // and it is load-bearing in a way the source name is not: a digest
+            // committed while the rows were not would make the NEXT run skip a
+            // rewrite the corpus still needs. Inside this transaction the two cannot
+            // disagree, so the guard above is reading a fact and not a promise.
+            self.conn
+                .execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('changes_digest', ?)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    duckdb::params![digest],
+                )
+                .context("stamp changes_digest")?;
             Ok(())
         })();
 
@@ -150,7 +254,7 @@ impl Store {
                 self.conn
                     .execute_batch("COMMIT;")
                     .context("replace_changes: commit")?;
-                Ok((written, skipped))
+                Ok((written, skipped, true))
             }
             Err(e) => {
                 // Leaving the transaction open would make every later statement on
