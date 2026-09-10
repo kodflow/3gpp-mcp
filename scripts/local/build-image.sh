@@ -57,8 +57,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-say() { printf '\n\033[1m[image] %s\033[0m\n' "$*"; }
-die() { printf '\033[31m[image] %s\033[0m\n' "$*" >&2; exit 1; }
+# EVERY PHASE LINE CARRIES ITS WALL-CLOCK TIME AND THE TIME SINCE THE START.
+#
+# The publish of 2026-09-10 spent 24m40 between its first line and its first
+# uploaded blob, and nothing in this log could say where: the phase lines had no
+# timestamps, so "re-running the contract", "gzipping 40 GB for crane" and
+# "repacking layers that did not change" were three equally plausible guesses
+# for a cost estimated at 3-5 days to remove. A number on every line turns the
+# next publish into the measurement. SECONDS is bash's own counter; it costs
+# nothing and cannot be skewed by the host clock moving mid-build.
+say() { printf '\n\033[1m[image %s +%dm%02ds] %s\033[0m\n' "$(date +%H:%M:%S)" $((SECONDS / 60)) $((SECONDS % 60)) "$*"; }
+die() { printf '\033[31m[image %s +%dm%02ds] %s\033[0m\n' "$(date +%H:%M:%S)" $((SECONDS / 60)) $((SECONDS % 60)) "$*" >&2; exit 1; }
 
 # field <key> <text> — the value of the "<key>=…" line, or empty.
 #
@@ -213,10 +222,41 @@ done
 # copying it is what stops the image and the local embedder from drifting apart.
 ORT_VERSION="${ORT_VERSION:-$(sed -n 's/^ORT_VERSION="\${ORT_VERSION:-\([0-9][0-9.]*\)}"$/\1/p' scripts/fetch-model.sh | head -1)}"
 [ -n "$ORT_VERSION" ] || die "cannot read the ORT_VERSION pin from scripts/fetch-model.sh"
-say "ONNX Runtime $ORT_VERSION (linux x64)"
+# A VERSION IS DIGITS AND DOTS, AND NOTHING ELSE MAY REACH THE sed PROGRAM BELOW.
+#
+# ORT_VERSION is an operator override, and the pin lookup interpolates it into a
+# sed script. Unchecked, `ORT_VERSION='x//;e id;#'` would have run `id` on the
+# build host — GNU sed's `e` command — before the empty-pin guard could refuse the
+# version, and the same value flows into the download URL. Found by review of
+# #324, in a line this branch had just added. Rejecting anything that is not a
+# dotted number closes it for every later use at once, rather than escaping it
+# for one.
+case "$ORT_VERSION" in
+  ''|*[!0-9.]*|.*|*.|*..*) die "ORT_VERSION='$ORT_VERSION' is not a dotted version number" ;;
+esac
+# THE CHECKSUM TOO, AND FROM THE SAME PLACE AS THE VERSION.
+#
+# The comment above said "pinned and checksummed exactly as fetch-model.sh pins
+# it", and until 2026-09-11 only the first half was true: this block downloaded the
+# tarball with a bare curl and untarred it, while fetch-model.sh — which fetches the
+# SAME package for the local embedder — verifies a pinned sha256 and refuses an
+# unverified native runtime. So the libonnxruntime.so every published image loads
+# into the server process was the one artefact in the image nothing checked. An
+# independent review of the publish step found it.
+#
+# The sha is read out of fetch-model.sh's pin table rather than copied here, for
+# the reason the version already is: one place decides, so the image and the
+# embedder cannot drift apart. A version with no pin there fails closed.
+ORT_PKG="onnxruntime-linux-x64-${ORT_VERSION}"
+ORT_SHA="$(sed -n "s/^[[:space:]]*${ORT_PKG})[[:space:]]*ORT_SHA=\([0-9a-f]\{64\}\)[[:space:]]*;;.*/\1/p" scripts/fetch-model.sh | head -1)"
+[ -n "$ORT_SHA" ] || die "scripts/fetch-model.sh pins no sha256 for $ORT_PKG — refusing to bake an unverified native runtime into the image"
+say "ONNX Runtime $ORT_VERSION (linux x64, sha256 ${ORT_SHA:0:12}…)"
 install -d "$ROOTFS/data/mcp-3gpp/models/onnxruntime"
 curl -fsSL -o "$STAGE/ort.tgz" \
-  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PKG}.tgz"
+ORT_GOT="$(sha256sum "$STAGE/ort.tgz" | cut -d' ' -f1)"
+[ "$ORT_GOT" = "$ORT_SHA" ] \
+  || die "ONNX Runtime $ORT_PKG: downloaded sha256 $ORT_GOT, pinned $ORT_SHA in scripts/fetch-model.sh — refusing it"
 "$IMGTAR" untar --in "$STAGE/ort.tgz" --dest "$ROOTFS/data/mcp-3gpp/models/onnxruntime" --strip 1
 rm -f "$STAGE/ort.tgz"
 
@@ -275,14 +315,21 @@ if [ "$WITH_CORPUS" = 1 ]; then
     # two gates that enforce it cannot drift; hardcoding a third opinion in the
     # thing that actually publishes would defeat the arrangement.
     #
-    # DATA_CONTRACT picks the level (dense | dense+sparse | dense+sparse+etsi).
+    # DATA_CONTRACT picks the level (dense | dense+sparse | dense+sparse+etsi),
+    # and data-contract.sh alone decides what an UNSET one means. The two lines
+    # below used to print `${DATA_CONTRACT:-dense}` — the third opinion the
+    # paragraph above forbids, and a wrong one: the default became
+    # dense+sparse+etsi on 2026-09-07, and all seven publishes since logged
+    # "corpus contract (dense)" above --require-sparse --require-etsi.
+    # internal/goal reads the real default out of data-contract.sh for publish's
+    # fingerprint; a label here must not be a second one.
     # DATA_ETSI_DB points --require-etsi at the local layout rather than the
     # image's absolute path.
     CONTRACT_FLAGS="$(DATA_ETSI_DB="$ROOT/data/etsi.duckdb" \
                       DATA_EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}" \
                       bash scripts/data-contract.sh)" \
-      || die "scripts/data-contract.sh refused DATA_CONTRACT=${DATA_CONTRACT:-dense}"
-    say "corpus contract (${DATA_CONTRACT:-dense}): $CONTRACT_FLAGS"
+      || die "scripts/data-contract.sh refused DATA_CONTRACT='${DATA_CONTRACT:-}'"
+    say "corpus contract (DATA_CONTRACT='${DATA_CONTRACT:-}', empty = its default): $CONTRACT_FLAGS"
     # THE GATE MUST RESOLVE THE SPARSE IDENTITY, OR --require-sparse CHECKS NOTHING.
     #
     # cmd/validate compares schema_meta.sparse_model against embed.SparseModelID(),

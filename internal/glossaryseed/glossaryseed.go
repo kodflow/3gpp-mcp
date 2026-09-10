@@ -79,6 +79,74 @@ const DefaultSpecs = "23.501,23.401,24.501,33.501,23.548,23.682"
 // read rather than a small vocabulary.
 const DefaultMin = 150
 
+// THE MASS-REMOVAL GUARD, and why the floor above is not enough.
+//
+// The write REPLACES the seeded rows, so a sweep that silently loses specs now
+// DELETES their rows — where the additive writer before it could only have left
+// them stale. The floor cannot see that: it is measured on the six preferred
+// specs, and a read that loses any of the other ~1 980 owning specs passes it
+// untouched. So a run is refused — nothing written, non-zero exit — on either of
+// two signatures, unless --allow-mass-removal says the removal is deliberate:
+//
+//  1. A SPEC GOES SILENT. It owns rows today, the catalogue still lists it, and
+//     the sweep came back with not one row from it (store.GlossaryDiff.Vanished).
+//     That is what a broken read looks like and what an editorial change almost
+//     never does; a spec that really dropped its vocabulary is rare enough to be
+//     worth one deliberate flag.
+//  2. TOO MANY ROWS AT ONCE — more than removalBound. This catches the loss that
+//     rule 1 cannot: a regression spread across many specs, each of which still
+//     yields something.
+//
+// THE BOUND IS DERIVED, from measurements taken 2026-09-11 on the shipped corpus:
+//
+//   - normal churn: the next run removes 1 row of the 13 722 seeded — 0.007 %;
+//   - the unit of legitimate churn is ONE spec re-issuing its list, which can
+//     remove at most what that spec owns: 1 984 specs own the 13 722 rows, median
+//     3, p90 17, p99 53, max 174 (24.501, a preferred spec), then 134 (33.501),
+//     127 (23.501), 124 (38.889).
+//
+// removalBoundPct = 1 %, 137 rows today: over a hundred times the measured churn,
+// and above the ENTIRE vocabulary of every spec but 24.501 — so any one spec,
+// re-issued with a rewritten list, still passes, while losses across several
+// specs at once do not. removalBoundRows = 53, the p99 above, is the floor under
+// that fraction: it only binds below 5 300 seeded rows (a partial rebuild, a test
+// corpus), where 1 % would refuse a single ordinary spec's re-issue.
+const (
+	removalBoundPct  = 1
+	removalBoundRows = 53
+)
+
+// removalBound is the most seeded rows one run may remove without
+// --allow-mass-removal.
+func removalBound(owned int) int {
+	return max(removalBoundRows, owned*removalBoundPct/100)
+}
+
+// massRemoval says why a diff would be refused, or "" when it passes.
+func massRemoval(d store.GlossaryDiff) string {
+	var why []string
+	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
+		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
+			n, d.Owned, bound))
+	}
+	if len(d.Vanished) > 0 {
+		// The first twenty by name; the JSON report carries every one. A broken
+		// sweep can silence a thousand specs, and a message that long is not read.
+		const named = 20
+		var names []string
+		for i, v := range d.Vanished {
+			if i == named {
+				names = append(names, fmt.Sprintf("and %d more", len(d.Vanished)-named))
+				break
+			}
+			names = append(names, fmt.Sprintf("%s (%d rows)", v.Spec, v.Owned))
+		}
+		why = append(why, fmt.Sprintf("%d spec(s) still in the catalogue would lose ALL their rows: %s",
+			len(d.Vanished), strings.Join(names, ", ")))
+	}
+	return strings.Join(why, "; and ")
+}
+
 // SpecReport is what one spec contributed.
 type SpecReport struct {
 	Spec    string `json:"spec"`
@@ -104,19 +172,84 @@ type Report struct {
 	// was attempted; on a corpus already carrying this glossary nothing is
 	// written, and that difference is what decides whether the published image
 	// has to be pushed again.
-	Changed bool   `json:"changed"`
-	OK      bool   `json:"ok"`
-	Error   string `json:"error,omitempty"`
+	Changed bool `json:"changed"`
+	// Rewritten counts the rows the write inserted or rewrote, Removed the seeded
+	// rows it took out because no spec declares them any more — and, on
+	// --check-only, what the write WOULD do. The two together are exactly what
+	// Changed summarises, so a check-only run answers the push question before
+	// anything is written.
+	Rewritten int `json:"rewritten_total"`
+	Removed   int `json:"removed_total"`
+	// RemovedRows names every removed row. A deletion nobody can list is the
+	// silent failure this package keeps refusing: the count alone would say that
+	// the glossary shrank, never what a reader can no longer find.
+	RemovedRows []RemovedRow `json:"removed,omitempty"`
+	// The mass-removal guard's inputs and verdict — see removalBound. Guard is
+	// "pass", "refused" or "overridden" (refused, and let through by
+	// --allow-mass-removal), and --check-only reaches the same verdict as the
+	// write would, from the same diff, without writing.
+	Owned        int            `json:"owned_total"`
+	RemovalBound int            `json:"removal_bound"`
+	Vanished     []VanishedSpec `json:"vanished_specs,omitempty"`
+	Guard        string         `json:"guard,omitempty"`
+	OK           bool           `json:"ok"`
+	Error        string         `json:"error,omitempty"`
+}
+
+// RemovedRow is one seeded row a run took out of the glossary.
+type RemovedRow struct {
+	Term      string `json:"term"`
+	Expansion string `json:"expansion"`
+	Source    string `json:"source"`
+}
+
+// VanishedSpec is a spec still in the catalogue that the sweep no longer hears
+// from: how many rows it owns, and how many of them the write would delete.
+type VanishedSpec struct {
+	Spec    string `json:"spec"`
+	Owned   int    `json:"owned"`
+	Removed int    `json:"removed"`
+}
+
+// Options is what a run is asked to do.
+//
+// A struct, not two more positional booleans: CheckOnly and AllowMassRemoval side
+// by side in a call are one transposition away from a check-only run that
+// refuses nothing, or a real run that was meant to be a check.
+type Options struct {
+	// Specs are the PREFERRED specs: the floor is measured on them and their id
+	// wins provenance. The sweep itself is always the whole corpus.
+	Specs []string
+	// Min is the floor on the preferred specs' contribution.
+	Min int
+	// CheckOnly parses, reports and reaches the guard's verdict, and writes
+	// nothing — the database is opened read-only.
+	CheckOnly bool
+	// AllowMassRemoval lets through a removal the guard would refuse. Off by
+	// default, and the pipeline's enrich step never sets it: it is for an
+	// operator's deliberate cleanup, run by hand.
+	AllowMassRemoval bool
 }
 
 // Run seeds the glossary from the named specs' Abbreviations clauses.
-func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly bool) (Report, error) {
+func Run(ctx context.Context, path string, opt Options) (Report, error) {
+	specIDs, min, checkOnly := opt.Specs, opt.Min, opt.CheckOnly
 	// Applied stays FALSE until the write actually lands. Setting it from
 	// checkOnly up front makes a failed run report applied=true, which is the
 	// one field a caller reads to decide whether the corpus changed.
 	rep := Report{Min: min}
 
-	s, err := store.Open(path)
+	// --check-only OPENS READ-ONLY, so "writes nothing" is a property of the
+	// handle rather than of every statement Open happens to run. Open migrates
+	// the schema in place — CREATE … IF NOT EXISTS, ADD COLUMN IF NOT EXISTS —
+	// and a check-only run is exactly what an operator points at the shipped
+	// 23 GB corpus to ask what the next write would remove, where one changed
+	// byte is a new image layer.
+	open := store.Open
+	if checkOnly {
+		open = store.OpenReadOnly
+	}
+	s, err := open(path)
 	if err != nil {
 		return rep, err
 	}
@@ -128,6 +261,10 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 	// Store.ResolveTerm, so a handful of them written before the run aborts
 	// would outrank the corpus's real vocabulary and stay there, with the
 	// command having exited non-zero as if nothing had happened.
+	//
+	// And since the write REPLACES the seeded rows, the same ordering is what
+	// keeps a broken read from DELETING them: nothing below the floor is ever
+	// handed to the store, so a run that fails there removes nothing at all.
 	type pending struct {
 		sr      SpecReport
 		entries []abbrev.Entry
@@ -145,11 +282,11 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 			preferred[id] = true
 		}
 	}
-	// Every spec is read, the preferred ones LAST — because UpsertAcronyms keeps
-	// the LAST row it sees for a key. Reading them first would have made them the
-	// ones overwritten, which is the opposite of the intent and would not have
-	// shown up as an error anywhere: the count would be identical and only the
-	// cited document would differ.
+	// Every spec is read, the preferred ones LAST — because ReplaceSeededAcronyms
+	// keeps the LAST row it sees for a key. Reading them first would have made
+	// them the ones overwritten, which is the opposite of the intent and would not
+	// have shown up as an error anywhere: the count would be identical and only
+	// the cited document would differ.
 	order := readOrder(sweep, preferred)
 
 	var todo []pending
@@ -190,68 +327,116 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 			rep.Floor, strings.Join(specIDs, ","), min, len(todo), rep.Parsed)
 	}
 
-	if !checkOnly {
-		// ONE TRANSACTION for the whole batch. Collecting before writing removes
-		// the partial write a failed FLOOR would leave; it does nothing about a
-		// failure on row 400 of 679, which would leave 399 high-precedence rows
-		// behind just the same. All of them land or none do.
-		// TALLY FIRST: declared_by is HOW MANY specs declare this exact expansion,
-		// and it is what lets a corpus-wide sweep rank correctly. Counting specs,
-		// not rows: a spec present at a dozen releases declares its vocabulary
-		// once, and counting rows would let a long-lived spec outvote a dozen.
-		type pair struct{ term, expansion string }
-		declarers := map[pair]map[string]bool{}
-		for i := range todo {
-			for _, e := range todo[i].entries {
-				k := pair{e.Term, e.Expansion}
-				if declarers[k] == nil {
-					declarers[k] = map[string]bool{}
-				}
-				declarers[k][todo[i].sr.Spec] = true
+	// TALLY FIRST: declared_by is HOW MANY specs declare this exact expansion,
+	// and it is what lets a corpus-wide sweep rank correctly. Counting specs,
+	// not rows: a spec present at a dozen releases declares its vocabulary
+	// once, and counting rows would let a long-lived spec outvote a dozen.
+	//
+	// The rows are built on --check-only too, because what a check-only run
+	// reports is the diff the write would apply — computed by the store from
+	// these very rows, not re-derived by a second query of its own.
+	type pair struct{ term, expansion string }
+	declarers := map[pair]map[string]bool{}
+	for i := range todo {
+		for _, e := range todo[i].entries {
+			k := pair{e.Term, e.Expansion}
+			if declarers[k] == nil {
+				declarers[k] = map[string]bool{}
 			}
+			declarers[k][todo[i].sr.Spec] = true
 		}
+	}
 
-		var rows []model.Acronym
-		for i := range todo {
-			for _, e := range todo[i].entries {
-				rows = append(rows, model.Acronym{
-					Term:      e.Term,
-					Expansion: e.Expansion,
-					// HOW MANY specs declare exactly this expansion. UpsertAcronyms
-					// keeps the LAST row for a key and the preferred specs are read
-					// LAST, so the row that survives cites a preferred spec whenever
-					// one declares the pair — while the count covers all of them.
-					DeclaredBy: len(declarers[pair{e.Term, e.Expansion}]),
-					// Domain stays empty on purpose. The clause declares an
-					// abbreviation, not which architecture owns it, and stamping
-					// "5GC" on all 221 rows of 23.501 §3.2 would assert something
-					// the source never said — 5G LAN and QoS live there too.
-					Domain:       "",
-					FirstRelease: todo[i].sr.Version,
-					LastRelease:  todo[i].sr.Version,
-					// The owning SPEC, not its two-digit series: it is what makes
-					// the precedence above auditable, and nothing consumes the
-					// series form.
-					SourceSeries: todo[i].sr.Spec,
-				})
-			}
-			todo[i].sr.Written = len(todo[i].entries)
+	var rows []model.Acronym
+	for i := range todo {
+		for _, e := range todo[i].entries {
+			rows = append(rows, model.Acronym{
+				Term:      e.Term,
+				Expansion: e.Expansion,
+				// HOW MANY specs declare exactly this expansion.
+				// ReplaceSeededAcronyms keeps the LAST row for a key and the
+				// preferred specs are read LAST, so the row that survives cites a
+				// preferred spec whenever one declares the pair — while the count
+				// covers all of them.
+				DeclaredBy: len(declarers[pair{e.Term, e.Expansion}]),
+				// Domain stays empty on purpose. The clause declares an
+				// abbreviation, not which architecture owns it, and stamping
+				// "5GC" on all 221 rows of 23.501 §3.2 would assert something
+				// the source never said — 5G LAN and QoS live there too.
+				Domain:       "",
+				FirstRelease: todo[i].sr.Version,
+				LastRelease:  todo[i].sr.Version,
+				// The owning SPEC, not its two-digit series: it is what makes
+				// the precedence above auditable, and it is what marks the row as
+				// this package's to replace (store.seededSource). The series form
+				// belongs to TS 21.905's rows, which this package never removes.
+				SourceSeries: todo[i].sr.Spec,
+			})
 		}
-		// The bool says whether the corpus actually changed, and the report repeats
+	}
+
+	// THE GUARD'S VERDICT, reached ONCE, from the diff that is written — the store
+	// calls approve between its plan and its transaction — and reached the same
+	// way on --check-only from the same plan, so a check that passes is a write
+	// that passes.
+	approve := func(d store.GlossaryDiff) error {
+		rep.Owned, rep.RemovalBound = d.Owned, removalBound(d.Owned)
+		for _, v := range d.Vanished {
+			rep.Vanished = append(rep.Vanished, VanishedSpec{v.Spec, v.Owned, v.Removed})
+		}
+		why := massRemoval(d)
+		switch {
+		case why == "":
+			rep.Guard = "pass"
+		case opt.AllowMassRemoval:
+			rep.Guard = "overridden"
+		default:
+			rep.Guard = "refused"
+			return fmt.Errorf("refusing to replace the seeded glossary: %s. Nothing was written. "+
+				"A sweep that silently lost specs looks exactly like this; if the removal is "+
+				"deliberate, re-run with --allow-mass-removal", why)
+		}
+		return nil
+	}
+
+	var diff store.GlossaryDiff
+	if checkOnly {
+		if diff, err = s.PlanSeededAcronyms(rows); err == nil {
+			err = approve(diff)
+		}
+	} else {
+		// ONE TRANSACTION for the whole batch, the removal included. Collecting
+		// before writing removes the partial write a failed FLOOR would leave; it
+		// does nothing about a failure on row 400 of 679, which would leave 399
+		// high-precedence rows behind just the same. All of them land or none do.
+		//
+		// Changed says whether the corpus actually moved, and the report repeats
 		// it rather than assuming. Re-seeding a glossary that is already correct
-		// writes nothing — which is the point, since one changed byte in this 23 GB
-		// file is an 11 GB push — and a run that announced "written=679" either way
-		// would hide exactly the thing worth knowing.
-		changed, err := s.UpsertAcronyms(rows)
-		if err != nil {
-			return rep, err
+		// writes nothing — which is the point, since one changed byte in this
+		// 23 GB file is an 11 GB push — and a run that announced "written=679"
+		// either way would hide exactly the thing worth knowing.
+		if diff, err = s.ReplaceSeededAcronyms(rows, approve); err == nil {
+			rep.Applied = true
+			rep.Changed = diff.Changed()
+			for i := range todo {
+				todo[i].sr.Written = len(todo[i].entries)
+			}
 		}
-		rep.Applied = true
-		rep.Changed = changed
+	}
+	// FILLED ON A REFUSAL TOO. The diff is exactly what is being refused, and an
+	// operator deciding whether to pass --allow-mass-removal needs to see the rows
+	// before deciding, not after.
+	rep.Rewritten = diff.Written
+	rep.Removed = len(diff.Removed)
+	for _, a := range diff.Removed {
+		rep.RemovedRows = append(rep.RemovedRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
 		rep.Written += todo[i].sr.Written
+	}
+	if err != nil {
+		return rep, err
 	}
 	rep.OK = true
 	return rep, nil
@@ -260,12 +445,12 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 // readOrder puts the preferred specs LAST.
 //
 // It is a function, and tested, because getting it backwards is invisible.
-// UpsertAcronyms keeps the LAST row it sees for a (term, expansion, domain) key,
-// so reading the preferred specs FIRST — which is what reads naturally, and what
-// this code did when it was written — makes them the ones overwritten. The row
-// count would be identical, every gate would pass, and the only difference would
-// be which document the glossary cites: an obscure spec instead of TS 23.501,
-// for the terms where citing 23.501 is the whole point.
+// store.ReplaceSeededAcronyms keeps the LAST row it sees for a (term, expansion,
+// domain) key, so reading the preferred specs FIRST — which is what reads
+// naturally, and what this code did when it was written — makes them the ones
+// overwritten. The row count would be identical, every gate would pass, and the
+// only difference would be which document the glossary cites: an obscure spec
+// instead of TS 23.501, for the terms where citing 23.501 is the whole point.
 func readOrder(sweep []string, preferred map[string]bool) []string {
 	order := make([]string, 0, len(sweep))
 	for _, id := range sweep {
@@ -330,7 +515,9 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (SpecReport, [
 	// below for the rule and the two measured cases that chose it.
 	//
 	// It is fixed HERE rather than in GetClauses' ORDER BY because `enrich` declares
-	// internal/glossaryseed and does NOT declare internal/store: a fix in the store
+	// internal/glossaryseed and does NOT declare internal/store/store.go, where
+	// GetClauses lives (only the glossary WRITE path, internal/store/acronyms_write.go,
+	// is declared — see that file for why it stops there): a fix in GetClauses
 	// would change what enrich produces without enrich replaying, which is the same
 	// provenance hole #322 closed when it found enrich declaring four Rust binaries
 	// and none of their manifests.

@@ -24,7 +24,6 @@ var countsTestFiles = map[string]string{
 	"test": "runs the suites; test files are its INPUT, not noise — the reason ExcludeTests exists",
 
 	// Cheap to replay, so the one-time fingerprint churn buys little.
-	"smoke":         "internal/mcp + internal/search; replaying it is 23.9 s (build E)",
 	"validate":      "cmd/validate; replaying it is 2m32 (build E)",
 	"validate-etsi": "cmd/validate, shared with validate; replaying it is 17.6 s (build E)",
 	"discover-etsi": "internal/etsicat; replaying it is 39.6 s and it re-enumerates anyway",
