@@ -57,8 +57,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-say() { printf '\n\033[1m[image] %s\033[0m\n' "$*"; }
-die() { printf '\033[31m[image] %s\033[0m\n' "$*" >&2; exit 1; }
+# EVERY PHASE LINE CARRIES ITS WALL-CLOCK TIME AND THE TIME SINCE THE START.
+#
+# The publish of 2026-09-10 spent 24m40 between its first line and its first
+# uploaded blob, and nothing in this log could say where: the phase lines had no
+# timestamps, so "re-running the contract", "gzipping 40 GB for crane" and
+# "repacking layers that did not change" were three equally plausible guesses
+# for a cost estimated at 3-5 days to remove. A number on every line turns the
+# next publish into the measurement. SECONDS is bash's own counter; it costs
+# nothing and cannot be skewed by the host clock moving mid-build.
+say() { printf '\n\033[1m[image %s +%dm%02ds] %s\033[0m\n' "$(date +%H:%M:%S)" $((SECONDS / 60)) $((SECONDS % 60)) "$*"; }
+die() { printf '\033[31m[image %s +%dm%02ds] %s\033[0m\n' "$(date +%H:%M:%S)" $((SECONDS / 60)) $((SECONDS % 60)) "$*" >&2; exit 1; }
 
 # field <key> <text> — the value of the "<key>=…" line, or empty.
 #
