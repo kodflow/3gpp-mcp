@@ -6,12 +6,19 @@
 //
 //	seed-glossary --db data/3gpp.duckdb [--specs 23.501,23.401,...]
 //	              [--min 150] [--check-only] [--report json]
+//	              [--allow-mass-removal]
 //
 // The behaviour lives in internal/glossaryseed; this is the thin CLI around it
-// (cmd/CLAUDE.md). It is additive and idempotent: rows are upserted on
-// (term, expansion, domain), so re-running changes nothing and the existing
-// TS 21.905 and ETSI entries stay where they are. What changes is which meaning
-// a reader is shown first.
+// (cmd/CLAUDE.md). It REPLACES the rows it owns — those citing a spec id — and
+// nothing else: what the sweep declares is written, a seeded row no spec declares
+// any more is removed, and the TS 21.905 and ETSI entries stay exactly where they
+// are. It is idempotent: re-running over an unchanged corpus writes nothing. What
+// changes is which meaning a reader is shown first.
+//
+// A run that would remove more rows than the mass-removal guard allows, or leave
+// a spec the catalogue still lists with none of its rows, is REFUSED: nothing is
+// written and it exits 1. --allow-mass-removal lets a deliberate cleanup through;
+// the pipeline never passes it.
 package main
 
 import (
@@ -33,6 +40,10 @@ func main() {
 	min := flag.Int("min", glossaryseed.DefaultMin,
 		"fail if fewer than this many abbreviations are parsed in total")
 	checkOnly := flag.Bool("check-only", false, "parse and report, write nothing")
+	allowMass := flag.Bool("allow-mass-removal", false,
+		"let through a removal the mass-removal guard refuses (too many rows, or a spec "+
+			"still in the catalogue losing all of its rows) — a deliberate cleanup only; "+
+			"the pipeline never passes it")
 	format := flag.String("report", "text", "text | json")
 	flag.Parse()
 	if *db == "" {
@@ -43,7 +54,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	rep, err := glossaryseed.Run(context.Background(), *db, strings.Split(*specs, ","), *min, *checkOnly)
+	rep, err := glossaryseed.Run(context.Background(), *db, glossaryseed.Options{
+		Specs:            strings.Split(*specs, ","),
+		Min:              *min,
+		CheckOnly:        *checkOnly,
+		AllowMassRemoval: *allowMass,
+	})
 	if err != nil {
 		rep.Error = err.Error()
 	}
@@ -71,14 +87,52 @@ func emit(rep glossaryseed.Report, format string) {
 	switch {
 	case !rep.Applied:
 		fmt.Printf("seed-glossary: parsed=%d (check-only, floor %d)\n", rep.Parsed, rep.Min)
+		if rep.OK {
+			fmt.Printf("seed-glossary: a write would rewrite %d row(s) and remove %d\n",
+				rep.Rewritten, rep.Removed)
+		}
 	case rep.Changed:
-		fmt.Printf("seed-glossary: parsed=%d written=%d (floor %d)\n", rep.Parsed, rep.Written, rep.Min)
+		fmt.Printf("seed-glossary: parsed=%d written=%d rewritten=%d removed=%d (floor %d)\n",
+			rep.Parsed, rep.Written, rep.Rewritten, rep.Removed, rep.Min)
 	default:
 		// Said out loud, because "written=679" used to be printed either way. A
 		// reader of the enrich log needs to tell a corpus left untouched from a
 		// step that did not run — the first means the image need not be pushed.
 		fmt.Printf("seed-glossary: parsed=%d — already correct, corpus untouched (floor %d)\n",
 			rep.Parsed, rep.Min)
+	}
+	// THE REMOVED ROWS ARE NAMED IN THE LOG, not only counted. The enrich log is
+	// read in text mode, and "removed=37" says that the glossary shrank without
+	// saying what a reader can no longer find. The first few are enough to judge
+	// a run by; --report json carries every one.
+	verb := "removed"
+	if !rep.Applied {
+		verb = "would remove"
+	}
+	const shown = 10
+	for i, r := range rep.RemovedRows {
+		if i == shown {
+			fmt.Printf("seed-glossary:   … and %d more (--report json lists every one)\n",
+				len(rep.RemovedRows)-shown)
+			break
+		}
+		fmt.Printf("seed-glossary:   %s %s = %q (%s)\n", verb, r.Term, r.Expansion, r.Source)
+	}
+	// The guard's verdict is printed on every run that reached it, pass included:
+	// "pass" with its numbers is what tells a reader of the enrich log how far this
+	// run was from being refused, which a silent pass never would.
+	switch rep.Guard {
+	case "pass":
+		fmt.Printf("seed-glossary: mass-removal guard: pass — %d of %d seeded row(s) removed "+
+			"(bound %d), no catalogued spec silenced\n", rep.Removed, rep.Owned, rep.RemovalBound)
+	case "overridden":
+		fmt.Printf("seed-glossary: mass-removal guard: OVERRIDDEN by --allow-mass-removal — "+
+			"%d of %d seeded row(s) (bound %d), %d catalogued spec(s) silenced\n",
+			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+	case "refused":
+		fmt.Printf("seed-glossary: mass-removal guard: REFUSED — nothing written "+
+			"(%d of %d seeded row(s), bound %d, %d catalogued spec(s) silenced)\n",
+			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
 	}
 	if rep.Error != "" {
 		fmt.Fprintf(os.Stderr, "seed-glossary: %s\n", rep.Error)

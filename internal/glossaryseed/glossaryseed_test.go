@@ -76,9 +76,9 @@ func splitCSV(s string) []string {
 // THE PREFERRED SPECS MUST BE READ LAST, and this test is here because getting it
 // backwards changes nothing measurable.
 //
-// store.UpsertAcronyms keeps the LAST row it sees for a (term, expansion, domain)
-// key. Reading the preferred specs first — which is what reads naturally, and what
-// this code did when the sweep was written — makes them the rows that get
+// store.ReplaceSeededAcronyms keeps the LAST row it sees for a (term, expansion,
+// domain) key. Reading the preferred specs first — which is what reads naturally,
+// and what this code did when the sweep was written — makes them the rows that get
 // overwritten: the count is identical, every gate passes, and the glossary quietly
 // cites an obscure spec where citing TS 23.501 was the entire purpose.
 func TestPreferredSpecsAreReadLastSoTheyWinTheKey(t *testing.T) {
