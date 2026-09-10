@@ -275,14 +275,21 @@ if [ "$WITH_CORPUS" = 1 ]; then
     # two gates that enforce it cannot drift; hardcoding a third opinion in the
     # thing that actually publishes would defeat the arrangement.
     #
-    # DATA_CONTRACT picks the level (dense | dense+sparse | dense+sparse+etsi).
+    # DATA_CONTRACT picks the level (dense | dense+sparse | dense+sparse+etsi),
+    # and data-contract.sh alone decides what an UNSET one means. The two lines
+    # below used to print `${DATA_CONTRACT:-dense}` — the third opinion the
+    # paragraph above forbids, and a wrong one: the default became
+    # dense+sparse+etsi on 2026-09-07, and all seven publishes since logged
+    # "corpus contract (dense)" above --require-sparse --require-etsi.
+    # internal/goal reads the real default out of data-contract.sh for publish's
+    # fingerprint; a label here must not be a second one.
     # DATA_ETSI_DB points --require-etsi at the local layout rather than the
     # image's absolute path.
     CONTRACT_FLAGS="$(DATA_ETSI_DB="$ROOT/data/etsi.duckdb" \
                       DATA_EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}" \
                       bash scripts/data-contract.sh)" \
-      || die "scripts/data-contract.sh refused DATA_CONTRACT=${DATA_CONTRACT:-dense}"
-    say "corpus contract (${DATA_CONTRACT:-dense}): $CONTRACT_FLAGS"
+      || die "scripts/data-contract.sh refused DATA_CONTRACT='${DATA_CONTRACT:-}'"
+    say "corpus contract (DATA_CONTRACT='${DATA_CONTRACT:-}', empty = its default): $CONTRACT_FLAGS"
     # THE GATE MUST RESOLVE THE SPARSE IDENTITY, OR --require-sparse CHECKS NOTHING.
     #
     # cmd/validate compares schema_meta.sparse_model against embed.SparseModelID(),

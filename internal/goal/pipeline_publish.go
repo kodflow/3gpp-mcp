@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -61,10 +63,16 @@ import (
 // a fixed timestamp on every member — so a code-only change re-uploads the 70 MB
 // binary layer rather than the 40 GB corpus.
 
-// defaultImageTag is what the pipeline publishes when IMAGE_TAG says nothing. It
-// matches the Makefile's own default; both are read by build-image.sh, and the
+// defaultImageTag is what the pipeline publishes when IMAGE_TAG says nothing. The
 // resolved value folds into the fingerprint below, so retagging is treated as
 // what it is — a different artefact that must be published.
+//
+// It is the one image default kept as a Go copy, because runPublish passes it as
+// --tag and the script's own `${IMAGE_TAG:-…}` never applies under the pipeline.
+// It must still equal that default, or `make image` and `make publish` push to
+// different places: TestAnUnsetKnobAndItsDefaultAreOneImage holds the two
+// together. (This comment used to say it matched "the Makefile's own default";
+// the Makefile has none.)
 const defaultImageTag = "ghcr.io/kodflow/3gpp-mcp:latest"
 
 // rerankModelName is the cross-encoder the image carries. sparseModelName (the
@@ -128,7 +136,7 @@ func stepPublish() *Step {
 		// whose HNSW is still "building" — which serve refuses.
 		Deps: []string{"smoke", "index-etsi"},
 		Impl: append([]string{
-			"scripts/local/build-image.sh",
+			buildImageScript,
 			"scripts/local/imgtar",
 			"scripts/local/zigcc",
 			"docker-entrypoint.sh",
@@ -139,14 +147,166 @@ func stepPublish() *Step {
 		ExcludeTests: true,
 		Heavy:        true,
 		Inputs:       publishInputs,
-		Extra: func(c *Ctx) (map[string]string, error) {
-			return map[string]string{"image_tag": imageTag()}, nil
-		},
+		// EVERY OVERRIDE THE SCRIPT HONOURS THAT CHANGES THE IMAGE, NOT ONLY THE TAG.
+		//
+		// This map held image_tag alone, while build-image.sh also reads
+		// IMAGE_BASE, ZIG_TARGET, ORT_VERSION, EMBED_FLOOR and DATA_CONTRACT from
+		// the environment it inherits — runPublish passes it the tag and nothing
+		// else. Exporting any one of them left this step "fingerprint unchanged,
+		// outputs present and valid", and the image built from the previous base,
+		// runtime or contract stayed on the registry as the current one. See
+		// imageKnobs for why each is a determinant, and publish_knobs_test.go for
+		// the test that reads the script so the next one cannot be missed.
+		Extra: publishExtra,
 		Outputs: func(c *Ctx) []string {
 			return []string{c.statePath("published.json")}
 		},
 		Validate: validatePublished,
 		Run:      runPublish,
+	}
+}
+
+// buildImageScript is the script runPublish drives and the file most image
+// defaults are read out of.
+const buildImageScript = "scripts/local/build-image.sh"
+
+// imageKnob is one environment variable build-image.sh reads that changes the
+// image it produces.
+type imageKnob struct {
+	Env string // what the operator exports
+	Key string // the determinant it becomes in publish's record
+	// DefaultIn is the script whose `${Env:-default}` decides what an UNSET Env
+	// means — the file the default is read out of, so there is never a copy of it
+	// here to drift. It is build-image.sh for most knobs and deliberately not for
+	// two, because build-image.sh does not decide those defaults itself.
+	DefaultIn string
+}
+
+// imageKnobs are folded into publish's fingerprint at their EFFECTIVE value: what
+// the script will actually use, its own default when the operator set nothing. So
+// leaving a knob unset and setting it to its default are one artefact and
+// fingerprint the same, and neither replays a 40 GB publish.
+//
+// WHY EACH ONE CHANGES THE IMAGE:
+//
+//	IMAGE_BASE     the image's first layers, the /etc/passwd and /etc/group the
+//	               script derives from it and re-ships (build-image.sh:176-188),
+//	               and the libraries the loader check resolves against (:430).
+//	ZIG_TARGET     the glibc floor the server binary and the embed-core cdylib are
+//	               linked against — exported for scripts/local/zigcc (:105).
+//	ORT_VERSION    the ONNX Runtime layer 30 carries, DOWNLOADED at build time
+//	               (:214-220). The ORT publishInputs does fingerprint is
+//	               data/models/onnxruntime, which on the machine that publishes is
+//	               lib/onnxruntime.dll — the Windows runtime, as the 2026-09-10
+//	               record in .local/state/steps/publish.json shows — so the version
+//	               that decides the layer was in neither Impl nor Extra. Its
+//	               default lives in scripts/fetch-model.sh, which build-image.sh
+//	               reads it out of by design ("sourcing the number rather than
+//	               copying it"), and which is not in Impl either.
+//	EMBED_FLOOR    and DATA_CONTRACT: the contract the corpus must pass before the
+//	DATA_CONTRACT  script bakes it at all (:288-306). They change no byte of an
+//	               image that passes, and that is exactly why they belong here:
+//	               what this step records is not "these bytes were pushed" but
+//	               "this corpus met this contract and was pushed". DATA_CONTRACT=dense
+//	               checks neither the sparse layer nor the ETSI half, so an image
+//	               published under it must replay when the gate is restored, not
+//	               stand on the registry as current under a contract it never met.
+//
+// DATA_CONTRACT is read by build-image.sh only to label its log. The value that
+// decides the gate is INHERITED by scripts/data-contract.sh, which applies its own
+// default — hence DefaultIn, and hence a knob whose script-side reads are all
+// `${DATA_CONTRACT:-}`.
+//
+// What build-image.sh reads and is NOT here — the push retry count, PATH — is in
+// notAnImageKnob in publish_knobs_test.go, each with its reason, and that test
+// fails on any read that is in neither place.
+var imageKnobs = []imageKnob{
+	{Env: "IMAGE_BASE", Key: "image_base", DefaultIn: buildImageScript},
+	{Env: "ZIG_TARGET", Key: "zig_target", DefaultIn: buildImageScript},
+	{Env: "ORT_VERSION", Key: "ort_version", DefaultIn: "scripts/fetch-model.sh"},
+	{Env: "EMBED_FLOOR", Key: "embed_floor", DefaultIn: buildImageScript},
+	{Env: "DATA_CONTRACT", Key: "data_contract", DefaultIn: "scripts/data-contract.sh"},
+}
+
+// publishExtra is publish's Extra: the tag, and every imageKnob at the value the
+// script will use.
+func publishExtra(c *Ctx) (map[string]string, error) {
+	m := map[string]string{"image_tag": imageTag()}
+	for _, k := range imageKnobs {
+		v, err := k.effective(c.Root)
+		if err != nil {
+			return nil, err
+		}
+		m[k.Key] = v
+	}
+	return m, nil
+}
+
+// effective is `${Env:-default}` evaluated the way bash evaluates it.
+//
+// Empty means unset, because that is what `:-` means. The value is NOT trimmed,
+// unlike imageTag: the script passes it on verbatim — to crane, zig, curl and
+// data-contract.sh — so a value that differs only in whitespace is a different
+// argument, and a fingerprint that trimmed it would record something the build
+// never used. The default is read
+// only when it is needed, as bash does — a knob the operator set does not depend
+// on a file that is not consulted.
+func (k imageKnob) effective(root string) (string, error) {
+	if v := os.Getenv(k.Env); v != "" {
+		return v, nil
+	}
+	return shellDefault(root, k.DefaultIn, k.Env)
+}
+
+// shellDefault is the literal default the script at rel gives name in its
+// `${name:-default}` expansions.
+//
+// READ OUT OF THE SCRIPT, NOT COPIED INTO GO. A second copy of a default is a
+// second default, and this repository has already shipped one: build-image.sh
+// labelled its gate `${DATA_CONTRACT:-dense}` after scripts/data-contract.sh's
+// default had become dense+sparse+etsi, so all seven publishes from 2026-09-07 to
+// 2026-09-10 logged "corpus contract (dense)" above --require-sparse and
+// --require-etsi (.local/logs/*-publish.log). A Go constant would have drifted
+// the same way and with worse consequences: the fingerprint would record the stale
+// copy while the script built from the real one.
+//
+// Strict on purpose, because every way this can be wrong is silent otherwise. A
+// default that is computed rather than written (a $, a backtick, a quote) is not
+// a literal this can read; two different literals for one name mean the answer
+// depends on which line runs; and no literal at all means this is looking in the
+// wrong file. Each is an error, so the plan stops instead of fingerprinting a
+// guess. `${name:-}` is not a default — it is how a `set -u` script reads a
+// variable that may be unset — and is skipped.
+func shellDefault(root, rel, name string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		return "", fmt.Errorf("cannot read the %s default out of %s: %w", name, rel, err)
+	}
+	re := regexp.MustCompile(`\$\{` + regexp.QuoteMeta(name) + `:-([^}]*)\}`)
+	var found []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		for _, m := range re.FindAllStringSubmatch(line, -1) {
+			d := m[1]
+			if d == "" || strings.ContainsAny(d, "$`\"'\\") {
+				continue
+			}
+			if !slices.Contains(found, d) {
+				found = append(found, d)
+			}
+		}
+	}
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("%s gives %s no literal `${%s:-default}`, so what an unset %s means "+
+			"cannot be read — and cannot be fingerprinted", rel, name, name, name)
+	case 1:
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("%s gives %s %d different defaults (%s): which one applies depends on "+
+			"the line that runs", rel, name, len(found), strings.Join(found, ", "))
 	}
 }
 
@@ -332,7 +492,7 @@ func runPublish(c *Ctx) error {
 		"registry does not already hold are transferred", tag)
 	if err := c.Run(Cmd{
 		Name: "bash",
-		Args: []string{"scripts/local/build-image.sh", "--tag", tag},
+		Args: []string{buildImageScript, "--tag", tag},
 		Echo: true,
 	}); err != nil {
 		return err
