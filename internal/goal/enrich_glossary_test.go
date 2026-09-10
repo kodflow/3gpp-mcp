@@ -188,6 +188,37 @@ func TestGlossaryWriterHasExactlyTheCallersEnrichAssumes(t *testing.T) {
 	}
 }
 
+// TestThePipelineNeverPassesTheMassRemovalOptOut pins that --allow-mass-removal
+// stays an operator's decision.
+//
+// The mass-removal guard exists because the glossary write now DELETES, and a
+// sweep that silently lost specs would delete their rows in an unattended run.
+// A pipeline that passed the opt-out would disarm the guard exactly where it is
+// needed, and every gate would stay green — the refusal it suppresses is the only
+// signal there is.
+func TestThePipelineNeverPassesTheMassRemovalOptOut(t *testing.T) {
+	root, err := filepath.Abs(repoRootForTest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const flag = "allow-mass-removal"
+	// A LOOP OVER AN EMPTY RESULT PASSES: prove the flag still exists under this
+	// name first, or renaming it would leave this test checking nothing.
+	if defs := grepTree(t, filepath.Join(root, "cmd", "seed-glossary"), ".go", `"`+flag+`"`); len(defs) == 0 {
+		t.Fatalf("cmd/seed-glossary no longer defines --%s; the search string is stale", flag)
+	}
+	var passers []string
+	for _, p := range grepTree(t, filepath.Join(root, "internal", "goal"), ".go", flag) {
+		if !strings.HasSuffix(p, "_test.go") {
+			passers = append(passers, filepath.ToSlash(p))
+		}
+	}
+	if len(passers) > 0 {
+		t.Errorf("the pipeline mentions --%s in %v: an unattended enrich must never disarm the "+
+			"mass-removal guard. A deliberate cleanup is run by hand.", flag, passers)
+	}
+}
+
 // binCallers names the functions, in the production files of dir, that spawn the
 // Go binary `name` through c.bin(name).
 func binCallers(t *testing.T, dir, name string) []string {

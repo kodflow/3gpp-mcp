@@ -130,6 +130,28 @@ type GlossaryDiff struct {
 	// Removed are the seeded rows the batch no longer declares, ordered by
 	// (term, expansion, domain) so two runs over one corpus list them alike.
 	Removed []model.Acronym
+	// Owned is how many seeded rows the table held BEFORE the replacement — the
+	// base a removal is measured against.
+	Owned int
+	// Vanished are the specs that own seeded rows today, declare NOTHING in this
+	// batch, and are still listed in `specs`, ordered by spec id.
+	//
+	// That is the signature of a broken read, not of an editorial change: the
+	// catalogue says the spec is there, and the sweep came back with not one row
+	// from it. It is deliberately NOT "ends with zero rows". A spec whose every
+	// pair is also declared by a spec read after it ends with zero rows of its own
+	// while being read perfectly — the corpus grew, the citation moved — and a
+	// guard keyed on that would refuse ordinary growth.
+	Vanished []VanishedSpec
+}
+
+// VanishedSpec is a spec the batch no longer hears from at all.
+type VanishedSpec struct {
+	Spec string
+	// Owned is how many seeded rows cite it today; Removed how many of those the
+	// replacement deletes. The difference passes to another spec that declares
+	// the same pair, which is why a vanished spec is not measured by Removed.
+	Owned, Removed int
 }
 
 // Changed reports whether applying the diff moves the corpus at all.
@@ -187,6 +209,17 @@ func (s *Store) PlanSeededAcronyms(as []model.Acronym) (GlossaryDiff, error) {
 // to produce one is a read that found nothing, and a caller that turned the floor
 // off (--min 0) must not be able to turn that into a wipe.
 //
+// AND THE FLOOR IS NOT ENOUGH, which is what approve is for. The floor watches
+// the six preferred specs; a sweep that silently loses any of the other ~1 980
+// passes it and — now that the write deletes — takes their rows with it, where
+// the additive writer could only have left them stale. approve sees the planned
+// diff, Vanished and Owned included, BEFORE the transaction opens: an error from
+// it is returned with the diff and nothing is written. The policy lives with the
+// caller (glossaryseed's mass-removal guard) because the opt-out is the caller's
+// flag; the enforcement point lives here because it has to sit between the plan
+// and the write, with nothing in between. A nil approve approves everything —
+// tests use it; the one production caller does not.
+//
 // The batch form is not an optimisation either. These rows outrank the general
 // vocabulary in Store.ResolveTerm, so a run that failed on row 400 of 679 would
 // leave 399 rows that outrank the corpus's real answers, having exited non-zero as
@@ -216,10 +249,18 @@ func (s *Store) PlanSeededAcronyms(as []model.Acronym) (GlossaryDiff, error) {
 //
 // Reading the table first is affordable precisely because it is small — some
 // fourteen thousand rows. The same trade would be wrong on clauses.
-func (s *Store) ReplaceSeededAcronyms(as []model.Acronym) (GlossaryDiff, error) {
+func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, approve func(GlossaryDiff) error) (GlossaryDiff, error) {
 	diff, pending, err := s.planSeededAcronyms(as)
-	if err != nil || !diff.Changed() {
+	if err != nil {
 		return diff, err
+	}
+	if approve != nil {
+		if err := approve(diff); err != nil {
+			return diff, err
+		}
+	}
+	if !diff.Changed() {
+		return diff, nil
 	}
 
 	tx, err := s.db.Begin()
@@ -339,11 +380,18 @@ func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Ac
 		pending = append(pending, a)
 	}
 	var removed []model.Acronym
+	owned := map[string]int{}
+	lost := map[string]int{}
 	for k, cur := range existing {
-		if _, declared := want[k]; declared || !seededBySpec(cur.SourceSeries) {
+		if !seededBySpec(cur.SourceSeries) {
+			continue
+		}
+		owned[cur.SourceSeries]++
+		if _, declared := want[k]; declared {
 			continue
 		}
 		removed = append(removed, cur)
+		lost[cur.SourceSeries]++
 	}
 	sort.Slice(removed, func(i, j int) bool {
 		a, b := removed[i], removed[j]
@@ -355,7 +403,57 @@ func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Ac
 		}
 		return a.Domain < b.Domain
 	})
-	return GlossaryDiff{Written: len(pending), Removed: removed}, pending, nil
+	diff := GlossaryDiff{Written: len(pending), Removed: removed}
+	for _, n := range owned {
+		diff.Owned += n
+	}
+	// WHO IS STILL HEARD FROM is read off the batch BEFORE deduplication: every
+	// spec's entries arrive under its own id there, including the pairs a later
+	// spec will end up citing. Reading it off `want` instead would call a spec
+	// silent merely because its pairs are also declared by one read after it.
+	heard := map[string]bool{}
+	for _, a := range as {
+		heard[a.SourceSeries] = true
+	}
+	var silent []string
+	for spec := range owned {
+		if !heard[spec] {
+			silent = append(silent, spec)
+		}
+	}
+	if len(silent) > 0 {
+		listed, err := s.catalogued()
+		if err != nil {
+			return GlossaryDiff{}, nil, err
+		}
+		sort.Strings(silent)
+		for _, spec := range silent {
+			// A spec the catalogue no longer lists has left the corpus, and its
+			// rows leaving with it is the replacement doing its job.
+			if listed[spec] {
+				diff.Vanished = append(diff.Vanished, VanishedSpec{Spec: spec, Owned: owned[spec], Removed: lost[spec]})
+			}
+		}
+	}
+	return diff, pending, nil
+}
+
+// catalogued returns the spec ids `specs` lists.
+func (s *Store) catalogued() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT spec_id FROM specs`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // stageAcronyms loads rows into a fresh TEMP table shaped like `acronyms`, with no

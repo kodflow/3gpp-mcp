@@ -89,7 +89,7 @@ func terms(t *testing.T, path string) map[string]string {
 func TestARunBelowTheFloorRemovesNothing(t *testing.T) {
 	path := replaceFixture(t)
 
-	rep, err := Run(context.Background(), path, []string{"23.501"}, DefaultMin, false)
+	rep, err := Run(context.Background(), path, Options{Specs: []string{"23.501"}, Min: DefaultMin})
 	if err == nil {
 		t.Fatalf("two abbreviations passed a floor of %d; the premise of this test is wrong", DefaultMin)
 	}
@@ -106,7 +106,7 @@ func TestARunBelowTheFloorRemovesNothing(t *testing.T) {
 	}
 
 	// --check-only with a floor it passes: reports the removal, performs none.
-	rep, err = Run(context.Background(), path, []string{"23.501"}, 1, true)
+	rep, err = Run(context.Background(), path, Options{Specs: []string{"23.501"}, Min: 1, CheckOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestARunBelowTheFloorRemovesNothing(t *testing.T) {
 	}
 
 	// THE CONTROL: the same corpus, a floor it passes, a real write.
-	rep, err = Run(context.Background(), path, []string{"23.501"}, 1, false)
+	rep, err = Run(context.Background(), path, Options{Specs: []string{"23.501"}, Min: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
