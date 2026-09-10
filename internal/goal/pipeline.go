@@ -706,9 +706,15 @@ func stepTest() *Step {
 			// ort/CUDA toolchain, a cdylib, a CI-matrix tool). What is left is
 			// precisely the DuckDB write side. rust-fmt_test.sh still covers the
 			// excluded three for formatting, so nothing loses a check.
-			c.Log.Printf("cargo test --release --workspace (rust/)")
+			// --locked HERE TOO, and this is the invocation the drift came through.
+			// `test` runs BEFORE `build-rust` in the DAG, so it is the first cargo
+			// command of a run and the first chance to re-resolve a lockfile — which
+			// is why rust/discover/Cargo.lock changed at 17:39 on 2026-09-10, between
+			// the step hashing it and build-rust reading it back. Locking only the
+			// build would have left the door it came through open.
+			c.Log.Printf("cargo test --release --locked --workspace (rust/)")
 			if err := c.Run(Cmd{Name: "cargo", Args: []string{
-				"test", "--release", "--manifest-path", "rust/Cargo.toml", "--workspace",
+				"test", "--release", "--locked", "--manifest-path", "rust/Cargo.toml", "--workspace",
 			}, Echo: true}); err != nil {
 				return err
 			}
