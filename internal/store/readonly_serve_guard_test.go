@@ -25,7 +25,7 @@ func TestServeIsCorpusWriteFree(t *testing.T) {
 	forbidden := map[string]bool{
 		"InsertClauses": true, "UpsertSpec": true, "UpsertVersion": true,
 		"SetEmbeddingsBatch": true, "SetEmbedding": true, "StripEmbeddings": true,
-		"UpsertAcronym": true, "InsertEvolutions": true, "InsertAPIOperations": true,
+		"UpsertAcronym": true, "ReplaceSeededAcronyms": true, "InsertEvolutions": true, "InsertAPIOperations": true,
 		"InsertAPISchemas": true, "ClearAPITables": true, "ApplyReleaseFreeze": true,
 		"UpsertReleases": true, "FoldShard": true, "BuildAndFreezeHNSW": true,
 		"EnableFTS": true, "LogIngest": true, "IngestDone": true,
