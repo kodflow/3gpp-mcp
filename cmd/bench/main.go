@@ -31,9 +31,9 @@ import (
 func main() {
 	dbPath := flag.String("db", "data/3gpp.duckdb", "DuckDB snapshot (read-only)")
 	setPath := flag.String("set", "docs/inputs/eval/li_5gc_queries.json", "graded query set")
-	systemsCSV := flag.String("systems", "lexical,hybrid,rerank", "comma list of systems to score; a vector-less CI run passes -systems lexical to skip the embedding-dependent backends")
-	jsonOut := flag.String("json", "", "if set, write the macro-avg metrics per system (keyed by system) as JSON to this path — the machine-readable sidecar the regression gate consumes")
-	baseline := flag.String("baseline", "", "if set, compare metrics to this committed baseline JSON and exit 1 on any tracked-metric regression; a missing file is SEEDED from the current run (advisory, exit 0)")
+	systemsCSV := flag.String("systems", "lexical,hybrid,rerank", "comma list of systems to score; the local pipeline gate (goal step smoke) passes -systems lexical, the only one its lexical build can score — hybrid and rerank need the onnx,embed_ffi build and the model environment")
+	jsonOut := flag.String("json", "", "if set, write the macro-avg metrics per system (keyed by system) as JSON to this path — a CANDIDATE baseline: committing it as the -baseline file is how the bar is moved, on purpose and in a diff")
+	baseline := flag.String("baseline", "", "if set, compare metrics to this committed baseline JSON and exit 1 on any tracked-metric regression. A missing or empty baseline, or one with no entry for a scored system, also exits 1: it is never seeded (write a candidate with -json and commit it)")
 	tol := flag.Float64("tol", 0.02, "absolute tolerance for -baseline: a tracked metric must drop by more than this to fail the gate")
 	synth := flag.Int("synth-hnsw", 0, "Phase-0: insert N random vectors, build+freeze HNSW, report build time; then exit (measure peak RSS via /usr/bin/time -v)")
 	synthOut := flag.String("synth-out", "data/phase0-synth.duckdb", "output DB for --synth-hnsw (created then removed)")
@@ -134,24 +134,23 @@ func main() {
 }
 
 // gateAgainstBaseline compares results to the committed baseline and reports any
-// regression. A missing baseline is SEEDED from this run and the gate stays
-// advisory (returns true) — the first run on a branch can never block itself.
-// Returns false only when an existing baseline shows a real regression.
+// regression. It returns true only when a real comparison was made and found no
+// tracked metric below (baseline - tol).
+//
+// A MISSING BASELINE FAILS, and is never written. This function used to SEED it
+// from the current run and return true, on the theory that "the first run on a
+// branch can never block itself" — which is the same sentence as "the gate
+// cannot fail", read from the other side: the run being judged became the
+// standard it was judged by. The verdict now lives in eval.Judge, shared with
+// the local pipeline's smoke step, so the two cannot drift apart. Creating a
+// baseline is still one flag away and is now a DECISION: run with -json, read
+// the numbers, commit the file.
 func gateAgainstBaseline(path string, results eval.Baseline, tol float64) bool {
-	base, err := eval.LoadBaseline(path)
-	if os.IsNotExist(err) {
-		if werr := eval.WriteBaseline(path, results); werr != nil {
-			fmt.Fprintf(os.Stderr, "seed baseline %s: %v\n", path, werr)
-			return false
-		}
-		fmt.Printf("\nbaseline %s absent — SEEDED from this run (advisory, gate passes). Commit it to make the gate binding.\n", path)
-		return true
-	}
+	regs, err := eval.Judge(path, results, tol)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load baseline %s: %v\n", path, err)
+		fmt.Fprintf(os.Stderr, "\nRETRIEVAL GATE CANNOT PASS: %v\n", err)
 		return false
 	}
-	regs := eval.Gate(results, base, tol)
 	if len(regs) == 0 {
 		fmt.Printf("\ngate OK: no tracked-metric regression beyond tol=%.3f vs %s\n", tol, path)
 		return true
