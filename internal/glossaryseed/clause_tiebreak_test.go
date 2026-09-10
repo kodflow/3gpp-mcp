@@ -44,6 +44,54 @@ func TestEarlierBreaksTheTieThatCompactCouldFlip(t *testing.T) {
 	}
 }
 
+// TestEarlierCountsCharactersNotBytes pins the half of the order that has to match
+// SQL rather than Go.
+//
+// GetClauses orders by `length(clause_path)`, which in DuckDB counts CHARACTERS.
+// Go's len() counts bytes. They agree on ASCII and part company on anything else:
+// "3.١" is three characters and four bytes, so SQL places it before "3.10"
+// and a byte comparison places it after. Measured 2026-09-10: zero non-ASCII clause
+// paths in either corpus — so this is not today's drift, but rust/parse's salvage
+// path captures `\d`, which Unicode digits satisfy, so it is reachable.
+func TestEarlierCountsCharactersNotBytes(t *testing.T) {
+	const arabicIndicOne = "3.١" // 3 runes, 4 bytes
+	if got := len(arabicIndicOne); got != 4 {
+		t.Fatalf("the fixture must be a multi-byte path, got %d bytes", got)
+	}
+	if !earlier(arabicIndicOne, 1, "3.10", 1) {
+		t.Error("a 3-character path must sort before a 4-character one, as SQL length() " +
+			"orders them; comparing bytes reverses this pair")
+	}
+}
+
+// TestBetterCandidatePrefersTheClauseThatDeclaresMore pins the correction that the
+// adversarial review forced.
+//
+// Ranking tied clauses by position alone is deterministic and demonstrably picks
+// worse text. Measured on the corpus published 2026-09-10: for 38.475 v0.3.0 §3.2
+// the lowest chunk is the clause's introduction while its tied sibling defines
+// gNB-CU, gNB-DU and gNB; for 33.802 v0.2.0 §3.3 the lowest chunk is an
+// "<ACRONYM> <Explanation>" template. This function exists to mine abbreviations,
+// so the clause that declares more of them is more of what was asked for.
+func TestBetterCandidatePrefersTheClauseThatDeclaresMore(t *testing.T) {
+	// Same path, and the richer clause sits at the HIGHER chunk — which is exactly
+	// the shape both measured cases have, and the one position alone gets wrong.
+	if !betterCandidate(12, "3.2", 9752140, 0, "3.2", 9752097) {
+		t.Error("a clause yielding 12 entries must beat one yielding none, whatever their " +
+			"chunk ids")
+	}
+	if betterCandidate(0, "3.2", 9752097, 12, "3.2", 9752140) {
+		t.Error("and the poorer clause must not win by sitting earlier")
+	}
+	// Position still decides, and only when the yields tie.
+	if !betterCandidate(5, "3.2", 1, 5, "3.2", 2) {
+		t.Error("equal yields must fall back to the positional order")
+	}
+	if betterCandidate(5, "3.2", 2, 5, "3.2", 1) {
+		t.Error("and that fallback must stay strict")
+	}
+}
+
 // TestEarlierIsATotalOrder is what makes "same corpus, same answer" true rather
 // than likely.
 //

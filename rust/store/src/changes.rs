@@ -64,24 +64,64 @@ fn put(h: &mut Sha256, b: &[u8]) {
 /// corpus and on the rows a run is about to write: if the two multisets differ by so
 /// much as one character of one summary, the sums differ.
 fn row_hash(r: &ChangeRow) -> u128 {
+    // A row this crate is about to write has a value in every string column and
+    // leaves `clauses` NULL — see ChangeRow for why the CR database cannot fill it.
+    hash_parts(
+        &[
+            Some(r.spec_id.as_str()),
+            Some(r.cr_number.as_str()),
+            Some(r.summary.as_str()),
+            Some(r.meeting.as_str()),
+            Some(r.category.as_str()),
+            Some(r.from_version.as_str()),
+            Some(r.to_version.as_str()),
+            Some(r.tdoc.as_str()),
+            None,
+        ],
+        r.cr_revision,
+    )
+}
+
+/// hash_parts is the one definition of what a change record hashes to, so the rows
+/// read back out of the corpus and the rows about to be written cannot drift apart
+/// by being hashed in two places.
+///
+/// NULL IS NOT THE EMPTY STRING, and here that is a correctness property rather
+/// than tidiness. `store.GetChangelog` scans these columns into plain Go strings, so
+/// a NULL where the reader expects text makes the whole call fail — the defect #322
+/// fixed for `cr_revision` and `clauses`, which was invisible for as long as the
+/// table had no writer. Coercing both to "" would let this guard declare a
+/// changelog the server cannot read identical to one it can, and skip the repair.
+/// Measured on the corpus published 2026-09-10: 268 rows carry at least one empty
+/// string, and none carry a NULL one — so the two are distinguishable today and the
+/// guard must keep them so.
+///
+/// THE LAST SLOT IS `clauses`, which this writer always leaves NULL and which is
+/// not on ChangeRow. Leaving it out of the hash was a hole with a working
+/// counterexample: set `clauses` on one row out of band and the count, the sum and
+/// the source stamp all still match, so the overlay reports "corpus untouched" and
+/// preserves an invented clause association — one that `find_cross_references` and
+/// `get_changelog` then filter on.
+fn hash_parts(text: &[Option<&str>; 9], revision: Option<i32>) -> u128 {
     let mut h = Sha256::new();
-    h.update(b"change-row-v1");
-    put(&mut h, r.spec_id.as_bytes());
-    put(&mut h, r.cr_number.as_bytes());
+    h.update(b"change-row-v2");
+    for f in text {
+        match f {
+            Some(s) => {
+                h.update([1u8]);
+                put(&mut h, s.as_bytes());
+            }
+            None => h.update([0u8]),
+        }
+    }
     // Some(0) and None are different facts about a CR and must not hash alike.
-    match r.cr_revision {
+    match revision {
         Some(v) => {
             h.update([1u8]);
             h.update(v.to_le_bytes());
         }
         None => h.update([0u8]),
     }
-    put(&mut h, r.summary.as_bytes());
-    put(&mut h, r.meeting.as_bytes());
-    put(&mut h, r.category.as_bytes());
-    put(&mut h, r.from_version.as_bytes());
-    put(&mut h, r.to_version.as_bytes());
-    put(&mut h, r.tdoc.as_bytes());
     let d = h.finalize();
     let mut b = [0u8; 16];
     b.copy_from_slice(&d[..16]);
@@ -102,29 +142,42 @@ impl Store {
     /// rewrite the corpus every run, and nothing would say why. The row error is
     /// propagated, as it is in the spec-list read below.
     fn changes_sum(&self) -> Result<(u128, usize)> {
+        // `clauses` is a VARCHAR[] and is read through CAST(... AS VARCHAR) rather
+        // than as a list: the only thing this comparison needs to know is whether
+        // the column is still NULL and, if it is not, what it says. Rendering it as
+        // text answers both without teaching this function a list type it would
+        // otherwise never touch.
+        //
+        // THE COLUMN ORDER HERE IS THE ORDER hash_parts EXPECTS, and the two are
+        // adjacent for that reason. They are the same nine slots the writer fills.
         let mut st = self.conn.prepare(
-            "SELECT cr_number, cr_revision, spec_id, from_version, to_version,
-                    meeting, category, summary, tdoc_url
+            "SELECT spec_id, cr_number, summary, meeting, category,
+                    from_version, to_version, tdoc_url, CAST(clauses AS VARCHAR),
+                    cr_revision
                FROM changes",
         )?;
         let it = st.query_map([], |r| {
-            Ok(ChangeRow {
-                cr_number: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                cr_revision: r.get::<_, Option<i32>>(1)?,
-                spec_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                from_version: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                to_version: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                meeting: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                category: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                summary: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                tdoc: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
-            })
+            Ok((
+                [
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ],
+                r.get::<_, Option<i32>>(9)?,
+            ))
         })?;
         let mut sum = 0u128;
         let mut n = 0usize;
         for r in it {
-            let r = r.context("read the changelog the corpus already holds")?;
-            sum = sum.wrapping_add(row_hash(&r));
+            let (text, revision) = r.context("read the changelog the corpus already holds")?;
+            let parts: [Option<&str>; 9] = std::array::from_fn(|i| text[i].as_deref());
+            sum = sum.wrapping_add(hash_parts(&parts, revision));
             n += 1;
         }
         Ok((sum, n))

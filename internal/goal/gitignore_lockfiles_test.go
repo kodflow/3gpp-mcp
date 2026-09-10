@@ -42,13 +42,24 @@ func TestEveryCrateLockfileIsTracked(t *testing.T) {
 			"not a pass on purpose")
 	}
 
-	locks := crateLockfiles(t, root)
+	// THE REQUIRED SET, NOT THE SET THAT HAPPENS TO EXIST. Walking for lockfiles
+	// and checking what it finds cannot notice a lockfile that is GONE — delete
+	// rust/Cargo.lock, the three standalone locks still satisfy a non-empty check,
+	// and the authoritative lock for store, parse, ingest and identity disappears
+	// with both tests green. Deriving the set from the manifest is what makes
+	// absence a failure.
+	locks := expectedLockfiles(t, root)
 	if len(locks) == 0 {
-		t.Fatal("found no Cargo.lock under rust/; either the crates moved or this test is " +
-			"looking in the wrong place, and either way it is checking nothing")
+		t.Fatal("derived no required lockfiles from rust/Cargo.toml; either the crates " +
+			"moved or this test is looking in the wrong place, and either way it is " +
+			"checking nothing")
 	}
 
 	for _, rel := range locks {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("%s is missing: %v", rel, err)
+			continue
+		}
 		cmd := exec.Command("git", "ls-files", "--error-unmatch", "--", rel)
 		cmd.Dir = root
 		out, err := cmd.CombinedOutput()
@@ -108,31 +119,35 @@ func TestEveryRustCrateHasItsLockfile(t *testing.T) {
 	}
 }
 
-// crateLockfiles returns every Cargo.lock under rust/, repo-relative with forward
-// slashes, which is the form git wants on every platform.
-func crateLockfiles(t *testing.T, root string) []string {
+// expectedLockfiles derives, from the workspace manifest, every Cargo.lock this
+// repository must have: the workspace's own, plus one for each crate the workspace
+// excludes. Paths are repo-relative with forward slashes, the form git wants on
+// every platform.
+//
+// THE WORKSPACE ROOT IS THE ONE THAT WAS MISSED. rust/Cargo.lock is the
+// authoritative lock for store, parse, ingest and identity — four crates with no
+// lockfile of their own by design — and a check built from directory listings walks
+// straight past it.
+func expectedLockfiles(t *testing.T, root string) []string {
 	t.Helper()
-	var out []string
-	err := filepath.WalkDir(filepath.Join(root, "rust"), func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		// target/ holds build output, including lockfiles cargo copies for vendored
-		// crates. Those are not ours to track.
-		if d.IsDir() && d.Name() == "target" {
-			return filepath.SkipDir
-		}
-		if !d.IsDir() && d.Name() == "Cargo.lock" {
-			rel, err := filepath.Rel(root, p)
-			if err != nil {
-				return err
-			}
-			out = append(out, filepath.ToSlash(rel))
-		}
-		return nil
-	})
+	rustDir := filepath.Join(root, "rust")
+	members := workspaceMembers(t, filepath.Join(rustDir, "Cargo.toml"))
+	if len(members) == 0 {
+		t.Fatal("read no workspace members out of rust/Cargo.toml")
+	}
+	out := []string{"rust/Cargo.lock"}
+	entries, err := os.ReadDir(rustDir)
 	if err != nil {
-		t.Fatalf("walk rust/: %v", err)
+		t.Fatalf("read rust/: %v", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "target" || members[e.Name()] {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(rustDir, e.Name(), "Cargo.toml")); err != nil {
+			continue
+		}
+		out = append(out, "rust/"+e.Name()+"/Cargo.lock")
 	}
 	return out
 }

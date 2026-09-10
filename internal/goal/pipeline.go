@@ -301,7 +301,22 @@ func stepBuildRust() *Step {
 				return err
 			}
 			for manifest, bins := range rustBins {
-				args := []string{"build", "--release", "--manifest-path", manifest}
+				// --locked TURNS A SILENT REWRITE INTO A LOUD FAILURE, and that is
+				// the root cause this flag closes rather than a tidiness.
+				//
+				// Without it cargo is free to resolve differently and REWRITE the
+				// lockfile as a side effect of building. It did, on 2026-09-10:
+				// rust/discover/Cargo.lock changed DURING this step, after the step
+				// had already hashed it into its fingerprint, so `build-rust` and
+				// `test` both replayed on the next plan for a change that appears in
+				// no commit and no diff. Tracking the lockfiles makes that drift
+				// visible; --locked makes it impossible, because a manifest that
+				// needs a new resolution now stops the build and asks for a
+				// deliberate `cargo update` instead of taking one.
+				//
+				// Verified before it was added: all four manifests here satisfy
+				// --locked today, so this changes no build that was already correct.
+				args := []string{"build", "--release", "--locked", "--manifest-path", manifest}
 				for _, b := range bins {
 					args = append(args, "--bin", b)
 				}

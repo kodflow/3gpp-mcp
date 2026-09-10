@@ -257,6 +257,92 @@ fn a_same_sized_but_different_changelog_is_rewritten() {
     );
 }
 
+#[test]
+fn an_invented_clause_association_is_not_preserved() {
+    // THE COLUMN THE COMPARISON FORGOT (adversarial review, 2026-09-10).
+    //
+    // `clauses` is deliberately left NULL: the CR database records WHICH change
+    // was made at which version transition, not which clause paths it touched. The
+    // first version of this guard did not read the column at all, so setting it out
+    // of band left the row count, the sum and the source stamp all matching — the
+    // overlay reported "corpus untouched" and preserved an association nothing in
+    // the source supports. get_changelog and find_cross_references then filter on
+    // it, so the invention would have been served as fact.
+    let t = Tmp::new("clauses");
+    let store = corpus(&t);
+    let rows = vec![row("23.501", "0001", "AMF registration")];
+    assert_eq!(
+        store.replace_changes(&rows, "CRDB_20260715").unwrap(),
+        (1, 0, true)
+    );
+
+    store
+        .raw()
+        .execute_batch("UPDATE changes SET clauses = ['5.2'] WHERE cr_number = '0001';")
+        .expect("invent a clause association behind the writer's back");
+
+    assert_eq!(
+        store.replace_changes(&rows, "CRDB_20260715").unwrap(),
+        (1, 0, true),
+        "every string column matches and only `clauses` was invented — it must still rewrite"
+    );
+    let n: i64 = store
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM changes WHERE clauses IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "and the column must be back to NULL");
+}
+
+#[test]
+fn a_null_is_not_the_empty_string() {
+    // NULL WHERE THE READER EXPECTS TEXT IS A BROKEN CALL, NOT A COSMETIC
+    // DIFFERENCE (adversarial review, 2026-09-10).
+    //
+    // store.GetChangelog scans these columns into plain Go strings, so ONE NULL
+    // makes the whole call fail — the defect #322 fixed for cr_revision and
+    // clauses, invisible for as long as the table had no writer. The first version
+    // of this guard read stored strings through unwrap_or_default(), so a NULL and
+    // an intended "" hashed alike: a changelog the server cannot read would have
+    // been declared identical to one it can, and the repair skipped.
+    //
+    // Measured on the corpus published 2026-09-10: 268 rows carry at least one
+    // empty string. Every one of them is a row where this substitution is
+    // available.
+    let t = Tmp::new("nulls");
+    let store = corpus(&t);
+    let mut r = row("23.501", "0001", "AMF registration");
+    r.meeting = String::new(); // as 268 real rows are
+    let rows = vec![r];
+    assert_eq!(
+        store.replace_changes(&rows, "CRDB_20260715").unwrap(),
+        (1, 0, true)
+    );
+
+    store
+        .raw()
+        .execute_batch("UPDATE changes SET meeting = NULL WHERE cr_number = '0001';")
+        .expect("turn an empty string into a NULL behind the writer's back");
+
+    assert_eq!(
+        store.replace_changes(&rows, "CRDB_20260715").unwrap(),
+        (1, 0, true),
+        "'' and NULL are the same length and different facts — it must rewrite"
+    );
+    let n: i64 = store
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM changes WHERE meeting IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "and the reader must find a string again");
+}
+
 /// ChangeRow is not Clone (it does not need to be in production), so the one test
 /// that needs a second copy builds it here rather than widening the type.
 trait CloneRows {
