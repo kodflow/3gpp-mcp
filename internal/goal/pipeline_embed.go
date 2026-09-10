@@ -537,7 +537,18 @@ func stepEnrich(t corpusTarget) *Step {
 		// would then carry a catalogue, an API surface, an LI registry and a
 		// changelog written by a binary that no longer exists, with nothing to show
 		// it. rust/parse's manifest is already covered by the directory below.
-		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/ingest/src/bin/ingest_crs.rs", "rust/ingest/Cargo.toml", "rust/store/src/changes.rs", "rust/store/src/lib.rs", "rust/store/Cargo.toml", "rust/Cargo.toml", "rust/Cargo.lock", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "scripts/fetch-crdb.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		//
+		// internal/store/acronyms_write.go is the Go twin of changes.rs, named here
+		// for the same reason. seed-glossary's rows reach the corpus through store
+		// methods, and until 2026-09-11 those sat in store.go, which this step does
+		// not declare — so a change to how the glossary is written changed what this
+		// step writes without this step replaying. That stopped being a nicety the
+		// day the write became a REPLACEMENT: it now deletes, and a deletion rule
+		// that can change without a replay ships a glossary the current code would
+		// not write, reported as current. Declaring internal/store whole would
+		// replay this step on every serve-path edit instead. See acronyms_write.go,
+		// and TestEnrichDeclaresTheGlossaryWriter for what holds the declaration.
+		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/ingest/src/bin/ingest_crs.rs", "rust/ingest/Cargo.toml", "rust/store/src/changes.rs", "rust/store/src/lib.rs", "rust/store/Cargo.toml", "rust/Cargo.toml", "rust/Cargo.lock", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "scripts/fetch-crdb.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary", "internal/store/acronyms_write.go"},
 		// A _test.go CANNOT CHANGE WHAT THIS STEP DOES. The four Go packages above
 		// are named as DIRECTORIES, so every test file in them counted toward this
 		// step's fingerprint — and this step runs binaries, it does not compile
@@ -696,9 +707,10 @@ func stepEnrich(t corpusTarget) *Step {
 			// catalogue overlay for the same reason the edge seed does — it
 			// reads clauses out of this corpus — and it is what stops
 			// resolve_term answering "Authentication Management Field" when
-			// asked what an AMF is. Additive and idempotent: it upserts, so the
-			// TS 21.905 and ETSI entries stay exactly where they are and only
-			// the ORDER a reader sees changes.
+			// asked what an AMF is. It REPLACES the rows it owns — those citing a
+			// spec id — so a row no spec declares any more leaves, while the
+			// TS 21.905 and ETSI entries stay exactly where they are. Idempotent:
+			// an unchanged corpus is left untouched, byte for byte.
 			c.Log.Printf("glossary seed (each spec's own Abbreviations clause)")
 			return c.Run(Cmd{Name: c.bin("seed-glossary"), Args: []string{"--db", db}, Echo: true})
 		},

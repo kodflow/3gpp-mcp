@@ -8,10 +8,11 @@
 //	              [--min 150] [--check-only] [--report json]
 //
 // The behaviour lives in internal/glossaryseed; this is the thin CLI around it
-// (cmd/CLAUDE.md). It is additive and idempotent: rows are upserted on
-// (term, expansion, domain), so re-running changes nothing and the existing
-// TS 21.905 and ETSI entries stay where they are. What changes is which meaning
-// a reader is shown first.
+// (cmd/CLAUDE.md). It REPLACES the rows it owns — those citing a spec id — and
+// nothing else: what the sweep declares is written, a seeded row no spec declares
+// any more is removed, and the TS 21.905 and ETSI entries stay exactly where they
+// are. It is idempotent: re-running over an unchanged corpus writes nothing. What
+// changes is which meaning a reader is shown first.
 package main
 
 import (
@@ -71,14 +72,36 @@ func emit(rep glossaryseed.Report, format string) {
 	switch {
 	case !rep.Applied:
 		fmt.Printf("seed-glossary: parsed=%d (check-only, floor %d)\n", rep.Parsed, rep.Min)
+		if rep.OK {
+			fmt.Printf("seed-glossary: a write would rewrite %d row(s) and remove %d\n",
+				rep.Rewritten, rep.Removed)
+		}
 	case rep.Changed:
-		fmt.Printf("seed-glossary: parsed=%d written=%d (floor %d)\n", rep.Parsed, rep.Written, rep.Min)
+		fmt.Printf("seed-glossary: parsed=%d written=%d rewritten=%d removed=%d (floor %d)\n",
+			rep.Parsed, rep.Written, rep.Rewritten, rep.Removed, rep.Min)
 	default:
 		// Said out loud, because "written=679" used to be printed either way. A
 		// reader of the enrich log needs to tell a corpus left untouched from a
 		// step that did not run — the first means the image need not be pushed.
 		fmt.Printf("seed-glossary: parsed=%d — already correct, corpus untouched (floor %d)\n",
 			rep.Parsed, rep.Min)
+	}
+	// THE REMOVED ROWS ARE NAMED IN THE LOG, not only counted. The enrich log is
+	// read in text mode, and "removed=37" says that the glossary shrank without
+	// saying what a reader can no longer find. The first few are enough to judge
+	// a run by; --report json carries every one.
+	verb := "removed"
+	if !rep.Applied {
+		verb = "would remove"
+	}
+	const shown = 10
+	for i, r := range rep.RemovedRows {
+		if i == shown {
+			fmt.Printf("seed-glossary:   … and %d more (--report json lists every one)\n",
+				len(rep.RemovedRows)-shown)
+			break
+		}
+		fmt.Printf("seed-glossary:   %s %s = %q (%s)\n", verb, r.Term, r.Expansion, r.Source)
 	}
 	if rep.Error != "" {
 		fmt.Fprintf(os.Stderr, "seed-glossary: %s\n", rep.Error)
