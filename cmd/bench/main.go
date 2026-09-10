@@ -60,7 +60,12 @@ func main() {
 	}
 	defer func() { _ = st.Close() }()
 	ctx := context.Background()
-	_ = st.LoadFTS(ctx)
+	if err := requireFTS(ctx, st, *dbPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	// VSS may legitimately be absent: the lexical system scores on a vector-less
+	// corpus, and hybrid/rerank say so in their own rows when it is missing.
 	_ = st.LoadVSS(ctx)
 	eng := search.New(st)
 
@@ -205,5 +210,35 @@ func runSynthHNSW(n int, outPath string, _ int) error {
 	}
 	fmt.Printf("synth-hnsw: build+freeze N=%d in %s (peak RSS = /usr/bin/time -v Maximum resident set size)\n",
 		n, time.Since(buildStart).Round(time.Millisecond))
+	return nil
+}
+
+// ftsLoader is the part of *store.Store requireFTS needs, so the refusal can be
+// tested without building a corpus that lacks an index.
+type ftsLoader interface {
+	LoadFTS(context.Context) error
+	FTSAvailable() bool
+}
+
+// requireFTS refuses to score when full-text search is not usable.
+//
+// FTS IS WHAT THE "lexical (BM25)" ROW MEASURES. The error used to be discarded,
+// and when LoadFTS fails SearchClauses does not stop — it falls back to plain token
+// matching. So the gate could score a retrieval implementation this corpus does not
+// serve, under the BM25 label, and pass on it: a quality gate approving
+// measurements of the wrong engine. Found by review of #324.
+//
+// A nil error is not enough either: LoadFTS can load the extension and still find no
+// index schema, in which case FTSAvailable stays false and the same fallback runs.
+func requireFTS(ctx context.Context, st ftsLoader, db string) error {
+	if err := st.LoadFTS(ctx); err != nil {
+		return fmt.Errorf("load FTS on %s: %w — refusing to score token matching under the "+
+			"BM25 label", db, err)
+	}
+	if !st.FTSAvailable() {
+		return fmt.Errorf("%s has no usable FTS index — SearchClauses would fall back to token "+
+			"matching, and scoring that under the BM25 label would gate a ranking this corpus "+
+			"does not serve", db)
+	}
 	return nil
 }

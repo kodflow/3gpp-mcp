@@ -213,6 +213,18 @@ done
 # copying it is what stops the image and the local embedder from drifting apart.
 ORT_VERSION="${ORT_VERSION:-$(sed -n 's/^ORT_VERSION="\${ORT_VERSION:-\([0-9][0-9.]*\)}"$/\1/p' scripts/fetch-model.sh | head -1)}"
 [ -n "$ORT_VERSION" ] || die "cannot read the ORT_VERSION pin from scripts/fetch-model.sh"
+# A VERSION IS DIGITS AND DOTS, AND NOTHING ELSE MAY REACH THE sed PROGRAM BELOW.
+#
+# ORT_VERSION is an operator override, and the pin lookup interpolates it into a
+# sed script. Unchecked, `ORT_VERSION='x//;e id;#'` would have run `id` on the
+# build host — GNU sed's `e` command — before the empty-pin guard could refuse the
+# version, and the same value flows into the download URL. Found by review of
+# #324, in a line this branch had just added. Rejecting anything that is not a
+# dotted number closes it for every later use at once, rather than escaping it
+# for one.
+case "$ORT_VERSION" in
+  ''|*[!0-9.]*|.*|*.|*..*) die "ORT_VERSION='$ORT_VERSION' is not a dotted version number" ;;
+esac
 # THE CHECKSUM TOO, AND FROM THE SAME PLACE AS THE VERSION.
 #
 # The comment above said "pinned and checksummed exactly as fetch-model.sh pins
