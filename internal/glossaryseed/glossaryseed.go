@@ -79,6 +79,74 @@ const DefaultSpecs = "23.501,23.401,24.501,33.501,23.548,23.682"
 // read rather than a small vocabulary.
 const DefaultMin = 150
 
+// THE MASS-REMOVAL GUARD, and why the floor above is not enough.
+//
+// The write REPLACES the seeded rows, so a sweep that silently loses specs now
+// DELETES their rows — where the additive writer before it could only have left
+// them stale. The floor cannot see that: it is measured on the six preferred
+// specs, and a read that loses any of the other ~1 980 owning specs passes it
+// untouched. So a run is refused — nothing written, non-zero exit — on either of
+// two signatures, unless --allow-mass-removal says the removal is deliberate:
+//
+//  1. A SPEC GOES SILENT. It owns rows today, the catalogue still lists it, and
+//     the sweep came back with not one row from it (store.GlossaryDiff.Vanished).
+//     That is what a broken read looks like and what an editorial change almost
+//     never does; a spec that really dropped its vocabulary is rare enough to be
+//     worth one deliberate flag.
+//  2. TOO MANY ROWS AT ONCE — more than removalBound. This catches the loss that
+//     rule 1 cannot: a regression spread across many specs, each of which still
+//     yields something.
+//
+// THE BOUND IS DERIVED, from measurements taken 2026-09-11 on the shipped corpus:
+//
+//   - normal churn: the next run removes 1 row of the 13 722 seeded — 0.007 %;
+//   - the unit of legitimate churn is ONE spec re-issuing its list, which can
+//     remove at most what that spec owns: 1 984 specs own the 13 722 rows, median
+//     3, p90 17, p99 53, max 174 (24.501, a preferred spec), then 134 (33.501),
+//     127 (23.501), 124 (38.889).
+//
+// removalBoundPct = 1 %, 137 rows today: over a hundred times the measured churn,
+// and above the ENTIRE vocabulary of every spec but 24.501 — so any one spec,
+// re-issued with a rewritten list, still passes, while losses across several
+// specs at once do not. removalBoundRows = 53, the p99 above, is the floor under
+// that fraction: it only binds below 5 300 seeded rows (a partial rebuild, a test
+// corpus), where 1 % would refuse a single ordinary spec's re-issue.
+const (
+	removalBoundPct  = 1
+	removalBoundRows = 53
+)
+
+// removalBound is the most seeded rows one run may remove without
+// --allow-mass-removal.
+func removalBound(owned int) int {
+	return max(removalBoundRows, owned*removalBoundPct/100)
+}
+
+// massRemoval says why a diff would be refused, or "" when it passes.
+func massRemoval(d store.GlossaryDiff) string {
+	var why []string
+	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
+		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
+			n, d.Owned, bound))
+	}
+	if len(d.Vanished) > 0 {
+		// The first twenty by name; the JSON report carries every one. A broken
+		// sweep can silence a thousand specs, and a message that long is not read.
+		const named = 20
+		var names []string
+		for i, v := range d.Vanished {
+			if i == named {
+				names = append(names, fmt.Sprintf("and %d more", len(d.Vanished)-named))
+				break
+			}
+			names = append(names, fmt.Sprintf("%s (%d rows)", v.Spec, v.Owned))
+		}
+		why = append(why, fmt.Sprintf("%d spec(s) still in the catalogue would lose ALL their rows: %s",
+			len(d.Vanished), strings.Join(names, ", ")))
+	}
+	return strings.Join(why, "; and ")
+}
+
 // SpecReport is what one spec contributed.
 type SpecReport struct {
 	Spec    string `json:"spec"`
@@ -116,8 +184,16 @@ type Report struct {
 	// silent failure this package keeps refusing: the count alone would say that
 	// the glossary shrank, never what a reader can no longer find.
 	RemovedRows []RemovedRow `json:"removed,omitempty"`
-	OK          bool         `json:"ok"`
-	Error       string       `json:"error,omitempty"`
+	// The mass-removal guard's inputs and verdict — see removalBound. Guard is
+	// "pass", "refused" or "overridden" (refused, and let through by
+	// --allow-mass-removal), and --check-only reaches the same verdict as the
+	// write would, from the same diff, without writing.
+	Owned        int            `json:"owned_total"`
+	RemovalBound int            `json:"removal_bound"`
+	Vanished     []VanishedSpec `json:"vanished_specs,omitempty"`
+	Guard        string         `json:"guard,omitempty"`
+	OK           bool           `json:"ok"`
+	Error        string         `json:"error,omitempty"`
 }
 
 // RemovedRow is one seeded row a run took out of the glossary.
@@ -127,8 +203,37 @@ type RemovedRow struct {
 	Source    string `json:"source"`
 }
 
+// VanishedSpec is a spec still in the catalogue that the sweep no longer hears
+// from: how many rows it owns, and how many of them the write would delete.
+type VanishedSpec struct {
+	Spec    string `json:"spec"`
+	Owned   int    `json:"owned"`
+	Removed int    `json:"removed"`
+}
+
+// Options is what a run is asked to do.
+//
+// A struct, not two more positional booleans: CheckOnly and AllowMassRemoval side
+// by side in a call are one transposition away from a check-only run that
+// refuses nothing, or a real run that was meant to be a check.
+type Options struct {
+	// Specs are the PREFERRED specs: the floor is measured on them and their id
+	// wins provenance. The sweep itself is always the whole corpus.
+	Specs []string
+	// Min is the floor on the preferred specs' contribution.
+	Min int
+	// CheckOnly parses, reports and reaches the guard's verdict, and writes
+	// nothing — the database is opened read-only.
+	CheckOnly bool
+	// AllowMassRemoval lets through a removal the guard would refuse. Off by
+	// default, and the pipeline's enrich step never sets it: it is for an
+	// operator's deliberate cleanup, run by hand.
+	AllowMassRemoval bool
+}
+
 // Run seeds the glossary from the named specs' Abbreviations clauses.
-func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly bool) (Report, error) {
+func Run(ctx context.Context, path string, opt Options) (Report, error) {
+	specIDs, min, checkOnly := opt.Specs, opt.Min, opt.CheckOnly
 	// Applied stays FALSE until the write actually lands. Setting it from
 	// checkOnly up front makes a failed run report applied=true, which is the
 	// one field a caller reads to decide whether the corpus changed.
@@ -270,15 +375,36 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		}
 	}
 
+	// THE GUARD'S VERDICT, reached ONCE, from the diff that is written — the store
+	// calls approve between its plan and its transaction — and reached the same
+	// way on --check-only from the same plan, so a check that passes is a write
+	// that passes.
+	approve := func(d store.GlossaryDiff) error {
+		rep.Owned, rep.RemovalBound = d.Owned, removalBound(d.Owned)
+		for _, v := range d.Vanished {
+			rep.Vanished = append(rep.Vanished, VanishedSpec{v.Spec, v.Owned, v.Removed})
+		}
+		why := massRemoval(d)
+		switch {
+		case why == "":
+			rep.Guard = "pass"
+		case opt.AllowMassRemoval:
+			rep.Guard = "overridden"
+		default:
+			rep.Guard = "refused"
+			return fmt.Errorf("refusing to replace the seeded glossary: %s. Nothing was written. "+
+				"A sweep that silently lost specs looks exactly like this; if the removal is "+
+				"deliberate, re-run with --allow-mass-removal", why)
+		}
+		return nil
+	}
+
 	var diff store.GlossaryDiff
 	if checkOnly {
-		if diff, err = s.PlanSeededAcronyms(rows); err != nil {
-			return rep, err
+		if diff, err = s.PlanSeededAcronyms(rows); err == nil {
+			err = approve(diff)
 		}
 	} else {
-		for i := range todo {
-			todo[i].sr.Written = len(todo[i].entries)
-		}
 		// ONE TRANSACTION for the whole batch, the removal included. Collecting
 		// before writing removes the partial write a failed FLOOR would leave; it
 		// does nothing about a failure on row 400 of 679, which would leave 399
@@ -289,12 +415,17 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 		// writes nothing — which is the point, since one changed byte in this
 		// 23 GB file is an 11 GB push — and a run that announced "written=679"
 		// either way would hide exactly the thing worth knowing.
-		if diff, err = s.ReplaceSeededAcronyms(rows); err != nil {
-			return rep, err
+		if diff, err = s.ReplaceSeededAcronyms(rows, approve); err == nil {
+			rep.Applied = true
+			rep.Changed = diff.Changed()
+			for i := range todo {
+				todo[i].sr.Written = len(todo[i].entries)
+			}
 		}
-		rep.Applied = true
-		rep.Changed = diff.Changed()
 	}
+	// FILLED ON A REFUSAL TOO. The diff is exactly what is being refused, and an
+	// operator deciding whether to pass --allow-mass-removal needs to see the rows
+	// before deciding, not after.
 	rep.Rewritten = diff.Written
 	rep.Removed = len(diff.Removed)
 	for _, a := range diff.Removed {
@@ -303,6 +434,9 @@ func Run(ctx context.Context, path string, specIDs []string, min int, checkOnly 
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
 		rep.Written += todo[i].sr.Written
+	}
+	if err != nil {
+		return rep, err
 	}
 	rep.OK = true
 	return rep, nil
