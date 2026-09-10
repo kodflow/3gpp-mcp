@@ -307,14 +307,52 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (SpecReport, [
 
 	// By HEADING, not by a hardcoded "3.2". The clause number differs between
 	// specs and moves between releases; the heading is what the editor writes.
+	//
+	// THE FIRST CANDIDATE IS NOT A CHOICE, IT IS WHATEVER THE SCAN HANDED BACK.
+	//
+	// This loop used to `break` on the first match, which reads like a decision and
+	// is not one. GetClauses orders by `len(clause_path), clause_path` and nothing
+	// else, so two rows sharing a clause_path — the same clause catalogued under
+	// more than one release, or a document that repeats it — come back TIED, and
+	// the winner is then whatever physical order the table happens to be in.
+	// `compact` rewrites that order.
+	//
+	// Measured on the corpus published 2026-09-10: of 3 433 (spec, clause) pairs
+	// headed "Abbreviations" at their newest version, 41 carry a tie and 8 of those
+	// have tied rows with DIFFERENT TEXT — enough to move the mined vocabulary. It
+	// did: `seed-glossary` reported parsed=55778 before a compact and parsed=55753
+	// after, on a corpus no ingest had touched between the two. Nothing failed. The
+	// only visible effect was that a 23 GB corpus moved, so its image layer got a
+	// new digest and the whole thing was pushed again.
+	//
+	// So the tie is broken HERE, on stored identity, and the choice is deliberately
+	// arbitrary: among rows the corpus says are the same clause of the same spec at
+	// the same version, there is no principled "better text" to prefer, and
+	// inventing one would be a claim about the data rather than a property of it.
+	// What matters is that the same corpus yields the same answer twice.
+	//
+	// It is fixed HERE rather than in GetClauses' ORDER BY because `enrich` declares
+	// internal/glossaryseed and does NOT declare internal/store: a fix in the store
+	// would change what enrich produces without enrich replaying, which is the same
+	// provenance hole #322 closed when it found enrich declaring four Rust binaries
+	// and none of their manifests.
 	var body, path string
+	var bestChunk uint64
 	for _, c := range clauses {
 		if c.Version != best {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(c.Heading), "abbreviations") {
-			body, path = c.Text, c.ClausePath
-			break
+		if !strings.EqualFold(strings.TrimSpace(c.Heading), "abbreviations") {
+			continue
+		}
+		// THE EXISTING ORDER IS PRESERVED AND ONLY EXTENDED. GetClauses sorts by
+		// `len(clause_path), clause_path` — shortest path first — so comparing paths
+		// lexicographically alone would put "10.2" ahead of "3.2" and silently pick
+		// a different clause for every spec that has more than one. The chunk id is
+		// appended as a THIRD key, which changes the answer only where there was no
+		// answer before.
+		if body == "" || earlier(c.ClausePath, c.ChunkID, path, bestChunk) {
+			body, path, bestChunk = c.Text, c.ClausePath, c.ChunkID
 		}
 	}
 	if body == "" {
@@ -326,6 +364,30 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (SpecReport, [
 	entries := abbrev.Parse(body)
 	sr.Parsed = len(entries)
 	return sr, entries, nil
+}
+
+// earlier reports whether the clause at (pathA, chunkA) sorts before (pathB,
+// chunkB) under the order readSpec needs.
+//
+// The first two keys are GetClauses' own — `len(clause_path), clause_path` — and
+// they are repeated here rather than relied upon, because relying on them is what
+// broke: an ORDER BY that leaves rows tied hands the decision to the physical
+// order of the table, and `compact` rewrites that. The third key, the chunk id, is
+// a stored value that compaction preserves, so it decides the tie the same way
+// every time.
+//
+// Length FIRST is not decoration. Compared as plain strings "10.2" sorts before
+// "3.2", so a spec with an Abbreviations clause under both would change which one
+// seeds the glossary — a silent content change, in the middle of a fix for silent
+// content changes.
+func earlier(pathA string, chunkA uint64, pathB string, chunkB uint64) bool {
+	if len(pathA) != len(pathB) {
+		return len(pathA) < len(pathB)
+	}
+	if pathA != pathB {
+		return pathA < pathB
+	}
+	return chunkA < chunkB
 }
 
 // newerVersion reports whether a is a higher dotted-numeric version than b.
