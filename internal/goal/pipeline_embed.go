@@ -1139,12 +1139,43 @@ func stepSmoke() *Step {
 		// all judged in internal/goal, which smoke's fingerprint does not cover, so
 		// only the version can say the step's meaning moved.
 		Version: 3,
-		Doc:     "start the real server over stdio, prove every probe answers, and that vector search stays enabled",
+		Doc:     "start the real server over stdio, prove every probe answers, and hold retrieval to the committed baseline",
 		// BOTH GATES, because there are two now. Naming only "validate" would let
 		// the smoke -- and `publish` behind it -- run while the ETSI contract had
 		// not been applied, which is the state this whole split ends.
-		Deps: []string{"validate", "validate-etsi"},
-		Impl: []string{"cmd/server", "internal/mcp", "internal/search"},
+		//
+		// build-go is an AVAILABILITY constraint, the one index and compact already
+		// declare: this step launches server.exe and bench.exe, and `--only smoke`
+		// force-builds a step's Tool deps and nothing else. Without it that command
+		// judged the corpus with yesterday's bench — the "a fix that was not built
+		// is inert" trap, reached through the gate. A Tool dep adds nothing to the
+		// fingerprint, so declaring it replays nothing.
+		Deps: []string{"validate", "validate-etsi", "build-go"},
+		Impl: []string{
+			"cmd/server", "internal/mcp", "internal/search",
+			// THE RETRIEVAL GATE'S DETERMINANTS (see smoke_gate.go). The instrument,
+			// the verdict, the lexical ranking it measures (Store.SearchClauses) and
+			// the shape a hit is read from; then the judged queries and the bar. bench
+			// also links internal/embed and internal/rerank, which -systems lexical
+			// never reaches, so they are left out rather than replaying the gate for
+			// code it cannot run.
+			"cmd/bench", "internal/eval", "internal/store", "internal/model",
+			retrievalQuerySet, retrievalBaseline,
+		},
+		// The step RUNS binaries; a _test.go cannot change what either of them does.
+		// It counted them until now, recorded in countsTestFiles as cheap to replay
+		// at 23.9 s — which understated it: smoke has no outputs, so every replay
+		// hands publish a new provenance and re-composes the image. Naming
+		// internal/store, whose 43 test files are more than any other package
+		// holds, would have made every store test edit do that. This change replays
+		// smoke once anyway, so switching now costs nothing extra.
+		ExcludeTests: true,
+		Extra: func(c *Ctx) (map[string]string, error) {
+			return map[string]string{
+				"retrieval_systems": retrievalSystems,
+				"retrieval_tol":     retrievalTol,
+			}, nil
+		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			in := []string{c.dataPath("3gpp.duckdb")}
 			// The ETSI corpus is served ALONGSIDE, so a change to it changes what
@@ -1155,7 +1186,31 @@ func stepSmoke() *Step {
 			}
 			return in, nil
 		},
-		Run: func(c *Ctx) error { return runSmoke(c) },
+		Run: func(c *Ctx) error {
+			if err := runSmoke(c); err != nil {
+				return err
+			}
+			if err := runRetrievalGate(c); err != nil {
+				return err
+			}
+			// THIS is the moment compact's own instruction points at: "once served
+			// and verified, remove <db>.pre-compact". Until now nothing did, and the
+			// consequence was not merely wasted disk — compact REFUSES to overwrite
+			// an existing .pre-compact, so the backup left by one build blocked the
+			// next one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB,
+			// 3 169 614 clauses) and then failed on the in-place swap because of a
+			// backup from the 2nd. A step that cannot run twice without someone
+			// deleting a file by hand is a step the pipeline cannot converge through.
+			//
+			// Removing it HERE, and nowhere earlier, is the point: the smoke has just
+			// started the shipped binary against this corpus and had it answer, and
+			// the retrieval gate has just held its ranking to the committed bar.
+			// Before both, the backup is the only way back — and a compaction that
+			// lost rows would show up in the second before it showed up anywhere
+			// else, so the release waits for it.
+			releasePreCompact(c)
+			return nil
+		},
 	}
 }
 
@@ -1357,20 +1412,9 @@ func runSmoke(c *Ctx) error {
 	}
 	c.Checkpoint("tools", strconv.Itoa(len(names)))
 	c.Log.Printf("the server did not disable vector search at startup (see prove.sh for the semantic proof)")
-
-	// THIS is the moment compact's own instruction points at: "once served and
-	// verified, remove <db>.pre-compact". Until now nothing did, and the
-	// consequence was not merely wasted disk — compact REFUSES to overwrite an
-	// existing .pre-compact, so the backup left by one build blocked the next
-	// one. On 2026-09-03 the ETSI half compacted and verified (14.7 GiB, 3 169 614
-	// clauses) and then failed on the in-place swap because of a backup from the
-	// 2nd. A step that cannot run twice without someone deleting a file by hand is
-	// a step the pipeline cannot converge through.
-	//
-	// Removing it HERE, and nowhere earlier, is the point: the smoke has just
-	// started the shipped binary against this corpus and had it answer. Before
-	// that the backup is the only way back.
-	releasePreCompact(c)
+	// The pre-compact backups are released by the step, AFTER the retrieval gate:
+	// see stepSmoke. The server is killed when this returns, so bench never
+	// shares the corpus with it.
 	return nil
 }
 
