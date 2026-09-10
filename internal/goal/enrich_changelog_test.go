@@ -55,12 +55,15 @@ func TestChangelogWriterHasExactlyOneCaller(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	callers := grepTree(t, filepath.Join(root, "rust"), ".rs", "replace_changes")
-	// changes.rs defines it; ingest_crs.rs calls it. Anything else is a new caller.
+	// MATCH THE CALL, NOT THE NAME. Grepping for the bare identifier matched the
+	// prose in crdb.rs that explains why the writer replaces rather than appends,
+	// and the test failed on its own documentation. A method call is `.replace_changes(`
+	// and a definition is `fn replace_changes(`; only the first is a caller.
+	callers := grepTree(t, filepath.Join(root, "rust"), ".rs", ".replace_changes(")
 	var unexpected []string
 	for _, p := range callers {
 		rel := filepath.ToSlash(strings.TrimPrefix(p, root+string(filepath.Separator)))
-		if rel == "rust/store/src/changes.rs" || rel == "rust/ingest/src/bin/ingest_crs.rs" {
+		if rel == "rust/ingest/src/bin/ingest_crs.rs" {
 			continue
 		}
 		unexpected = append(unexpected, rel)
@@ -71,13 +74,32 @@ func TestChangelogWriterHasExactlyOneCaller(t *testing.T) {
 			"step whose binaries link this writer. Add the file to the new caller's step Impl.",
 			unexpected)
 	}
+	if defs := grepTree(t, filepath.Join(root, "rust"), ".rs", "fn replace_changes("); len(defs) != 1 {
+		t.Fatalf("expected exactly one definition of replace_changes, found %v", defs)
+	}
+
+	// A LOOP OVER AN EMPTY SLICE PASSES. Both halves below assert a POSITIVE count
+	// first: without that, renaming replace_changes or changing how the step spawns
+	// the binary would empty the search and this test would go green while checking
+	// nothing — the failure mode of a guard whose whole job is to notice a change.
+	if len(callers) == 0 {
+		t.Fatal("no file mentions replace_changes; the search string is stale and this " +
+			"test is no longer checking anything")
+	}
 
 	runners := grepTree(t, filepath.Join(root, "internal", "goal"), ".go", `rbin("ingest-crs")`)
+	var prod []string
 	for _, p := range runners {
-		if strings.HasSuffix(p, "_test.go") {
-			continue
+		if !strings.HasSuffix(p, "_test.go") {
+			prod = append(prod, filepath.ToSlash(p))
 		}
-		if !strings.HasSuffix(filepath.ToSlash(p), "internal/goal/pipeline_embed.go") {
+	}
+	if len(prod) == 0 {
+		t.Fatal("no step runs ingest-crs; either the changelog overlay was removed or " +
+			"the search string is stale")
+	}
+	for _, p := range prod {
+		if !strings.HasSuffix(p, "internal/goal/pipeline_embed.go") {
 			t.Fatalf("ingest-crs is run from %s as well as enrich; the changelog writer's "+
 				"provenance now has to be declared there too", p)
 		}

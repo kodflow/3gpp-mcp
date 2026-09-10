@@ -75,11 +75,24 @@ impl Store {
     /// matters: a DELETE that committed without its INSERT would leave the corpus
     /// with no changelog at all, which is strictly worse than the fossil it
     /// replaces.
-    pub fn replace_changes(&self, rows: &[ChangeRow]) -> Result<(usize, usize)> {
+    pub fn replace_changes(&self, rows: &[ChangeRow], source: &str) -> Result<(usize, usize)> {
+        // A DISCARDED SCAN ERROR IS A SHORTER SPEC LIST, AND A SHORTER SPEC LIST IS
+        // SILENTLY FEWER CHANGES.
+        //
+        // `filter_map(Result::ok)` here would turn a driver error into "this corpus
+        // does not hold that spec", and every row for it would be counted as
+        // skipped rather than lost — the run would report success and the changelog
+        // would simply be short. It is the same defect `checkNoReingest` was fixed
+        // for in ad70abd, where a discarded Scan error made an unread corpus look
+        // clean. Both the row error and rows.Err() equivalent are propagated.
         let held: std::collections::HashSet<String> = {
             let mut st = self.conn.prepare("SELECT spec_id FROM specs")?;
             let it = st.query_map([], |r| r.get::<_, String>(0))?;
-            it.filter_map(std::result::Result::ok).collect()
+            let mut set = std::collections::HashSet::new();
+            for r in it {
+                set.insert(r.context("read the spec list the changelog is filtered against")?);
+            }
+            set
         };
 
         self.conn
@@ -116,6 +129,19 @@ impl Store {
                 .with_context(|| format!("insert change {} {}", r.spec_id, r.cr_number))?;
                 written += 1;
             }
+            // THE STAMP RIDES WITH THE DATA IT DESCRIBES.
+            //
+            // Written after the COMMIT it would be a separate failure point: the
+            // rows would land under the PREVIOUS export's name, and get_changelog
+            // would then tell readers, precisely and wrongly, which export its
+            // silence came from. Inside the transaction the two cannot disagree.
+            self.conn
+                .execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('changes_source', ?)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    duckdb::params![source],
+                )
+                .context("stamp changes_source")?;
             Ok(())
         })();
 

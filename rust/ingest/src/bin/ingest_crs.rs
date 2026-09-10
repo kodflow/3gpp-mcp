@@ -111,22 +111,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let store = Store::open_rw(&args.db)?;
-    let (written, skipped) = store.replace_changes(&rows)?;
-
-    // WHICH EXPORT THIS IS, recorded where the read side can reach it.
+    // WHICH EXPORT THIS IS, recorded where the read side can reach it and written
+    // in the SAME transaction as the rows.
     //
     // The CR database is re-exported every few months, so "the changelog stops at
-    // 19.4.0" has two possible causes that look identical from the outside: no CR
-    // has been raised since, or the export predates the ones that were. Without the
-    // stamp, get_changelog would have to describe its own staleness in the vague
-    // terms the fossil forced on it. With it, the note names the export and the
-    // reader can tell which silence they are looking at.
+    // 19.4.0" has two causes that look identical from the outside: no CR has been
+    // raised since, or the export predates the ones that were. The stamp is what
+    // lets get_changelog tell a reader which. Stamping after the commit would make
+    // it a second failure point — the rows would land under the previous export's
+    // name, and the note would then be precisely and confidently wrong.
     let stamp = std::path::Path::new(&args.crdb)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    store.set_meta("changes_source", &stamp)?;
+
+    let store = Store::open_rw(&args.db)?;
+    let (written, skipped) = store.replace_changes(&rows, &stamp)?;
     store.checkpoint()?;
     eprintln!(
         "ingest-crs: {read} record(s) read, {written} written, {skipped} skipped (spec not in this corpus), {not_landed} dropped as not landed"

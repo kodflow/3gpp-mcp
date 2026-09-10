@@ -527,7 +527,17 @@ func stepEnrich(t corpusTarget) *Step {
 		// out, an edit to the changelog costs one replay of this step. See
 		// changes.rs for why the narrow declaration is correct rather than merely
 		// cheap, and TestEnrichDeclaresTheChangelogWriter for what holds it there.
-		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/ingest/src/bin/ingest_crs.rs", "rust/store/src/changes.rs", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "scripts/fetch-crdb.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
+		//
+		// THE MANIFESTS AND THE LOCKFILE ARE PART OF THE IMPLEMENTATION, and their
+		// absence here was a gap the ETSI arm did not have — stepEnrichETSI has
+		// declared them since it was written. This step runs four Rust binaries and
+		// declared only their sources: `cargo update` alone, or a feature change in
+		// a manifest, produces a different binary from identical sources, and
+		// `build-rust` is a Step.Tool that never replays a data step. The corpus
+		// would then carry a catalogue, an API surface, an LI registry and a
+		// changelog written by a binary that no longer exists, with nothing to show
+		// it. rust/parse's manifest is already covered by the directory below.
+		Impl: []string{"rust/ingest/src/bin/ingest_catalog.rs", "rust/ingest/src/bin/ingest_openapi.rs", "rust/ingest/src/bin/ingest_li.rs", "rust/ingest/src/bin/ingest_crs.rs", "rust/ingest/Cargo.toml", "rust/store/src/changes.rs", "rust/store/src/lib.rs", "rust/store/Cargo.toml", "rust/Cargo.toml", "rust/Cargo.lock", "rust/parse", "scripts/fetch-5g-apis.sh", "scripts/fetch-li-asn.sh", "scripts/fetch-crdb.sh", "internal/evolseed", "cmd/seed-evolutions", "internal/abbrev", "internal/glossaryseed", "cmd/seed-glossary"},
 		// A _test.go CANNOT CHANGE WHAT THIS STEP DOES. The four Go packages above
 		// are named as DIRECTORIES, so every test file in them counted toward this
 		// step's fingerprint — and this step runs binaries, it does not compile

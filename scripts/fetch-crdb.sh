@@ -48,13 +48,38 @@ if [ -z "$listing" ]; then
     exit 1
 fi
 
-# Newest by NAME, which is a date stamp — CRDB_20260715.zip sorts after
-# CRDB_20260311.zip. sort -V rather than sort so a future four-digit day or a
-# suffix does not reorder them lexically.
-newest="$(printf '%s' "$listing" |
-    grep -oE 'CRDB_[0-9]{8}\.zip' |
-    sort -Vu |
-    tail -1)"
+# PINNING, AND WHY IT IS NOT THE DEFAULT.
+#
+# scripts/fetch-5g-apis.sh pins an immutable commit SHA per release, and it is
+# right to: a release's API set is finished, so a moving reference there would
+# only ever mean drift. The CR database is the opposite — ONE rolling export,
+# re-published every few months, whose whole value is that it is current. Pinning
+# it by default would freeze the changelog at whatever date was committed and
+# nothing would say so; the corpus would keep answering "no change request
+# recorded" for every CR raised since, which is the failure this work exists to
+# remove.
+#
+# Reproducibility is kept where it actually has to hold: `ingest-crs` stamps
+# `changes_source` INTO the corpus, so every published image names the export it
+# was built from, and CRDB_VERSION reproduces that build exactly.
+#
+#   CRDB_VERSION=CRDB_20260715.zip ./scripts/fetch-crdb.sh
+#
+if [ -n "${CRDB_VERSION:-}" ]; then
+    newest="$CRDB_VERSION"
+    if ! printf '%s' "$listing" | grep -qF "$newest"; then
+        echo "fetch-crdb: $BASE/ no longer carries $newest — 3GPP keeps a limited window of exports; drop CRDB_VERSION to take the newest" >&2
+        exit 1
+    fi
+else
+    # Newest by NAME, which is a date stamp — CRDB_20260715.zip sorts after
+    # CRDB_20260311.zip. sort -V rather than sort so a future four-digit day or a
+    # suffix does not reorder them lexically.
+    newest="$(printf '%s' "$listing" |
+        grep -oE 'CRDB_[0-9]{8}\.zip' |
+        sort -Vu |
+        tail -1)"
+fi
 
 if [ -z "$newest" ]; then
     echo "fetch-crdb: $BASE/ carries no CRDB_<date>.zip — the export may have been renamed" >&2

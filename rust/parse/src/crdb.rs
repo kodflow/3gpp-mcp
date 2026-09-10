@@ -268,11 +268,24 @@ where
     let mut in_value = 0usize;
     let mut header: Option<HashMap<String, usize>> = None;
     let mut emitted = 0usize;
+    // A TRUNCATED SHEET MUST NOT LOOK LIKE A SHORT ONE.
+    //
+    // quick-xml reports end-of-input as Eof whether or not the document closed, so
+    // a structurally valid zip whose worksheet stops mid-row parses as a SUCCESSFUL
+    // PREFIX. That is the one input that turns replace_changes — which DELETEs
+    // before it INSERTs — into a way to lose the changelog: a half-downloaded
+    // export would replace 256 471 records with however many rows arrived, and
+    // report success. So the close is tracked and its absence is an error.
+    let mut in_row = false;
+    let mut closed = false;
 
     loop {
         match rd.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"row" => row.clear(),
+                b"row" => {
+                    row.clear();
+                    in_row = true;
+                }
                 b"c" => {
                     let (c, k) = cell_attrs(&e);
                     col = c;
@@ -299,15 +312,30 @@ where
                 b"c" => {
                     if let Some(ci) = col {
                         let text = if kind == b"s" {
-                            // A shared-string cell holds an INDEX. One we cannot
-                            // resolve is a corrupt workbook, not an empty cell —
-                            // take it as absent rather than store the number, which
-                            // would put "412703" in a Subject.
-                            val.trim()
-                                .parse::<usize>()
-                                .ok()
-                                .and_then(|i| shared.get(i).cloned())
-                                .unwrap_or_default()
+                            // A shared-string cell holds an INDEX, and one this table
+                            // cannot resolve is a CORRUPT WORKBOOK, not an empty cell.
+                            //
+                            // Reading it as empty is the quiet failure: an unresolved
+                            // Spec number, TSG-level status or Version-new silently
+                            // drops the record, and replace_changes then commits the
+                            // short set as a complete replacement. The corpus would
+                            // lose changes and every counter would agree with itself.
+                            // So it fails, naming the cell and the index.
+                            let raw = val.trim();
+                            let idx = raw.parse::<usize>().map_err(|_| {
+                                invalid(format!(
+                                    "sheet1.xml: cell in column {ci} holds a non-numeric shared-string index {raw:?}"
+                                ))
+                            })?;
+                            shared
+                                .get(idx)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    invalid(format!(
+                                        "sheet1.xml: cell in column {ci} names shared string {idx}, but the table holds {}",
+                                        shared.len()
+                                    ))
+                                })?
                         } else {
                             val.clone()
                         };
@@ -353,7 +381,11 @@ where
                         }
                     }
                     row.clear();
+                    in_row = false;
                 }
+                // sheetData closing is the file SAYING it is complete. Anything that
+                // stops before it is truncated, however well-formed the prefix looks.
+                b"sheetData" => closed = true,
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -365,6 +397,13 @@ where
 
     if header.is_none() {
         return Err(invalid("CRDB sheet carried no rows at all"));
+    }
+    if !closed || in_row || in_value > 0 {
+        return Err(invalid(format!(
+            "sheet1.xml ended before it closed ({emitted} row(s) read, in_row={in_row}, \
+             open value element(s)={in_value}) — the export is truncated, and writing a \
+             prefix would replace the changelog with part of itself"
+        )));
     }
     Ok(emitted)
 }
@@ -609,5 +648,108 @@ mod tests {
         assert_eq!(clean("-"), "");
         assert_eq!(clean(" - "), "");
         assert_eq!(clean("F"), "F");
+    }
+
+    /// Like `xlsx`, but the worksheet is written WITHOUT its closing tags — a
+    /// structurally valid zip holding a truncated sheet, which is what a
+    /// half-finished download or a clipped export actually looks like.
+    fn xlsx_unclosed(shared: &[&str], sheet_rows: &str) -> Cursor<Vec<u8>> {
+        let mut buf = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let mut sst = String::from("<?xml version=\"1.0\"?><sst>");
+            for s in shared {
+                sst.push_str(&format!("<si><t>{s}</t></si>"));
+            }
+            sst.push_str("</sst>");
+            z.start_file("xl/sharedStrings.xml", opts).unwrap();
+            z.write_all(sst.as_bytes()).unwrap();
+            z.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+            z.write_all(
+                format!("<?xml version=\"1.0\"?><worksheet><sheetData>{sheet_rows}").as_bytes(),
+            )
+            .unwrap();
+            z.finish().unwrap();
+        }
+        Cursor::new(buf)
+    }
+
+    /// A TRUNCATED EXPORT MUST NOT LOOK LIKE A SHORT ONE.
+    ///
+    /// quick-xml reports end-of-input as Eof whether or not the document closed, so
+    /// a structurally valid zip whose worksheet stops mid-row parses as a
+    /// successful PREFIX. Paired with replace_changes — which DELETEs before it
+    /// INSERTs — that is the one input that can lose the changelog: a
+    /// half-downloaded export would replace 256 471 records with however many rows
+    /// arrived, and report success.
+    #[test]
+    fn a_truncated_sheet_is_an_error_not_a_short_read() {
+        let mut shared: Vec<&str> = HDR.to_vec();
+        shared.push("23.501");
+        // A complete first data row, then a second that stops inside its cell, and
+        // no </sheetData>.
+        let rows = format!(
+            "{}{}{}",
+            header_row(),
+            "<row r=\"2\"><c r=\"A2\" t=\"s\"><v>12</v></c></row>",
+            "<row r=\"3\"><c r=\"A3\" t=\"s\"><v>12"
+        );
+        let err = collect(xlsx_unclosed(&shared, &rows)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ended before it closed"),
+            "a truncated sheet must say so: {msg}"
+        );
+    }
+
+    /// The well-formed case must still pass, or the check above is only a way of
+    /// rejecting every export.
+    #[test]
+    fn a_complete_sheet_is_still_accepted() {
+        let mut shared: Vec<&str> = HDR.to_vec();
+        shared.push("23.501");
+        let rows = format!(
+            "{}{}",
+            header_row(),
+            "<row r=\"2\"><c r=\"A2\" t=\"s\"><v>12</v></c></row>"
+        );
+        assert_eq!(collect(xlsx(&shared, &rows)).unwrap().len(), 1);
+    }
+
+    /// AN UNRESOLVABLE SHARED-STRING INDEX IS A CORRUPT WORKBOOK, NOT AN EMPTY CELL.
+    ///
+    /// Read as empty, an unresolved Spec number silently drops the record and
+    /// replace_changes commits the short set as a complete replacement — the corpus
+    /// loses changes and every counter agrees with itself.
+    #[test]
+    fn an_out_of_range_shared_string_aborts_the_parse() {
+        let mut shared: Vec<&str> = HDR.to_vec();
+        shared.push("23.501");
+        let rows = format!(
+            "{}{}",
+            header_row(),
+            "<row r=\"2\"><c r=\"A2\" t=\"s\"><v>999</v></c></row>"
+        );
+        let err = collect(xlsx(&shared, &rows)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("999"), "must name the index: {msg}");
+        assert!(
+            msg.contains("shared string"),
+            "must say which kind of reference failed: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_shared_string_index_aborts_the_parse() {
+        let mut shared: Vec<&str> = HDR.to_vec();
+        shared.push("23.501");
+        let rows = format!(
+            "{}{}",
+            header_row(),
+            "<row r=\"2\"><c r=\"A2\" t=\"s\"><v>not-a-number</v></c></row>"
+        );
+        let err = collect(xlsx(&shared, &rows)).unwrap_err();
+        assert!(err.to_string().contains("non-numeric"), "{err}");
     }
 }
