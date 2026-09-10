@@ -1020,6 +1020,30 @@ func stepValidate(t corpusTarget) *Step {
 		Doc:     "run the data-completeness contract against the finished corpus",
 		Deps:    t.validateDeps(),
 		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
+		// THE CONTRACT THE GATE APPLIED IS A DETERMINANT OF ITS VERDICT, and until
+		// 2026-09-11 it was not in the fingerprint.
+		//
+		// Impl names scripts/data-contract.sh, so editing the SCRIPT replays this
+		// step. But the flags it emits also depend on the environment it runs in —
+		// DATA_CONTRACT picks dense | dense+sparse | dense+sparse+etsi — and cmd/goal
+		// evaluates it once, into c.Config, before any step runs. Changing that one
+		// variable changed what this gate would CHECK and left its fingerprint
+		// untouched, so the step reported "fingerprint unchanged, outputs present and
+		// valid" and kept a verdict rendered under a different contract. A build
+		// relaxed to dense would inherit a pass the full contract never gave; one
+		// tightened back would skip the check it was tightened to run. The floor is
+		// the same shape: it is a flag of the check (--embed-floor) that lives in
+		// config rather than in a file. The review of publish's fingerprint found the
+		// sibling defect there first (same knobs, same fix).
+		//
+		// Both values are computed once per goal invocation and are identical at plan
+		// and at run time, so this cannot make the step replay on every plan.
+		Extra: func(c *Ctx) (map[string]string, error) {
+			return map[string]string{
+				"contract":    c.Cfg(t.ContractKey),
+				"embed_floor": t.Floor(c),
+			}, nil
+		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			in := []string{t.dbPath(c)}
 			// THE ETSI GATE READS TWO MORE FILES, SO IT WATCHES THEM.
