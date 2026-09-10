@@ -2,6 +2,88 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased] — the changelog gets a writer (2026-09-10)
+
+### Added
+
+- **`ingest-crs`: the `changes` table has a writer again, and its source is the
+  authority rather than a transcription of it.** The table had had none since the
+  Go HTML-ingest write side was deleted (Phase 11b, `c635038`) and the Rust ingest
+  never reimplemented the change-history parser. Measured on the corpus published
+  2026-09-09: 61 321 rows over 3 452 specs, only **311 specs** naming anything
+  citable, 3 026 rows summarised `"Date"` — the change-history table's column
+  header, read positionally as a body row. PR #311 stopped `get_changelog` serving
+  that header; it could not give the table a source.
+
+  The source is the published **3GPP Change Request database**
+  (`/ftp/Information/Databases/Change_Request/CRDB_<date>.zip`, 57 MB, 596 696
+  records). Parsing the change-history table printed in each spec was the obvious
+  repair and it is the wrong one, measured: the converted tree holds 1 410
+  documents covering **1 038 of 3 568 specs**, and `ingest --resume` skips a
+  (spec, version) the corpus already holds whatever the parser version says — so
+  that repair would have covered nothing at all without re-fetching all 20 163
+  versions from 3gpp.org. The printed table is a rendering of this database.
+
+  Result: **256 471 change requests over 2 169 specs**, up from 311 citable specs
+  — `get_changelog(23.501)` answers **3 064** records with meeting, TDoc,
+  category and version transition, where it used to answer `count 1,
+  summary "Date"`.
+
+- `scripts/fetch-crdb.sh` acquires the newest export, reading the date from the
+  directory listing rather than pinning a URL that 404s the day 3GPP re-exports.
+  `enrich` runs it when the file is absent, like the OpenAPI and LI overlays.
+
+- `changes_source` in `schema_meta` names the export the corpus was built from
+  (`CRDB_20260715`), so `get_changelog`'s note can tell "no CR was raised" apart
+  from "the export predates it" instead of describing its staleness vaguely.
+
+### Fixed
+
+- **A CR database is a record of PROPOSALS, and writing it whole would have made
+  the corpus wrong by containing too much.** Tallied over the 596 696 records:
+  313 039 never reached TSG level and carry the literal placeholder `..` as their
+  target version; with `reissued`, `revised`, `withdrawn`, `rejected`,
+  `postponed`, `not pursued`, `noted`, `merged` and `endorsed`, **331 489 rows —
+  55.6%** — describe changes that did not happen. Only CRs the database records as
+  `approved` *and* naming a real target version are written. Both halves are
+  required and neither is redundant: 4 031 approved rows have no version allocated
+  yet, and 1 454 rows name a version the status contradicts.
+
+- **Two nullable columns had never been read as nullable, and one NULL aborted the
+  whole call.** `cr_revision` and `clauses` are nullable in the schema, but
+  `store.GetChangelog` scanned them into `int` and `[]any`. It went unnoticed for
+  as long as the table had no writer — the fossil happened to hold a value in
+  every row — and surfaced as `converting NULL to int is unsupported` and
+  `storing driver.Value type <nil>`, returning an error for the spec instead of
+  its changelog. Same shape as the `array_to_string`/NULL defect that broke
+  `search_api` for 84% of the corpus: a producer that only ever writes non-NULL
+  cannot find it, and only a real corpus can. Found by driving the real server
+  over JSON-RPC, not by a fixture.
+
+### Changed
+
+- `get_changelog`'s note no longer says the table has no writer, because it now
+  has one. It states the two silences that remain and are real: the database
+  records change requests, so an editorial republication raises none, and anything
+  approved after the export is absent rather than empty.
+
+- **`replace_changes` lives in `rust/store/src/changes.rs`, not in `lib.rs`.**
+  `merge` declares `rust/store/src/lib.rs`, so a changelog writer there would have
+  replayed merge (34m15), paragraphs (20m32), compact (19m22) and index (8m06) and
+  re-pushed 42 GB on every edit, to rewrite a table none of them read — the cost
+  `vectors.rs` was split out to stop paying. `enrich` declares the new file, and
+  `TestEnrichDeclaresTheChangelogWriter` plus
+  `TestChangelogWriterHasExactlyOneCaller` hold the narrow declaration honest:
+  narrow is the dangerous direction, so the tests count the callers rather than
+  trusting the comment.
+
+- `replace_changes` REPLACES rather than appends, which makes the step idempotent
+  on its output — the lesson `ingest-li` (#286) and `ingest-etsi` (#316) each paid
+  for separately. Proven by running it twice: identical counts. It is
+  cite-or-silent like every other overlay, skipping 8 736 records for specs this
+  corpus holds no text for.
+
+
 ## [Unreleased] — the corpus stops growing on its own (2026-09-09)
 
 Published and verified: `ghcr.io/kodflow/3gpp-mcp@sha256:0349248311a48073f8eb4b2252914e326b67f9d27b9434926cb13751cb2e3ec6`

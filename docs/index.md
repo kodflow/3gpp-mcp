@@ -21,16 +21,26 @@ Measured on the built corpus, not estimated — see [`local-pipeline.md`](./loca
 | LI events | 1 131 (5 148 fields, 2 919 ASN.1 types) |
 | Glossary | 14 126 acronyms (3GPP) + 28 154 (ETSI) |
 | ETSI deliverables (separate DB) | 5 142 (11 822 versions, 3 168 482 clauses) |
+| Change requests (approved, cited) | 256 471 over 2 169 specs |
 | MCP tools | 13 |
 
 Published and verified 2026-09-09:
 `ghcr.io/kodflow/3gpp-mcp@sha256:0349248311a48073f8eb4b2252914e326b67f9d27b9434926cb13751cb2e3ec6`.
 
-Two things the corpus does NOT have, said here rather than discovered later:
-no ETSI change requests (ETSI ships PDFs and the change-history table does not
-survive text extraction well enough to cite), and a 3GPP `changes` table that has
-had no writer since the ingest write-side moved to Rust — it covers 311 of the
-3 568 specs. `get_changelog` names both silences and points at `trace_clause`.
+One thing the corpus does NOT have, said here rather than discovered later: no
+ETSI change requests. ETSI ships PDFs, and the change-history table does not
+survive text extraction well enough to cite.
+
+The 3GPP changelog is built from the published **3GPP Change Request database**,
+not from the change-history table printed in each spec — that table is a rendering
+of this database, and parsing it would only ever cover the specs whose documents a
+delta fetch happened to leave on disk. `get_changelog` serves only change requests
+the database records as **approved into a version**: a CR that was withdrawn,
+rejected, or never reached TSG level is a proposal, not a change, and 55.6% of the
+raw export is exactly that. Editorial republications raise no CR and are therefore
+absent, so a count of 0 means "no change request recorded", not "never changed" —
+which is what the tool's own note says, pointing at `trace_clause` for the question
+answered from the text instead.
 
 ## Start here
 

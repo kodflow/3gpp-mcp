@@ -7,6 +7,7 @@
 
 pub mod asn1;
 pub mod catalog;
+pub mod crdb;
 pub mod etsi;
 pub mod glossary;
 pub mod html_bytes;

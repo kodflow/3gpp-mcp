@@ -21,6 +21,13 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 
+# The 3GPP Change Request database ships as one xlsx inside one zip (see crdb.rs).
+# zip is already in the workspace lock as a transitive dependency, so naming it here
+# adds a direct edge, not a new crate. quick-xml streams the 480 MB sheet: the whole
+# point of the reader is that it never holds the workbook in memory.
+zip = "6"
+quick-xml = "0.37"
+
 [lib]
 name = "parse3gpp"
 path = "src/lib.rs"

@@ -20,6 +20,12 @@ pub use identity3gpp as identity;
 // The write path embed-io owns — see vectors.rs for why it is not in this file.
 mod vectors;
 
+// The write path ingest-crs owns — see changes.rs for why it is not in this file.
+// ChangeRow is re-exported so callers name `store_rs::ChangeRow` alongside
+// `store_rs::ReleaseRow`, rather than learning which file a row type lives in.
+mod changes;
+pub use changes::ChangeRow;
+
 /// BGE-M3 dense dimensionality — must match clauses.embedding FLOAT[1024].
 pub const DENSE_DIM: usize = 1024;
 

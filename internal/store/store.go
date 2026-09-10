@@ -1343,6 +1343,41 @@ func versionRecencySQL(col string) string { return versionOrderSQL(col, "DESC") 
 // versionOrderSQL is versionRecencySQL with an explicit direction ("DESC" =
 // newest-first, "ASC" = oldest-first). dir must be a literal "ASC"/"DESC" set by
 // the caller, never user input.
+// versionMajorSQL is the leading number of a dotted version, as an INTEGER, or 0.
+// Shares its shape with versionOrderSQL so the two cannot disagree about what the
+// first component of a version is.
+func versionMajorSQL(col string) string {
+	return `COALESCE(TRY_CAST(split_part(` + col + `, '.', 1) AS INTEGER), 0)`
+}
+
+// releaseMajor maps a 3GPP release label to the version major it publishes under,
+// and reports whether the label was one it recognises. An empty or unparseable
+// label yields ok=false, which callers read as "no bound" rather than as zero —
+// the difference between an unbounded request and one that matches nothing.
+//
+// From Rel-4 onwards the two numbers are the same: Rel-15 ships 15.x.y. THE
+// EXCEPTION IS Rel-99, which ships 3.x.y — the release was named for the year and
+// the numbering only lined up afterwards. The corpus carries Rel-4 → Rel-20 and no
+// Rel-99 (that is what PR #320 corrected in the README), so this branch is
+// unreachable on the data that ships today. It is written anyway because the cost
+// is one line and the alternative is a silent off-by-twelve the first time a
+// Phase-2 deliverable is indexed.
+func releaseMajor(rel string) (int, bool) {
+	r := strings.TrimSpace(rel)
+	if r == "" {
+		return 0, false
+	}
+	r = strings.TrimPrefix(strings.TrimPrefix(r, "Rel-"), "rel-")
+	n, err := strconv.Atoi(r)
+	if err != nil {
+		return 0, false
+	}
+	if n == 99 {
+		return 3, true
+	}
+	return n, true
+}
+
 func versionOrderSQL(col, dir string) string {
 	c := func(n int) string {
 		return `COALESCE(TRY_CAST(split_part(` + col + `, '.', ` + strconv.Itoa(n) + `) AS INTEGER), 0) ` + dir
@@ -1652,10 +1687,30 @@ func (s *Store) ResolveTerm(ctx context.Context, term string) ([]model.Acronym, 
 // here and a method there is the same rule written twice, and the two would
 // drift the first time either was touched.
 func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string) ([]model.Change, error) {
+	// THE RELEASE BOUNDS WERE ACCEPTED AND NEVER APPLIED.
+	//
+	// Both arguments have been in this signature, and in the tool's schema, since
+	// the changelog existed — and the query only ever filtered on spec_id. It was
+	// invisible while the table was a fossil: the specs that had any records had a
+	// handful each, so "every record" and "the records in this range" were the same
+	// answer. With the CR database behind it, TS 23.501 holds 3 064 records
+	// spanning Rel-15 to Rel-20, and a request for Rel-18..Rel-19 was returning all
+	// of them — and changelogNote then computed "this history stops at" from a set
+	// the caller never asked for.
+	args := []any{specID}
+	where := "spec_id = ?"
+	if lo, ok := releaseMajor(fromRel); ok {
+		where += " AND " + versionMajorSQL("to_version") + " >= ?"
+		args = append(args, lo)
+	}
+	if hi, ok := releaseMajor(toRel); ok {
+		where += " AND " + versionMajorSQL("to_version") + " <= ?"
+		args = append(args, hi)
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT cr_number, cr_revision, spec_id, from_version, to_version,
 		        meeting, category, clauses, summary, tdoc_url
-		 FROM changes WHERE spec_id = ? ORDER BY `+versionOrderSQL("to_version", "ASC"), specID)
+		 FROM changes WHERE `+where+` ORDER BY `+versionOrderSQL("to_version", "ASC"), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1663,14 +1718,43 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 	var out []model.Change
 	for rows.Next() {
 		var c model.Change
-		var clauses []any
-		if err := rows.Scan(&c.CRNumber, &c.CRRevision, &c.SpecID, &c.FromVersion,
+		var clauses any
+		// cr_revision IS NULLABLE, and scanning it into an int is not.
+		//
+		// This was latent for as long as the table had no writer: the fossil
+		// happened to carry a value in every row, so `converting NULL to int is
+		// unsupported` never fired and the schema's nullability was never
+		// exercised. The CR database spells "this CR was never revised" as "-",
+		// which is an ABSENT revision rather than revision zero — so the column
+		// keeps NULL and the read maps it to 0 here, where model.Change.CRRevision
+		// is a plain int and 0 already means "no revision" to every client.
+		//
+		// The failure it caused was not a wrong number: one NULL anywhere in a
+		// spec's history aborted the whole call, so get_changelog returned an
+		// error for the spec instead of its changelog. Same shape as the
+		// array_to_string/NULL defect that broke search_api for 84% of the corpus
+		// — a producer that only ever wrote non-NULL cannot find it, and only a
+		// real corpus can.
+		var rev sql.NullInt64
+		if err := rows.Scan(&c.CRNumber, &rev, &c.SpecID, &c.FromVersion,
 			&c.ToVersion, &c.Meeting, &c.Category, &clauses, &c.Summary, &c.TDocURL); err != nil {
 			return nil, err
 		}
-		for _, v := range clauses {
-			if sv, ok := v.(string); ok {
-				c.Clauses = append(c.Clauses, sv)
+		c.CRRevision = int(rev.Int64)
+		// clauses IS NULLABLE TOO, and for the same reason it went unnoticed: the
+		// fossil never held a NULL there either. `*[]any` cannot receive one — the
+		// driver reports "storing driver.Value type <nil>" — so the destination is
+		// an untyped any and the list is taken only when there is a list.
+		//
+		// The CR database names the change, not the clause paths it touched, so
+		// this column is NULL for every row it writes. That is a real gap and it is
+		// stated rather than papered over: trace_clause answers "what happened to
+		// THIS clause" from the text, which is why both changelog notes point at it.
+		if list, ok := clauses.([]any); ok {
+			for _, v := range list {
+				if sv, ok := v.(string); ok {
+					c.Clauses = append(c.Clauses, sv)
+				}
 			}
 		}
 		if !c.Citable() {

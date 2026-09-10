@@ -33,3 +33,9 @@ path = "src/bin/ingest_li.rs"
 [[bin]]
 name = "ingest-glossary"
 path = "src/bin/ingest_glossary.rs"
+
+# ingest-crs — additive change-request overlay: the writer the `changes` table
+# lost when the write side moved to Rust (Phase 11b).
+[[bin]]
+name = "ingest-crs"
+path = "src/bin/ingest_crs.rs"
