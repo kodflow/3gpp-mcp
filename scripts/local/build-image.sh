@@ -213,10 +213,29 @@ done
 # copying it is what stops the image and the local embedder from drifting apart.
 ORT_VERSION="${ORT_VERSION:-$(sed -n 's/^ORT_VERSION="\${ORT_VERSION:-\([0-9][0-9.]*\)}"$/\1/p' scripts/fetch-model.sh | head -1)}"
 [ -n "$ORT_VERSION" ] || die "cannot read the ORT_VERSION pin from scripts/fetch-model.sh"
-say "ONNX Runtime $ORT_VERSION (linux x64)"
+# THE CHECKSUM TOO, AND FROM THE SAME PLACE AS THE VERSION.
+#
+# The comment above said "pinned and checksummed exactly as fetch-model.sh pins
+# it", and until 2026-09-11 only the first half was true: this block downloaded the
+# tarball with a bare curl and untarred it, while fetch-model.sh — which fetches the
+# SAME package for the local embedder — verifies a pinned sha256 and refuses an
+# unverified native runtime. So the libonnxruntime.so every published image loads
+# into the server process was the one artefact in the image nothing checked. An
+# independent review of the publish step found it.
+#
+# The sha is read out of fetch-model.sh's pin table rather than copied here, for
+# the reason the version already is: one place decides, so the image and the
+# embedder cannot drift apart. A version with no pin there fails closed.
+ORT_PKG="onnxruntime-linux-x64-${ORT_VERSION}"
+ORT_SHA="$(sed -n "s/^[[:space:]]*${ORT_PKG})[[:space:]]*ORT_SHA=\([0-9a-f]\{64\}\)[[:space:]]*;;.*/\1/p" scripts/fetch-model.sh | head -1)"
+[ -n "$ORT_SHA" ] || die "scripts/fetch-model.sh pins no sha256 for $ORT_PKG — refusing to bake an unverified native runtime into the image"
+say "ONNX Runtime $ORT_VERSION (linux x64, sha256 ${ORT_SHA:0:12}…)"
 install -d "$ROOTFS/data/mcp-3gpp/models/onnxruntime"
 curl -fsSL -o "$STAGE/ort.tgz" \
-  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PKG}.tgz"
+ORT_GOT="$(sha256sum "$STAGE/ort.tgz" | cut -d' ' -f1)"
+[ "$ORT_GOT" = "$ORT_SHA" ] \
+  || die "ONNX Runtime $ORT_PKG: downloaded sha256 $ORT_GOT, pinned $ORT_SHA in scripts/fetch-model.sh — refusing it"
 "$IMGTAR" untar --in "$STAGE/ort.tgz" --dest "$ROOTFS/data/mcp-3gpp/models/onnxruntime" --strip 1
 rm -f "$STAGE/ort.tgz"
 
