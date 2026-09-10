@@ -301,7 +301,22 @@ func stepBuildRust() *Step {
 				return err
 			}
 			for manifest, bins := range rustBins {
-				args := []string{"build", "--release", "--manifest-path", manifest}
+				// --locked TURNS A SILENT REWRITE INTO A LOUD FAILURE, and that is
+				// the root cause this flag closes rather than a tidiness.
+				//
+				// Without it cargo is free to resolve differently and REWRITE the
+				// lockfile as a side effect of building. It did, on 2026-09-10:
+				// rust/discover/Cargo.lock changed DURING this step, after the step
+				// had already hashed it into its fingerprint, so `build-rust` and
+				// `test` both replayed on the next plan for a change that appears in
+				// no commit and no diff. Tracking the lockfiles makes that drift
+				// visible; --locked makes it impossible, because a manifest that
+				// needs a new resolution now stops the build and asks for a
+				// deliberate `cargo update` instead of taking one.
+				//
+				// Verified before it was added: all four manifests here satisfy
+				// --locked today, so this changes no build that was already correct.
+				args := []string{"build", "--release", "--locked", "--manifest-path", manifest}
 				for _, b := range bins {
 					args = append(args, "--bin", b)
 				}
@@ -691,9 +706,15 @@ func stepTest() *Step {
 			// ort/CUDA toolchain, a cdylib, a CI-matrix tool). What is left is
 			// precisely the DuckDB write side. rust-fmt_test.sh still covers the
 			// excluded three for formatting, so nothing loses a check.
-			c.Log.Printf("cargo test --release --workspace (rust/)")
+			// --locked HERE TOO, and this is the invocation the drift came through.
+			// `test` runs BEFORE `build-rust` in the DAG, so it is the first cargo
+			// command of a run and the first chance to re-resolve a lockfile — which
+			// is why rust/discover/Cargo.lock changed at 17:39 on 2026-09-10, between
+			// the step hashing it and build-rust reading it back. Locking only the
+			// build would have left the door it came through open.
+			c.Log.Printf("cargo test --release --locked --workspace (rust/)")
 			if err := c.Run(Cmd{Name: "cargo", Args: []string{
-				"test", "--release", "--manifest-path", "rust/Cargo.toml", "--workspace",
+				"test", "--release", "--locked", "--manifest-path", "rust/Cargo.toml", "--workspace",
 			}, Echo: true}); err != nil {
 				return err
 			}

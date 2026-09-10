@@ -126,7 +126,18 @@ fn main() -> Result<()> {
         .unwrap_or_default();
 
     let store = Store::open_rw(&args.db)?;
-    let (written, skipped) = store.replace_changes(&rows, &stamp)?;
+    let (written, skipped, changed) = store.replace_changes(&rows, &stamp)?;
+    if !changed {
+        // NO CHECKPOINT ON THIS PATH, and that is the point rather than a saving. A
+        // checkpoint is a WRITE; reaching here means the corpus must not move, so
+        // the one thing this branch must not do is touch the file to say it did
+        // nothing. It is the line `ingest-openapi` and `ingest-li` already print,
+        // and now it means the same thing on disk that it means in the table.
+        eprintln!(
+            "ingest-crs: {read} record(s) read — the changelog already carries these {written} row(s) from {stamp}, corpus untouched"
+        );
+        return Ok(());
+    }
     store.checkpoint()?;
     eprintln!(
         "ingest-crs: {read} record(s) read, {written} written, {skipped} skipped (spec not in this corpus), {not_landed} dropped as not landed"

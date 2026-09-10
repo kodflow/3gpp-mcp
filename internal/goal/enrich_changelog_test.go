@@ -66,6 +66,19 @@ func TestChangelogWriterHasExactlyOneCaller(t *testing.T) {
 		if rel == "rust/ingest/src/bin/ingest_crs.rs" {
 			continue
 		}
+		// A TEST TARGET IS NOT A CALLER IN THE SENSE THIS TEST MEANS, and the
+		// second half of this same function already says so about Go by skipping
+		// `_test.go`. What is being protected is STEP PROVENANCE: a production
+		// caller in another step would make that step link a writer it never
+		// declares, and ship a stale corpus with nothing to show for it. A file
+		// under rust/<crate>/tests/ is a cargo test target — no pipeline step runs
+		// it and it writes no corpus, so it cannot make any step's provenance
+		// wrong. `#[cfg(test)]` inside src/ is deliberately NOT excused: it is not
+		// distinguishable by path, and being conservative there costs a comment
+		// rather than a corpus.
+		if strings.Contains(rel, "/tests/") {
+			continue
+		}
 		unexpected = append(unexpected, rel)
 	}
 	if len(unexpected) > 0 {

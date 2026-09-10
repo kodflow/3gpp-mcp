@@ -111,7 +111,17 @@ vendor/
 
 # Rust
 target/
-Cargo.lock
+# Cargo.lock IS NOT IGNORED, and the blanket rule that used to sit here is the
+# reason this comment exists. Every crate in rust/ is a BINARY crate, so its
+# lockfile is the record of what was actually built — which is why three of the
+# four were force-added past that rule, one at a time, as each turned out to
+# matter. The fourth, rust/discover, was simply never added.
+#
+# What that cost, measured 2026-09-10: cargo rewrote rust/discover/Cargo.lock
+# DURING `build-rust`, after the step had already fingerprinted it. `build-rust`
+# and `test` both replayed on the next plan, for a change no commit contains, no
+# diff shows and no `git status` reports. An ignored lockfile makes dependency
+# drift invisible; a tracked one makes it a line in a review.
 
 # Java
 *.class
