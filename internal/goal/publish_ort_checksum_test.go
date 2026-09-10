@@ -28,11 +28,7 @@ import (
 // which is safe but would be discovered 25 minutes into a build rather than here.
 func TestImageVerifiesTheORTItBakes(t *testing.T) {
 	root := repoRootForTest()
-	b, err := os.ReadFile(filepath.Join(root, "scripts", "local", "build-image.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(string(b), "\n")
+	lines := strings.Split(readLF(t, filepath.Join(root, "scripts", "local", "build-image.sh")), "\n")
 	find := func(what string, re *regexp.Regexp) int {
 		t.Helper()
 		for i, l := range lines {
@@ -77,18 +73,35 @@ func TestImageVerifiesTheORTItBakes(t *testing.T) {
 	}
 
 	// The default version must have a pin in fetch-model.sh, or every publish dies.
-	fm, err := os.ReadFile(filepath.Join(root, "scripts", "fetch-model.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := regexp.MustCompile(`(?m)^ORT_VERSION="\$\{ORT_VERSION:-([0-9][0-9.]*)\}"$`).FindStringSubmatch(string(fm))
+	fm := readLF(t, filepath.Join(root, "scripts", "fetch-model.sh"))
+	v := regexp.MustCompile(`(?m)^ORT_VERSION="\$\{ORT_VERSION:-([0-9][0-9.]*)\}"$`).FindStringSubmatch(fm)
 	if v == nil {
 		t.Fatal("scripts/fetch-model.sh declares no ORT_VERSION default build-image.sh can read")
 	}
 	pkg := "onnxruntime-linux-x64-" + v[1]
 	pin := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(pkg) + `\)\s*ORT_SHA=([0-9a-f]{64})\s*;;`)
-	if pin.FindStringSubmatch(string(fm)) == nil {
+	if pin.FindStringSubmatch(fm) == nil {
 		t.Errorf("scripts/fetch-model.sh pins no sha256 for %s, the package the image bakes: every "+
 			"publish would die at the ORT step", pkg)
 	}
+}
+
+// readLF reads a text file with its line endings normalised to LF.
+//
+// A TEST ABOUT A SCRIPT MUST NOT DEPEND ON HOW GIT CHECKED THE SCRIPT OUT. The
+// repository says eol=lf, but a working tree extracted before that attribute
+// existed keeps CRLF — measured 2026-09-11 on the build machine's own checkout:
+// 211 files, scripts/fetch-model.sh among them, with 180 CRs. A fresh worktree
+// is LF. So this test passed in every worktree it was written in and failed the
+// pipeline's `test` step on the checkout that actually builds, because the
+// version pattern ends in `"$` and a `\r` sits between the quote and the line end.
+// The scripts themselves were never affected: Git Bash's sed opens files in text
+// mode and strips the CR, which is why every publish read the pin correctly.
+func readLF(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
