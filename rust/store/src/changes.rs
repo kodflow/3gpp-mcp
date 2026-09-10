@@ -56,45 +56,80 @@ fn put(h: &mut Sha256, b: &[u8]) {
     h.update(b);
 }
 
-/// changes_digest names the OUTPUT of a run: the exact rows that would be written,
-/// in order, under the export they came from.
+/// row_hash reduces one change record to a number, so that a whole changelog can be
+/// compared to another without holding both.
 ///
-/// KEYED ON THE OUTPUT, NOT THE INPUT, which is the whole point of it existing.
-/// Keying on the export name — "have I already loaded CRDB_20260715?" — is cheaper
-/// and wrong: a fix to `rust/parse/src/crdb.rs` makes different rows out of the same
-/// zip, and a run that skipped on the name would leave the corpus holding what the
-/// OLD parser made of it while `changes_source` insisted it was current. That is the
-/// mistake `ingest-li` (#286) and `ingest-etsi` (#316) each paid for separately.
-///
-/// The scheme tag is part of the hash so that changing WHAT is hashed cannot collide
-/// with a digest written by the previous scheme.
-fn changes_digest(rows: &[&ChangeRow], source: &str) -> String {
+/// It hashes what the row IS, and nothing about where it came from or where it sits.
+/// That is what lets the same function be used on the rows read back out of the
+/// corpus and on the rows a run is about to write: if the two multisets differ by so
+/// much as one character of one summary, the sums differ.
+fn row_hash(r: &ChangeRow) -> u128 {
     let mut h = Sha256::new();
-    h.update(b"changes-v1");
-    put(&mut h, source.as_bytes());
-    h.update((rows.len() as u64).to_le_bytes());
-    for r in rows {
-        put(&mut h, r.spec_id.as_bytes());
-        put(&mut h, r.cr_number.as_bytes());
-        // Some(0) and None are different facts about a CR and must not hash alike.
-        match r.cr_revision {
-            Some(v) => {
-                h.update([1u8]);
-                h.update(v.to_le_bytes());
-            }
-            None => h.update([0u8]),
+    h.update(b"change-row-v1");
+    put(&mut h, r.spec_id.as_bytes());
+    put(&mut h, r.cr_number.as_bytes());
+    // Some(0) and None are different facts about a CR and must not hash alike.
+    match r.cr_revision {
+        Some(v) => {
+            h.update([1u8]);
+            h.update(v.to_le_bytes());
         }
-        put(&mut h, r.summary.as_bytes());
-        put(&mut h, r.meeting.as_bytes());
-        put(&mut h, r.category.as_bytes());
-        put(&mut h, r.from_version.as_bytes());
-        put(&mut h, r.to_version.as_bytes());
-        put(&mut h, r.tdoc.as_bytes());
+        None => h.update([0u8]),
     }
-    hex::encode(h.finalize())
+    put(&mut h, r.summary.as_bytes());
+    put(&mut h, r.meeting.as_bytes());
+    put(&mut h, r.category.as_bytes());
+    put(&mut h, r.from_version.as_bytes());
+    put(&mut h, r.to_version.as_bytes());
+    put(&mut h, r.tdoc.as_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    u128::from_le_bytes(b)
 }
 
 impl Store {
+    /// changes_sum reads the whole `changes` table and answers (sum of row hashes,
+    /// row count).
+    ///
+    /// A SCAN, NOT A RECORDED NUMBER. The point of the comparison this feeds is to
+    /// look at the corpus, so reading the corpus is the work, not an overhead to be
+    /// optimised away with a stamp. On the published corpus it is 256 471 rows; the
+    /// rewrite it avoids is 1m54 plus a 22 GiB image layer.
+    ///
+    /// A DISCARDED SCAN ERROR HERE WOULD BE THE WORST OF BOTH: a failed read that
+    /// returned an empty sum would look like an empty table, the overlay would
+    /// rewrite the corpus every run, and nothing would say why. The row error is
+    /// propagated, as it is in the spec-list read below.
+    fn changes_sum(&self) -> Result<(u128, usize)> {
+        let mut st = self.conn.prepare(
+            "SELECT cr_number, cr_revision, spec_id, from_version, to_version,
+                    meeting, category, summary, tdoc_url
+               FROM changes",
+        )?;
+        let it = st.query_map([], |r| {
+            Ok(ChangeRow {
+                cr_number: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                cr_revision: r.get::<_, Option<i32>>(1)?,
+                spec_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                from_version: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                to_version: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                meeting: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                category: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                summary: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                tdoc: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            })
+        })?;
+        let mut sum = 0u128;
+        let mut n = 0usize;
+        for r in it {
+            let r = r.context("read the changelog the corpus already holds")?;
+            sum = sum.wrapping_add(row_hash(&r));
+            n += 1;
+        }
+        Ok((sum, n))
+    }
+
     /// replace_changes rewrites the whole `changes` table from the CR database and
     /// answers `(written, skipped, changed)` — skipped being rows for specs this
     /// corpus does not hold.
@@ -167,31 +202,46 @@ impl Store {
             set
         };
 
-        // The filter that used to live inside the insert loop, hoisted so the digest
-        // can be taken over exactly the rows that will be written and nothing else.
+        // The filter that used to live inside the insert loop, hoisted so the
+        // comparison below is taken over exactly the rows that will be written and
+        // nothing else.
         let keep: Vec<&ChangeRow> = rows.iter().filter(|r| held.contains(&r.spec_id)).collect();
         let skipped = rows.len() - keep.len();
         let written = keep.len();
-        let digest = changes_digest(&keep, source);
 
-        // THE GUARD ASKS THE CORPUS, NOT ONLY THE LEDGER.
+        // THE GUARD READS THE TABLE. IT DOES NOT ASK A LEDGER WHAT THE TABLE SHOULD
+        // CONTAIN.
         //
-        // A recorded digest on its own is a CLAIM: it says what some earlier run
-        // meant to leave behind, not what is there now. `changes` could have been
-        // emptied by a restore, a hand-run repair, or a build that died between the
-        // two. Counting the rows is the cheap half of the answer that cannot be
-        // asserted, so both halves must agree before a rewrite is skipped — the same
-        // reason `TestNoArmExceptionOutlivesItsStep` reads the exception map instead
-        // of trusting it.
-        let held_digest = self.get_meta("changes_digest")?;
-        if held_digest == digest {
-            let n: i64 = self
-                .conn
-                .query_row("SELECT count(*) FROM changes", [], |r| r.get(0))
-                .context("count the changelog the digest claims to describe")?;
-            if n as usize == written {
-                return Ok((written, skipped, false));
-            }
+        // The first version of this stamped a digest into schema_meta and compared
+        // against that, with a row count beside it as a sanity check. Both halves
+        // were claims about the corpus rather than readings of it: a changelog
+        // replaced out of band by a DIFFERENT changelog of the SAME SIZE — a
+        // restore, a hand-run repair, a half-finished build — matched the recorded
+        // digest and the count, and the overlay would have left the wrong records in
+        // the served corpus while reporting "corpus untouched". This repository has
+        // been bitten by exactly that shape twice: `migrate-paragraphs` cut
+        // clause_occ to 5 % with every gate green, and the ETSI half re-ingested 566
+        // clauses per build for fifteen builds under a `require-worklist` gate that
+        // only ever asked whether something was MISSING.
+        //
+        // So there is no ledger key any more. The rows the corpus holds are compared
+        // against the rows that would be written, and the only thing schema_meta is
+        // trusted for is `changes_source`, which is a fact about provenance that the
+        // rows themselves do not carry.
+        //
+        // THE SUM IS ORDER-INDEPENDENT ON PURPOSE. Nothing guarantees the order a
+        // scan returns, `compact` rewrites the physical order, and sorting both
+        // sides would mean matching DuckDB's string collation to Rust's byte
+        // ordering — a second thing to get wrong. Wrapping ADDITION of per-row
+        // hashes, not XOR: XOR cancels a duplicated row against itself, and a
+        // changelog that holds one record twice is exactly the kind of damage worth
+        // noticing.
+        let want: u128 = keep
+            .iter()
+            .fold(0u128, |acc, r| acc.wrapping_add(row_hash(r)));
+        let (have, have_n) = self.changes_sum()?;
+        if have_n == written && have == want && self.get_meta("changes_source")? == source {
+            return Ok((written, skipped, false));
         }
 
         self.conn
@@ -234,18 +284,6 @@ impl Store {
                     duckdb::params![source],
                 )
                 .context("stamp changes_source")?;
-            // THE DIGEST RIDES WITH THE DATA FOR THE SAME REASON THE SOURCE DOES,
-            // and it is load-bearing in a way the source name is not: a digest
-            // committed while the rows were not would make the NEXT run skip a
-            // rewrite the corpus still needs. Inside this transaction the two cannot
-            // disagree, so the guard above is reading a fact and not a promise.
-            self.conn
-                .execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('changes_digest', ?)
-                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                    duckdb::params![digest],
-                )
-                .context("stamp changes_digest")?;
             Ok(())
         })();
 

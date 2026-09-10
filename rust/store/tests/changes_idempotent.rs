@@ -130,11 +130,11 @@ fn a_reparse_of_the_same_export_still_writes() {
 }
 
 #[test]
-fn a_skipped_row_is_not_in_the_digest() {
+fn a_skipped_row_is_not_in_the_comparison() {
     // A spec the corpus cannot quote is dropped, so two CR databases that differ
     // ONLY in rows for such specs produce the same table — and must not be
-    // rewritten. This is what makes the digest describe the output rather than the
-    // input it came from.
+    // rewritten. This is what makes the comparison describe the output rather than
+    // the input it came from.
     let t = Tmp::new("skip");
     let store = corpus(&t);
 
@@ -159,14 +159,13 @@ fn a_skipped_row_is_not_in_the_digest() {
 }
 
 #[test]
-fn an_emptied_table_is_rewritten_though_the_digest_still_matches() {
+fn an_emptied_table_is_rewritten() {
     // THE GUARD MUST ASK THE CORPUS, NOT ONLY THE LEDGER.
     //
-    // `changes_digest` records what an earlier run MEANT to leave behind. If that
-    // were the whole check, a corpus whose changelog had been emptied — by a
-    // restore, a hand-run repair, a build that died between two steps — would be
-    // left empty for ever, and `get_changelog` would answer "no change recorded"
-    // for every spec while the stamp said the export was loaded.
+    // A corpus whose changelog had been emptied — by a restore, a hand-run repair,
+    // a build that died between two steps — must be refilled. Under the first
+    // version of this guard, which trusted a recorded digest, it would have been
+    // left empty for ever while the stamp said the export was loaded.
     let t = Tmp::new("emptied");
     let store = corpus(&t);
     let rows = vec![row("23.501", "0001", "AMF registration")];
@@ -181,20 +180,16 @@ fn an_emptied_table_is_rewritten_though_the_digest_still_matches() {
         .expect("empty the table behind the writer's back");
 
     let out = store.replace_changes(&rows, "CRDB_20260715").unwrap();
-    assert_eq!(
-        out,
-        (1, 0, true),
-        "the digest matches but the rows are gone — it must rewrite"
-    );
+    assert_eq!(out, (1, 0, true), "the rows are gone — it must rewrite");
     assert_eq!(held(&store).len(), 1);
 }
 
 #[test]
 fn a_new_export_writes_even_when_the_rows_are_identical() {
-    // The stamp is part of the digest because `changes_source` is a fact
-    // get_changelog serves: "the changelog stops at 19.4.0" means something
-    // different under a July export than under a September one. Identical rows
-    // under a newer export must still update the stamp.
+    // The stamp is compared alongside the rows because `changes_source` is a fact
+    // get_changelog serves and the rows themselves do not carry: "the changelog
+    // stops at 19.4.0" means something different under a July export than under a
+    // September one. Identical rows under a newer export must still update it.
     let t = Tmp::new("newexport");
     let store = corpus(&t);
     let rows = vec![row("23.501", "0001", "AMF registration")];
@@ -210,6 +205,56 @@ fn a_new_export_writes_even_when_the_rows_are_identical() {
         "a newer export must land even when it says the same thing"
     );
     assert_eq!(store.get_meta("changes_source").unwrap(), "CRDB_20260930");
+}
+
+#[test]
+fn a_same_sized_but_different_changelog_is_rewritten() {
+    // THE FINDING THAT REMOVED THE LEDGER KEY (review of PR #323).
+    //
+    // The first version of this guard compared a digest recorded in schema_meta and
+    // a row COUNT. Both are claims about the corpus rather than readings of it, so
+    // a changelog replaced out of band by a DIFFERENT changelog of the SAME SIZE —
+    // a restore, a hand-run repair, a build that died between two steps — matched
+    // both and the overlay reported "corpus untouched" over the wrong records.
+    //
+    // This repository has been bitten by that exact shape twice: migrate-paragraphs
+    // cut clause_occ to 5 % with every gate green, and the ETSI half re-ingested
+    // 566 clauses per build for fifteen builds under a gate that only ever asked
+    // whether something was MISSING. A guard that cannot see a substitution is the
+    // same class of gate.
+    let t = Tmp::new("substituted");
+    let store = corpus(&t);
+    let rows = vec![
+        row("23.501", "0001", "AMF registration"),
+        row("23.502", "0002", "PDU session establishment"),
+    ];
+    assert_eq!(
+        store.replace_changes(&rows, "CRDB_20260715").unwrap(),
+        (2, 0, true)
+    );
+
+    // Same number of rows, one of them wrong. Nothing else is touched: the source
+    // stamp still says CRDB_20260715, as it would after any out-of-band edit.
+    store
+        .raw()
+        .execute_batch(
+            "UPDATE changes SET summary = 'something else entirely' WHERE cr_number = '0002';",
+        )
+        .expect("substitute a row behind the writer's back");
+
+    let out = store.replace_changes(&rows, "CRDB_20260715").unwrap();
+    assert_eq!(
+        out,
+        (2, 0, true),
+        "the count is unchanged and the stamp is unchanged, but the rows are not the \
+         rows this export produces — it must rewrite"
+    );
+    let after = held(&store);
+    assert_eq!(after.len(), 2);
+    assert_eq!(
+        after[1].2, "PDU session establishment",
+        "and the substituted row must be back to what the export says"
+    );
 }
 
 /// ChangeRow is not Clone (it does not need to be in production), so the one test

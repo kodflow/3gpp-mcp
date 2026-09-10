@@ -1,14 +1,16 @@
 package goal
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestGitignoreDoesNotHideCrateLockfiles fails when .gitignore carries a rule that
-// would hide a Rust crate's Cargo.lock.
+// TestEveryCrateLockfileIsTracked fails when a Rust crate's Cargo.lock is not in
+// git.
 //
 // THE DEFECT THIS PINS, measured 2026-09-10. .gitignore carried a bare
 // `Cargo.lock`. Three of the four crates here had been force-added past it, one at
@@ -17,82 +19,66 @@ import (
 // fingerprint. `build-rust` and `test` both replayed on the next plan for a change
 // that appears in no commit, no diff and no `git status`.
 //
-// WHY THE RULE AND NOT THE FILE. Adding rust/discover/Cargo.lock alone fixes the
-// four crates that exist today and leaves the trap armed for the fifth: a new crate
-// arrives, its lockfile is ignored by default, and the same silent drift comes back
-// under a different name. The rule is the cause; the missing file was the symptom.
+// IT ASKS GIT, AND THE FIRST VERSION OF THIS TEST DID NOT. That version read
+// .gitignore and rejected a list of literal rules, which is a PROXY for the
+// property and a leaky one: `rust/*/Cargo.lock` in the root file, or a crate-local
+// .gitignore, hides a lockfile without matching any literal in the list, and the
+// test goes green. Tracked-ness is the property itself, and it is also exactly
+// right about the escape hatch — a force-added file IS tracked despite any rule,
+// which is the state three of these four were already in.
 //
-// This checks the RULE rather than asking git what is tracked, deliberately. A test
-// that shells out to `git ls-files` reports "nothing is ignored" just as cheerfully
-// when git is absent, when the checkout is a tarball, or when the command fails for
-// any other reason — and a gate that turns a failed read into a pass is worse than
-// no gate, which is the same reasoning ReingestedDeliverables states about
-// discarding a scan error.
-func TestGitignoreDoesNotHideCrateLockfiles(t *testing.T) {
-	path := filepath.Join(repoRootForTest(), ".gitignore")
-	b, err := os.ReadFile(path)
+// A FAILED READ MUST NOT LOOK LIKE A PASS, which was the real objection to
+// shelling out, and it is answered by how the failure is handled rather than by
+// avoiding git: an unexpected git error FAILS, and a checkout with no repository
+// SKIPS loudly. A tarball cannot answer this question, and pretending it did is
+// the failure mode being avoided.
+func TestEveryCrateLockfileIsTracked(t *testing.T) {
+	root, err := filepath.Abs(repoRootForTest())
 	if err != nil {
-		t.Fatalf("read .gitignore: %v", err)
+		t.Fatal(err)
 	}
-	// Patterns that would match a crate lockfile at any depth. A leading "!" is a
-	// negation and re-includes, so it is not a hazard.
-	hides := map[string]bool{
-		"Cargo.lock":      true,
-		"/Cargo.lock":     true,
-		"**/Cargo.lock":   true,
-		"*.lock":          true,
-		"/*.lock":         true,
-		"**/*.lock":       true,
-		"rust/Cargo.lock": true,
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		t.Skip("no .git here, so nothing can be asked about tracking; this is a skip and " +
+			"not a pass on purpose")
 	}
-	for i, line := range strings.Split(string(b), "\n") {
-		s := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if s == "" || strings.HasPrefix(s, "#") || strings.HasPrefix(s, "!") {
+
+	locks := crateLockfiles(t, root)
+	if len(locks) == 0 {
+		t.Fatal("found no Cargo.lock under rust/; either the crates moved or this test is " +
+			"looking in the wrong place, and either way it is checking nothing")
+	}
+
+	for _, rel := range locks {
+		cmd := exec.Command("git", "ls-files", "--error-unmatch", "--", rel)
+		cmd.Dir = root
+		out, err := cmd.CombinedOutput()
+		if err == nil {
 			continue
 		}
-		if hides[s] {
-			t.Fatalf(".gitignore:%d ignores %q — a Rust crate's lockfile is the record of "+
-				"what was built, and an ignored one lets cargo rewrite it under a step's own "+
-				"fingerprint with nothing to show for it (build-rust and test, 2026-09-10). "+
-				"Track the lockfiles instead.", i+1, s)
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Skipf("could not run git (%v); this test needs it to mean anything", err)
 		}
+		t.Errorf("%s is not tracked by git: cargo can rewrite it under build-rust's own "+
+			"fingerprint, and the replay that follows appears in no commit and no diff. "+
+			"git said: %s", rel, strings.TrimSpace(string(out)))
 	}
 }
 
-// TestEveryRustCrateHasItsLockfile fails when a crate under rust/ has a Cargo.toml
-// and no Cargo.lock beside it.
+// TestEveryRustCrateHasItsLockfile fails when a crate outside the workspace has no
+// Cargo.lock, or a member of it has one.
 //
-// The rule above stops a lockfile being HIDDEN. This one stops it being ABSENT,
+// The test above stops a lockfile being HIDDEN. This one stops it being ABSENT,
 // which is the same drift arriving by the other door: a crate with no lockfile
 // resolves its dependencies afresh, so two builds of identical sources can produce
-// different binaries and the pipeline has nothing that would notice.
+// different binaries and nothing would notice.
 //
-// The workspace is the exception it looks like and not a hole: crates that are
-// MEMBERS of rust/Cargo.toml are locked by rust/Cargo.lock and must not carry one
-// of their own — cargo ignores it, and a second file that looks authoritative and
-// is not is worse than none.
+// The workspace is the exception it looks like and not a hole: MEMBERS are locked
+// by rust/Cargo.lock and must not carry one of their own — cargo ignores it, and a
+// second file that looks authoritative and is not is worse than none.
 func TestEveryRustCrateHasItsLockfile(t *testing.T) {
 	root := filepath.Join(repoRootForTest(), "rust")
-	ws, err := os.ReadFile(filepath.Join(root, "Cargo.toml"))
-	if err != nil {
-		t.Fatalf("read the rust workspace manifest: %v", err)
-	}
-	// ONLY the members line. `exclude = ["embedder", "embed-core", "discover"]`
-	// quotes the same names, so scanning the whole manifest would call every
-	// excluded crate a member — and report the three that correctly carry their own
-	// lockfile as carrying a misleading one.
-	members := map[string]bool{}
-	for _, line := range strings.Split(string(ws), "\n") {
-		s := strings.TrimSpace(line)
-		if !strings.HasPrefix(s, "members") {
-			continue
-		}
-		for _, part := range strings.Split(s, `"`)[1:] {
-			if name := strings.TrimSpace(part); name != "" && !strings.ContainsAny(name, "[],= ") {
-				members[name] = true
-			}
-		}
-	}
+	members := workspaceMembers(t, filepath.Join(root, "Cargo.toml"))
 	if len(members) == 0 {
 		t.Fatal("read no workspace members out of rust/Cargo.toml — this test would pass vacuously")
 	}
@@ -109,16 +95,88 @@ func TestEveryRustCrateHasItsLockfile(t *testing.T) {
 		}
 		_, lockErr := os.Stat(filepath.Join(root, e.Name(), "Cargo.lock"))
 		hasLock := lockErr == nil
-		member := members[e.Name()]
 		switch {
-		case member && hasLock:
-			t.Errorf("rust/%s is a workspace member AND carries its own Cargo.lock; "+
-				"cargo resolves it through rust/Cargo.lock, so this file is ignored and "+
-				"misleading", e.Name())
-		case !member && !hasLock:
-			t.Errorf("rust/%s is outside the workspace and has no Cargo.lock; its "+
-				"dependencies resolve afresh on every machine, so identical sources can "+
-				"build different binaries", e.Name())
+		case members[e.Name()] && hasLock:
+			t.Errorf("rust/%s is a workspace member AND carries its own Cargo.lock; cargo "+
+				"resolves it through rust/Cargo.lock, so this file is ignored and misleading",
+				e.Name())
+		case !members[e.Name()] && !hasLock:
+			t.Errorf("rust/%s is outside the workspace and has no Cargo.lock; its dependencies "+
+				"resolve afresh on every machine, so identical sources can build different "+
+				"binaries", e.Name())
 		}
 	}
+}
+
+// crateLockfiles returns every Cargo.lock under rust/, repo-relative with forward
+// slashes, which is the form git wants on every platform.
+func crateLockfiles(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(filepath.Join(root, "rust"), func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// target/ holds build output, including lockfiles cargo copies for vendored
+		// crates. Those are not ours to track.
+		if d.IsDir() && d.Name() == "target" {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && d.Name() == "Cargo.lock" {
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return err
+			}
+			out = append(out, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk rust/: %v", err)
+	}
+	return out
+}
+
+// workspaceMembers reads the `members` array of a cargo workspace manifest.
+//
+// IT SPANS LINES, because a valid manifest may write the array over several. The
+// first version read only the line beginning with `members`, so a reformat cargo
+// itself would accept left the set empty — and the caller's "this test would pass
+// vacuously" guard then failed a build for a workspace that had not changed.
+//
+// `exclude` quotes the same crate names and must not be read: taking it for
+// membership would report the three correctly-locked standalone crates as carrying
+// a misleading file. That is why collection stops at the array's closing bracket
+// instead of scanning the whole manifest.
+func workspaceMembers(t *testing.T, manifest string) map[string]bool {
+	t.Helper()
+	b, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("read the rust workspace manifest: %v", err)
+	}
+	members := map[string]bool{}
+	collecting := false
+	for _, line := range strings.Split(string(b), "\n") {
+		s := strings.TrimSpace(line)
+		if strings.HasPrefix(s, "#") {
+			continue
+		}
+		if !collecting {
+			if !strings.HasPrefix(s, "members") {
+				continue
+			}
+			collecting = true
+		}
+		// Odd indices are the quoted values; even ones are the punctuation between
+		// them.
+		for i, part := range strings.Split(s, `"`) {
+			if i%2 == 1 && part != "" {
+				members[part] = true
+			}
+		}
+		if strings.Contains(s, "]") {
+			break
+		}
+	}
+	return members
 }
