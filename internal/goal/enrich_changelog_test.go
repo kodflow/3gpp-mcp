@@ -1,0 +1,125 @@
+package goal
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// TestEnrichDeclaresTheChangelogWriter holds the narrow declaration that makes
+// rust/store/src/changes.rs worth being a file of its own.
+//
+// THE TRADE THIS PINS. The changelog writer links the store library, and `merge`
+// declares rust/store/src/lib.rs because it genuinely links it too. Leaving
+// replace_changes in lib.rs would have made every edit to the changelog replay
+// merge (34m15), then paragraphs (20m32), compact (19m22) and index (8m06), and
+// re-push a 42 GB image — to rewrite a table none of those steps read. Split into
+// its own file and declared by `enrich`, the same edit costs one replay of enrich.
+//
+// The split is the NARROW direction of a provenance declaration, and narrow is the
+// dangerous direction: a step that fails to replay ships a stale corpus and nothing
+// says so, which is how `cargo update` alone could once change a binary with no
+// data step noticing. It is safe here only while `enrich` is the step that runs
+// ingest-crs — so that is what this asserts, rather than trusting the comment.
+func TestEnrichDeclaresTheChangelogWriter(t *testing.T) {
+	step := stepEnrich(corpus3GPP())
+
+	for _, want := range []string{
+		"rust/store/src/changes.rs",
+		"rust/ingest/src/bin/ingest_crs.rs",
+		"scripts/fetch-crdb.sh",
+	} {
+		if !containsString(step.Impl, want) {
+			t.Errorf("enrich must declare %q: it runs ingest-crs, and a file it does not "+
+				"declare can change the changelog without replaying the step that writes it.\nImpl = %v",
+				want, step.Impl)
+		}
+	}
+}
+
+// TestChangelogWriterHasExactlyOneCaller is the other half of the trade above.
+//
+// enrich's narrow declaration is correct only while `ingest-crs` is the sole user
+// of replace_changes and `enrich` is the sole runner of ingest-crs. A second
+// caller in another step would make that step's provenance silently wrong — it
+// would link a writer it never declares — and the failure would look like a corpus
+// that did not update rather than like a missing declaration.
+//
+// So this counts the callers instead of asserting the comment. When it fails, the
+// fix is to add rust/store/src/changes.rs to the new caller's step, not to delete
+// this test.
+func TestChangelogWriterHasExactlyOneCaller(t *testing.T) {
+	root, err := filepath.Abs(repoRootForTest())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callers := grepTree(t, filepath.Join(root, "rust"), ".rs", "replace_changes")
+	// changes.rs defines it; ingest_crs.rs calls it. Anything else is a new caller.
+	var unexpected []string
+	for _, p := range callers {
+		rel := filepath.ToSlash(strings.TrimPrefix(p, root+string(filepath.Separator)))
+		if rel == "rust/store/src/changes.rs" || rel == "rust/ingest/src/bin/ingest_crs.rs" {
+			continue
+		}
+		unexpected = append(unexpected, rel)
+	}
+	if len(unexpected) > 0 {
+		t.Fatalf("replace_changes gained a caller outside ingest-crs: %v\n"+
+			"enrich declares rust/store/src/changes.rs on the assumption that it is the only "+
+			"step whose binaries link this writer. Add the file to the new caller's step Impl.",
+			unexpected)
+	}
+
+	runners := grepTree(t, filepath.Join(root, "internal", "goal"), ".go", `rbin("ingest-crs")`)
+	for _, p := range runners {
+		if strings.HasSuffix(p, "_test.go") {
+			continue
+		}
+		if !strings.HasSuffix(filepath.ToSlash(p), "internal/goal/pipeline_embed.go") {
+			t.Fatalf("ingest-crs is run from %s as well as enrich; the changelog writer's "+
+				"provenance now has to be declared there too", p)
+		}
+	}
+}
+
+// containsString is a local helper: the goal package has no generics dependency
+// and this reads better at the call site than a slices import for one predicate.
+func containsString(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// grepTree returns every file under dir with the given extension whose contents
+// hold needle.
+func grepTree(t *testing.T, dir, ext, needle string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() || filepath.Ext(p) != ext {
+			return nil
+		}
+		// target/ is build output: it carries copies of the sources and would make
+		// every count wrong.
+		if strings.Contains(filepath.ToSlash(p), "/target/") {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		if strings.Contains(string(b), needle) {
+			out = append(out, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	return out
+}

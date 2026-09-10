@@ -100,7 +100,7 @@ has run once, the register exists and the check is a real gate.
 | `ingest` / `ingest-etsi` | parse HTML into DuckDB. The ETSI resume key must be read with the SAME reader as the ingest (`html_bytes::read_html`, windows-1252 fallback): reading it as strict UTF-8 re-ingested the two non-UTF-8 files of 11 822 on **every** build, +566 clauses each time, for fifteen builds | minutes/series; ~10 min ETSI |
 | `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
 | `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
-| `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry | minutes |
+| `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry, CR database | minutes (`ingest-crs` alone: 1m54 for 256 471 rows, measured 2026-09-10) |
 | `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | **21.5 s** (measured 2026-09-08 over all 5 142 deliverables; it was 2 h 29 before the quadratic fix) |
 | `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
 | `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
@@ -282,16 +282,17 @@ from "condition failed", and so should anything added here.
 
 ---
 
-## The two overlays `enrich` cannot invent
+## The three overlays `enrich` cannot invent
 
-`enrich` folds three sources into the corpus. The DynaReport catalogue is
-derived from what `discover` already fetched; the other two are external and
+`enrich` folds four sources into the corpus. The DynaReport catalogue is
+derived from what `discover` already fetched; the other three are external and
 have their own scripts, because the corpus is useless as a *retrieval* target
 for them if they are missing and nothing says so:
 
 ```bash
 ./scripts/fetch-5g-apis.sh auto   # 5GC OpenAPI YAMLs -> data/sources/5g-apis
 ./scripts/fetch-li-asn.sh         # TS 33.128 ASN.1   -> data/sources/asn
+./scripts/fetch-crdb.sh           # 3GPP CR database  -> data/sources/crdb
 ```
 
 - Without the first, `enrich` logs *"no data/sources/5g-apis — skipping the
@@ -302,6 +303,13 @@ for them if they are missing and nothing says so:
   published on their own: they ride in a zip inside the zip of TS 33.128, and
   `fetch-li-asn.sh` reads the version code from the HTML the corpus already
   holds so the registry describes the same version as the text.
+- Without the third, `enrich` logs *"no CRDB_*.zip and none could be fetched —
+  get_changelog keeps whatever it holds"*. The export is one 57 MB zip covering
+  every spec, re-published under a new dated name every few months, so the script
+  reads the newest name out of the directory listing rather than pinning a URL
+  that would 404 on the next re-export. `ingest-crs` writes only the CRs the
+  database records as approved into a real version: 265 207 of the 596 696
+  records, the rest being proposals that never landed.
 - `fetch-5g-apis.sh` needs a Python 3 for JSON. The Windows toolchain provisions
   none and `python3` on PATH is the Store stub — it prints an advert and exits
   non-zero — so the script accepts `PYTHON=…`, otherwise falls back to the

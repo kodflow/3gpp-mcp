@@ -1663,14 +1663,43 @@ func (s *Store) GetChangelog(ctx context.Context, specID, fromRel, toRel string)
 	var out []model.Change
 	for rows.Next() {
 		var c model.Change
-		var clauses []any
-		if err := rows.Scan(&c.CRNumber, &c.CRRevision, &c.SpecID, &c.FromVersion,
+		var clauses any
+		// cr_revision IS NULLABLE, and scanning it into an int is not.
+		//
+		// This was latent for as long as the table had no writer: the fossil
+		// happened to carry a value in every row, so `converting NULL to int is
+		// unsupported` never fired and the schema's nullability was never
+		// exercised. The CR database spells "this CR was never revised" as "-",
+		// which is an ABSENT revision rather than revision zero — so the column
+		// keeps NULL and the read maps it to 0 here, where model.Change.CRRevision
+		// is a plain int and 0 already means "no revision" to every client.
+		//
+		// The failure it caused was not a wrong number: one NULL anywhere in a
+		// spec's history aborted the whole call, so get_changelog returned an
+		// error for the spec instead of its changelog. Same shape as the
+		// array_to_string/NULL defect that broke search_api for 84% of the corpus
+		// — a producer that only ever wrote non-NULL cannot find it, and only a
+		// real corpus can.
+		var rev sql.NullInt64
+		if err := rows.Scan(&c.CRNumber, &rev, &c.SpecID, &c.FromVersion,
 			&c.ToVersion, &c.Meeting, &c.Category, &clauses, &c.Summary, &c.TDocURL); err != nil {
 			return nil, err
 		}
-		for _, v := range clauses {
-			if sv, ok := v.(string); ok {
-				c.Clauses = append(c.Clauses, sv)
+		c.CRRevision = int(rev.Int64)
+		// clauses IS NULLABLE TOO, and for the same reason it went unnoticed: the
+		// fossil never held a NULL there either. `*[]any` cannot receive one — the
+		// driver reports "storing driver.Value type <nil>" — so the destination is
+		// an untyped any and the list is taken only when there is a list.
+		//
+		// The CR database names the change, not the clause paths it touched, so
+		// this column is NULL for every row it writes. That is a real gap and it is
+		// stated rather than papered over: trace_clause answers "what happened to
+		// THIS clause" from the text, which is why both changelog notes point at it.
+		if list, ok := clauses.([]any); ok {
+			for _, v := range list {
+				if sv, ok := v.(string); ok {
+					c.Clauses = append(c.Clauses, sv)
+				}
 			}
 		}
 		if !c.Citable() {
