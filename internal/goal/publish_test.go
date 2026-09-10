@@ -296,7 +296,7 @@ func TestValidatePublishedRejectsWhatIsNotADigest(t *testing.T) {
 // different tag is a different artefact, and a step that ignored the tag would
 // report the new one as already published.
 func TestTheImageTagFoldsIntoTheFingerprint(t *testing.T) {
-	c, _ := newTestCtx(t)
+	c := publishCtx(t)
 	s := publishStep(t)
 
 	t.Setenv("IMAGE_TAG", "")
