@@ -43,7 +43,10 @@
 // cmd/seed-glossary.
 package abbrev
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // Entry is one declared abbreviation.
 type Entry struct {
@@ -88,6 +91,9 @@ func Parse(text string) []Entry {
 	var out []Entry
 	seen := make(map[Entry]bool)
 	started := false
+	// closed is set by a change-request marker: the entry above it is finished,
+	// and nothing after the boundary may be joined to it as a wrapped tail.
+	closed := false
 
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	// One decision for the whole clause. Mixing the two rules line by line would
@@ -97,6 +103,16 @@ func Parse(text string) []Entry {
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimRight(raw, " \t")
 		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		// A CHANGE-REQUEST MARKER IS NEITHER AN ENTRY NOR A WRAPPED TAIL — see
+		// changeMarker. It is tested FIRST, before either rule below can claim the
+		// line: glued on, it produced the stored row
+		//   UA | User Agent ***** END SET OF CHANGES ***** ***** BEGIN SET OF CHANGES *****
+		// and a marker phrased "START SET OF CHANGES" would even pass Plausible as
+		// the entry "START = SET OF CHANGES" in a space-aligned clause.
+		if changeMarker(line) {
+			closed = true
 			continue
 		}
 		term, exp, tabbed := strings.Cut(line, "\t")
@@ -119,7 +135,11 @@ func Parse(text string) []Entry {
 			// "Anti-Bidding down Between Architectures NG-RAN 5G Radio Access
 			// Network". Skipping it loses one row; joining it silently falsifies
 			// another, and the falsified one still looks like a citation.
-			if tabbedClause && started && len(out) > 0 {
+			//
+			// AND NEVER ACROSS A CHANGE-REQUEST BOUNDARY: what follows a marker
+			// belongs to another change, so it cannot be the rest of the entry
+			// the marker closed.
+			if tabbedClause && started && !closed && len(out) > 0 {
 				if j := join(out[len(out)-1].Expansion, strings.TrimSpace(line)); j != "" {
 					delete(seen, out[len(out)-1])
 					out[len(out)-1].Expansion = j
@@ -136,7 +156,7 @@ func Parse(text string) []Entry {
 		if !Plausible(term, exp) {
 			continue
 		}
-		started = true
+		started, closed = true, false
 		e := Entry{Term: term, Expansion: exp}
 		if seen[e] {
 			continue
@@ -170,6 +190,82 @@ func splitFields(line string) (term, expansion string, ok bool) {
 	}
 	return "", "", false
 }
+
+// changeMarker reports whether a line is a change-request boundary marker —
+// "***** END SET OF CHANGES *****" and its kin — which a 3GPP draft or CR carries
+// into the text and the converter keeps.
+//
+// MEASURED 2026-09-11 ON THE SHIPPED CORPUS, before a rule was written. One stored
+// glossary expansion carries a marker, and it came from this parser:
+//
+//	UA | User Agent ***** END SET OF CHANGES ***** ***** BEGIN SET OF CHANGES *****
+//
+// 33.802 v0.2.0 §3.3 ends its list with "UA<TAB>User Agent" and then the markers,
+// split by the conversion into "*****" and "END SET OF CHANGES *****" lines; with
+// no tab in them they read as the wrapped tail of UA. It is the only Abbreviations
+// clause in the corpus that holds marker lines. Across ALL clause text the shapes
+// seen are, verbatim:
+//
+//	*****                                     END SET OF CHANGES *****
+//	* * NEXT CHANGE * * * *                   -------------------------- NEXT CHANGE
+//	END OF CHANGES TS 23.272 [3]*****         FIRST CHANGE TS 23.401 [2]*****
+//	START OF CHANGE IN TS 25.212 =========    START OF CHANGES INTENDED FOR TS38.101-2 >
+//	NEXT CHANGES >                            END OF CHANGES**************
+//
+// NOT "ANY LINE WITH ASTERISKS", which is what makes this narrow. 28 stored
+// expansions legitimately carry "(*)" — "Access Point Name (*)", a footnote mark —
+// and the corpus's asterisk lines are overwhelmingly ASN.1 comment rules and table
+// cells such as "(***) IF THE MS THAT NEEDS ONLY GPRS SERVICES". Nor is it "any
+// line naming a change": "Conditional PSCell Addition or Change" is a real
+// expansion, and the corpus holds prose such as "SECOND CHANGE THIS FIELD IS
+// CONDITIONAL, AND INCLUDED ONLY IF THE" and table text "NEXT CHANGE 60".
+//
+// So a marker is either
+//
+//  1. a SEPARATOR: nothing but '*', '=' and '-' (and spaces), at least three of
+//     them — no letter or digit, so no expansion text can be lost to it; or
+//  2. a BOUNDARY PHRASE — begin/start/end [of] [the] [ordinal] [set of] change(s),
+//     or an ordinal/next/last change(s), optionally numbered and optionally naming
+//     the spec it applies to — with nothing else on the line but DECORATION, and at
+//     least one decoration character. The decoration is what separates the marker
+//     from a wrapped expansion that happens to read "Next Change Indication"; every
+//     marker shape measured carries it, and the prose and table near-misses do not.
+func changeMarker(line string) bool {
+	line = strings.TrimSpace(line)
+	if separator(line) {
+		return true
+	}
+	m := boundaryPhrase.FindStringSubmatch(line)
+	return m != nil && strings.Trim(m[1]+m[2], " \t") != ""
+}
+
+// separator reports a line of rule characters only: three or more of '*', '=',
+// '-', with nothing else but spaces.
+func separator(line string) bool {
+	n := 0
+	for _, r := range line {
+		switch r {
+		case '*', '=', '-':
+			n++
+		case ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return n >= 3
+}
+
+// boundaryPhrase captures the decoration before (1) and after (2) a change
+// boundary phrase that fills the rest of the line. See changeMarker.
+var boundaryPhrase = func() *regexp.Regexp {
+	const (
+		decor   = `([\s*=<>#~_-]*)`
+		ordinal = `(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|next|last|\d{1,2}(?:st|nd|rd|th))`
+		lead    = `(?:(?:start|end|begin|beginning)\s+(?:of\s+)?(?:the\s+)?(?:` + ordinal + `\s+)?(?:set\s+of\s+)?|` + ordinal + `\s+(?:set\s+of\s+)?)`
+		spec    = `(?:\s+(?:(?:in|to|for|intended\s+for)\s+)?(?:3gpp\s+)?t[sr]\s*\d{2}\.\d{3}(?:-\d+)?(?:\s*\[\d+\])?)?`
+	)
+	return regexp.MustCompile(`(?i)^` + decor + lead + `changes?(?:\s+\d{1,3})?` + spec + decor + `$`)
+}()
 
 // join appends a wrapped tail to an expansion, refusing anything that does not
 // read as a continuation: a tail that starts a new sentence, or that is long

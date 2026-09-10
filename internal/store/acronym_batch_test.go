@@ -7,15 +7,16 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
-// THE SWAP MUST REPLACE WHAT THE BATCH NAMES AND TOUCH NOTHING ELSE.
+// THE SWAP MUST REPLACE WHAT THE BATCH NAMES AND TOUCH NOTHING IT DOES NOT OWN.
 //
-// UpsertAcronyms used to run one `INSERT … ON CONFLICT` per row inside the
+// The glossary write used to run one `INSERT … ON CONFLICT` per row inside the
 // transaction, which DuckDB checks against the transaction's own uncommitted
 // rows — quadratic in the batch. At the 679 rows six specs produced it was
 // invisible; at the 30 000 a corpus-wide sweep produces it did not finish (661 s
 // of CPU, ZERO bytes written). It now stages into a constraint-free TEMP table
 // and swaps set-based, and this test pins that the rewrite kept the semantics:
-// a named key is REPLACED, an unnamed row SURVIVES.
+// a named key is REPLACED — a TS 21.905 row included, because a spec's own
+// declaration outranks it — and a row the seed does not own SURVIVES.
 func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "c.duckdb")
 	s, err := Open(db)
@@ -24,13 +25,16 @@ func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	// A row nothing later mentions, and one the batch will replace.
-	seed := []model.Acronym{
+	// A row nothing later mentions, and one the batch will replace — both
+	// TS 21.905's, written the way the Rust ingest writes them: one at a time,
+	// stamped with the series.
+	for _, a := range []model.Acronym{
 		{Term: "UNTOUCHED", Expansion: "Left Exactly As It Was", SourceSeries: "21"},
 		{Term: "AMF", Expansion: "ATM Mapping Function", SourceSeries: "21"},
-	}
-	if _, err := s.UpsertAcronyms(seed); err != nil {
-		t.Fatal(err)
+	} {
+		if err := s.UpsertAcronym(a); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// The batch names the AMF row's key and adds a new one.
@@ -38,11 +42,11 @@ func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 		{Term: "AMF", Expansion: "ATM Mapping Function", SourceSeries: "23.501", DeclaredBy: 74},
 		{Term: "SMF", Expansion: "Session Management Function", SourceSeries: "23.501", DeclaredBy: 84},
 	}
-	changed, err := s.UpsertAcronyms(batch)
+	diff, err := s.ReplaceSeededAcronyms(batch, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !diff.Changed() {
 		t.Error("a batch that rewrites provenance reported no change")
 	}
 
@@ -70,9 +74,9 @@ func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 
 	// AND IT IS IDEMPOTENT: writing the same batch again must report no change,
 	// because one changed byte in a 23 GB corpus is a new layer digest and a push.
-	if changed, err := s.UpsertAcronyms(batch); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
 		t.Fatal(err)
-	} else if changed {
-		t.Error("re-writing an identical batch reported a change — the corpus would be re-pushed")
+	} else if diff.Changed() {
+		t.Errorf("re-writing an identical batch reported a change (%+v) — the corpus would be re-pushed", diff)
 	}
 }

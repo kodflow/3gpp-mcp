@@ -155,7 +155,7 @@ func TestReplaceEvolutionsSkipsAnIdenticalSeed(t *testing.T) {
 // the other within a single call. Comparing each incoming row against the stored
 // one then found 145 of 679 "different" on a corpus that was already correct, and
 // the 23 GB file moved by ±3.9 MB on every run.
-func TestUpsertAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
+func TestReplaceSeededAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 	path, cleanup := scratchDB(t)
 	defer cleanup()
 	s, err := Open(path)
@@ -174,9 +174,9 @@ func TestUpsertAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 			FirstRelease: "20.2.0", LastRelease: "20.2.0", SourceSeries: "33.501"},
 	}
 
-	if changed, err := s.UpsertAcronyms(batch); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
 		t.Fatalf("first seed: %v", err)
-	} else if !changed {
+	} else if !diff.Changed() {
 		t.Fatal("the first seed wrote nothing; the premise of this test is wrong")
 	}
 	// The table holds one row per (term, expansion, domain): the duplicate pair
@@ -198,22 +198,26 @@ func TestUpsertAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 	// duplicate pair is written back and forth, so counting rows would have
 	// passed on the very bug this exists for.
 	countBefore := rowCount(t, s, "acronyms")
-	if changed, err := s.UpsertAcronyms(batch); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
 		t.Fatalf("re-seed: %v", err)
-	} else if changed {
-		t.Error("re-seeding an identical glossary reported a write")
+	} else if diff.Changed() {
+		t.Errorf("re-seeding an identical glossary reported a write: %+v", diff)
 	}
 	if n := rowCount(t, s, "acronyms"); n != countBefore {
 		t.Errorf("re-seeding changed the row count %d -> %d", countBefore, n)
 	}
 
-	// NEGATIVE CONTROL: a real change still lands.
-	if changed, err := s.UpsertAcronyms([]model.Acronym{{Term: "SMF",
+	// NEGATIVE CONTROL: a real change still lands. The whole sweep is handed over
+	// again plus one new term, because the batch is the COMPLETE seeded glossary
+	// now — a batch of SMF alone would release AMF and UP, which is a different
+	// test (acronyms_replace_test.go).
+	grown := append(append([]model.Acronym{}, batch...), model.Acronym{Term: "SMF",
 		Expansion: "Session Management Function", FirstRelease: "20.2.0",
-		LastRelease: "20.2.0", SourceSeries: "23.501"}}); err != nil {
+		LastRelease: "20.2.0", SourceSeries: "23.501"})
+	if diff, err := s.ReplaceSeededAcronyms(grown, nil); err != nil {
 		t.Fatalf("new row: %v", err)
-	} else if !changed {
-		t.Error("a new term was not reported as a write")
+	} else if !diff.Changed() || diff.Written != 1 || len(diff.Removed) != 0 {
+		t.Errorf("a new term was not reported as exactly one write: %+v", diff)
 	}
 	if n := rowCount(t, s, "acronyms"); n != countBefore+1 {
 		t.Errorf("a new term was not written: %d rows, want %d", n, countBefore+1)
