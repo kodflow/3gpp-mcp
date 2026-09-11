@@ -2,7 +2,6 @@ package goal
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,10 +12,16 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/eval"
 )
 
-// wireServedInfo is server_info as server-full answered it on 2026-09-11, over the
-// real 3gpp.duckdb with etsi.duckdb attached, in the environment servedServerEnv
-// builds — the bytes the served gate reads before it scores.
-const wireServedInfo = `{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\n  \"baseline\": \"latest\",\n  \"embed_floor\": \"\",\n  \"embedding_model_client\": \"38067f8c6efe\",\n  \"embedding_model_db\": \"38067f8c6efe\",\n  \"etsi\": {\n    \"attached\": true,\n    \"embedding_model\": \"38067f8c6efe\",\n    \"embedding_model_ok\": true,\n    \"fts\": true,\n    \"hnsw\": true,\n    \"sparse\": true\n  },\n  \"fts\": true,\n  \"hnsw\": true,\n  \"lexical\": true,\n  \"reason\": \"\",\n  \"reranker\": true,\n  \"reranker_reason\": \"\",\n  \"semantic\": true,\n  \"sparse\": true,\n  \"sparse_model\": \"b13103bce7ae\",\n  \"sparse_reason\": \"\",\n  \"version\": \"dev\"\n}"}]}}`
+// wireServedInfoBoth is server_info as server-full answered it on 2026-09-11,
+// over the real 3gpp.duckdb WITH etsi.duckdb attached, in the environment
+// servedServerEnv builds. The gate starts it with --etsi-db off, so what it must
+// accept is this answer with the ETSI half detached (wireServedInfo).
+const wireServedInfoBoth = `{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\n  \"baseline\": \"latest\",\n  \"embed_floor\": \"\",\n  \"embedding_model_client\": \"38067f8c6efe\",\n  \"embedding_model_db\": \"38067f8c6efe\",\n  \"etsi\": {\n    \"attached\": true,\n    \"embedding_model\": \"38067f8c6efe\",\n    \"embedding_model_ok\": true,\n    \"fts\": true,\n    \"hnsw\": true,\n    \"sparse\": true\n  },\n  \"fts\": true,\n  \"hnsw\": true,\n  \"lexical\": true,\n  \"reason\": \"\",\n  \"reranker\": true,\n  \"reranker_reason\": \"\",\n  \"semantic\": true,\n  \"sparse\": true,\n  \"sparse_model\": \"b13103bce7ae\",\n  \"sparse_reason\": \"\",\n  \"version\": \"dev\"\n}"}]}}`
+
+// wireServedInfo is the answer the gate accepts: the same server, ETSI declined.
+var wireServedInfo = strings.Replace(wireServedInfoBoth,
+	`\"etsi\": {\n    \"attached\": true,\n    \"embedding_model\": \"38067f8c6efe\",\n    \"embedding_model_ok\": true,\n    \"fts\": true,\n    \"hnsw\": true,\n    \"sparse\": true\n  }`,
+	`\"etsi\": {\n    \"attached\": false\n  }`, 1)
 
 // servedSet is a two-query judged set: enough for one query to differ between
 // arms while the other does not.
@@ -86,7 +91,7 @@ func (f *fakeServed) call(tool string, args map[string]any) (map[string]any, err
 // goodServed is a served path where each arm ranks better than the one before:
 // the relevant clause at rank 5, 2, then 1 on q1.
 func goodServed() *fakeServed {
-	noise := [2]string{"ETSI EN 300 392-2", "16.8.6"}
+	noise := [2]string{"23.501", "6.2.1"}
 	return &fakeServed{pages: map[string]map[string][][2]string{
 		"lexical": {"q1": {noise, noise, noise, noise, {"33.128", "6.2.2.2"}}, "q2": {noise, {"33.128", "6.2.3.2"}}},
 		"hybrid":  {"q1": {noise, {"33.128", "6.2.2.2"}}, "q2": {noise, {"33.128", "6.2.3.2"}}},
@@ -99,7 +104,7 @@ func goodServed() *fakeServed {
 // its own — and each arm's metrics come from its own answers.
 func TestTheServedGateScoresEachArmThroughSearchSpec(t *testing.T) {
 	f := goodServed()
-	run, err := scoreServed(servedSet, f.call, true, nil)
+	run, err := scoreServed(servedSet, f.call, nil)
 	if err != nil {
 		t.Fatalf("a served path that ranks well was refused: %v", err)
 	}
@@ -133,7 +138,7 @@ func TestTheServedGateScoresEachArmThroughSearchSpec(t *testing.T) {
 func TestTheServedGateRefusesADegradedMode(t *testing.T) {
 	f := goodServed()
 	f.mode = map[string]string{"hybrid": "lexical"}
-	if _, err := scoreServed(servedSet, f.call, true, nil); err == nil || !strings.Contains(err.Error(), `was served "lexical"`) {
+	if _, err := scoreServed(servedSet, f.call, nil); err == nil || !strings.Contains(err.Error(), `was served "lexical"`) {
 		t.Fatalf("a hybrid arm answered in lexical mode and the gate scored it: %v", err)
 	}
 	// mode_degraded alone is enough, whatever `mode` says.
@@ -155,32 +160,14 @@ func TestTheServedGateRefusesADegradedMode(t *testing.T) {
 func TestTheServedGateRefusesARerankArmThatDidNotRerank(t *testing.T) {
 	f := goodServed()
 	f.pages["rerank"] = f.pages["hybrid"]
-	_, err := scoreServed(servedSet, f.call, true, nil)
+	_, err := scoreServed(servedSet, f.call, nil)
 	if err == nil || !strings.Contains(err.Error(), "cross-encoder did not reorder") {
 		t.Fatalf("the rerank arm returned the hybrid pages and the gate scored it: %v", err)
 	}
 	// The control: ONE reordered page is a reranker that acted (goodServed differs
 	// on q1 only).
-	if _, err := scoreServed(servedSet, goodServed().call, true, nil); err != nil {
+	if _, err := scoreServed(servedSet, goodServed().call, nil); err != nil {
 		t.Errorf("a reranker that reordered one page was refused: %v", err)
-	}
-}
-
-// A PAGE THE ETSI HALF DID NOT REACH IS REFUSED when etsi.duckdb is attached.
-// search_spec drops a failing ETSI search silently, and a 3GPP-only page scores
-// HIGHER on this 3GPP-judged set — so the metrics would have approved it.
-func TestTheServedGateRefusesAnAnswerTheETSIHalfDroppedOutOf(t *testing.T) {
-	f := goodServed()
-	// The shape measured under DUCKDB_MEMORY_LIMIT=4GB: the ETSI half gone, and the
-	// relevant clause promoted because the noise left with it.
-	f.pages["hybrid"]["q2"] = [][2]string{{"33.128", "6.2.3.2"}, {"33.127", "6.2.3.3"}}
-	_, err := scoreServed(servedSet, f.call, true, nil)
-	if !errors.Is(err, errETSIDropped) || !strings.Contains(err.Error(), "hybrid") || !strings.Contains(err.Error(), "q2") {
-		t.Fatalf("a hybrid page with no ETSI hit was scored with etsi.duckdb attached: %v", err)
-	}
-	// Without the ETSI half attached, a 3GPP-only page is the product.
-	if _, err := scoreServed(servedSet, f.call, false, nil); err != nil {
-		t.Errorf("a 3GPP-only page was refused with no ETSI half attached: %v", err)
 	}
 }
 
@@ -195,32 +182,36 @@ func TestTheServedGateRefusesAnAnswerItCannotScore(t *testing.T) {
 		},
 		"transport": func(string, map[string]any) (map[string]any, error) { return nil, fmt.Errorf("EOF") },
 	} {
-		if _, err := scoreServed(servedSet, call, true, nil); err == nil {
+		if _, err := scoreServed(servedSet, call, nil); err == nil {
 			t.Errorf("%s: the gate scored an answer it could not read", name)
 		}
 	}
-	if _, err := scoreServed(nil, goodServed().call, true, nil); err == nil {
+	if _, err := scoreServed(nil, goodServed().call, nil); err == nil {
 		t.Error("an empty judged set was scored — nothing scored cannot regress")
 	}
 }
 
 // A SERVER THAT CANNOT SERVE THE ARMS IS REFUSED BEFORE SCORING, with its reason.
 func TestTheServedGateRefusesAServerWithoutItsArms(t *testing.T) {
-	if _, err := requireServedArms(decodeWire(t, wireServedInfo), true); err != nil {
-		t.Fatalf("the real server-full's server_info was refused: %v", err)
+	if wireServedInfo == wireServedInfoBoth {
+		t.Fatal("the detached fixture is the attached one: the edit did not apply")
+	}
+	if _, err := requireServedArms(decodeWire(t, wireServedInfo)); err != nil {
+		t.Fatalf("the real server-full's server_info, ETSI declined, was refused: %v", err)
 	}
 	for _, tc := range []struct{ name, from, to, want string }{
 		{"no reranker", `\"reranker\": true,\n  \"reranker_reason\": \"\"`,
 			`\"reranker\": false,\n  \"reranker_reason\": \"model.onnx is missing at X\"`, "model.onnx is missing at X"},
 		{"no embedder", `\"semantic\": true`, `\"semantic\": false`, "semantic=false"},
-		{"ETSI served lexically", `\"embedding_model_ok\": true`, `\"embedding_model_ok\": false`, "ETSI half"},
+		// The bound the gate is sized for: an ETSI half that attached anyway.
+		{"ETSI attached", `\"attached\": false`, `\"attached\": true`, "--etsi-db off"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			line := strings.Replace(wireServedInfo, tc.from, tc.to, 1)
 			if line == wireServedInfo {
 				t.Fatalf("the fixture edit %q did not apply", tc.from)
 			}
-			_, err := requireServedArms(decodeWire(t, line), true)
+			_, err := requireServedArms(decodeWire(t, line))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("a server with %s was accepted, or refused without saying why (want %q): %v", tc.name, tc.want, err)
 			}
@@ -478,5 +469,18 @@ func TestTheCommittedServedBaselineCoversEveryArm(t *testing.T) {
 	}
 	if err := requireServedBaseline(filepath.Join(root, filepath.FromSlash(servedBaseline))); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// THE BOUND IS ON THE COMMAND LINE: the 3GPP corpus, and the ETSI half declined
+// with "off" — an empty --etsi-db would attach the etsi.duckdb beside the corpus
+// and double the memory the gate is sized for (see the measurements atop
+// smoke_served.go).
+func TestTheServedGateServesThe3GPPHalfAlone(t *testing.T) {
+	c, _ := newTestCtx(t)
+	args := servedServerArgs(c)
+	want := []string{"serve", "--db", c.dataPath("3gpp.duckdb"), "--etsi-db", "off"}
+	if !slices.Equal(args, want) {
+		t.Errorf("server-full is started with %v, want %v", args, want)
 	}
 }

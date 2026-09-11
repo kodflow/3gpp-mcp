@@ -30,14 +30,37 @@ import (
 //
 // WHY IT DRIVES server-full.exe AND NOT A SEMANTIC BENCH. A bench built with the
 // right tags would score store+search, not the product: search_spec adds the
-// normative doc-type default, the ETSI federation (a second engine, RRF-merged —
-// on these queries it puts an ETSI hit at every other rank), the page size a
-// client gets by default, and the server's own startup guards (the embedding
-// identity check refuses to start on a mismatch). A gate that measures a proxy of
-// that path approves the proxy. So this one starts the binary build-serve builds —
-// onnx + embed_ffi, the tags the image compiles — over BOTH corpus halves, with the
-// environment .mcp.json and scripts/local/prove-serving.sh give it, and asks
-// search_spec, over JSON-RPC, exactly what a client asks.
+// normative doc-type default, the page size a client gets by default, and the
+// server's own startup guards (the embedding identity check refuses to start on a
+// mismatch). A gate that measures a proxy of that path approves the proxy. So this
+// one starts the binary build-serve builds — onnx + embed_ffi, the tags the image
+// compiles — with the environment .mcp.json and scripts/local/prove-serving.sh
+// give it, and asks search_spec, over JSON-RPC, exactly what a client asks. Its
+// first run found what no other gate could: search_spec(rerank=true) PANICKED in
+// the stdio worker on a passage with an empty body and never answered (fixed in
+// internal/rerank, forTokenizer).
+//
+// THE ONE BOUND: THE 3GPP HALF ALONE (--etsi-db off), measured, not assumed. Over
+// both halves, on this 28 GB machine, 2026-09-11:
+//
+//	image defaults (16GB DuckDB limit per store)  39.8 GB committed on the FIRST
+//	                                              hybrid query, unanswered after
+//	                                              3 min 30 — killed
+//	DUCKDB_MEMORY_LIMIT=6GB                       27.6 GB committed, 33 min without
+//	                                              finishing the rerank arm — killed
+//	DUCKDB_MEMORY_LIMIT=4GB                       the ETSI half FAILS after its
+//	                                              first semantic query (its index
+//	                                              no longer fits) and search_spec
+//	                                              drops it without a word
+//
+// Each half is its own engine — its own HNSW (3.37 and 3.68 GB), its own hybrid
+// pass and its own cross-encoder window per query — so dropping one halves the
+// work and the index memory. What is lost is the federation MERGE, and on this
+// judged set it is the part that cannot be judged: every judgement is a 3GPP
+// clause, the ETSI hits are unjudged by construction, and the merge interleaves
+// them 1:1 (5 of every 10 hits on every page measured with both halves). The
+// embedder, the reranker, both ONNX Runtimes, the sparse arm, the fusion and the
+// handler — the regressions this gate exists for — are all on the path it keeps.
 //
 // WHAT IT REFUSES BEFORE IT SCORES, because each is a way to record one ranking
 // under another's name — the defect that kept the semantic arms out of the lexical
@@ -131,27 +154,17 @@ func servedArgs(q eval.Query, a servedArm) map[string]any {
 // EMBED_MODELS_CONFIG would swap the registry the query embedder resolves.
 var servedPinnedEnv = []string{"RERANK_ALL", "RERANK_WINDOW", "EMBEDDER", "RERANKER", "EMBED_MODELS_CONFIG"}
 
-// servedMemoryLimit is the DUCKDB_MEMORY_LIMIT the gate's server runs with — the
-// ONE place the gate departs from the image's configuration, and the reason it
-// can run on this machine at all. Measured 2026-09-11, server-full over both
-// halves, the judged set:
-//
-//	unset (16GB per store, the image's)  39.8 GB committed, 22.1 GB resident, the
-//	                                     FIRST hybrid query still unanswered after
-//	                                     3 min 30 — killed, 14.6 GB of swap in use
-//	4GB                                  the ETSI half FAILS after its first
-//	                                     semantic query, every later page is
-//	                                     3GPP-only (twice) — errETSIDropped
-//
-// The limit caps each store's buffer pool, and the frozen HNSW index lives IN
-// that pool (duckdb_memory(), tag ART_INDEX, after one k-NN: 3.37 GB on the 3GPP
-// half, 3.68 GB on the ETSI half — with 5.5 and 6.1 GB of table pages cached
-// beside it). 4GB leaves the ETSI index 0.3 GB to work in; the value here leaves
-// each half at least 2.3 GB beyond its index. It changes what DuckDB CACHES, not
-// what a query returns: a query that runs out of room fails, it does not answer
-// differently — and the failures that search_spec would swallow are exactly the
-// ones this gate refuses (errETSIDropped, the mode check). An operator's own
-// DUCKDB_MEMORY_LIMIT is overridden for the same reason the knobs above are.
+// servedMemoryLimit is the DUCKDB_MEMORY_LIMIT the gate's server runs with. The
+// image leaves it unset, and the store's default is 16GB — a CACHE ceiling that a
+// scan-heavy query fills (39.8 GB committed over both halves, above). The limit
+// caps the buffer pool, and the frozen HNSW index lives IN that pool
+// (duckdb_memory(), tag ART_INDEX, after one k-NN: 3.37 GB on the 3GPP half, with
+// 5.5 GB of table pages cached beside it); 6GB leaves the 3GPP index 2.6 GB to
+// work in, where 4GB left the ETSI one 0.3 GB and broke it. It changes what DuckDB
+// caches, not what a query returns: a query that runs out of room fails — and an
+// arm that fails is what the mode check and the rerank check are for. An
+// operator's own DUCKDB_MEMORY_LIMIT is overridden for the same reason the knobs
+// above are.
 const servedMemoryLimit = "6GB"
 
 // servedServerEnv is the environment server-full is started with. Two ONNX
@@ -186,6 +199,12 @@ func servedRuntimeInputs(c *Ctx) []string {
 		}
 	}
 	return nil
+}
+
+// servedServerArgs is the command line: the 3GPP corpus, and the ETSI half
+// declined explicitly — an empty --etsi-db would attach the etsi.duckdb beside it.
+func servedServerArgs(c *Ctx) []string {
+	return []string{"serve", "--db", c.dataPath("3gpp.duckdb"), "--etsi-db", "off"}
 }
 
 // servedMetricsPath is where the gate leaves what it measured: a CANDIDATE
@@ -242,7 +261,7 @@ type servedRun struct {
 // logf, when not nil, receives one line per call — the arm, the query, the
 // latency and the ETSI share of the page — so a slow or stuck call is visible in
 // the step log while the gate runs, not only in its verdict.
-func scoreServed(set eval.Set, call toolCaller, etsiAttached bool, logf func(string, ...any)) (*servedRun, error) {
+func scoreServed(set eval.Set, call toolCaller, logf func(string, ...any)) (*servedRun, error) {
 	if len(set) == 0 {
 		return nil, errors.New("the judged query set is empty — there is nothing to score, and nothing scored " +
 			"cannot regress")
@@ -261,19 +280,9 @@ func scoreServed(set eval.Set, call toolCaller, etsiAttached bool, logf func(str
 			if err != nil {
 				return nil, err
 			}
-			if etsiAttached && !carriesETSI(refs) {
-				return nil, fmt.Errorf("the %s arm's page for %q carries no ETSI hit although etsi.duckdb is "+
-					"attached: %w", a.Key, q.ID, errETSIDropped)
-			}
 			run.Ranked[a.Key] = append(run.Ranked[a.Key], refs)
 			if logf != nil {
-				etsi := 0
-				for _, r := range refs {
-					if strings.HasPrefix(r.SpecID, "ETSI ") {
-						etsi++
-					}
-				}
-				logf("  %-8s %-22s %6.1fs  %d hit(s), %d from ETSI", a.Key, q.ID, time.Since(t0).Seconds(), len(refs), etsi)
+				logf("  %-8s %-22s %6.1fs  %d hit(s)", a.Key, q.ID, time.Since(t0).Seconds(), len(refs))
 			}
 			return refs, nil
 		}
@@ -289,35 +298,6 @@ func scoreServed(set eval.Set, call toolCaller, etsiAttached bool, logf func(str
 		return nil, err
 	}
 	return run, nil
-}
-
-// errETSIDropped is the federation failing without a word.
-//
-// search_spec federates the attached ETSI index into every query not scoped to a
-// spec or a series, and RRF-merges the two pages — which interleaves them: on the
-// judged set, a healthy page carries an ETSI hit at every other rank (5 of 10, on
-// all eighteen answers measured 2026-09-11). When the ETSI search FAILS the
-// handler drops it without a trace (`eerr == nil && len(eh) > 0`, internal/mcp
-// searchSpec), and the page comes back 3GPP-only. Measured the same day with
-// DUCKDB_MEMORY_LIMIT=4GB: the ETSI half failed after the first semantic query and
-// every later page, in all three arms, was 3GPP-only.
-//
-// And that failure RAISES every metric this gate tracks, because the judgements
-// are 3GPP clauses and the ETSI hits were the ones pushing them down. A gate that
-// only compared numbers would have passed the loss of half the product, and
-// recorded the improvement.
-var errETSIDropped = errors.New("the ETSI half was dropped from the federated answer — search_spec swallows " +
-	"the ETSI search's error, and a 3GPP-only page scores HIGHER on this 3GPP-judged set, so the metrics " +
-	"cannot be trusted to see it")
-
-// carriesETSI reports whether a page holds at least one hit from the ETSI half.
-func carriesETSI(refs []eval.Ref) bool {
-	for _, r := range refs {
-		if strings.HasPrefix(r.SpecID, "ETSI ") {
-			return true
-		}
-	}
-	return false
 }
 
 // rerankActed refuses a rerank arm that returned the hybrid order for every
@@ -363,15 +343,13 @@ type servedInfo struct {
 	Model          string `json:"embedding_model_db"`
 	Etsi           struct {
 		Attached bool `json:"attached"`
-		ModelOK  bool `json:"embedding_model_ok"`
-		Hnsw     bool `json:"hnsw"`
 	} `json:"etsi"`
 }
 
 // requireServedArms refuses a server that cannot serve the arms the gate scores.
 // Every refusal names what the server said, because "reranker false" with its
 // reason is a diagnosis and "gate failed" is not.
-func requireServedArms(m map[string]any, etsiAttached bool) (servedInfo, error) {
+func requireServedArms(m map[string]any) (servedInfo, error) {
 	var si servedInfo
 	text, _, err := judgeToolAnswer("server_info", m, false)
 	if err != nil {
@@ -387,9 +365,9 @@ func requireServedArms(m map[string]any, etsiAttached bool) (servedInfo, error) 
 	if !si.Reranker {
 		missing = append(missing, fmt.Sprintf("reranker=false (%s)", si.RerankerReason))
 	}
-	if etsiAttached && (!si.Etsi.Attached || !si.Etsi.ModelOK) {
-		missing = append(missing, fmt.Sprintf("the ETSI half is not served semantically (attached=%v, "+
-			"embedding_model_ok=%v)", si.Etsi.Attached, si.Etsi.ModelOK))
+	if si.Etsi.Attached {
+		missing = append(missing, "the ETSI half is attached although the gate started the server with "+
+			"--etsi-db off — the memory bound this gate is sized for does not hold")
 	}
 	if len(missing) > 0 {
 		return si, fmt.Errorf("server-full cannot serve what the served gate scores: %s — scoring it would "+
@@ -514,12 +492,7 @@ func runServedRetrievalGate(c *Ctx) error {
 		return fmt.Errorf("load the judged query set: %w", err)
 	}
 
-	args := []string{"serve", "--db", c.dataPath("3gpp.duckdb")}
-	etsiAttached := false
-	if etsi := c.dataPath("etsi.duckdb"); fileNonEmpty(etsi) {
-		args = append(args, "--etsi-db", etsi)
-		etsiAttached = true
-	}
+	args := servedServerArgs(c)
 	c.Log.Printf("served retrieval gate: %s %s (arms %s, tol %s, SEARCH_BUDGET=%s, DUCKDB_MEMORY_LIMIT=%s) vs %s",
 		c.bin("server-full"), strings.Join(args, " "), servedArmKeys(), servedTol, servedSearchBudget,
 		servedMemoryLimit, servedBaseline)
@@ -537,15 +510,15 @@ func runServedRetrievalGate(c *Ctx) error {
 	if err != nil {
 		return fmt.Errorf("server_info failed: %w", err)
 	}
-	si, err := requireServedArms(info, etsiAttached)
+	si, err := requireServedArms(info)
 	if err != nil {
 		return err
 	}
-	c.Log.Printf("server-full serves semantic=%v reranker=%v hnsw=%v sparse=%v model=%s (ETSI attached=%v hnsw=%v)",
-		si.Semantic, si.Reranker, si.Hnsw, si.Sparse, si.Model, si.Etsi.Attached, si.Etsi.Hnsw)
+	c.Log.Printf("server-full serves semantic=%v reranker=%v hnsw=%v sparse=%v model=%s (3GPP half only)",
+		si.Semantic, si.Reranker, si.Hnsw, si.Sparse, si.Model)
 
 	scoring := time.Now()
-	run, err := scoreServed(set, srv.call, etsiAttached, c.Log.Printf)
+	run, err := scoreServed(set, srv.call, c.Log.Printf)
 	if err != nil {
 		return fmt.Errorf("SERVED RETRIEVAL GATE FAILED: %w", err)
 	}
