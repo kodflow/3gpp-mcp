@@ -57,7 +57,7 @@ var rustBins = map[string][]string{
 	// compiled and never staged: a fresh clone would fail enrich-etsi with "the
 	// binary is missing", and the only reason this machine did not was that a
 	// stale file happened to sit at the path.
-	"rust/ingest/Cargo.toml":   {"ingest", "ingest-catalog", "ingest-openapi", "ingest-li", "ingest-glossary", "ingest-crs"},
+	"rust/ingest/Cargo.toml":   {"ingest", "ingest-catalog", "ingest-openapi", "ingest-li", "ingest-glossary", "ingest-crs", "ingest-etsi-changes"},
 	"rust/store/Cargo.toml":    {"merge", "overlay", "freeze-hnsw", "embed-io", "compact"},
 	"rust/discover/Cargo.toml": {"discover"},
 }
