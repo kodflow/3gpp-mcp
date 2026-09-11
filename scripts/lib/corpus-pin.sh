@@ -40,6 +40,29 @@ pin_corpus_snapshot() {
 		return 1
 	fi
 
+	# ONE WRITER AT A TIME. The rewrite reads the whole file and renames a new one
+	# over it, so two publishes of different packages (`--only etsi` and `--only
+	# 3gpp` run side by side) would each start from the same original and the last
+	# rename would drop the other's pin. mkdir is the portable atomic test-and-set;
+	# the lock is held from the read to the rename and released on every path.
+	local lock="$file.lock.d" waited=0
+	until mkdir "$lock" 2>/dev/null; do
+		if [ "$waited" -ge "${PIN_LOCK_WAIT:-120}" ]; then
+			printf 'pin: %s is locked (%s) — another publish is writing it; if none is running, remove that directory\n' "$file" "$lock" >&2
+			return 1
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	local rc=0
+	_pin_rewrite "$file" "$pkg" "$ref" || rc=$?
+	rmdir "$lock"
+	return "$rc"
+}
+
+# _pin_rewrite FILE PACKAGE REF — the read/modify/rename, under the caller's lock.
+_pin_rewrite() {
+	local file="$1" pkg="$2" ref="$3"
 	local out="" line bare cr found=0
 	while IFS= read -r line || [ -n "$line" ]; do
 		bare="${line%$'\r'}"

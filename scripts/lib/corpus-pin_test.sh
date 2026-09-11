@@ -70,6 +70,57 @@ pin_corpus_snapshot "$g" etsi-corpus "$NEWE"
 printf '# c\r\n%s\r\n%s\r\n' "$OLD3" "$NEWE" >"$work/crlf.want"
 if cmp -s "$g" "$work/crlf.want"; then pass "CRLF preserved"; else fail "CRLF not preserved"; fi
 
+# 9. A held lock is honoured: the writer waits, then writes once the lock is gone.
+g="$work/locked"
+fixture "$g"
+mkdir "$g.lock.d"
+(PIN_LOCK_WAIT=30 pin_corpus_snapshot "$g" etsi-corpus "$NEWE") &
+bg=$!
+sleep 2
+if grep -qF "$NEWE" "$g"; then fail "the writer did not wait for a held lock"; else pass "the writer waits while the lock is held"; fi
+rmdir "$g.lock.d"
+if wait "$bg" && grep -qF "$NEWE" "$g" && [ ! -d "$g.lock.d" ]; then
+	pass "the writer writes once the lock is released, and releases it"
+else
+	fail "the writer did not complete after the lock was released"
+fi
+
+# 10. A lock that never frees fails the write and leaves both the file and the
+# other writer's lock alone.
+g="$work/stuck"
+fixture "$g"
+before="$(cat "$g")"
+mkdir "$g.lock.d"
+if PIN_LOCK_WAIT=1 pin_corpus_snapshot "$g" etsi-corpus "$NEWE" 2>/dev/null; then
+	fail "a write went through a lock it never acquired"
+elif [ "$(cat "$g")" = "$before" ] && [ -d "$g.lock.d" ]; then
+	pass "a stuck lock fails the write, file and lock untouched"
+else
+	fail "a stuck lock changed the file or removed someone else's lock"
+fi
+rmdir "$g.lock.d"
+
+# 11. A refused rewrite still releases the lock.
+g="$work/refused"
+printf '%s\n' "$OLD3" >"$g"
+pin_corpus_snapshot "$g" etsi-corpus "$NEWE" 2>/dev/null || true
+if [ -d "$g.lock.d" ]; then fail "a refused rewrite left its lock behind"; else pass "a refused rewrite releases its lock"; fi
+
+# 12. Two publishes of different packages, side by side: both pins land.
+g="$work/concurrent"
+fixture "$g"
+ok=1
+for i in 4 5 6; do
+	pin_corpus_snapshot "$g" 3gpp-corpus "ghcr.io/kodflow/3gpp-corpus@$(d "$i")" &
+	p1=$!
+	pin_corpus_snapshot "$g" etsi-corpus "ghcr.io/kodflow/etsi-corpus@$(d "$i")" &
+	p2=$!
+	wait "$p1" && wait "$p2" || ok=0
+	grep -qF "ghcr.io/kodflow/3gpp-corpus@$(d "$i")" "$g" || ok=0
+	grep -qF "ghcr.io/kodflow/etsi-corpus@$(d "$i")" "$g" || ok=0
+done
+if [ "$ok" = 1 ]; then pass "concurrent writers of two packages both land (3 rounds)"; else fail "a concurrent write lost a pin"; fi
+
 # 8. The COMMITTED pin is writable by this tool: exactly one line per package.
 g="$work/real"
 cp "$ROOT/contracts/corpus-pin.txt" "$g"
