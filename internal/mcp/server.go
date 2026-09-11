@@ -212,11 +212,13 @@ type handlers struct {
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
 // goes to the attached ETSI store (when present), everything else to the 3GPP store.
 // This is how the two SPLIT indexes are federated without a merge.
+//
+// ONE PREDICATE FOR BOTH ROUTERS (CodeRabbit, #332). This used to test the raw
+// string for "ETSI " while storeFor trimmed and ignored case, so the same id could
+// reach different halves depending on which tool received it — and get_changelog
+// routed with one rule and chose its note with the other. It now delegates.
 func (h *handlers) specStore(specID string) store.Reader {
-	if h.etsi != nil && strings.HasPrefix(specID, "ETSI ") {
-		return h.etsi
-	}
-	return h.st
+	return h.storeFor(specID)
 }
 
 // ---- response shapes ----------------------------------------------------
@@ -540,8 +542,12 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	changes := all
 	bounded := from.raw != "" || to.raw != ""
 	if bounded {
-		if changes, err = st.GetChangelog(ctx, specID, from.release, to.release); err != nil {
-			return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
+		// Only a RELEASE bound is the store's to apply; for any other the query
+		// would repeat the one above verbatim (CodeRabbit, #332).
+		if from.release != "" || to.release != "" {
+			if changes, err = st.GetChangelog(ctx, specID, from.release, to.release); err != nil {
+				return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
+			}
 		}
 		changes = applyVersionBounds(changes, from, to)
 	}
@@ -602,7 +608,12 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if isETSISpecID(specID) {
 		note = etsiChangelogNote(ctx, h.etsi, specID, all)
 		if h.etsi != nil && len(changes) > 0 {
-			out["citations"] = etsiChangeCitations(ctx, h.etsi, specID, changes)
+			cites, uncited := etsiChangeCitations(ctx, h.etsi, specID, changes)
+			out["citations"] = cites
+			if uncited > 0 {
+				note = fmt.Sprintf("%d of these records name a version whose document this corpus could not "+
+					"resolve, so they carry no citation. ", uncited) + note
+			}
 		}
 	} else {
 		note = changelogNote(ctx, st, specID, all)
@@ -620,8 +631,10 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 		// And a PARTLY blind filter is not a complete answer either (Qodo, #332):
 		// when only some records name their clauses, the others were dropped
 		// untested, and a count built from the rest — zero or not — must say so.
+		// "in range" only when a bound was actually APPLIED: an unreadable one is
+		// named as not applied by boundsNote, and the two must not contradict.
 		scope := ""
-		if bounded {
+		if from.release != "" || from.version != "" || to.release != "" || to.version != "" {
 			scope = " in range"
 		}
 		if clauseless == inRange {
@@ -787,19 +800,38 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	// FEDERATED, like every other lookup that can name an ETSI entity, and each
 	// half reports how many edges it had to look at — see evolutionHalves and
 	// evolutionNote for the silence this replaces.
+	//
+	// ONE HALF FAILING DOES NOT SILENCE THE OTHER (CodeRabbit, #332). search_spec
+	// federates the same optional half defensively, and aborting here would drop
+	// the 3GPP edges — today the only ones there are — over an ETSI read error. A
+	// half that cannot be read is named in the note and left out of edges_held, so
+	// its silence is never read as a count of zero. Only when no half can be read
+	// is there nothing to serve.
 	evos := []model.Evolution{}
 	cites := []model.Citation{}
 	held := map[string]int{}
-	for _, half := range h.evolutionHalves() {
+	var unread []string
+	var lookupErr error
+	halves := h.evolutionHalves()
+	for _, half := range halves {
 		es, err := half.st.GetEvolutions(ctx, entity)
 		if err != nil {
-			return mcp.NewToolResultErrorFromErr("trace_evolution failed on the "+half.name+" half", err), nil
+			unread = append(unread, half.name)
+			lookupErr = err
+			continue
 		}
 		for _, e := range es {
 			evos = append(evos, e)
 			cites = append(cites, h.evolutionCitation(ctx, e))
 		}
-		held[half.name] = countEvolutions(ctx, half.st)
+		if n, err := countEvolutions(ctx, half.st); err == nil {
+			held[half.name] = n
+		} else {
+			unread = append(unread, half.name)
+		}
+	}
+	if lookupErr != nil && len(unread) == len(halves) {
+		return mcp.NewToolResultErrorFromErr("trace_evolution failed on every half", lookupErr), nil
 	}
 	return jsonResult(map[string]any{
 		"entity":     entity,
@@ -807,7 +839,7 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 		"evolutions": evos,
 		"citations":  cites,
 		"edges_held": held,
-		"note":       evolutionNote(entity, len(evos), held, h.etsi != nil),
+		"note":       evolutionNote(entity, len(evos), held, unread, h.etsi != nil),
 	})
 }
 
