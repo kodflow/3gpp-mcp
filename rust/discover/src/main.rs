@@ -142,9 +142,13 @@ fn main() {
 
     match a.mode {
         Mode::Worklist => {
-            let (lines, n, skipped) = emit_worklist(&site, floor_major, &a.series);
+            let (lines, c) = emit_worklist(&site, floor_major, &a.series);
             print!("{lines}");
-            eprintln!("emit-worklist: {n} entries ({skipped} un-encodable versions skipped)");
+            eprintln!(
+                "emit-worklist: {} entries ({} un-encodable versions skipped, \
+                 {} re-filed under the release their version names, {} deduped)",
+                c.emitted, c.unencodable, c.refiled, c.deduped
+            );
         }
         Mode::DraftLedger => {
             println!("{}", emit_draft_ledger(&site, floor_major, &a.series));
@@ -175,14 +179,17 @@ fn main() {
             print!("{lines}");
             eprintln!(
                 "repair-plan: upstream_missing={} upstream_stale={} corpus_holes={} overlap={} -> repair_specs={} \
-                 ({} un-encodable, {} holes absent from the status report, recovered from the anchor)",
+                 ({} un-encodable, {} holes absent from the status report, recovered from the anchor, \
+                 {} re-filed under the release their version names, {} deduped)",
                 c.upstream_missing,
                 c.upstream_stale,
                 c.corpus_holes,
                 c.overlap,
                 c.emitted,
                 c.unencodable,
-                c.holes_not_in_report
+                c.holes_not_in_report,
+                c.refiled,
+                c.deduped
             );
         }
         Mode::Delta => {
