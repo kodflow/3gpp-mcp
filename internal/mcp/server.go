@@ -58,9 +58,13 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 				"pinned to the baseline release; get_spec also reports new_in_baseline "+
 				"(vs previous release) and added_in_later_releases (annex)."),
 	)
+	eng.SetName("3gpp")
 	var etsiEng *search.Engine
 	if etsi != nil {
-		etsiEng = search.New(etsi) // its own single-DB FTS/HNSW; no 3GPP vec shards
+		// Its own single-DB FTS/HNSW and no 3GPP vec shards — but the SAME models:
+		// a second cross-encoder session is 2.3 GB for no concurrency (NewSharing).
+		etsiEng = search.NewSharing(etsi, eng)
+		etsiEng.SetName("etsi")
 	}
 	h := &handlers{st: st, etsi: etsi, eng: eng, etsiEng: etsiEng, reg: registry.Default(), baseline: baseline, version: version}
 	for _, o := range opts {
@@ -366,6 +370,13 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// ONE budget for the whole call, and a record of what every arm of every pass
+	// did (internal/search/report.go): the federation below runs up to three
+	// searches, and each used to start a SEARCH_BUDGET of its own and to drop a
+	// skipped arm without a word.
+	ctx, trace := search.WithTrace(ctx)
+	ctx, cancelBudget := search.WithBudget(ctx)
+	defer cancelBudget()
 	// Over-fetch the page window + 1 to detect "more exists" without a count.
 	mode, rerank := r.GetString("mode", ""), r.GetBool("rerank", false)
 	want := offset + pageSize + 1
@@ -461,6 +472,21 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		resp["mode_requested"] = requested
 		resp["mode_degraded"] = fmt.Sprintf(
 			"requested %q, served %q — call server_info for why semantic is unavailable", requested, served)
+	}
+	// ModeServed says what the engine CAN run; the trace says what this call DID.
+	// A requested arm that contributed nothing — its budget spent, its embedder or
+	// store call failed, a capability absent — is named here and in mode_degraded,
+	// so an answer never claims a rerank (or a sparse pass) it did not get.
+	reps := trace.Reports()
+	resp["arms"] = reps
+	if deg := search.Degraded(reps); len(deg) > 0 {
+		resp["degraded"] = deg
+		note := "not served: " + strings.Join(deg, "; ")
+		if prev, ok := resp["mode_degraded"].(string); ok {
+			resp["mode_degraded"] = prev + "; " + note
+		} else {
+			resp["mode_degraded"] = note
+		}
 	}
 	if next != "" {
 		resp["next_cursor"] = next
