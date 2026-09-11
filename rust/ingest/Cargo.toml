@@ -39,3 +39,9 @@ path = "src/bin/ingest_glossary.rs"
 [[bin]]
 name = "ingest-crs"
 path = "src/bin/ingest_crs.rs"
+
+# ingest-etsi-changes — the ETSI half's changelog, read from the change-history
+# annex a deliverable prints about itself (TC LI layout only). Run by enrich-etsi.
+[[bin]]
+name = "ingest-etsi-changes"
+path = "src/bin/ingest_etsi_changes.rs"

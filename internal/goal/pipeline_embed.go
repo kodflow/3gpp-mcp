@@ -749,15 +749,24 @@ func stepEnrichETSI(t corpusTarget) *Step {
 	return &Step{
 		Name:    "enrich" + t.Suffix,
 		Version: 1,
-		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary",
+		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary, and its change-history annex into the changelog",
 		Deps:    []string{"ingest-etsi", "build-rust"},
 		// NAMED FILES, NOT THE CRATE — the declaration ingest-etsi carries, for the
 		// reason measured on 2026-09-06: naming rust/ingest/src/bin made a fix to
 		// ingest_li.rs invalidate the whole ETSI half (~1 h of rework, 18.8 GiB
 		// re-pushed) over a binary that half never runs. This step runs exactly
-		// one, so it names exactly its source and the crates it links.
+		// two, so it names exactly their sources and the crates they link.
 		Impl: []string{
 			"rust/ingest/src/bin/ingest_glossary.rs", "rust/ingest/Cargo.toml",
+			// THE ETSI CHANGELOG WRITER, and the store file its write goes through.
+			// rust/store/src/changes.rs holds replace_changes, which ingest-crs on
+			// the 3GPP arm also calls: each arm declares it for its own binary, so
+			// an edit to the guard replays both writers and neither corpus keeps a
+			// changelog the current code would not write.
+			// TestEveryChangelogWriterIsDeclaredByTheStepThatRunsIt holds the pairing.
+			"rust/ingest/src/bin/ingest_etsi_changes.rs", "rust/store/src/changes.rs",
+			// Both binaries read the converted HTML through it.
+			"rust/parse/src/html_bytes.rs",
 			// The extraction rule and the ETSI provenance header it keys on — AND the
 			// crate's manifest, for the reason rust/ingest/Cargo.toml is here: a
 			// dependency or feature change produces a different binary from identical
@@ -825,7 +834,23 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		},
 		Run: func(c *Ctx) error {
 			c.Log.Printf("mining the Abbreviations clause of each ETSI deliverable (newest version of each)")
-			return c.Run(Cmd{Name: c.rbin("ingest-glossary"), Args: []string{
+			if err := c.Run(Cmd{Name: c.rbin("ingest-glossary"), Args: []string{
+				"--convert", c.dataPath("sources", "convert-etsi"),
+				"--db", t.dbPath(c),
+			}, Echo: true}); err != nil {
+				return err
+			}
+			// THE ETSI CHANGELOG. etsi.duckdb carried no change record at all, and
+			// get_changelog could only say so. ETSI publishes no change-request
+			// database; what it does publish is the change-history annex some
+			// deliverables print about themselves, and in the TC LI layout that
+			// annex names each CR on a line of its own. The writer reads EVERY
+			// version — the version a CR landed in is where it first appears — and
+			// declines every layout it cannot read without guessing. Idempotent on
+			// its output: an unchanged archive leaves the corpus untouched, byte for
+			// byte (replace_changes compares the rows the table holds).
+			c.Log.Printf("ETSI changelog from the change-history annexes (every version of each deliverable)")
+			return c.Run(Cmd{Name: c.rbin("ingest-etsi-changes"), Args: []string{
 				"--convert", c.dataPath("sources", "convert-etsi"),
 				"--db", t.dbPath(c),
 			}, Echo: true})
