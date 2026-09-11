@@ -204,8 +204,11 @@ the `latest` GitHub release. That asset was last written on 2026-06-05 and nothi
 republishes it; the "corpus manifest" meant to pair it with a snapshot was verified
 by `seed` but never written by anyone. Measured against the corpus the next
 snapshot will be published from: the release anchor is behind it on 645 keys and
-lacks 140, so discover on a fresh clone would re-acquire ~785 spec versions the
-snapshot already holds. Independently, the path that was to regenerate a missing
+lacks 140. Run through the real `discover` against the 2026-09-11 status report,
+a clone seeding the pinned snapshot gets a work list of **805** (spec, release)
+pairs over 18 series with that anchor, against **20** over 6 series with the
+anchor derived from the snapshot — the latter identical to this machine's own
+work list. Independently, the path that was to regenerate a missing
 anchor (`merge --index-out --base <corpus>` with no shard) is refused by merge
 before it starts, so it failed `ingest` whenever it was reached.
 

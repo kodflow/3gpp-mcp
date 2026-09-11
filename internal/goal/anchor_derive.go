@@ -7,7 +7,10 @@ package goal
 // written 2026-06-05, republished by nothing — beside a corpus pulled by digest
 // from GHCR, so a fresh clone paired a snapshot of one generation with an anchor of
 // another: measured against the corpus the next snapshot will be published from,
-// 645 keys behind and 140 missing, ~785 spec versions discover would re-acquire.
+// 645 keys behind and 140 missing. Run through the real discover against the
+// 2026-09-11 status report, a clone seeding the pinned snapshot got a work list of
+// 805 (spec, release) pairs over 18 series with that anchor — and 20 pairs over 6
+// series with the derived one, exactly this machine's own work list.
 // And when no anchor was present, `ingest` meant to regenerate one with
 // `merge --index-out --base <corpus>` and no shard — which merge refuses outright
 // ("pass at least one shard path"), so that path failed the step every time it
