@@ -59,6 +59,160 @@ struct Args {
     /// what this scratch shard happens to remember. Optional; absent = shard-only resume.
     #[arg(long, default_value = "")]
     corpus: String,
+    /// With --etsi: report, WITHOUT WRITING, what `--etsi --resume` would add to --db,
+    /// and the state of its vector index. --db is attached READ_ONLY; nothing is
+    /// restored, dropped, rebuilt or checkpointed. See run_etsi_plan.
+    #[arg(long, default_value_t = false)]
+    plan: bool,
+}
+
+/// What an `--etsi --resume` pass would add to a corpus, measured without writing.
+#[derive(Debug, Default, PartialEq)]
+struct EtsiPlan {
+    /// Deliverables whose (spec, version) is not yet `done` in the corpus ledger.
+    pending_docs: usize,
+    /// Clauses those deliverables would write. ZERO is the only number the step
+    /// needs: every pending deliverable parses to nothing, so a pass would re-parse
+    /// them, write no clause, and still rewrite the file around them.
+    pending_clauses: usize,
+    /// Pending deliverables whose (spec, version) the corpus does NOT catalogue in
+    /// spec_versions. A pass would write their spec and version rows even when they
+    /// parse to nothing — catalogue work, which a decline must not skip.
+    pending_uncatalogued: usize,
+    /// schema_meta.hnsw_state of the corpus ("" when absent).
+    hnsw_state: String,
+}
+
+/// What the corpus already holds, read READ_ONLY: the ledger's done pairs, the
+/// catalogued (spec, version) pairs, and hnsw_state.
+#[derive(Debug, Default)]
+struct EtsiHeld {
+    done: std::collections::HashSet<(String, String)>,
+    catalogued: std::collections::HashSet<(String, String)>,
+    hnsw_state: String,
+}
+
+/// etsi_done_set reads, READ_ONLY, the (spec, version) pairs the corpus ledger marks
+/// done under this pipeline version, and its hnsw_state.
+///
+/// The corpus is ATTACHED to a throwaway in-memory database rather than opened with
+/// Store::open_rw, which bootstraps the schema and migrates: opening it that way is
+/// itself a write, and the whole point of the plan is that a pass with nothing to do
+/// leaves the file byte for byte as it was.
+fn etsi_done_set(corpus: &str) -> Result<EtsiHeld> {
+    let mem = Store::in_memory()?;
+    let conn = mem.raw();
+    // Best-effort, as in open_rw: a corpus whose `clauses` carries an HNSW index is
+    // attached fine without vss, but loading it costs nothing and keeps a future
+    // DuckDB from refusing to bind the catalogue.
+    let _ = conn.execute_batch("INSTALL vss; LOAD vss;");
+    conn.execute_batch(&format!(
+        "ATTACH '{}' AS corp (READ_ONLY)",
+        corpus.replace('\'', "''")
+    ))
+    .with_context(|| format!("attach {corpus} read-only"))?;
+    // A corpus WITHOUT the ledger or the meta table (an older or foreign file) has
+    // nothing marked done and no index state: that is an empty answer, which plans
+    // everything as pending — not an error that would stop the step before the
+    // ingest could run. Genuine attach and query errors still propagate.
+    let has = |table: &str| -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'corp' AND table_name = ?",
+            [table],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    if !has("ingest_log")? || !has("schema_meta")? || !has("spec_versions")? {
+        conn.execute_batch("DETACH corp")?;
+        return Ok(EtsiHeld::default());
+    }
+    let done = {
+        let mut st = conn.prepare(
+            "SELECT DISTINCT spec_id, version FROM corp.ingest_log
+             WHERE status = 'done' AND pipeline_version = ?",
+        )?;
+        let rows = st.query_map([PIPELINE_VERSION], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()?
+    };
+    let catalogued = {
+        let mut st = conn.prepare("SELECT DISTINCT spec_id, version FROM corp.spec_versions")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()?
+    };
+    let hnsw_state: String = conn.query_row(
+        "SELECT COALESCE(MAX(value), '') FROM corp.schema_meta WHERE key = 'hnsw_state'",
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute_batch("DETACH corp")?;
+    Ok(EtsiHeld {
+        done,
+        catalogued,
+        hnsw_state,
+    })
+}
+
+/// etsi_plan decides, file by file, exactly what the `--etsi --resume` loop in main
+/// would: the same reader (read_html, windows-1252 fallback — the resume key must be
+/// the ingest key, see the comment in that loop), the same header, the same done
+/// predicate. What it does NOT do is write: a pending file is parsed in memory and its
+/// clauses counted.
+fn etsi_plan(files: &[String], held: &EtsiHeld) -> EtsiPlan {
+    let mut plan = EtsiPlan::default();
+    for f in files {
+        let Ok(html) = parse3gpp::html_bytes::read_html(f) else {
+            // The ingest would log "skip" and write nothing for it either.
+            continue;
+        };
+        let Some(meta) = parse3gpp::etsi::parse_etsi_meta(&html) else {
+            continue; // not an ETSI deliverable: the ingest skips it too
+        };
+        let key = (meta.spec_id.clone(), meta.version.clone());
+        if held.done.contains(&key) {
+            continue;
+        }
+        let (clauses, _, _) =
+            parse_html_clauses(&html, &meta.spec_id, &meta.release, &meta.version);
+        plan.pending_docs += 1;
+        plan.pending_clauses += clauses.len();
+        if !held.catalogued.contains(&key) {
+            plan.pending_uncatalogued += 1;
+        }
+    }
+    plan.hnsw_state = held.hnsw_state.clone();
+    plan
+}
+
+/// run_etsi_plan prints the plan as ONE line the pipeline parses:
+///
+///   ingest-plan: ETSI pending_docs=19 pending_clauses=0 pending_uncatalogued=0 hnsw_state=frozen corpus=present files=11822
+///
+/// A missing corpus is reported, not an error: it simply has everything to add.
+fn run_etsi_plan(convert: &str, db: &str) -> Result<()> {
+    let files = collect_html_recursive(convert)?;
+    let present = std::path::Path::new(db)
+        .metadata()
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    let held = if present {
+        etsi_done_set(db)?
+    } else {
+        EtsiHeld::default()
+    };
+    let plan = etsi_plan(&files, &held);
+    println!(
+        "ingest-plan: ETSI pending_docs={} pending_clauses={} pending_uncatalogued={} hnsw_state={} corpus={} files={}",
+        plan.pending_docs,
+        plan.pending_clauses,
+        plan.pending_uncatalogued,
+        plan.hnsw_state,
+        if present { "present" } else { "absent" },
+        files.len()
+    );
+    Ok(())
 }
 
 /// run_count_only mirrors Go cmd/ingest --count-only: a read-only count summary as JSON.
@@ -235,6 +389,17 @@ fn collect_series_html(convert: &str, series: &str, release: &str) -> Result<Vec
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // BEFORE open_rw, which bootstraps and migrates — i.e. writes. The plan must not.
+    if args.plan {
+        anyhow::ensure!(args.etsi, "--plan is only defined with --etsi");
+        let convert = args
+            .convert
+            .as_deref()
+            .context("--etsi --plan requires --convert <dir>")?;
+        return run_etsi_plan(convert, &args.db);
+    }
+
     let store = Store::open_rw(&args.db)?;
     let _ = (&args.quiet, &args.origin); // accepted-for-compat no-ops
 
@@ -421,6 +586,153 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ingest-plan-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const WITH_TEXT: &str = r#"<!-- ETSI-SPEC: 103 221-1 | 1.21.1 --><html><body><h1>4.1 Architecture</h1><p>the actual text</p></body></html>"#;
+    const EMPTY: &str =
+        r#"<!-- ETSI-SPEC: 103 999 | 1.1.1 --><html><body><p>cover note</p></body></html>"#;
+
+    // THE PLAN IS THE INGEST'S OWN DECISION, MINUS THE WRITES. A corpus that already
+    // holds the deliverable with text, plus a deliverable that parses to nothing (the
+    // 19 the real corpus re-parses on every pass), plans ZERO clauses — and the file
+    // is not modified by asking.
+    #[test]
+    fn a_corpus_holding_everything_plans_zero_clauses_and_is_not_touched() {
+        let dir = tmp("held");
+        let conv = dir.join("convert");
+        std::fs::create_dir_all(&conv).unwrap();
+        std::fs::write(conv.join("TS_103_221-1_v1.21.1.html"), WITH_TEXT).unwrap();
+        std::fs::write(conv.join("TS_103_999_v1.1.1.html"), EMPTY).unwrap();
+        let db = dir.join("etsi.duckdb");
+        {
+            let store = Store::open_rw(db.to_str().unwrap()).unwrap();
+            let meta = parse3gpp::etsi::parse_etsi_meta(WITH_TEXT).unwrap();
+            assert!(write_spec(&store, &meta, WITH_TEXT, 0).unwrap() > 0);
+            store.set_meta("hnsw_state", "frozen").unwrap();
+            store.checkpoint().unwrap();
+        }
+        let before = std::fs::read(&db).unwrap();
+
+        let files = collect_html_recursive(conv.to_str().unwrap()).unwrap();
+        let held = etsi_done_set(db.to_str().unwrap()).unwrap();
+        let plan = etsi_plan(&files, &held);
+        assert_eq!(plan.pending_docs, 1, "only the cover note is pending");
+        assert_eq!(plan.pending_clauses, 0, "and it parses to nothing");
+        assert_eq!(plan.hnsw_state, "frozen");
+        // The cover note was never catalogued here — a pass would write its spec and
+        // version rows, so it IS work (see the next test for the steady state).
+        assert_eq!(plan.pending_uncatalogued, 1);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "planning wrote to the corpus"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And a deliverable the corpus does not hold, with text, is counted.
+    #[test]
+    fn a_new_deliverable_with_text_is_pending() {
+        let dir = tmp("new");
+        let conv = dir.join("convert");
+        std::fs::create_dir_all(&conv).unwrap();
+        std::fs::write(conv.join("TS_103_221-1_v1.21.1.html"), WITH_TEXT).unwrap();
+        let db = dir.join("etsi.duckdb");
+        {
+            let store = Store::open_rw(db.to_str().unwrap()).unwrap();
+            store.checkpoint().unwrap();
+        }
+        let files = collect_html_recursive(conv.to_str().unwrap()).unwrap();
+        let held = etsi_done_set(db.to_str().unwrap()).unwrap();
+        let plan = etsi_plan(&files, &held);
+        assert_eq!(plan.pending_docs, 1);
+        assert!(
+            plan.pending_clauses > 0,
+            "a new deliverable with text must plan clauses"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE STEADY STATE: a deliverable that parses to nothing but was catalogued by an
+    // earlier pass is no work — a pass would only rewrite the same spec and version
+    // rows. This is the 19 the real corpus re-parses every time.
+    #[test]
+    fn a_catalogued_empty_deliverable_is_not_catalogue_work() {
+        let dir = tmp("catalogued");
+        let conv = dir.join("convert");
+        std::fs::create_dir_all(&conv).unwrap();
+        std::fs::write(conv.join("TS_103_999_v1.1.1.html"), EMPTY).unwrap();
+        let db = dir.join("etsi.duckdb");
+        {
+            let store = Store::open_rw(db.to_str().unwrap()).unwrap();
+            let meta = parse3gpp::etsi::parse_etsi_meta(EMPTY).unwrap();
+            assert_eq!(write_spec(&store, &meta, EMPTY, 0).unwrap(), 0);
+            store.checkpoint().unwrap();
+        }
+        let files = collect_html_recursive(conv.to_str().unwrap()).unwrap();
+        let plan = etsi_plan(&files, &etsi_done_set(db.to_str().unwrap()).unwrap());
+        assert_eq!(
+            (
+                plan.pending_docs,
+                plan.pending_clauses,
+                plan.pending_uncatalogued
+            ),
+            (1, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file that is not a corpus of this schema — no ledger, no meta — plans as
+    // "everything pending", it does not fail the step before the ingest can run.
+    #[test]
+    fn a_corpus_without_the_ledger_plans_everything_pending() {
+        let dir = tmp("bare");
+        let db = dir.join("etsi.duckdb");
+        {
+            let mem = Store::in_memory().unwrap();
+            mem.raw()
+                .execute_batch(&format!(
+                    "ATTACH '{}' AS f; CREATE TABLE f.other (x INTEGER); DETACH f;",
+                    db.to_str().unwrap().replace('\'', "''")
+                ))
+                .unwrap();
+        }
+        let held = etsi_done_set(db.to_str().unwrap()).unwrap();
+        assert!(held.done.is_empty() && held.catalogued.is_empty() && held.hnsw_state.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A ledger row from ANOTHER pipeline version does not count as done: the ingest
+    // re-ingests it, so the plan must say so.
+    #[test]
+    fn a_ledger_row_from_another_pipeline_version_is_not_done() {
+        let dir = tmp("pv");
+        let db = dir.join("etsi.duckdb");
+        {
+            let store = Store::open_rw(db.to_str().unwrap()).unwrap();
+            store
+                .log_ingest("ETSI TS 103 221-1", "1.21.1", "done", "some-older-pipeline")
+                .unwrap();
+            store.checkpoint().unwrap();
+        }
+        let held = etsi_done_set(db.to_str().unwrap()).unwrap();
+        assert!(
+            held.done.is_empty(),
+            "a done row under another pipeline version was trusted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
