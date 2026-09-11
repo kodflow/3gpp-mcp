@@ -2,6 +2,7 @@ package goal
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -128,5 +129,58 @@ func TestPublishDisarmsAnInheritedCertificate(t *testing.T) {
 	if !strings.Contains(script, `if [ -n "${CORPUS_CONTRACT_CERTIFIED:-}" ]; then`) {
 		t.Fatal("build-image.sh no longer tests CORPUS_CONTRACT_CERTIFIED with -n, so an empty value " +
 			"may not disarm it")
+	}
+}
+
+// BYTES REWRITTEN UNDER A RESTORED SIZE AND MTIME are the case a timestamp cannot
+// see; the content sample does, wherever the change touches a sampled block — and
+// a DuckDB file's header, at offset 0, changes on every checkpoint.
+func TestACorpusRewrittenUnderItsOldMtimeVoidsTheCertificate(t *testing.T) {
+	c, _ := newTestCtx(t)
+	c.Config["contract_flags"] = "--require-fts"
+	c.Config["embed_floor"] = "Rel-99"
+	for _, f := range certifiedFiles(c) {
+		write(t, f, strings.Repeat("corpus bytes ", 200000)) // > the whole-file sample limit
+	}
+	if err := writeContractCertificate(c, corpus3GPP()); err != nil {
+		t.Fatal(err)
+	}
+	p := c.dataPath("3gpp.duckdb")
+	st, _ := os.Stat(p)
+	f, err := os.OpenFile(p, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("HEADER CHANGED BY A CHECKPOINT"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if err := os.Chtimes(p, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if st2, _ := os.Stat(p); st2.Size() != st.Size() || !st2.ModTime().Equal(st.ModTime()) {
+		t.Fatal("the test did not restore size and mtime, so it proves nothing")
+	}
+	if why := contractCertified(c, "Rel-99"); why != "" {
+		t.Fatalf("a corpus rewritten under its old size and mtime kept its certificate: %s", why)
+	}
+}
+
+// A CERTIFICATE FOR ANOTHER DATA DIRECTORY IS NOT ONE FOR THE CORPUS THE SCRIPT
+// BAKES: build-image.sh reads <repo>/data whatever --data goal ran with.
+func TestACertificateForAnotherDataDirectoryDoesNotExcuseThisOne(t *testing.T) {
+	c, _ := newTestCtx(t)
+	c.Config["contract_flags"] = "--require-fts"
+	c.Config["embed_floor"] = "Rel-99"
+	c.Data = filepath.Join(t.TempDir(), "elsewhere")
+	for _, f := range certifiedFiles(c) {
+		write(t, f, "corpus bytes")
+	}
+	if err := writeContractCertificate(c, corpus3GPP()); err != nil {
+		t.Fatal(err)
+	}
+	if why := contractCertified(c, "Rel-99"); why != "" {
+		t.Fatalf("a certificate for %s excused the corpus the script bakes from %s: %s",
+			c.Data, filepath.Join(c.Root, "data"), why)
 	}
 }
