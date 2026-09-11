@@ -69,6 +69,18 @@ func imageEmbedFloor(c *Ctx) (string, error) {
 // lastFlagValue is the value of a Go-style flag in an argument list, spelled with
 // one dash or two, as "-name value" or "-name=value". The LAST occurrence wins, as it
 // does in the flag package that parses cmd/validate's arguments.
+//
+// It STOPS AT "--", where that package stops (review of #330, Qodo). Past the
+// terminator an --embed-floor is a positional argument cmd/validate never applies;
+// reading it would certify, fingerprint and hand the image a floor the gate did not
+// check. validateArgs stays consistent with this without a change: hasFlag sees such
+// a floor and appends none, and one it did append would land after the terminator
+// too — either way cmd/validate applies no floor, and this answers "".
+//
+// What it does not model is the flag package's other stop, the first positional
+// argument: telling a positional from a flag's value needs every flag's arity, which
+// only cmd/validate knows. data-contract.sh emits flags and flag values only.
+// TestLastFlagValueAgreesWithTheFlagPackage holds the shapes it does claim.
 func lastFlagValue(args []string, name string) (string, bool) {
 	var (
 		val   string
@@ -76,6 +88,9 @@ func lastFlagValue(args []string, name string) (string, bool) {
 	)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			break
+		}
 		if !strings.HasPrefix(a, "-") {
 			continue
 		}
