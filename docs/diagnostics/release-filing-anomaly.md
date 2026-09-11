@@ -153,7 +153,25 @@ bookkeeping row anchorcheck already expects (`NonContent`), and nothing is lost.
 Implemented in `rust/discover/src/lib.rs` (`filing_release`), applied by
 `emit_worklist` and by both loops of `emit_repair_worklist`. Class A is untouched
 because the condition requires the report to list the spec under the version's own
-release, and there is no Rel-99 section.
+release, and there is no Rel-99 section — and, since that is an accident of the
+report's shape, a target below the release floor is refused as well.
+
+`delta_series` and `emit_repair_worklist` ask "do we already hold this document?"
+**of the release the line lands in**. Asked of the key, a carrying row the corpus
+can never mirror — no `26.510|Rel-20` row is ever written once the file lands
+under Rel-18 — would read as drift on every build for ever.
+
+**What this does NOT do: write the carrying row as bookkeeping.** Nothing in the
+pipeline ever has. The only production writer of `spec_versions` is
+`upsert_version`, called once per ingested file (`rust/ingest/src/main.rs:274`),
+and `enrich` discards the catalogue's own `(spec, release, version)` rows at
+`ingest_catalog.rs:36`. So today the carrying key exists only when a file was
+ingested under it — which is the defect, not the record. After this change a
+carrying row the report carries but the corpus cannot mirror is simply **absent**
+rather than **present holding the wrong text**; making it present-and-empty needs
+a writer that does not exist. The live report holds 20 237 keys against the
+corpus's 20 057, so that writer's first run would insert ~180 rows — a corpus
+write, priced with the rest in §4.
 
 Measured against today's live report:
 
@@ -161,6 +179,7 @@ Measured against today's live report:
 |---|---:|---:|
 | `--emit-worklist` lines | 20 225 | 20 224 (one duplicate of `33816-a00.zip` collapsed; 1 re-filed) |
 | `--repair-plan` lines (the production path) | 201 | 201, **byte-identical** |
+| series delta (the ingest matrix) | `["21","23","28","30","33","55"]` | identical |
 
 And replayed against the report as it must have stood at crawl time — today's
 Rel-18/Rel-19 rows for these 16 specs, plus the 16 Rel-20 rows the corpus
