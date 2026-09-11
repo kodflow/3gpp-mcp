@@ -31,9 +31,11 @@ The corpus is pushed by `scripts/local/publish-corpus.sh` to
 
 ```text
 GitHub Release `latest` — PUBLIC, carries no clause text
-└── corpus-index.json                            ← the delta anchor:
-                                                    spec|release → highest indexed
-                                                    version. A version list, no text.
+└── corpus-index.json                            ← a 2026-06-05 delta anchor that
+                                                    nothing reads any more: `seed`
+                                                    DERIVES the anchor from the
+                                                    snapshot it pulls (ADR 0003,
+                                                    second 2026-09-11 amendment).
     (the binary archives it used to carry came from release.yml, which is deleted;
      build one with `make build-bin`, or pull the image, which needs no install)
 
