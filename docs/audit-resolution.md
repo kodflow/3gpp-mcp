@@ -309,7 +309,9 @@ rather than trusting a caller-supplied list — a repair plan is only proportion
   checksum at all, so an authentic corpus could still be paired with an anchor
   from another generation. A missing manifest is tolerated (legacy publishes) and
   **said out loud**, because a silent fallback to the unverified path reads
-  exactly like a verified one.
+  exactly like a verified one. *(2026-09-11: superseded and removed — no publish
+  ever wrote the manifest; the anchor is now derived from the corpus it describes,
+  `cmd/derive-anchor`, so there is no second artefact to pair.)*
 - `scripts/snapshot-smoke.sh` downloads the published artefact into an empty
   directory, verifies it against the manifest, serves it and asserts vector
   search is on. It reads the bootstrap URL **out of `cmd/server/bootstrap.go`**
