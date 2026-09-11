@@ -57,7 +57,7 @@ func TestIngestStepsIgnoreBinariesTheyNeverRun(t *testing.T) {
 		step *Step
 	}{
 		{"ingest-etsi", stepIngestETSI()},
-		{"ingest", stepIngest()},
+		{"ingest", stepIngest(corpus3GPP())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -94,7 +94,7 @@ func TestIngestStepsStillWatchWhatTheyActuallyUse(t *testing.T) {
 		step *Step
 	}{
 		{"ingest-etsi", stepIngestETSI()},
-		{"ingest", stepIngest()},
+		{"ingest", stepIngest(corpus3GPP())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, rel := range []string{
@@ -131,7 +131,7 @@ func TestIngestStepsDeclareFilesNotTheIngestCrate(t *testing.T) {
 		step *Step
 	}{
 		{"ingest-etsi", stepIngestETSI()},
-		{"ingest", stepIngest()},
+		{"ingest", stepIngest(corpus3GPP())},
 	} {
 		for _, p := range tc.step.Impl {
 			switch p {
@@ -231,7 +231,7 @@ func TestTheLedgerImportInvalidatesEmbedAndSparseButNotMerge(t *testing.T) {
 	}{
 		{"embed", stepEmbed(corpus3GPP()), true},
 		{"sparse", stepSparse(corpus3GPP()), true},
-		{"merge", stepMerge(), false},
+		{"ingest", stepIngest(corpus3GPP()), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -258,10 +258,11 @@ func TestTheLedgerImportInvalidatesEmbedAndSparseButNotMerge(t *testing.T) {
 	}
 }
 
-// And merge must still re-run for the library it DOES use: the narrowing above
-// must not have turned a loud waste into a silent staleness.
-func TestMergeStillReRunsForTheLibraryItActuallyLinks(t *testing.T) {
-	step := stepMerge()
+// And the fold must still re-run for the library it DOES use: the narrowing above
+// must not have turned a loud waste into a silent staleness. The fold is the second
+// half of `ingest` now, so it is ingest's Impl that must see rust/store/src/lib.rs.
+func TestTheFoldStillReRunsForTheLibraryItActuallyLinks(t *testing.T) {
+	step := stepIngest(corpus3GPP())
 	root := t.TempDir()
 	implFixture(t, root, step.Impl)
 
@@ -271,7 +272,7 @@ func TestMergeStillReRunsForTheLibraryItActuallyLinks(t *testing.T) {
 	}
 	after := implAfterWriting(t, root, step.Impl, "rust/store/src/lib.rs", "fn a() { let _ = 1; }\n")
 	if before == after {
-		t.Fatal("merge ignores rust/store/src/lib.rs — the narrowing went too far, and a " +
+		t.Fatal("ingest ignores rust/store/src/lib.rs — the narrowing went too far, and a " +
 			"stale corpus is worse than a wasted hour")
 	}
 }

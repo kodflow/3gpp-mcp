@@ -2,6 +2,7 @@ package goal
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -83,4 +84,138 @@ func TestSmokeDeclaresTheModuleGraph(t *testing.T) {
 			t.Errorf("smoke does not declare %s: a dependency bump would keep the old verdict", f)
 		}
 	}
+}
+
+// TestPublishDeclaresEveryCrateTheImageBuildCompiles fails when build-image.sh
+// compiles a Rust crate whose sources, manifest or lockfile publish does not name.
+//
+// THE DEFECT THIS PINS, found by review on 2026-09-11. The script builds
+// rust/embed-core --features ort and ships it as /usr/local/lib/libembed_core.so,
+// and publish declared none of the crate. The steps that did cover it are all
+// Tools (build-rust hashes rust/, build-serve and build-sparse its src), and a
+// dirty Tool invalidates no consumer — so a fix to the query embedder, or an ort
+// bump in its manifest, left publish "fingerprint unchanged" and the previous
+// cdylib on the registry as current.
+//
+// It reads every --manifest-path the script passes, so the NEXT cargo build added
+// to it fails here until publish declares that crate too. The lockfile required
+// is the one cargo obeys: the nearest Cargo.lock above the crate, which for
+// embed-core — excluded from the rust/ workspace — is its own, and for a workspace
+// member would be rust/Cargo.lock.
+func TestPublishDeclaresEveryCrateTheImageBuildCompiles(t *testing.T) {
+	root := repoRootForTest()
+	impl := stepPublish().Impl
+	crates := 0
+	for _, inv := range buildImageCargoInvocations(t) {
+		manifest := flagValue(inv.Args, "--manifest-path")
+		if manifest == "" {
+			t.Errorf("%s:%d runs `cargo %s` with no --manifest-path: this test cannot tell which "+
+				"crate it compiles into the image, so it cannot hold publish to it",
+				buildImageScript, inv.Line, strings.Join(inv.Args, " "))
+			continue
+		}
+		crates++
+		crate := path.Dir(manifest)
+		want := []string{crate + "/src", manifest}
+		if lock := nearestLockfile(root, crate); lock != "" {
+			want = append(want, lock)
+		} else {
+			t.Errorf("%s:%d compiles %s and no Cargo.lock above it decides its versions: the image "+
+				"would carry whatever cargo resolved that day", buildImageScript, inv.Line, crate)
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(crate), "build.rs")); err == nil {
+			want = append(want, crate+"/build.rs")
+		}
+		for _, w := range want {
+			if !declaresPath(impl, w) {
+				t.Errorf("%s:%d compiles %s into the image, and publish's Impl does not name %s: "+
+					"editing it changes what ships while publish reports the previous image as current",
+					buildImageScript, inv.Line, crate, w)
+			}
+		}
+	}
+	if crates == 0 {
+		t.Fatalf("found no --manifest-path in %s; the reader is stale and this test would pass "+
+			"while checking nothing", buildImageScript)
+	}
+}
+
+// TestEveryCargoBuildInTheImageIsLocked fails when build-image.sh runs a cargo
+// command that resolves dependencies without --locked.
+//
+// Without the flag cargo may re-resolve and rewrite the lockfile as a side effect
+// of the build. It did for rust/discover/Cargo.lock on 2026-09-10, mid-step, and
+// #323 closed that for build-rust and test; this script's cdylib build was left
+// open. Since publish fingerprints rust/embed-core/Cargo.lock, a rewrite there
+// would ship versions no commit names AND move publish's fingerprint behind its
+// back, replaying the whole publish on the next plan.
+//
+// Each invocation is judged on its own flags, comments excluded. The reader this
+// test first stood on (6cafdc7) let a `# --locked` comment pass the check, and
+// judged a second cargo on the line by the first one's flags;
+// TestTheCargoReaderJudgesEachInvocation holds those shapes.
+func TestEveryCargoBuildInTheImageIsLocked(t *testing.T) {
+	invs := buildImageCargoInvocations(t)
+	if len(invs) == 0 {
+		t.Fatalf("found no cargo command in %s; the reader is stale and this test would pass "+
+			"while checking nothing", buildImageScript)
+	}
+	for _, inv := range invs {
+		if !cargoIsLocked(inv.Args) {
+			t.Errorf("%s:%d runs `cargo %s` without --locked: cargo may rewrite the lockfile publish "+
+				"fingerprints, and the image would carry versions no commit names",
+				buildImageScript, inv.Line, strings.Join(inv.Args, " "))
+		}
+	}
+}
+
+// buildImageCargoInvocations reads every dependency-resolving cargo command out of
+// build-image.sh, one per command bash runs (see readShellCommands, which replaced
+// a line scan that missed four shapes, and cargoLeavesTheLockAlone, which replaced
+// a list of the subcommands that resolve).
+//
+// The cdylib build is one command over six lines, four environment assignments
+// then `cargo build` on one line and --manifest-path on the next, which is why a
+// per-line reader never could say which crate a flag belongs to. The file is read
+// LF-normalised, because the checkout the pipeline tests in has kept CRLF files
+// before (#325).
+func buildImageCargoInvocations(t *testing.T) []cargoInvocation {
+	t.Helper()
+	return cargoInvocationsIn(readLF(t, filepath.Join(repoRootForTest(), filepath.FromSlash(buildImageScript))))
+}
+
+// flagValue is the value of a long flag in an argument list, in either spelling
+// cargo accepts ("--flag value" and "--flag=value"), with shell quoting and a
+// leading $ROOT/ removed so the answer is a repository-relative path.
+func flagValue(args []string, flag string) string {
+	for i, a := range args {
+		var v string
+		switch {
+		case a == flag && i+1 < len(args):
+			v = args[i+1]
+		case strings.HasPrefix(a, flag+"="):
+			v = strings.TrimPrefix(a, flag+"=")
+		default:
+			continue
+		}
+		v = strings.Trim(v, `"'`)
+		for _, prefix := range []string{"$ROOT/", "${ROOT}/", "./"} {
+			v = strings.TrimPrefix(v, prefix)
+		}
+		return v
+	}
+	return ""
+}
+
+// nearestLockfile is the repository-relative path of the Cargo.lock cargo would
+// obey for the crate at crateDir: its own if it has one, else the first one above
+// it, which is where a workspace keeps the lock of all its members. Empty when
+// there is none below the repository root.
+func nearestLockfile(root, crateDir string) string {
+	for d := crateDir; d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(d), "Cargo.lock")); err == nil {
+			return d + "/Cargo.lock"
+		}
+	}
+	return ""
 }

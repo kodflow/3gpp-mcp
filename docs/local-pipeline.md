@@ -35,26 +35,40 @@ toolchain ─┬─ build-go ── test
            ├─ build-rust ─────────┐
            └─ build-embedder ──┐  │
                                │  │
-  3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
-                                                                                                                     ├─ smoke ─ publish
+  3GPP  seed ─ discover ─ fetch ─ ingest ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
+                                                                                                             ├─ smoke ─ publish
   ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
 
-**The two arms are the same list twice.** Every data step of the 3GPP arm has a
-same-named `-etsi` twin, in the same position, under the same contract. That is
+**The two arms are the same list twice** — literally: `Pipeline()` builds each
+arm with one `armSteps(corpusTarget)`. Every data step of the 3GPP arm has a
+same-named `-etsi` twin, in the same position, standing on the twins of the same
+dependencies. That is
 not tidiness: every place the two arms differed was a place the ETSI half silently
 went without something the 3GPP half had, and not one of them was found by
 something failing — they were found by reading this list and seeing a gap in a
 column. The glossary miner was built by `build-rust` and run by no step; the
 contract ran on `3gpp.duckdb` and judged the ETSI half by one composite flag; one
 shared `compact` declared the ETSI sparse import and not the 3GPP one.
-`TestTheTwoArmsRunTheSameSteps` pins the pairing, and its `shared` map is the only
-place an exception can be recorded.
+`TestTheArmsAreTheSameListInTheSameOrder` pins the columns,
+`TestEveryTwinStandsOnTheTwinsOfItsDependencies` pins the edges (tool edges
+excepted: the arms launch different binaries), and `armShared` is the only place
+an exception can be recorded — it now holds no data step at all.
 
-`merge` has no twin, structurally: it folds the 3GPP shards, while the ETSI ingest
-writes one database directly, so there is nothing to fold. `smoke` and `publish`
-are not per corpus either — one server is started over both stores, one image is
-pushed carrying both.
+**There is no `merge` step any more** (2026-09-11). It was the last data step with
+no twin: the 3GPP ingest parses one DuckDB shard per series and `merge` folded them
+into `3gpp.duckdb`, while the ETSI ingest writes `etsi.duckdb` directly. Folding is
+how the 3GPP ingest *publishes* what it parsed, so it is now the second half of
+`ingest`, and both ingests end in the same state. `.local/state/fold-state.json`
+keeps what the runner used to remember for `merge`: a fold that died is retried
+even though `--resume` makes the retry's parse report nothing new, and a change to
+the fold's own code (`merge.rs`, the store library, `migrate-paragraphs`) re-folds.
+The same refactor dropped two redundant edges that told the arms apart — `index`
+waiting on `enrich` (both arms reach it through `paragraphs`) and `publish` naming
+`index-etsi` (both indexes are reached through `smoke`).
+
+`smoke` and `publish` are not per corpus — one server is started over both stores,
+one image is pushed carrying both.
 
 `seed` DID appear in that list, with a reason that described the curated seeds in
 `enrich` rather than what the step does. `bootstrap.CorpusETSI` existed, was
@@ -89,7 +103,7 @@ has run once, the register exists and the check is a real gate.
 | `toolchain` | records the compiler identity | instant |
 | `build-go` | server + offline tools | ~25 s |
 | `test` | `go test ./...` | ~1 min |
-| `build-rust` | ingest, merge, overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
+| `build-rust` | ingest, merge (the fold `ingest` runs), overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
 | `seed` | adopt the published 3GPP snapshot **and its delta anchor** | one-off |
 | `seed-etsi` | adopt the published `etsi-corpus` snapshot. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off |
@@ -97,8 +111,7 @@ has run once, the register exists and the check is a real gate.
 | `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
 | `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
 | `fetch-etsi` | download + convert the work list (pdftotext), and **record which deliverables it could not convert** into `.local/state/etsi-absences.tsv` | hours cold; **3m54 warm** (skip pass over 11 822) |
-| `ingest` / `ingest-etsi` | parse HTML into DuckDB. The ETSI resume key must be read with the SAME reader as the ingest (`html_bytes::read_html`, windows-1252 fallback): reading it as strict UTF-8 re-ingested the two non-UTF-8 files of 11 822 on **every** build, +566 clauses each time, for fifteen builds | minutes/series; ~10 min ETSI |
-| `merge` | fold the 3GPP shards into the corpus, rewrite the anchor | minutes |
+| `ingest` / `ingest-etsi` | parse HTML into the corpus DB — per-series shards folded into `3gpp.duckdb` on the 3GPP arm (the fold is skipped when no shard gained a clause), `etsi.duckdb` directly on the ETSI arm. The ETSI resume key must be read with the SAME reader as the ingest (`html_bytes::read_html`, windows-1252 fallback): reading it as strict UTF-8 re-ingested the two non-UTF-8 files of 11 822 on **every** build, +566 clauses each time, for fifteen builds | minutes/series; ~10 min ETSI |
 | `embed` / `embed-etsi` | vectorise on the GPU, reusing every known content hash | **the long pole** |
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry, CR database | minutes (`ingest-crs` alone: 1m54 for 256 471 rows, measured 2026-09-10) |
 | `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | **21.5 s** (measured 2026-09-08 over all 5 142 deliverables; it was 2 h 29 before the quadratic fix) |
@@ -146,7 +159,7 @@ Long steps checkpoint internally, so an interruption costs minutes, not hours:
 |---|---|
 | `fetch` | per resource — `corpus.sh` skips what is already downloaded and converted |
 | `ingest` | per `(spec, version)` via the `ingest_log` table, stamped `PIPELINE_VERSION` |
-| `merge` | per `(spec_id, release)` bucket via `--base` |
+| `ingest` (fold) | per `(spec_id, release)` bucket via `merge --base`; a fold that died is retried from `fold-state.json` |
 | `embed` | per clause **and per content hash**, via `.local/vecs/ledger.jsonl` |
 
 State lives in `.local/state/steps/*.json`, written tmp→fsync→rename. A fresh
@@ -181,11 +194,11 @@ clause_hash = sha256( heading + "\n" + text + "|" + embed_identity )[:16]
 embedded under a different `chunk_id` — another release, another series — is
 filled by copy and never reaches the GPU.
 
-**This is why merge comes before embed.** `ingest` rebases `chunk_id` to ~0 in
-every shard, so two shards both contain a `chunk_id` 42; a ledger shared across
+**This is why the fold comes before embed.** The parse rebases `chunk_id` to ~0
+in every shard, so two shards both contain a `chunk_id` 42; a ledger shared across
 shards would silently skip clauses on that collision
-(`rust/embedder/src/main.rs:263`). After the merge the ids are globally unique,
-so one ledger is both safe and optimal.
+(`rust/embedder/src/main.rs:263`). `ingest` ends with the fold, after which the ids
+are globally unique, so one ledger is both safe and optimal.
 
 The pipeline deduplicates the **computation**. Deduplicating the **storage** —
 a `vectors(content_hash, embedding)` table, worth 5.93 GB — is deliberately not
@@ -200,7 +213,7 @@ asserts the index is `clauses_hnsw`, so it is read-side surgery. See ADR 0003.
 make goal ARGS="--scope '23 24 29 33 38'"   # restrict the series
 make goal ARGS="--embed-floor Rel-19"       # vectorise only recent releases
 make goal ARGS="--full"                     # ignore the anchor, reindex everything
-.local/bin/goal run --from merge            # this step and everything after
+.local/bin/goal run --from ingest           # this step and everything after
 .local/bin/goal invalidate embed            # forget a step; it and its dependants replay
 ```
 

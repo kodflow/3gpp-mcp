@@ -37,7 +37,7 @@ func TestAFinishedCorpusDoesNotScheduleTheWriteSide(t *testing.T) {
 	write(t, c.statePath("series.json"), `["21","23"]`)
 	write(t, c.statePath("worklist.txt"), "\n")
 
-	err := stepFetch().Run(c)
+	err := stepFetch(corpus3GPP()).Run(c)
 	if !Declined(err) {
 		t.Fatalf("an empty work list must decline, not succeed; got %v", err)
 	}
@@ -56,7 +56,7 @@ func TestAnEmptySeriesListAlsoDeclines(t *testing.T) {
 	write(t, c.statePath("series.json"), `[]`)
 	write(t, c.statePath("worklist.txt"), "Rel-4 https://example.invalid/21100-100.zip 21100-100.zip\n")
 
-	if err := stepFetch().Run(c); !Declined(err) {
+	if err := stepFetch(corpus3GPP()).Run(c); !Declined(err) {
 		t.Fatalf("no series to ingest must decline, not succeed; got %v", err)
 	}
 }
@@ -77,7 +77,7 @@ func TestRealWorkIsNotDeclined(t *testing.T) {
 	write(t, c.statePath("worklist.txt"),
 		"Rel-4 https://example.invalid/21100-100.zip 21100-100.zip\n")
 
-	err := stepFetch().Run(c)
+	err := stepFetch(corpus3GPP()).Run(c)
 	if err == nil {
 		t.Fatal("a work list with a spec in it cannot have completed a fetch in a unit test")
 	}
@@ -126,7 +126,7 @@ func TestTheWholesaleWorkListSurvivesWhereItIsTheTruth(t *testing.T) {
 // a statement about what to download.
 func TestFetchReadsTheWorkListItWasGiven(t *testing.T) {
 	c, _ := newTestCtx(t)
-	step := stepFetch()
+	step := stepFetch(corpus3GPP())
 
 	ins, err := step.Inputs(c)
 	if err != nil {
@@ -150,7 +150,7 @@ func TestFetchReadsTheWorkListItWasGiven(t *testing.T) {
 // thing that can invalidate them, and leaving it at 1 would have shipped the new
 // behaviour behind a fingerprint that still claimed the old one was current.
 func TestTheStepsThatChangedSaySo(t *testing.T) {
-	for _, s := range []*Step{stepDiscover(), stepFetch()} {
+	for _, s := range []*Step{stepDiscover(corpus3GPP()), stepFetch(corpus3GPP())} {
 		if s.Version < 2 {
 			t.Errorf("%s changed which specs it acquires but still declares Version %d",
 				s.Name, s.Version)
@@ -284,28 +284,6 @@ func TestTheCorpusIsNobodysInput(t *testing.T) {
 					"replay on every build", s.Name, filepath.Base(in))
 			}
 		}
-	}
-}
-
-// The negative control: dropping the corpus must not have dropped the shards,
-// which are what there actually is to fold. A merge that ignored them would
-// never notice new content at all.
-func TestMergeStillWatchesTheShards(t *testing.T) {
-	c, _ := newTestCtx(t)
-	write(t, filepath.Join(c.Local, "shards", "23.duckdb"), "shard")
-
-	ins, err := stepMerge().Inputs(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sawShard bool
-	for _, in := range ins {
-		if filepath.Base(in) == "23.duckdb" {
-			sawShard = true
-		}
-	}
-	if !sawShard {
-		t.Error("merge no longer watches the shards, so new clauses would never replay the fold")
 	}
 }
 

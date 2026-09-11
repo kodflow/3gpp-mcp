@@ -42,7 +42,7 @@ func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 		{Term: "AMF", Expansion: "ATM Mapping Function", SourceSeries: "23.501", DeclaredBy: 74},
 		{Term: "SMF", Expansion: "Session Management Function", SourceSeries: "23.501", DeclaredBy: 84},
 	}
-	diff, err := s.ReplaceSeededAcronyms(batch, nil)
+	diff, err := s.ReplaceSeededAcronyms(batch, cleared, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestTheGlossaryBatchReplacesOnlyWhatItNames(t *testing.T) {
 
 	// AND IT IS IDEMPOTENT: writing the same batch again must report no change,
 	// because one changed byte in a 23 GB corpus is a new layer digest and a push.
-	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, cleared, nil); err != nil {
 		t.Fatal(err)
 	} else if diff.Changed() {
 		t.Errorf("re-writing an identical batch reported a change (%+v) — the corpus would be re-pushed", diff)

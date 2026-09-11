@@ -175,7 +175,7 @@ Une fois dans le container :
 ```bash
 # L'orchestrateur de corpus — il ne refait que ce qui a réellement changé
 make plan                     # ce que `make build` ferait, et POURQUOI. Ne change rien.
-make build                    # tout : fetch → ingest → merge → embed → sparse → index → smoke → publish
+make build                    # tout : fetch → ingest (+ repli des shards) → embed → sparse → index → smoke → publish
 make build/<étape>            # une seule étape ; `make steps` liste les noms
 make status                   # l'état persisté, étape par étape
 
@@ -193,7 +193,7 @@ make publish
 déclare ses sources, et une étape qui n'a rien à faire **décline** au lieu de
 reprogrammer tout l'aval. Sur un corpus déjà complet, un build converge vers
 « rien à faire » — un `fetch` qui ne reçoit aucune nouvelle version décline, et
-ingest, merge, embed et index sautent derrière lui.
+ingest, embed et index sautent derrière lui.
 
 Pour les binaires seuls, sans toucher au corpus : `make build-bin` bâtit le
 serveur dans `bin/`, `make goal-bin` l'orchestrateur, et `make build/build-go`

@@ -218,7 +218,7 @@ CREATE TABLE evolutions (
 | `api_operations`, `api_schemas` | `ingest-openapi` | opérations et schémas des YAML OpenAPI 5GC, épinglés au SHA Forge (`search_api`) |
 | `li_events`, `li_event_fields`, `li_nf_clauses`, `asn1_types` | `ingest-li` | registre ASN.1 de TS 33.128 (`li_events`) |
 | `clause_sparse` | `embed --sparse-only` | bras sparse — **produit mais consommé par personne**, cf. §13 |
-| `ingest_log` | `ingest`/`merge` | ce qui a été réellement ingéré, pour que `--resume` interroge le corpus et pas seulement le shard |
+| `ingest_log` | `ingest` (parse + repli) | ce qui a été réellement ingéré, pour que `--resume` interroge le corpus et pas seulement le shard |
 | `schema_meta` | toutes | `(key, value)` : identité d'embedding, état HNSW, version de schéma — c'est ce que le serveur lit pour refuser de démarrer sur un désaccord |
 
 ## 5. Surface MCP — **10 tools au cœur, + 1 par sujet**
@@ -248,9 +248,9 @@ chemin autorisé pour étendre la surface. Aujourd'hui : 12 + `li_events` = **13
 ## 6. Pipeline d'ingestion
 
 Depuis le 2026-08-23, tout passe par **une machine** et une seule commande :
-`cmd/goal` + `internal/goal`, une machine à états de **32 étapes** reprenable
-(**11 paires** d'étapes de données — 12 côté 3GPP, 11 côté ETSI, `merge` n'ayant
-pas de jumelle — plus les builds et le produit).
+`cmd/goal` + `internal/goal`, une machine à états de **31 étapes** reprenable
+(**11 paires** d'étapes de données, 11 de chaque côté, plus les builds et le
+produit).
 Runbook complet : `docs/local-pipeline.md`. Décision : `docs/adr/0003`.
 
 ```
@@ -258,25 +258,33 @@ toolchain ─┬─ build-go ── test
            ├─ build-rust ─────────┐
            └─ build-embedder ──┐  │
                                │  │
-  3GPP  seed ─ discover ─ fetch ─ ingest ─ merge ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
-                                                                                                                     ├─ smoke ─ publish
+  3GPP  seed ─ discover ─ fetch ─ ingest ─ embed ─ enrich ─ paragraphs ─ sparse ─ compact ─ index ─ validate ─┐
+                                                                                                             ├─ smoke ─ publish
   ETSI  seed-etsi ─ discover-etsi ─ fetch-etsi ─ ingest-etsi ─ embed-etsi ─ enrich-etsi ─ paragraphs-etsi ─ sparse-etsi ─ compact-etsi ─ index-etsi ─ validate-etsi ─┘
 ```
 
-**Les deux bras sont la même liste, deux fois.** Chaque étape de données du bras
-3GPP a une jumelle `-etsi` de même nom, au même endroit, sous le même contrat.
+**Les deux bras sont la même liste, deux fois** — littéralement : `Pipeline()`
+construit chaque bras avec un seul `armSteps(corpusTarget)`. Chaque étape de
+données du bras 3GPP a une jumelle `-etsi` de même nom, au même endroit, qui
+dépend des jumelles des mêmes étapes.
 Ce n'est pas de la cosmétique : chaque endroit où les deux bras différaient était
 un endroit où la moitié ETSI se passait silencieusement de quelque chose que la
 moitié 3GPP avait, et **aucun** n'a été trouvé par un échec — tous en lisant la
 liste et en voyant un trou dans une colonne (glossaire jamais miné, contrat jamais
 appliqué, compaction dont la déclaration nommait l'import sparse ETSI et pas le
-3GPP). `TestTheTwoArmsRunTheSameSteps` verrouille l'appariement.
+3GPP). `TestTheArmsAreTheSameListInTheSameOrder` verrouille les colonnes,
+`TestEveryTwinStandsOnTheTwinsOfItsDependencies` les arêtes (hors outils : les
+bras lancent des binaires différents).
 
-`seed` et `merge` n'ont pas de jumelle, et c'est structurel : `merge` plie les
-shards 3GPP alors que l'ingest ETSI écrit une base directement, et `seed` applique
-les deux seeds 3GPP curées alors que le vocabulaire ETSI est **miné**, par
-`enrich-etsi`. `smoke` et `publish` ne sont pas par corpus non plus : un seul
-serveur est démarré au-dessus des deux stores, une seule image est poussée.
+**Il n'y a plus d'étape `merge`** (2026-09-11) — c'était la dernière étape de
+données sans jumelle. Le repli des shards par série dans `3gpp.duckdb` est la
+façon dont l'ingest 3GPP *publie* ce qu'il a parsé, comme `ingest --etsi` écrit
+`etsi.duckdb` : c'est maintenant la seconde moitié d'`ingest`. Le runner ne se
+souvenant plus d'un `merge` échoué, `.local/state/fold-state.json` le fait : un
+repli mort est rejoué même si `--resume` fait dire « 0 clause » au re-parse, et un
+changement du code de repli (`merge.rs`, la lib store, `migrate-paragraphs`)
+replie à nouveau. `smoke` et `publish` ne sont pas par corpus : un seul serveur
+est démarré au-dessus des deux stores, une seule image est poussée.
 
 | Étape | Fait quoi | Coût mesuré |
 |---|---|---|
@@ -285,8 +293,7 @@ serveur est démarré au-dessus des deux stores, une seule image est poussée.
 | `discover-etsi` | ré-énumère `/deliver` et compare à `etsi-index.json` — **il n'y a pas d'ancre ETSI** | ~3 s |
 | `fetch` | télécharge le delta 3GPP et convertit (LibreOffice → HTML) | 4m10 |
 | `fetch-etsi` | télécharge la work-list et convertit (pdftotext) — une work-list, pas un delta | ~1 h |
-| `ingest` / `ingest-etsi` | parse le HTML en DuckDB (Rust) | minutes/série ; ~15 min ETSI |
-| `merge` | plie les shards 3GPP, réécrit l'ancre, construit le FTS | ~6 min |
+| `ingest` / `ingest-etsi` | parse le HTML (Rust) dans le corpus — shards par série repliés dans `3gpp.duckdb` (repli sauté si aucun shard n'a gagné de clause), `etsi.duckdb` directement | minutes/série ; ~11 min ETSI ; repli 3GPP ~34 min quand il a lieu |
 | `embed` / `embed-etsi` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
 | `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | **21,5 s** (mesuré le 08/09 sur les 5 142 livrables ; c'était 2 h 29 avant le correctif quadratique) |
@@ -309,20 +316,21 @@ Points qui ne se devinent pas en lisant le code :
   (`internal/store.migrate`, `Store::open_rw`) les retirent quand le nom est une
   vue. Sans ça, l'application du schéma étant tout-ou-rien, **tous** les outils
   d'écriture mouraient au bootstrap : « can only create an index on a base
-  table ». Ouvrir n'est pas écrire : `merge` et `embed` modifient réellement
+  table ». Ouvrir n'est pas écrire : le repli d'`ingest` et `embed` modifient réellement
   `clauses` et appellent `--restore` d'abord ; `freeze-hnsw` est le seul qui doit
   fonctionner *sur* la forme convertie, et c'est pour ça que c'est le binaire Go
   (`cmd/freeze-hnsw`) — il pose l'index sur la table qui porte les vecteurs.
-- **`merge` rend d'abord au corpus la forme que le write side connaît.** Un corpus
+- **Le repli d'`ingest` rend d'abord au corpus la forme que le write side connaît.** Un corpus
   converti sert `clauses` comme une VUE ; `merge --base` recopie la base *table par
   table* (`duckdb_tables()`), donc la vue est laissée derrière et `schema.sql` la
   recrée **vide** dans la destination. Le fold remplirait cette table vide pendant
   que `clause_occ` garde ses 2 752 688 occurrences — et `max_chunk_id()` lirait 0,
   donnant au shard des `chunk_id` qui entrent en collision avec l'existant. Donc
-  `merge` lance `migrate-paragraphs --restore` avant de plier, et `paragraphs`
+  le repli lance `migrate-paragraphs --restore` avant de plier (`ingest-etsi` aussi,
+  avant d'écrire), et `paragraphs`
   reconvertit après. Le write side ne connaît jamais ADR 0004 : c'est ADR 0001 qui
   l'exige, et ça coûte une reconstruction groupée (1m47 pour 2,87 Go, mesuré).
-- **`merge` avant `embed`**, l'inverse de l'ancienne CI — cf. §13.
+- **Le repli avant `embed`**, l'inverse de l'ancienne CI — cf. §13.
 - **Le batch d'embedding est dynamique**, dimensionné sur `nvidia-smi` et
   `--vram-fraction`, avec repli réversible sur OOM. Pas de « batch de 32 ».
 - **Chaque étape est adressée par contenu.** `goal plan` donne le différentiel ;
@@ -547,9 +555,10 @@ Les décisions ci-dessous sont **figées**. Une PR/MR proposant l'inverse doit �
 - ❌ Pas d'OCR
 - ❌ Pas de chunking par token-window arbitraire — toujours clause-aware
 - ❌ Pas de résumés côté serveur — Claude synthétise
-- ✅ **`merge` AVANT `embed`** (l'inverse de l'ancienne CI). `ingest` rebase les
-  `chunk_id` à ~0 par shard : partager un ledger entre shards fait **sauter des
-  clauses par collision**, en silence. Après le merge les ids sont uniques, donc
+- ✅ **Le repli des shards AVANT `embed`** (l'inverse de l'ancienne CI). Le parse
+  rebase les `chunk_id` à ~0 par shard : partager un ledger entre shards fait
+  **sauter des clauses par collision**, en silence. `ingest` finit par le repli,
+  après lequel les ids sont uniques, donc
   un ledger unique est sûr *et* donne la dédup de contenu sur tout le corpus
   (2,74× de GPU économisé, mesuré).
 - ✅ **fp32, pas fp16.** La précision fait partie de l'`EmbedIdentity` : basculer

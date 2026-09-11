@@ -139,11 +139,26 @@ CXX_SHIM="$(cd "$ROOT/.local/bin" && (pwd -W 2>/dev/null || pwd))/zigcxx.exe"
 
 # The cdylib FIRST: the server links against it. -soname is what stops lld from
 # writing this machine's absolute path into the binary's NEEDED list.
+#
+# --locked, because this lockfile decides what ships and nothing else does.
+# rust/embed-core is outside the rust/ workspace, so rust/embed-core/Cargo.lock
+# alone picks the ort, tokenizers and ndarray baked into libembed_core.so. Without
+# the flag cargo is free to re-resolve and REWRITE it as a side effect of the
+# build: the drift that moved rust/discover/Cargo.lock mid-step on 2026-09-10,
+# closed for build-rust and test by #323 (internal/goal/pipeline.go) and left open
+# here. The image would carry versions no commit names, and the lockfile publish
+# fingerprints would move after publish hashed it, so the next plan replays the
+# whole publish for a change no commit made. With the flag, a manifest that needs
+# a new resolution stops the publish and asks for a deliberate `cargo update`.
+# Verified before it was added (2026-09-11): `cargo metadata --locked
+# --manifest-path rust/embed-core/Cargo.toml` exits 0, so this changes no build
+# that was already correct. TestEveryCargoBuildInTheImageIsLocked holds every
+# cargo command in this script to it.
 CC_x86_64_unknown_linux_gnu="$CC_SHIM" \
 CXX_x86_64_unknown_linux_gnu="$CXX_SHIM" \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC_SHIM" \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,-soname,libembed_core.so" \
-  cargo build --release --target x86_64-unknown-linux-gnu \
+  cargo build --release --locked --target x86_64-unknown-linux-gnu \
     --manifest-path rust/embed-core/Cargo.toml --features ort
 
 CDYLIB="$ROOT/rust/embed-core/target/x86_64-unknown-linux-gnu/release/libembed_core.so"
