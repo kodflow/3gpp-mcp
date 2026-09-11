@@ -63,6 +63,20 @@ func TestTheRerankerTokenizesPassagesWithAnEmptyBody(t *testing.T) {
 			t.Errorf("encodePair changed the tokens of %q:\n  library %v\n  served  %v", passage, raw.Ids, served.Ids)
 		}
 	}
+	// ONLY THE PASSAGE IS FOLDED when folding it is enough: a query whose own
+	// whitespace the library encodes keeps its tokens for a panicking passage.
+	spaced := "AMF  location update"
+	got, err := encodePair(tok, spaced, "Foreword\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := tok.EncodePair(spaced, forTokenizer("Foreword\n"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.Ids, want.Ids) {
+		t.Errorf("the query was folded along with the passage:\n  got  %v\n  want %v", got.Ids, want.Ids)
+	}
 	// The library still panics on these shapes: if it stops, the fallback is merely
 	// redundant — say so rather than fail.
 	func() {

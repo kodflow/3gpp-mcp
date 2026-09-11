@@ -1361,6 +1361,11 @@ func stepSmoke() *Step {
 				"served_search_budget": servedSearchBudget,
 				"served_memory_limit":  servedMemoryLimit,
 				"served_queries":       strings.Join(servedQueryIDs, ","),
+				// The tags server.exe, bench.exe and server-full are compiled with
+				// (review of #340): build-go and build-serve read GOTAGS, and as Tool
+				// deps they pass no provenance on, so a tag-only change rebuilt the
+				// binaries this step judges and left its verdict standing.
+				"gotags": os.Getenv("GOTAGS"),
 			}, nil
 		},
 		Inputs: func(c *Ctx) ([]string, error) {

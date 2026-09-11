@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -221,7 +222,7 @@ func servedServerEnv(c *Ctx) []string {
 	for _, k := range servedPinnedEnv {
 		env = append(env, k+"=")
 	}
-	return append(env,
+	return append(append(env,
 		"EMBED_MODEL="+sparseModelName,
 		"EMBED_MODEL_DIR="+c.dataPath("models", sparseModelName),
 		"BGE_RERANKER_DIR="+c.dataPath("models", rerankModelName),
@@ -229,7 +230,32 @@ func servedServerEnv(c *Ctx) []string {
 		"SEARCH_BUDGET="+servedSearchBudget,
 		"DUCKDB_MEMORY_LIMIT="+servedMemoryLimit,
 		"MCP3GPP_NO_UPDATE=1",
-	)
+	), servedLoaderEnv(c)...)
+}
+
+// servedLoaderEnv points the dynamic loader at the embed-core library build-serve
+// compiles (review of #340). On Windows build-serve stages embed_core.dll beside
+// server-full, where the loader looks first; elsewhere serveDLLs stages nothing,
+// and the binary's own run path names rust/embed-core/target/release, which
+// build-serve does not build into — so without this, server-full on Linux or
+// macOS would not start.
+func servedLoaderEnv(c *Ctx) []string { return servedLoaderEnvFor(c, runtime.GOOS) }
+
+func servedLoaderEnvFor(c *Ctx, goos string) []string {
+	var key string
+	switch goos {
+	case "windows":
+		return nil
+	case "darwin":
+		key = "DYLD_LIBRARY_PATH"
+	default:
+		key = "LD_LIBRARY_PATH"
+	}
+	dir := filepath.Join(c.Local, "cargo-target-embedcore", "release")
+	if prev := os.Getenv(key); prev != "" {
+		dir += string(os.PathListSeparator) + prev
+	}
+	return []string{key + "=" + dir}
 }
 
 // servedRuntimeInputs are the files the served server loads that no Impl can
@@ -262,8 +288,13 @@ type servedHits struct {
 	Mode         string `json:"mode"`
 	ModeDegraded string `json:"mode_degraded"`
 	Hits         []struct {
-		SpecID string `json:"spec_id"`
-		Clause string `json:"clause"`
+		SpecID   string `json:"spec_id"`
+		Clause   string `json:"clause"`
+		Citation struct {
+			SpecID  string `json:"spec_id"`
+			Version string `json:"version"`
+			URL     string `json:"url"`
+		} `json:"citation"`
 	} `json:"hits"`
 }
 
@@ -284,6 +315,14 @@ func readServedHits(a servedArm, q eval.Query, m map[string]any) ([]eval.Ref, er
 	}
 	refs := make([]eval.Ref, len(h.Hits))
 	for i, x := range h.Hits {
+		// CITE OR DO NOT ANSWER (CLAUDE.md §1), checked on what is scored (review of
+		// #340): a hit the client cannot trace to a spec version and its URL is not
+		// a result, however well it ranks.
+		if x.Citation.SpecID != x.SpecID || x.Citation.Version == "" || x.Citation.URL == "" {
+			return nil, fmt.Errorf("the %s arm's hit %d for %q (%s %s) carries no usable citation "+
+				"(spec_id %q, version %q, url %q)", a.Key, i+1, q.ID, x.SpecID, x.Clause,
+				x.Citation.SpecID, x.Citation.Version, x.Citation.URL)
+		}
 		refs[i] = eval.Ref{SpecID: x.SpecID, Clause: x.Clause}
 	}
 	return refs, nil
@@ -408,6 +447,12 @@ func requireServedArms(m map[string]any) (servedInfo, error) {
 	if !si.Reranker {
 		missing = append(missing, fmt.Sprintf("reranker=false (%s)", si.RerankerReason))
 	}
+	// The sparse arm too (review of #340): with it off, Search fuses BM25 and dense
+	// only and still reports mode "hybrid", so the hybrid rows would compare a
+	// different stack with the sparse-backed baseline.
+	if !si.Sparse {
+		missing = append(missing, fmt.Sprintf("sparse=false (%s)", si.SparseReason))
+	}
 	if si.Etsi.Attached {
 		missing = append(missing, "the ETSI half is attached although the gate started the server with "+
 			"--etsi-db off — the memory bound this gate is sized for does not hold")
@@ -513,8 +558,27 @@ func buildServeSucceeded(c *Ctx) error {
 		return fmt.Errorf("build-serve's last run is %s, so %s is whatever an earlier tree left there — the "+
 			"served gate will not score a binary this tree did not build", rec.Status, c.bin("server-full"))
 	}
-	if !fileNonEmpty(c.bin("server-full")) {
-		return fmt.Errorf("%s is missing although build-serve recorded success", c.bin("server-full"))
+	// THE BINARY, NOT ONLY THE RECORD (review of #340). A successful record says
+	// build-serve once produced a server-full; it does not say the file there now
+	// is that one — a copy dropped in by hand, or a rebuild from another tree,
+	// leaves the record untouched. The runner saves each output's identity (size
+	// and content hash for a file this size); the gate scores only the bytes that
+	// record names.
+	bin := c.bin("server-full")
+	fi, err := os.Stat(bin)
+	if err != nil || fi.Size() == 0 {
+		return fmt.Errorf("%s is missing although build-serve recorded success", bin)
+	}
+	key := filepath.ToSlash(rel(c.Root, bin))
+	want, ok := rec.Outputs[key]
+	if !ok {
+		return fmt.Errorf("build-serve's record names no identity for %s — the gate cannot tell whether the "+
+			"binary there is the one it built; re-run build-serve", key)
+	}
+	if got := outputIdentity(bin, fi); got != want {
+		return fmt.Errorf("%s is not the binary build-serve recorded (%s now, %s then) — it changed after the "+
+			"build, and the served gate will not score bytes this tree did not produce; re-run build-serve",
+			key, got, want)
 	}
 	return nil
 }

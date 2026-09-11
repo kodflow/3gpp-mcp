@@ -201,6 +201,12 @@ func encodePair(tok *tokenizer.Tokenizer, query, passage string) (*tokenizer.Enc
 	if enc, panicked, err := tryEncodePair(tok, query, passage); !panicked {
 		return enc, err
 	}
+	// The passage first, alone: it is what the engine builds with a trailing
+	// "\n", and folding the QUERY too would change the query's tokens for every
+	// candidate of this call that reaches here (review of #340).
+	if enc, panicked, err := tryEncodePair(tok, query, forTokenizer(passage)); !panicked {
+		return enc, err
+	}
 	enc, panicked, err := tryEncodePair(tok, forTokenizer(query), forTokenizer(passage))
 	if panicked {
 		return nil, fmt.Errorf("the tokenizer panicked on a %d-byte passage, folded or not: %w", len(passage), err)

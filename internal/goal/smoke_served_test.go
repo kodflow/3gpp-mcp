@@ -34,14 +34,24 @@ var servedSet = eval.Set{
 
 // searchAnswer is a search_spec response on the wire shape internal/mcp builds.
 func searchAnswer(mode string, refs ...[2]string) map[string]any {
+	type cite struct {
+		SpecID  string `json:"spec_id"`
+		Release string `json:"release"`
+		Version string `json:"version"`
+		Clause  string `json:"clause"`
+		URL     string `json:"url"`
+	}
 	type hit struct {
-		SpecID string `json:"spec_id"`
-		Clause string `json:"clause"`
+		SpecID   string `json:"spec_id"`
+		Clause   string `json:"clause"`
+		Citation cite   `json:"citation"`
 	}
 	payload := map[string]any{"mode": mode, "count": len(refs)}
 	hits := []hit{}
 	for _, r := range refs {
-		hits = append(hits, hit{r[0], r[1]})
+		// The citation the handler attaches to every hit, on the real shape.
+		hits = append(hits, hit{r[0], r[1], cite{r[0], "Rel-17", "17.15.0", r[1],
+			"https://www.3gpp.org/ftp/Specs/archive/33_series/33.128/33128-hf0.zip"}})
 	}
 	payload["hits"] = hits
 	b, _ := json.Marshal(payload)
@@ -203,6 +213,7 @@ func TestTheServedGateRefusesAServerWithoutItsArms(t *testing.T) {
 		{"no reranker", `\"reranker\": true,\n  \"reranker_reason\": \"\"`,
 			`\"reranker\": false,\n  \"reranker_reason\": \"model.onnx is missing at X\"`, "model.onnx is missing at X"},
 		{"no embedder", `\"semantic\": true`, `\"semantic\": false`, "semantic=false"},
+		{"no sparse arm", `\"sparse\": true,\n  \"sparse_model\"`, `\"sparse\": false,\n  \"sparse_model\"`, "sparse=false"},
 		// The bound the gate is sized for: an ETSI half that attached anyway.
 		{"ETSI attached", `\"attached\": false`, `\"attached\": true`, "--etsi-db off"},
 	} {
@@ -318,11 +329,29 @@ func TestTheServedGateRefusesAServerFullBuildServeDidNotVouchFor(t *testing.T) {
 	if err := buildServeSucceeded(c); err == nil || !strings.Contains(err.Error(), string(StatusFailed)) {
 		t.Errorf("build-serve failed and the gate would score the binary an earlier tree left: %v", err)
 	}
+	// A success with no output identity cannot vouch for the file.
 	if err := st.Save(&Record{Step: "build-serve", Status: StatusSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	if err := buildServeSucceeded(c); err == nil || !strings.Contains(err.Error(), "no identity") {
+		t.Errorf("a record with no output identity vouched for the binary: %v", err)
+	}
+	fi, err := os.Stat(c.bin("server-full"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.ToSlash(rel(c.Root, c.bin("server-full")))
+	if err := st.Save(&Record{Step: "build-serve", Status: StatusSuccess,
+		Outputs: map[string]string{key: outputIdentity(c.bin("server-full"), fi)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := buildServeSucceeded(c); err != nil {
 		t.Errorf("build-serve succeeded and its binary is there, and the gate refused: %v", err)
+	}
+	// The file replaced after the build — an older binary dropped in — is refused.
+	write(t, c.bin("server-full"), "another tree's binary")
+	if err := buildServeSucceeded(c); err == nil || !strings.Contains(err.Error(), "not the binary build-serve recorded") {
+		t.Errorf("a server-full replaced after build-serve was accepted: %v", err)
 	}
 	if err := os.Remove(c.bin("server-full")); err != nil {
 		t.Fatal(err)
@@ -367,6 +396,18 @@ func TestTheServedServerEnvironment(t *testing.T) {
 	if got := servedRuntimeInputs(c); !slices.Equal(got, []string{filepath.Join(ort, ortLibName())}) {
 		t.Errorf("the Rust side's runtime is not a smoke input: %v", got)
 	}
+	// The embed-core library build-serve compiles is found by the loader off
+	// Windows, where nothing is staged beside the binary.
+	lib := filepath.Join(c.Local, "cargo-target-embedcore", "release")
+	for goos, key := range map[string]string{"linux": "LD_LIBRARY_PATH", "darwin": "DYLD_LIBRARY_PATH"} {
+		got := servedLoaderEnvFor(c, goos)
+		if len(got) != 1 || !strings.HasPrefix(got[0], key+"="+lib) {
+			t.Errorf("%s: server-full would not find embed-core: %v", goos, got)
+		}
+	}
+	if got := servedLoaderEnvFor(c, "windows"); got != nil {
+		t.Errorf("windows stages the DLL beside the binary and needs no loader path: %v", got)
+	}
 }
 
 // --------------------------------------------------------------- declaration
@@ -405,7 +446,8 @@ func TestTheServedGateReplaysWhenItsJudgementMoves(t *testing.T) {
 		t.Fatal(err)
 	}
 	for k, want := range map[string]string{"served_arms": "lexical,hybrid,rerank", "served_tol": servedTol,
-		"served_search_budget": servedSearchBudget, "served_memory_limit": servedMemoryLimit} {
+		"served_search_budget": servedSearchBudget, "served_memory_limit": servedMemoryLimit,
+		"gotags": os.Getenv("GOTAGS")} {
 		if extra[k] != want {
 			t.Errorf("smoke's Extra[%s] = %q, want %q: loosening it would not replay the gate", k, extra[k], want)
 		}
@@ -523,5 +565,25 @@ func TestTheServedGateScoresItsListedQueriesAndOnlyThose(t *testing.T) {
 	}
 	if extra["served_queries"] != strings.Join(servedQueryIDs, ",") {
 		t.Errorf("smoke's Extra does not carry the scored queries: %q", extra["served_queries"])
+	}
+}
+
+// A HIT WITHOUT A CITATION IS NOT SCORED (CLAUDE.md §1: cite or do not answer).
+func TestTheServedGateRefusesAHitWithoutACitation(t *testing.T) {
+	m := searchAnswer("hybrid", [2]string{"33.128", "6.2.2.2"})
+	if _, err := readServedHits(servedArms[1], servedSet[0], m); err != nil {
+		t.Fatalf("a cited hit was refused: %v", err)
+	}
+	for _, field := range []string{"url", "version"} {
+		m := searchAnswer("hybrid", [2]string{"33.128", "6.2.2.2"})
+		blocks := m["result"].(map[string]any)["content"].([]any)
+		var p map[string]any
+		_ = json.Unmarshal([]byte(blocks[0].(map[string]any)["text"].(string)), &p)
+		p["hits"].([]any)[0].(map[string]any)["citation"].(map[string]any)[field] = ""
+		b, _ := json.Marshal(p)
+		blocks[0].(map[string]any)["text"] = string(b)
+		if _, err := readServedHits(servedArms[1], servedSet[0], m); err == nil || !strings.Contains(err.Error(), "citation") {
+			t.Errorf("a hit with no citation %s was scored: %v", field, err)
+		}
 	}
 }
