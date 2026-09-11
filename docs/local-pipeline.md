@@ -116,7 +116,7 @@ has run once, the register exists and the check is a real gate.
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry, CR database | minutes (`ingest-crs` alone: 1m54 for 256 471 rows, measured 2026-09-10) |
 | `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | **21.5 s** (measured 2026-09-08 over all 5 142 deliverables; it was 2 h 29 before the quadratic fix) |
 | `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
-| `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
+| `sparse` / `sparse-etsi` | learned lexical postings (additive layer). Declines when every clause carries a posting **written by the current producer** — the sparse model plus embed-core's sources, `Cargo.toml` and `Cargo.lock`, recorded in `.local/state/sparse-producer[-etsi].json`. A different producer re-encodes every clause and replaces the layer (a corpus rewrite, so a layer re-push) | ~30 min; ~2 min to decline |
 | `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
 | `index` / `index-etsi` | build and freeze the HNSW cosine index | RAM-bound |
 | `validate` / `validate-etsi` | the data-completeness contract (+ `anchorcheck` on the 3GPP arm) | seconds |
@@ -171,6 +171,7 @@ Long steps checkpoint internally, so an interruption costs minutes, not hours:
 | `ingest` | per `(spec, version)` via the `ingest_log` table, stamped `PIPELINE_VERSION` |
 | `ingest` (fold) | per `(spec_id, release)` bucket via `merge --base`; a fold that died is retried from `fold-state.json` |
 | `embed` | per clause **and per content hash**, via `.local/vecs/ledger.jsonl` |
+| `sparse` | per clause and text hash, via `.local/vecs/sparse[-etsi].jsonl`; the sidecar `.producer` says which producer appended to it, and a re-encode that died is finished from `sparse-producer[-etsi].json` (`pending`) |
 
 State lives in `.local/state/steps/*.json`, written tmp→fsync→rename. A fresh
 process — a new agent, a new terminal, a rebooted machine — reads those files and
