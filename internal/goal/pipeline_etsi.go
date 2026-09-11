@@ -461,6 +461,7 @@ type etsiIngestPlan struct {
 	ok             bool // the report was read; false = unparseable, which never declines
 	pendingDocs    int
 	pendingClauses int
+	uncatalogued   int
 	hnswState      string
 	corpusPresent  bool
 	files          int
@@ -468,7 +469,7 @@ type etsiIngestPlan struct {
 }
 
 // etsiPlanRe reads the one line run_etsi_plan prints.
-var etsiPlanRe = regexp.MustCompile(`ingest-plan: ETSI pending_docs=(\d+) pending_clauses=(\d+) hnsw_state=(\S*) corpus=(present|absent) files=(\d+)`)
+var etsiPlanRe = regexp.MustCompile(`ingest-plan: ETSI pending_docs=(\d+) pending_clauses=(\d+) pending_uncatalogued=(\d+) hnsw_state=(\S*) corpus=(present|absent) files=(\d+)`)
 
 func parseETSIIngestPlan(out string) etsiIngestPlan {
 	m := etsiPlanRe.FindStringSubmatch(out)
@@ -480,9 +481,10 @@ func parseETSIIngestPlan(out string) etsiIngestPlan {
 		ok:             true,
 		pendingDocs:    atoi(m[1]),
 		pendingClauses: atoi(m[2]),
-		hnswState:      m[3],
-		corpusPresent:  m[4] == "present",
-		files:          atoi(m[5]),
+		uncatalogued:   atoi(m[3]),
+		hnswState:      m[4],
+		corpusPresent:  m[5] == "present",
+		files:          atoi(m[6]),
 		raw:            m[0],
 	}
 }
@@ -506,17 +508,22 @@ func planETSIIngest(c *Ctx) (etsiIngestPlan, error) {
 //
 //	unreadable plan      the binary may not be the one this code expects
 //	no corpus            everything is to add
+//	no source file       the tree is missing or empty; the ingest's own guard must
+//	                     fail on it loudly, not a decline certify it
 //	pending clauses      that is the work
+//	uncatalogued docs    a deliverable that parses to nothing still gets its spec
+//	                     and version rows on a pass — catalogue work
 //	HNSW not "frozen"    the ingest drops the vector index and sets "building", and
 //	                     only index-etsi freezes it again — so anything but frozen
 //	                     means a pass since the last complete chain, possibly one
 //	                     that died mid-rewrite. A decline must not certify that file.
 //
-// Deliverables that are pending but parse to NOTHING do not count: the ingest would
-// re-parse them, write no clause, and leave their slot open, exactly as now.
+// Deliverables that are pending, parse to NOTHING and are ALREADY catalogued do not
+// count: the ingest would re-parse them, rewrite the same catalogue rows, write no
+// clause and leave their slot open, exactly as now.
 func etsiIngestDeclines(p etsiIngestPlan) string {
 	switch {
-	case !p.ok, !p.corpusPresent, p.pendingClauses > 0, p.hnswState != "frozen":
+	case !p.ok, !p.corpusPresent, p.files == 0, p.pendingClauses > 0, p.uncatalogued > 0, p.hnswState != "frozen":
 		return ""
 	}
 	return fmt.Sprintf("etsi.duckdb already holds every converted deliverable that yields a clause "+
