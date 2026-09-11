@@ -625,31 +625,82 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // A PASS THAT FINDS NOTHING IS A BROKEN PASS, not "no changes": the archive
-    // this runs over holds hundreds of these lines. Writing an empty set would
-    // DELETE a changelog the corpus already carries.
-    if rows.is_empty() {
-        anyhow::bail!(
-            "no change record was read from {} — the annex reader or the converted tree is broken; \
-             refusing to empty the changelog",
-            args.convert
-        );
-    }
     let Some(store) = store else {
         return Ok(());
     };
-    let (written, skipped, changed) = store.replace_changes(&rows, SOURCE)?;
+    match write_changelog(&store, &rows)? {
+        Outcome::LeftEmpty { pairs } => eprintln!(
+            "ingest-etsi-changes: no record to date — {pairs} deliverable(s) hold two versions or more, and the changelog was already empty: corpus untouched"
+        ),
+        Outcome::Untouched { written } => eprintln!(
+            "ingest-etsi-changes: the changelog already carries these {written} row(s) from {SOURCE}, corpus untouched"
+        ),
+        Outcome::Written { written, skipped } => eprintln!(
+            "ingest-etsi-changes: {written} written, {skipped} skipped (deliverable not in this corpus)"
+        ),
+    }
+    Ok(())
+}
+
+/// What write_changelog did to the corpus.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    /// Nothing to write and nothing to lose: the file was not opened for a write.
+    LeftEmpty {
+        pairs: usize,
+    },
+    /// The table already holds exactly these rows: the file was not touched.
+    Untouched {
+        written: usize,
+    },
+    Written {
+        written: usize,
+        skipped: usize,
+    },
+}
+
+/// write_changelog puts the mined rows into the corpus, or declines.
+///
+/// AN EMPTY RESULT MEANS TWO THINGS, AND ONLY ONE OF THEM MAY PASS (Qodo, #335).
+/// The rule dates a CR by comparing two consecutive versions, so an archive that
+/// holds ONE version per deliverable — a fresh `li-suite` or `all` build fetches
+/// only the newest — has nothing to compare and yields nothing, correctly. The
+/// first draft bailed on every empty result and would have failed enrich-etsi on
+/// exactly that supported build. What an empty result must never do is ERASE a
+/// changelog the corpus already carries: that is a broken reader or a thinned
+/// tree, and replace_changes would DELETE every row. So: empty and empty passes,
+/// untouched; empty against a non-empty table refuses.
+fn write_changelog(store: &Store, rows: &[ChangeRow]) -> Result<Outcome> {
+    if rows.is_empty() {
+        let held: i64 = store
+            .raw()
+            .query_row("SELECT count(*) FROM changes", [], |r| r.get(0))
+            .context("count the changelog the corpus already carries")?;
+        if held > 0 {
+            anyhow::bail!(
+                "no change record was read, and the corpus carries {held} — the annex reader or the converted tree is broken; refusing to empty the changelog"
+            );
+        }
+        let pairs: i64 = store
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM (SELECT spec_id FROM spec_versions GROUP BY spec_id HAVING count(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .context("count the deliverables held at two versions or more")?;
+        return Ok(Outcome::LeftEmpty {
+            pairs: pairs as usize,
+        });
+    }
+    let (written, skipped, changed) = store.replace_changes(rows, SOURCE)?;
     if !changed {
         // No checkpoint: reaching here means the corpus must not move, and a
         // checkpoint is a write. Same line, same meaning as ingest-crs.
-        eprintln!(
-            "ingest-etsi-changes: the changelog already carries these {written} row(s) from {SOURCE}, corpus untouched"
-        );
-        return Ok(());
+        return Ok(Outcome::Untouched { written });
     }
     store.checkpoint()?;
-    eprintln!("ingest-etsi-changes: {written} written, {skipped} skipped (deliverable not in this corpus)");
-    Ok(())
+    Ok(Outcome::Written { written, skipped })
 }
 
 #[cfg(test)]
@@ -929,6 +980,66 @@ mod tests {
             rows.iter().map(|r| &r.to_version).collect::<Vec<_>>()
         );
         assert_eq!(d.version_gap, 1);
+    }
+
+    fn row(spec: &str, n: &str) -> ChangeRow {
+        ChangeRow {
+            spec_id: spec.into(),
+            cr_number: n.into(),
+            cr_revision: None,
+            summary: "s".into(),
+            meeting: String::new(),
+            category: "F".into(),
+            from_version: "1.1.1".into(),
+            to_version: "1.2.1".into(),
+            tdoc: String::new(),
+        }
+    }
+
+    fn changes_held(st: &Store) -> i64 {
+        st.raw()
+            .query_row("SELECT count(*) FROM changes", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A NEWEST-ONLY ARCHIVE IS A SUPPORTED BUILD (Qodo, #335): `li-suite` and
+    /// `all` fetch one version per deliverable, the rule has no pair to compare,
+    /// and the pass must succeed without touching the corpus.
+    #[test]
+    fn an_empty_result_on_an_empty_changelog_passes_untouched() {
+        let st = Store::in_memory().unwrap();
+        assert_eq!(
+            write_changelog(&st, &[]).unwrap(),
+            Outcome::LeftEmpty { pairs: 0 }
+        );
+        assert_eq!(changes_held(&st), 0);
+    }
+
+    /// ...and the guard it replaced still stands where it matters: an empty
+    /// result must never erase a changelog the corpus already carries.
+    #[test]
+    fn an_empty_result_never_erases_a_changelog() {
+        let st = Store::in_memory().unwrap();
+        st.raw()
+            .execute_batch("INSERT INTO specs(spec_id) VALUES ('ETSI TS 103 221-1')")
+            .unwrap();
+        let first = write_changelog(&st, &[row("ETSI TS 103 221-1", "CR001")]).unwrap();
+        assert_eq!(
+            first,
+            Outcome::Written {
+                written: 1,
+                skipped: 0
+            }
+        );
+        assert!(
+            write_changelog(&st, &[]).is_err(),
+            "an empty pass must refuse"
+        );
+        assert_eq!(changes_held(&st), 1, "and leave the changelog where it was");
+        assert_eq!(
+            write_changelog(&st, &[row("ETSI TS 103 221-1", "CR001")]).unwrap(),
+            Outcome::Untouched { written: 1 }
+        );
     }
 
     #[test]
