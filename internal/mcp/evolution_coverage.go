@@ -98,7 +98,7 @@ func (h *handlers) evolutionCitation(ctx context.Context, e model.Evolution) mod
 		SpecID: spec, Release: rel, Version: ver,
 		Clause: e.JustificationClause,
 		URL:    url,
-		Stable: model.IsStableVersion(ver),
+		Stable: model.IsStableSpecVersion(spec, ver),
 	}
 }
 

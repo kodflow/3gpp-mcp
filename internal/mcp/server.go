@@ -486,12 +486,16 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 		"spec_id": specID, "release": release, "version": version,
 		"count": len(out), "clauses": out, "citations": cites,
 		"obsolete_count": obsolete,
-		"stable":         model.IsStableVersion(version),
+		"stable":         model.IsStableSpecVersion(specID, version),
 	}
 	// Stable-first doctrine: the resolver already prefers a published version, so a
 	// draft here means NO stable version is indexed for this spec/release. Say so
 	// loudly rather than let the client treat work-in-progress text as normative.
-	if !model.IsStableVersion(version) {
+	//
+	// Half-aware (model.IsStableSpecVersion): the "major < 3" rule is 3GPP's, and
+	// applied to ETSI it warned that 4 354 of 5 142 published deliverables were
+	// drafts — ETSI TS 103 221-1 V1.23.1 among them.
+	if !model.IsStableSpecVersion(specID, version) {
 		resp["draft_warning"] = "returned version " + version +
 			" is a DRAFT (major < 3, work-in-progress); no stable/published version is indexed for this spec/release"
 	}
@@ -925,7 +929,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 				if url == "" {
 					url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(id) + "_series/" + id + "/"
 				}
-				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableVersion(ver)})
+				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableSpecVersion(id, ver)})
 			}
 		}
 		for _, m := range reEtsiRef.FindAllStringSubmatch(hay, -1) {
@@ -954,7 +958,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 					if rel, v, ok, _ := h.etsi.LatestVersion(ctx, full); ok {
 						cite = model.Citation{
 							SpecID: full, Release: rel, Version: v,
-							URL: model.SpecURL(full, v), Stable: model.IsStableVersion(v),
+							URL: model.SpecURL(full, v), Stable: model.IsStableSpecVersion(full, v),
 						}
 						break
 					}
@@ -972,7 +976,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		// store for a spec_id beginning "ETSI ", and ArchiveURL answers "" for
 		// anything that is not a 3GPP id — so this citation named a deliverable
 		// with no pointer to it.
-		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableVersion(version)},
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableSpecVersion(specID, version)},
 		"ref_citations": refCites,
 		// ETSI cross-references (separate keys; absent-as-empty, never null).
 		"etsi_references":    etsiRefs,
