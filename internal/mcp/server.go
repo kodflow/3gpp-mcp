@@ -47,6 +47,10 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	s := server.NewMCPServer("3gpp-mcp", version,
 		server.WithToolCapabilities(true),
 		server.WithResourceCapabilities(false, false), // static corpus: no subscribe/listChanged
+		// A panic in any handler is an ANSWER on the request that caused it, never
+		// a hang or a dead process — see recover.go for what mcp-go does without it.
+		server.WithToolHandlerMiddleware(recoverTools),
+		server.WithResourceHandlerMiddleware(recoverResources),
 		server.WithInstructions(
 			"3GPP corpus retrieval, scoped to "+scope+". Returns spec fragments with "+
 				"exact citations {spec_id, release, version, clause, url}; it never "+
