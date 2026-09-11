@@ -111,3 +111,20 @@ func contractCertified(c *Ctx, imageFloor string) string {
 	return fmt.Sprintf("certified by the validate step at %s over these exact bytes (%s), flags %q, floor %q",
 		cert.CertifiedAt, strings.Join(names, "; "), cert.Flags, cert.EmbedFloor)
 }
+
+// contractEnv is what runPublish adds to build-image.sh's environment about the
+// contract: the certificate's reason when it matches, and otherwise the variable
+// set EMPTY.
+//
+// CLEARED, NOT OMITTED. Ctx.Run hands the child append(os.Environ(), …), so a
+// CORPUS_CONTRACT_CERTIFIED left in the operator's shell would reach the script
+// and skip the contract with no certificate behind it. The script tests -n, so an
+// explicit empty value disarms an inherited one.
+func contractEnv(c *Ctx, imageFloor string) []string {
+	if why := contractCertified(c, imageFloor); why != "" {
+		c.Log.Printf("corpus contract: %s", why)
+		return []string{"CORPUS_CONTRACT_CERTIFIED=" + why}
+	}
+	c.Log.Printf("corpus contract: no certificate matches these bytes — build-image.sh re-runs it")
+	return []string{"CORPUS_CONTRACT_CERTIFIED="}
+}
