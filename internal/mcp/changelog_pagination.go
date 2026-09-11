@@ -41,21 +41,27 @@ const (
 // silently skip some and repeat others — the lie this whole file exists to avoid.
 //
 // So the order is total, over every field a record carries: to_version (the
-// store's primary key, compared numerically — "9.0.0" before "18.0.0"), then
-// from_version, CR number, revision, and the remaining text. Two records equal on
-// all of them are the same record, and their order cannot be observed.
+// store's primary key, compared numerically — "9.0.0" before "18.0.0"), then CR
+// number — the order the page note, the tool description and CLAUDE.md promise
+// (Qodo, #341: from_version used to come second, so the promise was false) —
+// then revision, from_version and the remaining text. Two records equal on all of
+// them are the same record, and their order cannot be observed.
 func sortChanges(cs []model.Change) {
 	sort.SliceStable(cs, func(i, j int) bool {
 		a, b := cs[i], cs[j]
 		if c := compareVersions(a.ToVersion, b.ToVersion); c != 0 {
 			return c < 0
 		}
+		if a.CRNumber != b.CRNumber {
+			return a.CRNumber < b.CRNumber
+		}
+		if a.CRRevision != b.CRRevision {
+			return a.CRRevision < b.CRRevision
+		}
 		if c := compareVersions(a.FromVersion, b.FromVersion); c != 0 {
 			return c < 0
 		}
 		for _, p := range [][2]string{
-			{a.CRNumber, b.CRNumber},
-			{fmt.Sprintf("%010d", a.CRRevision), fmt.Sprintf("%010d", b.CRRevision)},
 			{a.SpecID, b.SpecID},
 			{a.Category, b.Category},
 			{a.Meeting, b.Meeting},

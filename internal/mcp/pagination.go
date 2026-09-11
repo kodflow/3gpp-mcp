@@ -56,3 +56,32 @@ func resolveOffset(cursor, qh string) (int, error) {
 	}
 	return c.Offset, nil
 }
+
+// paginate cuts ONE page out of an already ordered, already filtered list: it
+// resolves the cursor against qh, clamps the window to the list, and mints the
+// cursor of the next page when records remain. It is the one place page bounds
+// are computed, so a tool that pages a list cannot drift from another that does
+// (Qodo, #341). An invalid cursor, or one bound to another query, is an error the
+// caller turns into a tool error.
+//
+// A page past the end is empty rather than an error: a cursor from a larger list
+// (the corpus was rebuilt between two calls) must not crash the walk, and the
+// caller's note says the page holds nothing.
+func paginate[T any](items []T, cursor, qh string, limit int) (page []T, start int, next string, err error) {
+	offset, err := resolveOffset(cursor, qh)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if offset < 0 {
+		return nil, 0, "", fmt.Errorf("invalid cursor for this query")
+	}
+	if limit <= 0 {
+		return nil, 0, "", fmt.Errorf("page size must be positive")
+	}
+	start = min(offset, len(items))
+	end := min(start+limit, len(items))
+	if end < len(items) {
+		next = encodeCursor(pageCursor{Offset: end, QHash: qh})
+	}
+	return items[start:end], start, next, nil
+}
