@@ -8,6 +8,34 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
+// THE READER ANCHORS WHERE THE WRITER DOES. extract_acronyms reads the region of
+// any heading that CONTAINS "abbreviation"; generalRegion used to require the
+// exact heading "Abbreviations". A TS 21.905 issue that moved its list under
+// "Definitions and abbreviations" would then yield keys the writer stores and
+// the reader never sees — and since the retirement, the reader's set decides
+// which "21" rows are deleted. (Found by review on #337; identical on all 16
+// stored versions, which each carry the one heading "4 Abbreviations".)
+func TestTheReaderAnchorsOnTheWritersHeadingTest(t *testing.T) {
+	c := func(chunk uint64, path, heading string) model.Clause {
+		return model.Clause{ChunkID: chunk, SpecID: ts21905, Version: "20.0.0", Release: "Rel-20",
+			ClausePath: path, Heading: heading}
+	}
+	got := generalRegion([]model.Clause{
+		c(1, "3", "Definitions and abbreviations"),
+		c(2, "", "A"),
+		c(3, "3.1", "Symbols"),
+		c(4, "4", "Architecture"),
+	})
+	var headings []string
+	for _, cl := range got.clauses {
+		headings = append(headings, cl.Heading)
+	}
+	if strings.Join(headings, ",") != "Definitions and abbreviations,A,Symbols" {
+		t.Errorf("region = %v, want the heading that contains \"abbreviation\", its unnumbered and "+
+			"numbered clauses, and not clause 4 — what the Rust writer reads", headings)
+	}
+}
+
 // A RETIREMENT IS A DELETION, AND THE GUARD COUNTS IT. Retiring a TS 21.905 row
 // rests on one read of one document; a read that cleared the floor while losing a
 // letter clause would retire every row of that letter at once. The bound is what

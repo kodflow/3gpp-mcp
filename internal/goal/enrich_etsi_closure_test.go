@@ -86,22 +86,110 @@ func implCoversFile(impl []string, f string) bool {
 
 // rustCrate is one crate of the workspace, as its manifest describes it.
 type rustCrate struct {
-	dir  string   // repo-relative, e.g. "rust/parse"
-	lib  string   // the name code uses for it, e.g. "parse3gpp", "store_rs"
-	deps []string // lib names of its path dependencies
-	mods []string // modules its crate root declares
+	dir  string    // repo-relative, e.g. "rust/parse"
+	lib  string    // the name code uses for it, e.g. "parse3gpp", "store_rs"
+	deps []rustDep // its path dependencies
+	mods []string  // modules its crate root declares
+}
+
+// rustDep is one path dependency: the name the depending crate's code uses for
+// it, and the crate's directory.
+type rustDep struct{ name, dir string }
+
+// manifestDepEntry is a path dependency as a manifest writes it.
+type manifestDepEntry struct {
+	key, path string
+	// renamed: `package = "..."` is set, so code names the dependency by its key
+	// rather than by the library's own name.
+	renamed bool
 }
 
 var (
 	manifestName = regexp.MustCompile(`(?m)^\s*name\s*=\s*"([^"]+)"`)
-	manifestDep  = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*\{[^}\n]*\bpath\s*=\s*"([^"]+)"`)
+	manifestDep  = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*(\{[^}\n]*\bpath\s*=\s*"([^"]+)"[^}\n]*\})`)
+	manifestPath = regexp.MustCompile(`(?m)^\s*path\s*=\s*"([^"]+)"`)
+	manifestPkg  = regexp.MustCompile(`\bpackage\s*=`)
+	tableHeader  = regexp.MustCompile(`(?m)^\[([^\[\]]+)\]\s*$`)
+	anyHeader    = regexp.MustCompile(`(?m)^\[`)
+	depsTable    = regexp.MustCompile(`^(?:target\..+\.)?dependencies$`)
+	depTable     = regexp.MustCompile(`^(?:target\..+\.)?dependencies\.([A-Za-z0-9_-]+)$`)
 	modDecl      = regexp.MustCompile(`(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*;`)
 	includeMacro = regexp.MustCompile(`include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)`)
 )
 
-// loadRustCrates reads every rust/*/Cargo.toml. The lib name is the [lib] name
-// when there is one, else the package name with '-' turned into '_' — cargo's
-// own rule.
+// manifestPathDeps lists the path dependencies a Cargo.toml declares, in every
+// form Cargo accepts for them: an inline table under [dependencies], a
+// [dependencies.<name>] table, and both again under a
+// [target.<cfg>.dependencies] header. dev-dependencies are not linked into a
+// binary and are left out.
+func manifestPathDeps(s string) []manifestDepEntry {
+	var out []manifestDepEntry
+	for _, h := range tableHeader.FindAllStringSubmatchIndex(s, -1) {
+		name := strings.TrimSpace(s[h[2]:h[3]])
+		body := s[h[1]:]
+		if next := anyHeader.FindStringIndex(body); next != nil {
+			body = body[:next[0]]
+		}
+		switch {
+		case depsTable.MatchString(name):
+			for _, d := range manifestDep.FindAllStringSubmatch(body, -1) {
+				out = append(out, manifestDepEntry{key: d[1], path: d[3], renamed: manifestPkg.MatchString(d[2])})
+			}
+		case depTable.MatchString(name):
+			if p := manifestPath.FindStringSubmatch(body); p != nil {
+				out = append(out, manifestDepEntry{key: depTable.FindStringSubmatch(name)[1], path: p[1],
+					renamed: manifestPkg.MatchString(body)})
+			}
+		}
+	}
+	return out
+}
+
+// TestTheClosureReadsEveryPathDependencyForm pins manifestPathDeps on the forms
+// Cargo accepts: rewriting a dependency from an inline table to a table of its
+// own must not drop it from the closure and leave the declaration test green.
+// (Found by review on #337.)
+func TestTheClosureReadsEveryPathDependencyForm(t *testing.T) {
+	got := manifestPathDeps(`[package]
+name = "x"
+
+[dependencies]
+parse3gpp = { path = "../parse" }
+anyhow = "1"
+db = { package = "store-rs", path = "../store" }
+
+[dependencies.identity3gpp]
+path = "../identity"
+
+[target.'cfg(windows)'.dependencies]
+winonly = { path = "../winonly" }
+
+[dev-dependencies]
+testonly = { path = "../testonly" }
+
+[[bin]]
+name = "x"
+path = "src/main.rs"
+`)
+	want := []manifestDepEntry{
+		{key: "parse3gpp", path: "../parse"},
+		{key: "db", path: "../store", renamed: true},
+		{key: "identity3gpp", path: "../identity"},
+		{key: "winonly", path: "../winonly"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("manifestPathDeps = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("dependency %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// loadRustCrates reads every rust/*/Cargo.toml, keyed by crate directory. The lib
+// name is the [lib] name when there is one, else the package name with '-'
+// turned into '_' — cargo's own rule.
 func loadRustCrates(t *testing.T, root string) map[string]*rustCrate {
 	t.Helper()
 	manifests, err := filepath.Glob(filepath.Join(root, "rust", "*", "Cargo.toml"))
@@ -109,7 +197,7 @@ func loadRustCrates(t *testing.T, root string) map[string]*rustCrate {
 		t.Fatalf("no Rust manifest under %s/rust (%v)", root, err)
 	}
 	byDir := map[string]*rustCrate{}
-	depPaths := map[string][]string{}
+	depPaths := map[string][]manifestDepEntry{}
 	for _, m := range manifests {
 		b, err := os.ReadFile(m)
 		if err != nil {
@@ -127,9 +215,7 @@ func loadRustCrates(t *testing.T, root string) map[string]*rustCrate {
 		if c.lib == "" {
 			t.Fatalf("%s names no package: the deriver cannot tell which crate it is", m)
 		}
-		for _, d := range manifestDep.FindAllStringSubmatch(manifestSection(s, "dependencies"), -1) {
-			depPaths[dir] = append(depPaths[dir], filepath.ToSlash(filepath.Join(dir, d[2])))
-		}
+		depPaths[dir] = manifestPathDeps(s)
 		if src, err := os.ReadFile(filepath.Join(root, dir, "src", "lib.rs")); err == nil {
 			for _, m := range modDecl.FindAllStringSubmatch(stripRustComments(string(src)), -1) {
 				c.mods = append(c.mods, m[1])
@@ -137,21 +223,20 @@ func loadRustCrates(t *testing.T, root string) map[string]*rustCrate {
 		}
 		byDir[dir] = c
 	}
-	for dir, paths := range depPaths {
-		for _, p := range paths {
-			if d, ok := byDir[p]; ok {
-				byDir[dir].deps = append(byDir[dir].deps, d.lib)
+	for dir, deps := range depPaths {
+		for _, e := range deps {
+			d, ok := byDir[filepath.ToSlash(filepath.Join(dir, e.path))]
+			if !ok {
+				continue
 			}
+			name := d.lib
+			if e.renamed {
+				name = strings.ReplaceAll(e.key, "-", "_")
+			}
+			byDir[dir].deps = append(byDir[dir].deps, rustDep{name: name, dir: d.dir})
 		}
 	}
-	byLib := map[string]*rustCrate{}
-	for _, c := range byDir {
-		if other, dup := byLib[c.lib]; dup {
-			t.Fatalf("%s and %s both build a library named %q", other.dir, c.dir, c.lib)
-		}
-		byLib[c.lib] = c
-	}
-	return byLib
+	return byDir
 }
 
 // manifestSection returns the body of one `[name]` table of a Cargo.toml — from
@@ -175,12 +260,7 @@ func manifestSection(s, name string) string {
 func rustSourceClosure(t *testing.T, root, crateDir, entry string) []string {
 	t.Helper()
 	crates := loadRustCrates(t, root)
-	var own *rustCrate
-	for _, c := range crates {
-		if c.dir == crateDir {
-			own = c
-		}
-	}
+	own := crates[crateDir]
 	if own == nil {
 		t.Fatalf("no crate at %s", crateDir)
 	}
@@ -234,9 +314,9 @@ func rustSourceClosure(t *testing.T, root, crateDir, entry string) []string {
 			}
 		}
 		if in != nil {
-			for _, lib := range in.deps {
-				dep := crates[lib]
-				re := regexp.MustCompile(`\b` + regexp.QuoteMeta(lib) + `\b\s*(?:::\s*([A-Za-z_][A-Za-z0-9_]*)|\s+as\b|;)`)
+			for _, d := range in.deps {
+				dep := crates[d.dir]
+				re := regexp.MustCompile(`\b` + regexp.QuoteMeta(d.name) + `\b\s*(?:::\s*([A-Za-z_][A-Za-z0-9_]*)|\s+as\b|;)`)
 				for _, m := range re.FindAllStringSubmatch(src, -1) {
 					refer(dep, m[1])
 				}
