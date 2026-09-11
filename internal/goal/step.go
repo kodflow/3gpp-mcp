@@ -310,6 +310,13 @@ type Ctx struct {
 
 	// record is the in-flight record, so Run can set checkpoints.
 	record *Record
+
+	// previous is the step's own record as it stood BEFORE this attempt, or nil if
+	// it never ran. The runner overwrites the state file with a "running" record
+	// before Run starts, so without this a Run cannot ask what its last run saw.
+	// runSparse needs exactly that to adopt the producer of postings it did not
+	// write (see loadSparseProducerState).
+	previous *Record
 }
 
 // Checkpoint records resume detail for the running step. It is flushed with the

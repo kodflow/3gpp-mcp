@@ -617,6 +617,7 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	stepCtx := *r.ctx
 	stepCtx.Log = log
 	stepCtx.record = rec
+	stepCtx.previous = prev
 
 	fmt.Fprintf(os.Stderr, "\n\033[1mSTEP %s\033[0m — %s\n", s.Name, s.Doc)
 	fmt.Fprintf(os.Stderr, "  reason       %s\n", d.Reason)
