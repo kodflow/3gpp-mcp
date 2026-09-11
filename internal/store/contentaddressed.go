@@ -453,7 +453,7 @@ func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.Sea
 		-- nDCG@10 to 0.000; max takes it to 0.072, against 0.014 for the BM25
 		-- over the clauses table it replaces.
 		scored AS (
-			SELECT bs.body_id, max(h.s) AS sc
+			SELECT bs.body_id, ` + stableScore("max(h.s)") + ` AS sc
 			FROM hits h JOIN body_seq bs USING (para_id)
 			WHERE h.s IS NOT NULL AND h.s > 0
 			GROUP BY bs.body_id
