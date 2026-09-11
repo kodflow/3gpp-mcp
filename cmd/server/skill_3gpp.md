@@ -40,9 +40,10 @@ Add the domain tools when they apply: `search_api` (5GC SBI/OpenAPI, TS 29.5xx),
 `li_events` (LI, TS 33.128), `trace_clause` (what a clause SAYS differently
 between two releases or versions — the reliable way to diff),
 `trace_evolution` (NE↔NF lineage, e.g. MME → AMF+SMF).
-`get_changelog` is a bonus, not a diff tool: its table covers 311 of 3 568 3GPP
-specs and nothing on the ETSI half, and it returns a `note` saying which of those
-two silences you hit.
+`get_changelog` lists change requests, not text diffs: the 3GPP CR database on
+the 3GPP half, and on the ETSI half only deliverables whose change-history annex
+lists one CR per line. It is PAGED (default 100 records, max 500, `next_cursor`
+for the rest; `total` says how many match), and its `note` says what a 0 means.
 
 **C — Read, don't skim.** For the top 2–3 hits: `get_spec` the FULL clause (and
 its parent when the snippet looks truncated) — never quote from a search snippet

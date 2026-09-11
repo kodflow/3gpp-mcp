@@ -231,7 +231,7 @@ chemin autorisé pour étendre la surface. Aujourd'hui : 12 + `li_events` = **13
 |---|---|---|
 | `search_spec` | `(query, release?, series?, spec_type?, top_k=10, mode='hybrid' \| 'lexical' \| 'semantic')` | Retrieval hybride avec citations |
 | `get_spec` | `(spec_id, release, version?, clause?)` | Fetch d'une spec ou d'une clause précise |
-| `get_changelog` | `(spec_id, from_release, to_release, clause?)` | CRs et leur impact. **Table figée** : 311 specs sur 3 568, rien côté ETSI. Un `count` de 0 veut dire « pas enregistré ici », jamais « n'a pas changé » — la réponse porte un `note` qui dit lequel des deux silences on a touché, et renvoie vers `trace_clause` |
+| `get_changelog` | `(spec_id, from_release?, to_release?, clause?, limit=100, cursor?)` | CRs et leur impact. Côté 3GPP : la base CR 3GPP (#322) ; côté ETSI : l'annexe « Change history » des livrables qui listent un CR par ligne (#335). **Paginé** : au plus `limit` enregistrements (défaut 100, max 500), `total` + `next_cursor` ; bornes et filtre appliqués AVANT la page, ordre total (to_version puis n° de CR). Un `count` de 0 veut dire « pas enregistré ici », jamais « n'a pas changé » — la réponse porte un `note` |
 | `trace_clause` | `(spec_id, clause, from_release?, to_release?)` | Ce que la clause DIT différemment, paragraphe par paragraphe. Répond depuis le texte du corpus, donc c'est **l'outil de diff fiable** — `get_changelog` est un bonus |
 | `list_releases` | `(spec_id)` | Toutes les `(release, version, freeze_date)` |
 | `resolve_term` | `(term, release?)` | Définition + domaine + références |
@@ -371,13 +371,13 @@ l'une de ces quatre. Les quatre sont **nommées** dans
 version manque sans raison enregistrée (voir la réserve sur le registre absent
 dans `docs/local-pipeline.md`).
 
-**Ce que le corpus n'a PAS, et qui se dit plutôt que se cache :** aucun change
-request côté ETSI (une table de change history 3GPP survit à `.doc → HTML`, un
-PDF ETSI passé à `pdftotext -layout` ne survit pas — reconstruire citerait la
-mauvaise transition) ; côté 3GPP la table `changes` n'a plus d'écrivain depuis
-que l'ingest HTML est passé en Rust et ne couvre que **311 specs sur 3 568**.
-`get_changelog` nomme ces deux silences séparément et renvoie vers `trace_clause`,
-qui répond depuis le texte du corpus.
+**Ce que le corpus n'a PAS, et qui se dit plutôt que se cache :** côté ETSI, les
+change requests ne sont lus que dans l'annexe « Change history » des livrables qui
+listent un CR par ligne (mise en page TC LI, #335) — le tableau de style 3GPP d'un
+PDF passé à `pdftotext -layout` ne survit pas, reconstruire citerait la mauvaise
+transition ; côté 3GPP, la table `changes` vient de la base CR 3GPP (#322) et ne
+nomme pas les clauses touchées. `get_changelog` le dit dans son `note` et renvoie
+vers `trace_clause`, qui répond depuis le texte du corpus.
 
 | Capacité | État |
 |---|---|
