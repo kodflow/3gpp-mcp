@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Reranker re-scores passages for a query; higher score = more relevant.
@@ -128,6 +129,41 @@ func forTokenizer(s string) string {
 		folded = " " + folded
 	}
 	return folded
+}
+
+// rrPrefixBytes is where windowIDs first cuts a passage: 2.5 KB of technical
+// English is ~570 bge-reranker-v2-m3 tokens (measured: 400 words, 2 503 bytes,
+// 570 ids with the query), past the 512-token window on the first try for most
+// clauses, and 0.26 s to tokenize where the whole of a long clause took seconds.
+const rrPrefixBytes = 2560
+
+// windowPrefix returns the shortest prefix of p that is at least n bytes long and
+// ends at a word end — an ASCII byte that is neither a space nor a control
+// character, followed by an ASCII space — and whether it cut anything. With no
+// such boundary past n (a passage shorter than n, or one without spaces, such as
+// CJK text), it returns p whole.
+//
+// Both bytes are ASCII on purpose: the cut then falls on a character boundary and
+// on a grapheme boundary (no combining mark attaches to an ASCII letter across a
+// space), and the prefix ends in no whitespace for the normaliser to strip or
+// collapse — the conditions under which a prefix encodes to a prefix of the ids.
+func windowPrefix(p string, n int) (string, bool) {
+	if n < 1 || len(p) <= n {
+		return p, false
+	}
+	for i := n; i < len(p); i++ {
+		if p[i] == ' ' && p[i-1] > ' ' && p[i-1] < 0x7f {
+			return p[:i], true
+		}
+	}
+	return p, false
+}
+
+// endsInSpace reports whether s ends in whitespace — the shape the tokenizer is
+// measured to panic on at the end of an input (see forTokenizer).
+func endsInSpace(s string) bool {
+	r, _ := utf8.DecodeLastRuneInString(s)
+	return s != "" && unicode.IsSpace(r)
 }
 
 func tokenSet(s string) map[string]bool {

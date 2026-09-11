@@ -453,7 +453,7 @@ func (s *Store) searchClausesCA(ctx context.Context, q SearchQuery) ([]model.Sea
 		-- nDCG@10 to 0.000; max takes it to 0.072, against 0.014 for the BM25
 		-- over the clauses table it replaces.
 		scored AS (
-			SELECT bs.body_id, max(h.s) AS sc
+			SELECT bs.body_id, ` + stableScore("max(h.s)") + ` AS sc
 			FROM hits h JOIN body_seq bs USING (para_id)
 			WHERE h.s IS NOT NULL AND h.s > 0
 			GROUP BY bs.body_id
@@ -530,20 +530,20 @@ func (s *Store) hnswTarget() (index, table string) {
 	return "clauses_hnsw", "clauses"
 }
 
-// searchVectorsCA is dense search over the content-addressed corpus: nearest
-// bodies, then one occurrence per clause, then the text rebuilt for those.
-func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
-	if topK <= 0 {
-		topK = 10
-	}
-	filterSQL, filterArgs := filterClause(f)
-	// Over-fetch bodies: several of them can collapse onto the same clause, and
-	// the filter is applied after the nearest-neighbour scan. Asking for exactly
-	// topK bodies would return fewer than topK clauses.
-	const overFetch = 8
-
-	args := []any{vecLiteral(vec), topK * overFetch}
-	full := `
+// vectorsCASQL is the dense k-NN over a content-addressed corpus, as one string
+// so a test can EXPLAIN exactly what serve runs.
+//
+// THE `near` CTE MUST REACH THE HNSW INDEX, and nothing in the result says
+// whether it did: an index scan and a full cosine scan return the same rows, one
+// in milliseconds and one after reading every vector in the corpus (897 556 of
+// them, 3.6 GB, on the 3GPP half). DuckDB's vss optimizer rewrites
+// `ORDER BY array_cosine_distance(col, q) LIMIT k` into an HNSW index scan, and
+// it is easy to write a query out of that shape — a JOIN before the ORDER BY, a
+// `1 - dist DESC`, a filter it cannot lift. This form is held to the plan by
+// TestTheDenseArmReachesTheHNSWIndex; the IS NOT NULL and the bound parameters
+// are IN it because they were measured NOT to cost the rewrite (DuckDB 1.5.3).
+func vectorsCASQL(filterSQL string) string {
+	return `
 		WITH near AS (
 			SELECT body_id, array_cosine_distance(embedding, CAST(? AS FLOAT[1024])) AS dist
 			FROM bodies WHERE embedding IS NOT NULL
@@ -561,6 +561,22 @@ func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter
 		)
 		SELECT chunk_id, spec_id, release, version, clause_path, heading, is_normative, body_id, dist
 		FROM pick WHERE rn = 1 ORDER BY dist ASC LIMIT ?`
+}
+
+// searchVectorsCA is dense search over the content-addressed corpus: nearest
+// bodies, then one occurrence per clause, then the text rebuilt for those.
+func (s *Store) searchVectorsCA(ctx context.Context, vec []float32, f SpecFilter, topK int) ([]model.SearchHit, error) {
+	if topK <= 0 {
+		topK = 10
+	}
+	filterSQL, filterArgs := filterClause(f)
+	// Over-fetch bodies: several of them can collapse onto the same clause, and
+	// the filter is applied after the nearest-neighbour scan. Asking for exactly
+	// topK bodies would return fewer than topK clauses.
+	const overFetch = 8
+
+	args := []any{vecLiteral(vec), topK * overFetch}
+	full := vectorsCASQL(filterSQL)
 	args = append(args, filterArgs...)
 	args = append(args, topK)
 

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/sugarme/tokenizer"
@@ -126,22 +127,34 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 	b := len(passages)
 	rows := make([][]int64, b)
 	maxLen := 1
+	// Tokenised side by side: the tokenizer is pure Go and its only shared state,
+	// the Unigram cache, is a synchronised go-cache — and it is by far the slower
+	// half of a pair on a long passage (see windowIDs).
+	errs := make([]error, b)
+	var wg sync.WaitGroup
 	for i, p := range passages {
-		enc, err := encodePair(r.tok, query, p)
-		if err != nil {
-			return fmt.Errorf("tokenize pair %d: %w", i, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, err := windowIDs(r.tok, query, p)
+			if err != nil {
+				errs[i] = fmt.Errorf("tokenize pair %d: %w", i, err)
+				return
+			}
+			row := make([]int64, len(ids))
+			for j, id := range ids {
+				row[j] = int64(id)
+			}
+			rows[i] = row
+		}()
+	}
+	wg.Wait()
+	for i := range rows {
+		if errs[i] != nil {
+			return errs[i]
 		}
-		ids := enc.Ids
-		if len(ids) > rrMaxTokens {
-			ids = ids[:rrMaxTokens]
-		}
-		row := make([]int64, len(ids))
-		for j, id := range ids {
-			row[j] = int64(id)
-		}
-		rows[i] = row
-		if len(row) > maxLen {
-			maxLen = len(row)
+		if len(rows[i]) > maxLen {
+			maxLen = len(rows[i])
 		}
 	}
 	flatIDs := make([]int64, b*maxLen)
@@ -185,6 +198,81 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 		dst[i] = 1.0 / (1.0 + math.Exp(-float64(logits[i])))
 	}
 	return nil
+}
+
+// windowIDs is the token ids the cross-encoder sees for one pair: the first
+// rrMaxTokens of encodePair(query, passage) — computed WITHOUT tokenizing the part
+// of the passage that falls past them.
+//
+// WHY. The window is 512 tokens and a clause is often thousands of words, and
+// github.com/sugarme/tokenizer is superlinear in its input: one pair costs 0.26 s
+// at 2.5 KB, 0.67 s at 5 KB, 1.95 s at 10 KB, and twelve 3 000-word passages took
+// 76 s to tokenize before the model ran at all (measured 2026-09-11, this
+// machine). All of it was then cut to 512 ids and thrown away.
+//
+// WHY THE IDS DO NOT CHANGE. The passage is cut at a word end (windowPrefix: an
+// ASCII non-space byte followed by an ASCII space), and bge-reranker-v2-m3's
+// tokenizer.json is Precompiled + Strip(right) + Replace(" {2,}") normalisation,
+// a Metaspace pre-tokenizer that splits on those spaces, and a Unigram model that
+// tokenizes each word on its own — every step local to a word, none reaching
+// across a space into the next. So the prefix encodes to a prefix of the whole
+// passage's ids, and once it encodes to MORE than the window, the first
+// rrMaxTokens ids are the ones the whole passage would have given. When the cut
+// yields too few ids the prefix doubles, up to the whole passage: the answer is
+// the old one either way, only the work differs. TestTheWindowIsTheWholePassages
+// holds it on the passages that exercise each rule; the PR that introduced it
+// checked it on real corpus passages.
+//
+// Two inputs the argument does not cover, because the LIBRARY is not local there:
+//
+//   - the text of a special token ("<s>", "<mask>", …). The library extracts them
+//     with one regex per token and then sorts the matches by token id rather than
+//     by position (added-vocabulary.go, findMatches), so which occurrences it
+//     keeps depends on the whole string: a passage mixing "<mask>" and "<s>"
+//     tokenized differently from its own prefix at id 396 (window_onnx_test.go).
+//     Such a passage is tokenized whole, as before.
+//   - one the library PANICS on: the fallback folds whitespace (forTokenizer), and
+//     a panic caused by a shape past the cut would have folded the whole passage
+//     where the prefix is encoded as is. The shape measured to cause it at the END
+//     of a passage — trailing whitespace, "Foreword\n" — is carried over: such a
+//     passage's prefix is folded too.
+func windowIDs(tok *tokenizer.Tokenizer, query, passage string) ([]int, error) {
+	whole := false
+	for _, s := range tok.GetSpecialTokens() {
+		if strings.Contains(passage, s) {
+			whole = true
+			break
+		}
+	}
+	for n := rrPrefixBytes; ; n *= 2 {
+		prefix, cut := windowPrefix(passage, n)
+		if !cut || whole {
+			enc, err := encodePair(tok, query, passage)
+			if err != nil {
+				return nil, err
+			}
+			return clipIDs(enc.Ids), nil
+		}
+		if endsInSpace(passage) {
+			prefix = forTokenizer(prefix)
+		}
+		enc, err := encodePair(tok, query, prefix)
+		if err != nil {
+			return nil, err
+		}
+		// MORE than the window, and by two: the last id of a pair is its closing
+		// </s>, which the whole passage would have put further out.
+		if len(enc.Ids) > rrMaxTokens+1 {
+			return clipIDs(enc.Ids), nil
+		}
+	}
+}
+
+func clipIDs(ids []int) []int {
+	if len(ids) > rrMaxTokens {
+		return ids[:rrMaxTokens]
+	}
+	return ids
 }
 
 // encodePair tokenizes one (query, passage) pair, and survives the tokenizer's

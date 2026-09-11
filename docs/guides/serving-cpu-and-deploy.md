@@ -29,6 +29,34 @@ The server prints the effective config at startup:
 > vector arm is k-NN in ms; the only remaining per-query cost is the embed, which
 > the thread knobs + cache address.
 
+## What a query costs, and what the server does when it cannot afford it
+
+Measured 2026-09-11/12 on the published halves, through `search_spec` over
+JSON-RPC on a **4-core** development box (a slower floor than the 8-core profile
+above), both corpora attached, warm:
+
+| arm | 3GPP half | ETSI half (per document type) |
+|---|---|---|
+| lexical (BM25 over paragraphs) | 1-4 s | 0.7-1.0 s |
+| dense (frozen HNSW k-NN) | 0.4-1.4 s | 0.2-0.3 s |
+| sparse (learned lexical) | 1-6 s | 0.5-2.4 s |
+| cross-encoder rerank | ONE pass per call, ~20 s for a window of 12 | — |
+
+- **The first query of a session used to be different**: the HNSW index is read
+  into the buffer pool on the first k-NN (19-28 s on the 3GPP half, 14-16 s on
+  the ETSI one). `serve` now warms both halves in the background at startup and
+  logs what each took; `MCP3GPP_NO_WARMUP=1` declines.
+- **`SEARCH_BUDGET` (default 20 s) is ONE budget for the whole call**, both
+  halves included. When it runs out, the arms that had not started are skipped —
+  and the answer says so: `arms` carries every arm with `ran`, `hits` and `ms`,
+  `degraded` lists what was skipped and why, and `mode_degraded` repeats it. A
+  cross-encoder pass already running is not interrupted mid-batch, so a call can
+  answer past its budget; it never silently answers as if the arm had run.
+- **Memory**: each corpus's buffer pool is capped at 6 GB unless
+  `DUCKDB_MEMORY_LIMIT` says otherwise — the frozen index lives in that pool
+  (3.59 GB for 3GPP, 3.95 GB for ETSI) and the rest is cache. Both halves plus
+  the models peak around 24 GB committed, which is why 32 GB is the profile.
+
 ## Is my server healthy? (30-second diagnosis)
 
 ```bash

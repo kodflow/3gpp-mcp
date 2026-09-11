@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -173,6 +174,20 @@ func serve(args []string) error {
 
 	// Best-effort: load the persisted BM25 index (built at ingest). We LOAD,
 	// never rebuild — rebuilding on a 700k-clause corpus would stall startup.
+	// THE SERVER'S OWN CEILING, ON EACH CORPUS IT OPENS. store.OpenReadOnly bounds
+	// the pool with the WRITER's default (16 GB); serve holds two corpora and needs
+	// only the frozen index plus a working set, so it applies the serve ceiling
+	// unless the operator named one. See store.ServeMemoryLimit for the numbers.
+	limitMemory := func(what string, s *store.Store) {
+		lim := store.ServeMemoryLimitFor(os.Getenv(store.MemoryLimitEnv))
+		if err := s.LimitMemory(lim); err != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] could not cap the %s buffer pool at %s (%v)\n", what, lim, err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] %s buffer pool capped at %s (set %s to change it)\n",
+			what, lim, store.MemoryLimitEnv)
+	}
+	limitMemory("3GPP", st)
 	if err := st.LoadFTS(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] FTS unavailable, lexical search uses LIKE: %v\n", err)
 	}
@@ -288,6 +303,7 @@ func serve(args []string) error {
 			mcpOpts = append(mcpOpts, mcp.WithETSIUnavailable(
 				fmt.Sprintf("%s (%s) could not be opened at startup: %v", etsiPath, etsiWhy, eerr)))
 		} else {
+			limitMemory("ETSI", es)
 			_ = es.LoadFTS(ctx)
 			_ = es.LoadVSS(ctx)
 			_ = es.LoadSparse(ctx)
@@ -303,6 +319,27 @@ func serve(args []string) error {
 	var etsiReader store.Reader
 	if etsiSt != nil {
 		etsiReader = etsiSt
+	}
+	// Warm every half in the background (search.Engine.Warm): the first dense query
+	// of a session loads the HNSW index — 19-28 s on the 3GPP half, measured — and
+	// did so inside the client's search budget. MCP3GPP_NO_WARMUP=1 declines it.
+	//
+	// IT IS STOPPED AND WAITED FOR BEFORE THE CORPORA CLOSE. This defer is
+	// registered AFTER both stores' Close defers, so it runs BEFORE them: an
+	// untracked warm-up would otherwise still be querying a store this function is
+	// closing on its way out (Qodo, #348). Cancelling stops it between arms and
+	// between halves — a DuckDB query in flight is never cancelled, by design
+	// (storeCtxNote) — so the wait is bounded by the one query it is running.
+	if os.Getenv("MCP3GPP_NO_WARMUP") != "1" {
+		warmCtx, stopWarm := context.WithCancel(ctx)
+		var warmed sync.WaitGroup
+		defer func() {
+			stopWarm()
+			warmed.Wait()
+		}()
+		mcpOpts = append(mcpOpts, mcp.WithWarmup(warmCtx, &warmed, func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] "+format+"\n", args...)
+		}))
 	}
 	srv, eng := mcp.New(st, Version, *release, vecShards, etsiReader, mcpOpts...)
 	scope := *release
