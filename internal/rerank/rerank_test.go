@@ -39,20 +39,23 @@ func TestLexicalRanksOverlap(t *testing.T) {
 	}
 }
 
-// A passage reaches the tokenizer without its trailing whitespace — the shape the
-// cross-encoder's tokenizer panics on (see forTokenizer) — and nothing else about
-// it changes: leading and inner whitespace are the tokenizer's to fold.
-func TestForTokenizerDropsOnlyTrailingWhitespace(t *testing.T) {
+// The fallback form of a passage the tokenizer panicked on: its whitespace runs
+// folded to one space, none at the end, a leading run kept as one space — the
+// rewrites the library's normaliser crashes performing (see forTokenizer).
+func TestForTokenizerFoldsWhitespace(t *testing.T) {
 	for in, want := range map[string]string{
-		"Foreword\n":       "Foreword",
-		"5.1 Scope\n":      "5.1 Scope",
-		"0 1 0 1 1 5\n":    "0 1 0 1 1 5",
-		"Foreword\r\n":     "Foreword",
-		"Foreword\t \n":    "Foreword",
-		"\nForeword":       "\nForeword",
-		"Scope\nbody text": "Scope\nbody text",
-		"":                 "",
-		"\n":               "",
+		"Foreword\n":                      "Foreword",
+		"5.1 Scope\n":                     "5.1 Scope",
+		"0 1 0 1 1 5\n":                   "0 1 0 1 1 5",
+		"Foreword\r\n":                    "Foreword",
+		"Foreword\t \n":                   "Foreword",
+		"Step Direction      Description": "Step Direction Description",
+		"Scope\nbody\ttext":               "Scope body text",
+		"\nForeword":                      " Foreword",
+		"  a":                             " a",
+		"":                                "",
+		"\n":                              "",
+		"AMF":                             "AMF",
 	} {
 		if got := forTokenizer(in); got != want {
 			t.Errorf("forTokenizer(%q) = %q, want %q", in, got, want)
