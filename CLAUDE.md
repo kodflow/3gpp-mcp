@@ -293,7 +293,7 @@ est démarré au-dessus des deux stores, une seule image est poussée.
 | `discover-etsi` | ré-énumère `/deliver` et compare à `etsi-index.json` — **il n'y a pas d'ancre ETSI** | ~3 s |
 | `fetch` | télécharge le delta 3GPP et convertit (LibreOffice → HTML) | 4m10 |
 | `fetch-etsi` | télécharge la work-list et convertit (pdftotext) — une work-list, pas un delta | ~1 h |
-| `ingest` / `ingest-etsi` | parse le HTML (Rust) dans le corpus — shards par série repliés dans `3gpp.duckdb` (repli sauté si aucun shard n'a gagné de clause), `etsi.duckdb` directement | minutes/série ; ~11 min ETSI ; repli 3GPP ~34 min quand il a lieu |
+| `ingest` / `ingest-etsi` | parse le HTML (Rust) dans le corpus — shards par série repliés dans `3gpp.duckdb` (repli sauté si aucun shard n'a gagné de clause), `etsi.duckdb` directement. Les deux **déclinent** s'il n'y a rien à ajouter — l'ETSI AVANT de toucher au fichier (`ingest --etsi --plan`, lecture seule, HNSW figé exigé) | minutes/série ; ~11 min ETSI ou ~1 min en déclin ; repli 3GPP ~34 min quand il a lieu |
 | `embed` / `embed-etsi` | vectorise sur GPU en réutilisant chaque hash de contenu connu | le long pôle |
 | `enrich` | catalogue DynaReport, OpenAPI 5GC, registre LI | ~2 min |
 | `enrich-etsi` | mine la clause Abbreviations de chaque livrable dans le glossaire | **21,5 s** (mesuré le 08/09 sur les 5 142 livrables ; c'était 2 h 29 avant le correctif quadratique) |

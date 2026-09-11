@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -269,6 +270,34 @@ func stepIngestETSI() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
+			// ASK FIRST, WITHOUT TOUCHING THE FILE — the decline its 3GPP twin has.
+			//
+			// Everything below rewrites etsi.duckdb even when there is nothing to
+			// add: the restore undoes paragraphs-etsi's conversion, and the Rust
+			// ingest drops and rebuilds the clause indexes and the FTS around 19
+			// deliverables that parse to nothing on every pass. A rewritten file is
+			// a changed output, so embed-etsi, enrich-etsi, paragraphs-etsi,
+			// sparse-etsi, compact-etsi, index-etsi and validate-etsi all replayed,
+			// and the 19 GB ETSI layer was re-pushed — ~45 minutes of work to
+			// reproduce a corpus nobody had added to. The 3GPP ingest has declined
+			// in that situation for weeks ("no shard gained a clause"); this arm
+			// had no way to.
+			//
+			// `ingest --etsi --plan` answers with the ingest's own resume predicate,
+			// read-only. See etsiIngestDeclines for when its answer is trusted.
+			//
+			// A plan that FAILS is not a reason to stop: it only means the question
+			// could not be answered, and the answer to "may I skip?" is then no. The
+			// ingest runs exactly as it did before the plan existed.
+			plan, err := planETSIIngest(c)
+			if err != nil {
+				c.Log.Printf("WARNING: the ETSI ingest plan failed, running the ingest anyway: %v", err)
+			} else if why := etsiIngestDeclines(plan); why != "" {
+				return fmt.Errorf("%w: %s", ErrDeclined, why)
+			} else {
+				c.Log.Printf("ingest plan: %s", plan.raw)
+			}
+
 			// pdftotext IS NOT CHECKED HERE ANY MORE. It is the fetch's tool, and this
 			// step neither converts nor reads a PDF. Keeping the guard would have been
 			// the same over-broad coupling as the provenance it just shed.
@@ -425,4 +454,79 @@ func lookPath(name string) (string, error) {
 		return "", statErr
 	}
 	return filepath.Clean(p), nil
+}
+
+// etsiIngestPlan is what `ingest --etsi --plan` reports about data/etsi.duckdb.
+type etsiIngestPlan struct {
+	ok             bool // the report was read; false = unparseable, which never declines
+	pendingDocs    int
+	pendingClauses int
+	uncatalogued   int
+	hnswState      string
+	corpusPresent  bool
+	files          int
+	raw            string
+}
+
+// etsiPlanRe reads the one line run_etsi_plan prints.
+var etsiPlanRe = regexp.MustCompile(`ingest-plan: ETSI pending_docs=(\d+) pending_clauses=(\d+) pending_uncatalogued=(\d+) hnsw_state=(\S*) corpus=(present|absent) files=(\d+)`)
+
+func parseETSIIngestPlan(out string) etsiIngestPlan {
+	m := etsiPlanRe.FindStringSubmatch(out)
+	if m == nil {
+		return etsiIngestPlan{raw: strings.TrimSpace(out)}
+	}
+	atoi := func(s string) int { n, _ := strconv.Atoi(s); return n }
+	return etsiIngestPlan{
+		ok:             true,
+		pendingDocs:    atoi(m[1]),
+		pendingClauses: atoi(m[2]),
+		uncatalogued:   atoi(m[3]),
+		hnswState:      m[4],
+		corpusPresent:  m[5] == "present",
+		files:          atoi(m[6]),
+		raw:            m[0],
+	}
+}
+
+// planETSIIngest runs the read-only plan. It reads the SAME tree the ingest reads —
+// scripts/etsi-ingest.sh passes --convert "$ETSI_CONVERT".
+func planETSIIngest(c *Ctx) (etsiIngestPlan, error) {
+	out, err := c.Output(Cmd{Name: c.rbin("ingest"), Args: []string{
+		"--etsi", "--plan",
+		"--convert", c.dataPath("sources", "convert-etsi"),
+		"--db", c.dataPath("etsi.duckdb"),
+	}})
+	if err != nil {
+		return etsiIngestPlan{}, fmt.Errorf("planning the ETSI ingest: %w", err)
+	}
+	return parseETSIIngestPlan(out), nil
+}
+
+// etsiIngestDeclines says why the ETSI ingest has nothing to do, or "" when it must
+// run. Every doubt resolves to running — the old behaviour, slower and never wrong:
+//
+//	unreadable plan      the binary may not be the one this code expects
+//	no corpus            everything is to add
+//	no source file       the tree is missing or empty; the ingest's own guard must
+//	                     fail on it loudly, not a decline certify it
+//	pending clauses      that is the work
+//	uncatalogued docs    a deliverable that parses to nothing still gets its spec
+//	                     and version rows on a pass — catalogue work
+//	HNSW not "frozen"    the ingest drops the vector index and sets "building", and
+//	                     only index-etsi freezes it again — so anything but frozen
+//	                     means a pass since the last complete chain, possibly one
+//	                     that died mid-rewrite. A decline must not certify that file.
+//
+// Deliverables that are pending, parse to NOTHING and are ALREADY catalogued do not
+// count: the ingest would re-parse them, rewrite the same catalogue rows, write no
+// clause and leave their slot open, exactly as now.
+func etsiIngestDeclines(p etsiIngestPlan) string {
+	switch {
+	case !p.ok, !p.corpusPresent, p.files == 0, p.pendingClauses > 0, p.uncatalogued > 0, p.hnswState != "frozen":
+		return ""
+	}
+	return fmt.Sprintf("etsi.duckdb already holds every converted deliverable that yields a clause "+
+		"(%d file(s); %d pending one(s) parse to nothing) and its index is frozen — the file is left untouched",
+		p.files, p.pendingDocs)
 }
