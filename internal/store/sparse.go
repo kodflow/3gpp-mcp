@@ -115,7 +115,7 @@ func (s *Store) SearchSparse(ctx context.Context, query model.SparseVec, f SpecF
 	sql := `SELECT cl.chunk_id, cl.spec_id, cl.release, cl.version, cl.clause_path,
 	               cl.heading, cl.text, cl.is_normative, sub.score
 	        FROM (
-	          SELECT cs.chunk_id AS chunk_id, SUM(q.qw * cs.weight) AS score
+	          SELECT cs.chunk_id AS chunk_id, ` + stableScore("SUM(q.qw * cs.weight)") + ` AS score
 	          FROM clause_sparse cs
 	          JOIN (VALUES ` + values + `) AS q(term_id, qw) ON cs.term_id = q.term_id
 	          GROUP BY cs.chunk_id

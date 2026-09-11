@@ -60,7 +60,7 @@ func (s *Store) searchSparseCA(ctx context.Context, values string, vargs []any, 
 	q := `SELECT o.chunk_id, o.spec_id, o.release, o.version, o.clause_path,
 	             b.heading, o.is_normative, o.body_id, sub.score
 	      FROM (
-	        SELECT cs.chunk_id AS chunk_id, SUM(q.qw * cs.weight) AS score
+	        SELECT cs.chunk_id AS chunk_id, ` + stableScore("SUM(q.qw * cs.weight)") + ` AS score
 	        FROM clause_sparse cs
 	        JOIN (VALUES ` + values + `) AS q(term_id, qw) ON cs.term_id = q.term_id
 	        GROUP BY cs.chunk_id

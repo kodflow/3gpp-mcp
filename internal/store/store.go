@@ -988,7 +988,7 @@ func (s *Store) SearchClauses(ctx context.Context, q SearchQuery) ([]model.Searc
 	if s.ftsAvailable {
 		sql = `SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative, score FROM (
 			SELECT chunk_id, spec_id, release, version, clause_path, heading, text, is_normative,
-			       fts_main_clauses.match_bm25(chunk_id, ?) AS score
+			       ` + stableScore("fts_main_clauses.match_bm25(chunk_id, ?)") + ` AS score
 			FROM clauses) sq WHERE score IS NOT NULL` + filterSQL +
 			` ORDER BY score DESC, spec_id, clause_path LIMIT ?`
 		args = append(args, q.Text)
