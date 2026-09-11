@@ -502,14 +502,29 @@ func RRF(k float64, lists ...[]model.SearchHit) []model.SearchHit {
 		a.hit.Score = a.score
 		out = append(out, a.hit)
 	}
+	// A TOTAL ORDER over the fusion key. The tie-break stopped at (spec_id,
+	// clause_path) while the key also carries release and version, so two versions
+	// of one clause with equal fused scores — rank r in one arm each, common when
+	// the arms surface different versions of the same text — were ordered by Go's
+	// randomised map iteration, and the served page could change between two
+	// identical calls. Found by the served retrieval gate (2026-09-11): one query's
+	// hybrid nDCG@10 read 0.50, then 0.43, on the same corpus. Release and version
+	// come AFTER clause_path, so every order the old comparison decided is kept.
 	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].Clause, out[j].Clause
 		if out[i].Score != out[j].Score {
 			return out[i].Score > out[j].Score
 		}
-		if out[i].Clause.SpecID != out[j].Clause.SpecID {
-			return out[i].Clause.SpecID < out[j].Clause.SpecID
+		if a.SpecID != b.SpecID {
+			return a.SpecID < b.SpecID
 		}
-		return out[i].Clause.ClausePath < out[j].Clause.ClausePath
+		if a.ClausePath != b.ClausePath {
+			return a.ClausePath < b.ClausePath
+		}
+		if a.Release != b.Release {
+			return a.Release < b.Release
+		}
+		return a.Version < b.Version
 	})
 	return out
 }
