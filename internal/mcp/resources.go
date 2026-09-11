@@ -214,6 +214,9 @@ func (h *handlers) readResource(ctx context.Context, uri string) ([]mcp.Resource
 	if len(clauses) == 0 {
 		return nil, fmt.Errorf("%w: %s", server.ErrResourceNotFound, uri)
 	}
+	// The filing the URI names, once — not every release's copy of the version
+	// (filings.go: 3gpp://30.531/Rel-12@1.62.0 served the same text nine times).
+	clauses, _ = oneFiling(clauses, ref.release)
 	var b strings.Builder
 	for _, c := range clauses {
 		if c.ClausePath != "" || c.Heading != "" {

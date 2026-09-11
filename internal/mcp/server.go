@@ -494,6 +494,16 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	release := r.GetString("release", h.baseline) // default: the baseline norm
 	version := r.GetString("version", "")
 	st := h.specStore(specID) // route "ETSI …" ids to the attached ETSI store
+	// BOTH NAMED EXPLICITLY MUST AGREE (Qodo, #347; resources/read has refused
+	// this since #345). Clauses are selected by version alone, so a version that
+	// is not filed under the release asked for would be served under its name.
+	// Only when the CALLER named the release: the default is the baseline, and a
+	// version belonging to another release is a legitimate question there.
+	if version != "" && r.GetString("release", "") != "" {
+		if rerr := versionIsInRelease(ctx, st, specID, release, version); rerr != nil {
+			return mcp.NewToolResultError(rerr.Error()), nil
+		}
+	}
 	if version == "" {
 		if v, ok, _ := st.VersionForRelease(ctx, specID, release); ok {
 			version = v
@@ -507,6 +517,23 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	}
 	if len(clauses) == 0 {
 		return mcp.NewToolResultError("no such spec/clause in corpus: " + specID), nil
+	}
+	// A version filed under several releases comes back once per filing; serve
+	// one, and say where else it is filed (filings.go).
+	all := len(clauses)
+	clauses, filedUnder := oneFiling(clauses, release)
+	// SAY WHICH FILING WAS SERVED. The release asked for is not always one the
+	// version's clauses are filed under — the baseline, on a version of another
+	// release; or a catalogue row with no clauses behind it, as 26.510 18.4.0 has
+	// under Rel-18 while its text is filed under Rel-20. The answer then names the
+	// release it actually served rather than the one requested (Qodo, #347).
+	servedNote := ""
+	if served := clauses[0].Release; served != release && sameRelease(clauses) {
+		if release != "" && len(filedUnder) == 0 {
+			servedNote = "the clauses this corpus holds for " + specID + " " + version + " are filed under " +
+				served + ", not " + release + ": this answer is scoped to " + served + "."
+		}
+		release = served
 	}
 	// Release lineage per clause (present_in / introduced / last_seen / obsolete)
 	// so every fragment says where it lives across releases and whether it's gone.
@@ -566,6 +593,14 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 			resp["added_in_later_releases"] = rv.AddedLater
 			resp["removed_before_baseline"] = rv.RemovedBefore
 		}
+	}
+	if len(filedUnder) > 0 {
+		resp["filed_under"] = filedUnder
+		servedNote = filingNote(specID, version, filedUnder, clauses[0].Release, len(clauses) < all, filingScope(clause))
+	}
+	if servedNote != "" {
+		note, _ := resp["note"].(string)
+		resp["note"] = joinNotes(servedNote, note)
 	}
 	return jsonResult(resp)
 }
@@ -767,9 +802,17 @@ func changelogNote(ctx context.Context, st store.Reader, specID string, changes 
 	// stop a number from being read as more than it is. The export STAMP is not a
 	// count — it is read from the corpus being served, so it cannot go stale
 	// against it.
-	source := strings.TrimSpace(st.GetMeta(ctx, "changes_source"))
+	//
+	// Read through metaReads, not GetMeta: a stamp that could not be read is said
+	// to be unreadable, not dropped as if there were none (meta_reads.go).
+	meta := newMetaReads(ctx, st)
+	source, sourceOK := meta.get("changes_source")
+	source = strings.TrimSpace(source)
 	from := " from the 3GPP change-request database"
-	if source != "" {
+	switch {
+	case !sourceOK:
+		from += " (its export stamp could not be read: " + meta.errs["changes_source"] + ")"
+	case source != "":
 		from += " (" + source + ")"
 	}
 	if len(changes) == 0 {
