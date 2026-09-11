@@ -868,8 +868,28 @@ pub fn emit_repair_worklist(
             None => continue,
         };
 
+        // THE DRIFT QUESTION IS "DO WE ALREADY HOLD THIS DOCUMENT?", AND RE-FILING
+        // CHANGES WHERE IT WOULD LAND — so it has to be asked of the release the
+        // line will actually carry. Asked of the key instead, a report row whose
+        // key the corpus can never mirror (the file lands under Rel-18, so no
+        // Rel-20 row is ever written) reads as drift on EVERY build: the work list
+        // never empties and `fetch` re-downloads the same archive for ever, because
+        // purgeConvertedZips deletes it after each conversion. The converted tree
+        // would not grow, so `fetch` still declines and nothing downstream replays —
+        // but it is a download per row per build, for nothing.
+        //
+        // `have` itself stays the KEY's version: it is what a hole was anchored at,
+        // and that is a statement about the key, not about where the file belongs.
         let have = idx.get(key).map(String::as_str).unwrap_or("");
-        let drifted = cmp_ver(ver, have) == Ordering::Greater;
+        let lands_in = filing_release(site, spec, rel, ver, floor_major);
+        let have_there = match &lands_in {
+            Some(own) => idx
+                .get(&format!("{spec}|{own}"))
+                .map(String::as_str)
+                .unwrap_or(""),
+            None => have,
+        };
+        let drifted = cmp_ver(ver, have_there) == Ordering::Greater;
         let holed = holes.contains(key);
         if !drifted && !holed {
             continue;
@@ -881,7 +901,7 @@ pub fn emit_repair_worklist(
         // hole detector and the drift computation have stopped agreeing about what
         // the corpus contains, and that is a defect, not an improvement.
         if drifted {
-            if have.is_empty() {
+            if have_there.is_empty() {
                 counts.upstream_missing += 1;
             } else {
                 counts.upstream_stale += 1;
@@ -1256,6 +1276,43 @@ mod repair_tests {
             lines.starts_with("Rel-4 "),
             "the document must still be fetched, as Rel-4; got: {lines}"
         );
+    }
+
+    /// A REPORT ROW THE CORPUS CAN NEVER MIRROR MUST NOT READ AS DRIFT FOR EVER.
+    /// 26.510 is listed at 18.4.0 under Rel-20; the file lands under Rel-18, so no
+    /// `26.510|Rel-20` row is ever written and the key's own entry stays empty. Asked
+    /// of the key, that is drift on every build — and `purgeConvertedZips` deletes
+    /// the archive after each conversion, so it is a fresh download every time. Asked
+    /// of Rel-18, where the corpus already holds 18.5.0, there is nothing to fetch.
+    #[test]
+    fn drift_is_measured_at_the_release_the_line_lands_in() {
+        let site = m(&[
+            ("26.510|Rel-18", "18.5.0"),
+            ("26.510|Rel-19", "19.2.0"),
+            ("26.510|Rel-20", "18.4.0"),
+        ]);
+        let idx = m(&[("26.510|Rel-18", "18.5.0"), ("26.510|Rel-19", "19.2.0")]);
+        let (lines, c) = emit_repair_worklist(&site, &idx, &BTreeSet::new(), 4, "");
+        assert_eq!(c.emitted, 0, "the corpus already holds it; got: {lines}");
+        assert!(lines.is_empty(), "got: {lines}");
+    }
+
+    /// The same shape, one version behind: the corpus's Rel-19 filing is older than
+    /// what the Rel-20 row asks for, so the document IS missing and must be fetched —
+    /// under Rel-19, and counted as drift there.
+    #[test]
+    fn a_refiled_row_the_corpus_lacks_is_still_fetched() {
+        let site = m(&[("29.558|Rel-19", "19.4.0"), ("29.558|Rel-20", "19.5.0")]);
+        let idx = m(&[("29.558|Rel-19", "19.4.0")]);
+        let (lines, c) = emit_repair_worklist(&site, &idx, &BTreeSet::new(), 4, "");
+        assert_eq!(c.refiled, 1, "got: {lines}");
+        assert!(
+            lines.contains(
+                "Rel-19 https://www.3gpp.org/ftp/Specs/archive/29_series/29.558/29558-j50.zip"
+            ),
+            "19.5.0 must be fetched as Rel-19; got: {lines}"
+        );
+        assert!(!lines.contains("Rel-20 "), "got: {lines}");
     }
 
     /// Two keys of one spec that re-file onto the same release at the same version
