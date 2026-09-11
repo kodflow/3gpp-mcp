@@ -10,8 +10,8 @@ import (
 // THE ETSI INGEST DECLINES WHEN IT HAS NOTHING TO ADD, and only then.
 
 func TestTheETSIIngestPlanIsReadFromTheBinarysLine(t *testing.T) {
-	p := parseETSIIngestPlan("noise\ningest-plan: ETSI pending_docs=19 pending_clauses=0 hnsw_state=frozen corpus=present files=11822\n")
-	want := etsiIngestPlan{ok: true, pendingDocs: 19, pendingClauses: 0, hnswState: "frozen", corpusPresent: true, files: 11822}
+	p := parseETSIIngestPlan("noise\ningest-plan: ETSI pending_docs=19 pending_clauses=0 pending_uncatalogued=2 hnsw_state=frozen corpus=present files=11822\n")
+	want := etsiIngestPlan{ok: true, pendingDocs: 19, pendingClauses: 0, uncatalogued: 2, hnswState: "frozen", corpusPresent: true, files: 11822}
 	p.raw = ""
 	if p != want {
 		t.Fatalf("parsed %+v, want %+v", p, want)
@@ -35,6 +35,8 @@ func TestTheETSIIngestDeclinesOnlyOverAnUntouchedCorpusWithNothingToAdd(t *testi
 		{"no corpus yet", func(p *etsiIngestPlan) { p.corpusPresent = false }},
 		{"a new deliverable with text", func(p *etsiIngestPlan) { p.pendingClauses = 42 }},
 		{"a pass since the last freeze", func(p *etsiIngestPlan) { p.hnswState = "building" }},
+		{"an empty or missing source tree", func(p *etsiIngestPlan) { p.files = 0 }},
+		{"a new deliverable with no clause, not yet catalogued", func(p *etsiIngestPlan) { p.uncatalogued = 1 }},
 		{"no index state at all", func(p *etsiIngestPlan) { p.hnswState = "" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
