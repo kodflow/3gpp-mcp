@@ -11,27 +11,20 @@ import (
 // reason it is not. This map is the ONLY place an exception can be recorded, so
 // adding one is a decision someone typed and a reviewer can see.
 var armShared = map[string]string{
-	"toolchain":       "verifies the machine, not a corpus",
-	"build-go":        "builds the binaries both arms run",
-	"build-rust":      "builds the binaries both arms run",
-	"build-embedder":  "builds the binaries both arms run",
-	"build-sparse":    "builds the binaries both arms run",
-	"build-serve":     "builds the binaries both arms run",
-	"test":            "runs the suite, not a corpus",
-	"merge":           "folds the 3GPP shards; the ETSI ingest writes one database directly",
-	"smoke":           "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither. Its retrieval gate is 3GPP-ONLY: every judged query is TS 33.128, and the ETSI half has no judged set, so its ranking is guarded by nothing (smoke_gate.go)",
-	"publish":         "pushes ONE image carrying both corpora",
-	"seed-etsi":       "twin of seed",
-	"discover-etsi":   "twin of discover",
-	"fetch-etsi":      "twin of fetch",
-	"ingest-etsi":     "twin of ingest",
-	"embed-etsi":      "twin of embed",
-	"enrich-etsi":     "twin of enrich",
-	"paragraphs-etsi": "twin of paragraphs",
-	"sparse-etsi":     "twin of sparse",
-	"compact-etsi":    "twin of compact",
-	"index-etsi":      "twin of index",
-	"validate-etsi":   "twin of validate",
+	"toolchain":      "verifies the machine, not a corpus",
+	"build-go":       "builds the binaries both arms run",
+	"build-rust":     "builds the binaries both arms run",
+	"build-embedder": "builds the binaries both arms run",
+	"build-sparse":   "builds the binaries both arms run",
+	"build-serve":    "builds the binaries both arms run",
+	"test":           "runs the suite, not a corpus",
+	"smoke":          "starts ONE server over BOTH stores — splitting it would prove each half serves and leave the federation proven by neither. Its retrieval gate is 3GPP-ONLY: every judged query is TS 33.128, and the ETSI half has no judged set, so its ranking is guarded by nothing (smoke_gate.go)",
+	"publish":        "pushes ONE image carrying both corpora",
+	// `merge` WAS HERE — "folds the 3GPP shards; the ETSI ingest writes one
+	// database directly" — and it was the last data step the list excused. The
+	// fold is how the 3GPP ingest publishes what it parsed, so it became the second
+	// half of `ingest` (stepIngest3GPP) and the exception went with it. A data step
+	// with no twin must not come back through this map.
 }
 
 // THE TWO ARMS MUST BE THE SAME LIST TWICE.
@@ -57,6 +50,10 @@ var armShared = map[string]string{
 //	ingest-etsi      was called `corpus-etsi`: the one step in either arm whose name
 //	                 did not pair. A name that does not pair is a step nobody looks
 //	                 for when they ask whether both halves get the same treatment.
+//	merge            the 3GPP arm folded its shards in a step of its own, and the
+//	                 ETSI arm has no shards — so one arm had eleven data steps and
+//	                 the other ten, excused here in `shared`. The fold is now how
+//	                 the 3GPP ingest ends; no data step is excused any more.
 //
 // So the pairing is the invariant, and this test is what makes it one. Adding a
 // data step to either arm without its twin fails here, at compile-and-test time,
@@ -321,5 +318,117 @@ func TestEachArmSeedsFromItsOwnSnapshot(t *testing.T) {
 	if got3.Member != three.DB || gotE.Member != etsi.DB {
 		t.Errorf("member/DB mismatch: 3gpp %q vs %q, etsi %q vs %q",
 			got3.Member, three.DB, gotE.Member, etsi.DB)
+	}
+}
+
+// THE ARMS ARE ONE LIST, IN ONE ORDER. Pairing names (above) would still pass if
+// the ETSI arm ran its steps in a different order, or if a data step were excused
+// in `shared`; this compares the two columns position by position, and the only
+// difference allowed is the suffix.
+func TestTheArmsAreTheSameListInTheSameOrder(t *testing.T) {
+	three, etsi := armSteps(corpus3GPP()), armSteps(corpusETSI())
+	if len(three) != len(etsi) {
+		t.Fatalf("the 3GPP arm has %d steps and the ETSI arm %d", len(three), len(etsi))
+	}
+	for i := range three {
+		if etsi[i].Name != three[i].Name+"-etsi" {
+			t.Errorf("position %d: 3GPP runs %q, ETSI runs %q", i, three[i].Name, etsi[i].Name)
+		}
+	}
+	// And no data step lives outside the arms: everything Pipeline() holds is an
+	// arm step or a recorded exception.
+	inArm := map[string]bool{}
+	for _, s := range append(three, etsi...) {
+		inArm[s.Name] = true
+	}
+	for _, s := range Pipeline() {
+		if _, ok := armShared[s.Name]; !ok && !inArm[s.Name] {
+			t.Errorf("%q is in the pipeline, in neither arm, and not recorded in armShared", s.Name)
+		}
+		if _, ok := armShared[s.Name]; ok && inArm[s.Name] {
+			t.Errorf("%q is an arm step AND excused in armShared", s.Name)
+		}
+	}
+}
+
+// EVERY TWIN STANDS ON THE TWINS OF ITS DEPENDENCIES. Same names in the same
+// order is not yet the same DAG: `index` used to wait on `enrich` while
+// `index-etsi` did not name `enrich-etsi`, and `publish` named the ETSI index and
+// not the 3GPP one. For every pair, the DATA edges (Deps and AnyDeps, tools
+// excluded — the arms legitimately launch different binaries) must be the same
+// set once the suffix is applied, in the same field. The one recorded exception is
+// crossArm: validate opens the other half for --require-etsi.
+func TestEveryTwinStandsOnTheTwinsOfItsDependencies(t *testing.T) {
+	byName := map[string]*Step{}
+	for _, s := range Pipeline() {
+		byName[s.Name] = s
+	}
+	crossArm := map[string][]string{"validate": {"index-etsi"}}
+	data := func(owner string, deps []string) []string {
+		var out []string
+		for _, d := range deps {
+			if byName[d] != nil && byName[d].Tool {
+				continue
+			}
+			if slices.Contains(crossArm[owner], d) {
+				continue
+			}
+			out = append(out, d)
+		}
+		sort.Strings(out)
+		return out
+	}
+	withSuffix := func(names []string) []string {
+		out := make([]string, len(names))
+		for i, n := range names {
+			out[i] = n + "-etsi"
+		}
+		sort.Strings(out)
+		return out
+	}
+	for _, s := range armSteps(corpus3GPP()) {
+		twin := byName[s.Name+"-etsi"]
+		if twin == nil {
+			t.Fatalf("%s has no twin", s.Name)
+		}
+		if got, want := data(twin.Name, twin.Deps), withSuffix(data(s.Name, s.Deps)); !slices.Equal(got, want) {
+			t.Errorf("%s stands on %v, its twin %s on %v", s.Name, want, twin.Name, got)
+		}
+		if got, want := data(twin.Name, twin.AnyDeps), withSuffix(data(s.Name, s.AnyDeps)); !slices.Equal(got, want) {
+			t.Errorf("%s has alternative producers %v, its twin %s %v", s.Name, want, twin.Name, got)
+		}
+		if s.Heavy != twin.Heavy || s.Optional != twin.Optional || s.Tool != twin.Tool {
+			t.Errorf("%s and %s disagree on heavy/optional/tool: %v/%v/%v vs %v/%v/%v", s.Name, twin.Name,
+				s.Heavy, s.Optional, s.Tool, twin.Heavy, twin.Optional, twin.Tool)
+		}
+	}
+}
+
+// NO STEP OUTSIDE AN ARM MAY NAME ONE ARM'S DATA STEP WITHOUT ITS TWIN. smoke
+// stands on validate AND validate-etsi; publish used to stand on smoke and
+// index-etsi, which told the arms apart one level above them.
+func TestSharedStepsTreatBothArmsAlike(t *testing.T) {
+	arm := map[string]bool{}
+	for _, s := range append(armSteps(corpus3GPP()), armSteps(corpusETSI())...) {
+		arm[s.Name] = true
+	}
+	for _, s := range Pipeline() {
+		if arm[s.Name] {
+			continue
+		}
+		deps := append(append([]string{}, s.Deps...), s.AnyDeps...)
+		for _, d := range deps {
+			if !arm[d] {
+				continue
+			}
+			base, isETSI := strings.CutSuffix(d, "-etsi")
+			other := d + "-etsi"
+			if isETSI {
+				other = base
+			}
+			if !slices.Contains(deps, other) {
+				t.Errorf("%s depends on %s and not on %s", s.Name, d, other)
+			}
+		}
 	}
 }

@@ -24,15 +24,16 @@ import (
 // documentation, because every duplicate description eventually disagrees with
 // the code (which is precisely what happened to the CI it replaces).
 //
-// # Ordering note: MERGE BEFORE EMBED
+// # Ordering note: FOLD BEFORE EMBED
 //
 // The retired CI embedded each shard separately and merged afterwards. That is
-// unsafe with a shared embedding ledger: `ingest` rebases chunk_id to ~0 in every
+// unsafe with a shared embedding ledger: the parse rebases chunk_id to ~0 in every
 // shard, so two shards both contain a chunk_id 42, and rust/embedder's resume set
 // (a HashSet<chunk_id>) would make one shard's clauses silently skipped because
-// another shard already used that id. After the merge, chunk_ids are globally
-// unique, so ONE ledger is both safe and optimal — and its content-hash map
-// deduplicates across every release and series at once.
+// another shard already used that id. `ingest` therefore ends by folding the
+// shards into the corpus; after the fold, chunk_ids are globally unique, so ONE
+// ledger is both safe and optimal — and its content-hash map deduplicates across
+// every release and series at once.
 
 // exe appends the platform's executable suffix.
 func exe(name string) string {
@@ -73,10 +74,12 @@ func (c *Ctx) statePath(parts ...string) string {
 
 // Pipeline returns the ordered step list.
 //
-// THE TWO ARMS ARE THE SAME LIST TWICE. Every data step of the 3GPP arm has a
-// same-named `-etsi` twin, in the same position, with the same contract:
+// THE TWO ARMS ARE THE SAME LIST TWICE — literally: armSteps builds one arm from a
+// corpusTarget, and Pipeline calls it once per corpus. Every data step of the 3GPP
+// arm has a same-named `-etsi` twin, in the same position, standing on the twins
+// of the same dependencies:
 //
-//	discover  fetch  ingest  embed  enrich  paragraphs  sparse  compact  index  validate
+//	seed  discover  fetch  ingest  embed  enrich  paragraphs  sparse  compact  index  validate
 //
 // That is not tidiness. Each place the two arms differed was a place the ETSI half
 // silently went without something the 3GPP half had, and every one of them was
@@ -87,11 +90,15 @@ func (c *Ctx) statePath(parts ...string) string {
 // the 3GPP one, and a name -- `corpus-etsi` -- that did not pair with anything. A
 // missing twin is invisible; a hole in a column is not.
 //
-// `seed` and `merge` have no twin, and that is structural rather than an omission.
-// `merge` folds the 3GPP shards, and the ETSI ingest writes one database directly;
-// `seed` applies the two curated 3GPP seeds, and the ETSI vocabulary is MINED, by
-// `enrich-etsi`, which is where that work belongs. TestTheTwoArmsRunTheSameSteps
-// pins both the pairing and this exception list.
+// THERE IS NO `merge` ANY MORE, and that closes the last hole in the column. It
+// was a 3GPP-only step that folded the per-series shards into 3gpp.duckdb, while
+// the ETSI ingest writes its database directly — so the two arms were eleven data
+// steps against ten, and the exception had to be argued for in a test. Folding is
+// how the 3GPP ingest PUBLISHES what it parsed, exactly as `ingest --etsi`
+// publishes into etsi.duckdb; it is now the second half of `ingest` (see
+// stepIngest3GPP), and both ingests end with the corpus written.
+// TestTheArmsAreTheSameListInTheSameOrder pins the columns,
+// TestEveryTwinStandsOnTheTwinsOfItsDependencies pins the edges.
 //
 // # Ordering note
 //
@@ -100,7 +107,7 @@ func (c *Ctx) statePath(parts ...string) string {
 // `validate` names index-etsi, which is declared below it. What the order buys is
 // legibility: the two arms read as two columns.
 func Pipeline() []*Step {
-	return []*Step{
+	steps := []*Step{
 		stepToolchain(),
 		stepBuildGo(),
 		stepTest(),
@@ -108,61 +115,22 @@ func Pipeline() []*Step {
 		stepBuildEmbedder(),
 		stepBuildSparse(),
 		stepBuildServe(),
+	}
 
-		// ------------------------------------------------------------- the 3GPP arm
-		stepSeed(corpus3GPP()),
-		stepDiscover(),
-		stepFetch(),
-		stepIngest(),
-		stepMerge(),
-		stepEmbed(corpus3GPP()),
-		stepEnrich(corpus3GPP()),
-		stepParagraphs(corpus3GPP()),
-		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
-		// does not carry custom indexes), so both sit between the conversion and the
-		// freeze rather than after it.
-		stepSparse(corpus3GPP()),
-		stepCompact(corpus3GPP()),
-		stepIndex(corpus3GPP()),
-		stepValidate(corpus3GPP()),
+	// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment, step for
+	// step. An opt-in — or a lexical-only ETSI — would let one corpus fall silently
+	// behind, which is precisely the state the tooling was in.
+	for _, t := range []corpusTarget{corpus3GPP(), corpusETSI()} {
+		steps = append(steps, armSteps(t)...)
+	}
 
-		// ------------------------------------------------------------- the ETSI arm
-		//
-		// ETSI is built ALONGSIDE 3GPP, always, and gets the SAME treatment, step for
-		// step. An opt-in — or a lexical-only ETSI — would let one corpus fall
-		// silently behind, which is precisely the state the tooling was in.
-		stepSeed(corpusETSI()),
-		stepDiscoverETSI(),
-		// fetch-etsi and ingest-etsi were ONE step until 2026-09-07, which meant a
-		// change to the Rust parser re-ran the downloads and a change to the download
-		// script re-ran the parse.
-		stepFetchETSI(),
-		stepIngestETSI(),
-		stepEmbed(corpusETSI()),
-		// The ETSI enrichment is not the same WORK as the 3GPP one — ETSI publishes no
-		// DynaReport catalogue, no 5GC OpenAPI corpus and no LI ASN.1 registry — but it
-		// HAS a vocabulary, one Abbreviations clause per deliverable, and
-		// ingest-glossary was written to mine it and then wired to nothing. What the
-		// two share is the name, the contract and the position. See stepEnrich.
-		stepEnrich(corpusETSI()),
-		// The ETSI half gets the content-addressed conversion too. Without it
-		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
-		// clauses, which was harmless only while ETSI held one version per
-		// deliverable; with every published version in the corpus it is the
-		// "CHECK_IMEI" failure — a result window filled by one clause seen from a
-		// dozen versions, and the deliverable that answers never in it.
-		stepParagraphs(corpusETSI()),
-		stepSparse(corpusETSI()),
-		stepCompact(corpusETSI()),
-		stepIndex(corpusETSI()),
-		stepValidate(corpusETSI()),
-
-		// ------------------------------------------------------------- the product
-		//
-		// smoke and publish are not per corpus, and they are the only data steps that
-		// are not: one server is started, over both stores, and one image is pushed
-		// carrying both. Splitting them would prove each half serves and leave the
-		// federation — which is the product — proven by neither.
+	// ------------------------------------------------------------- the product
+	//
+	// smoke and publish are not per corpus, and they are the only data steps that
+	// are not: one server is started, over both stores, and one image is pushed
+	// carrying both. Splitting them would prove each half serves and leave the
+	// federation — which is the product — proven by neither.
+	return append(steps,
 		stepSmoke(),
 		// The image is the LAST step, and it is a step rather than a separate entry
 		// point because it was the only output of this repository with no
@@ -170,7 +138,67 @@ func Pipeline() []*Step {
 		// this machine had built. See pipeline_publish.go for the two failures that
 		// cost.
 		stepPublish(),
+	)
+}
+
+// armSteps is ONE arm of the pipeline, for the corpus t names.
+//
+// A step whose WORK differs between the corpora — discover, fetch, ingest and
+// enrich read different archives with different tools — still takes the target
+// and dispatches on it, so the list below cannot grow a step on one side only.
+func armSteps(t corpusTarget) []*Step {
+	return []*Step{
+		stepSeed(t),
+		stepDiscover(t),
+		// fetch and ingest are separate on both arms: one step for the two meant a
+		// change to the parser re-ran the downloads and a change to the download
+		// script re-ran the parse (split on the ETSI arm on 2026-09-07).
+		stepFetch(t),
+		stepIngest(t),
+		stepEmbed(t),
+		// The ETSI enrichment is not the same WORK as the 3GPP one — ETSI publishes no
+		// DynaReport catalogue, no 5GC OpenAPI corpus and no LI ASN.1 registry — but it
+		// HAS a vocabulary, one Abbreviations clause per deliverable. What the two
+		// share is the name, the contract and the position. See stepEnrich.
+		stepEnrich(t),
+		// Both halves get the content-addressed conversion. Without it
+		// Store.SearchClauses takes the branch that ranks VERSIONS instead of
+		// clauses — the "CHECK_IMEI" failure, a result window filled by one clause
+		// seen from a dozen versions, and the deliverable that answers never in it.
+		stepParagraphs(t),
+		// sparse is ADDITIVE and compact must precede the index (COPY FROM DATABASE
+		// does not carry custom indexes), so both sit between the conversion and the
+		// freeze rather than after it.
+		stepSparse(t),
+		stepCompact(t),
+		stepIndex(t),
+		stepValidate(t),
 	}
+}
+
+// stepDiscover, stepFetch and stepIngest take the arm like every other data step.
+// The bodies differ — 3gpp.org's status report and LibreOffice on one side, the
+// ETSI /deliver archive and pdftotext on the other — and the dispatch is the only
+// place that difference is allowed to show.
+func stepDiscover(t corpusTarget) *Step {
+	if t.Suffix != "" {
+		return stepDiscoverETSI()
+	}
+	return stepDiscover3GPP()
+}
+
+func stepFetch(t corpusTarget) *Step {
+	if t.Suffix != "" {
+		return stepFetchETSI()
+	}
+	return stepFetch3GPP()
+}
+
+func stepIngest(t corpusTarget) *Step {
+	if t.Suffix != "" {
+		return stepIngestETSI()
+	}
+	return stepIngest3GPP()
 }
 
 // ---------------------------------------------------------------- toolchain
@@ -523,7 +551,7 @@ func readCorpusStateCounts(path string) (map[string]int, error) {
 // skips; past it the bucket moves and the step re-runs.
 const discoverTTL = 6 * time.Hour
 
-func stepDiscover() *Step {
+func stepDiscover3GPP() *Step {
 	return &Step{
 		Name:    "discover",
 		Version: 3,

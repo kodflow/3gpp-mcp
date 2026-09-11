@@ -36,8 +36,11 @@ var countsTestFiles = map[string]string{
 
 	// Expensive, and deliberately deferred: fixing it costs one replay of the
 	// thing it protects.
-	"merge":           "cmd/migrate-paragraphs; replaying merge is 34m15 and rewrites the corpus, which then costs a 42 GB image re-push",
-	"paragraphs":      "cmd/migrate-paragraphs, same binary as merge; deferred with it so the two move together",
+	// `merge` sat here too, until the fold became the second half of `ingest`:
+	// that change replays the step anyway, so it was the free moment to stop
+	// counting cmd/migrate-paragraphs' main_test.go — ingest and ingest-etsi both
+	// set ExcludeTests.
+	"paragraphs":      "cmd/migrate-paragraphs, the binary ingest's fold also runs; replaying paragraphs rewrites the corpus, which then costs a 42 GB image re-push",
 	"paragraphs-etsi": "cmd/migrate-paragraphs, the ETSI twin; replaying it is 8m07 and rewrites etsi.duckdb, which drags compact-etsi, index-etsi and a 19 GB layer re-push",
 }
 

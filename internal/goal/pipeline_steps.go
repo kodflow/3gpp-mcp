@@ -9,9 +9,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// This file holds the corpus steps proper: discover, fetch, ingest, merge,
+// This file holds the corpus steps proper: discover, fetch, ingest (parse + fold),
 // embed, enrich, index, validate and smoke. pipeline.go holds the DAG shape and
 // the build/seed steps.
 
@@ -268,7 +269,7 @@ func fileNonEmpty(p string) bool {
 
 // -------------------------------------------------------------------- fetch
 
-func stepFetch() *Step {
+func stepFetch3GPP() *Step {
 	return &Step{
 		Name:    "fetch",
 		Version: 3,
@@ -449,50 +450,100 @@ func ingestedNothing(logText string) bool {
 	return true
 }
 
-func stepIngest() *Step {
+// stepIngest3GPP parses the converted 3GPP HTML into per-series shards and folds
+// them into data/3gpp.duckdb. It is the 3GPP body of `ingest`; stepIngestETSI is
+// the other one.
+//
+// # WHY THE FOLD IS PART OF INGEST
+//
+// It used to be a step of its own, `merge`, and it was the one data step with no
+// twin: the ETSI ingest writes etsi.duckdb directly, so the arms were eleven steps
+// against ten and the gap had to be excused in armShared. Folding is not a
+// separate stage of the corpus — it is how the 3GPP ingest PUBLISHES what it
+// parsed, because the parse runs one DuckDB per series and the corpus is one file.
+// Both ingests now end in the same state: their corpus holds what was converted.
+//
+// # THE FOLD RUNS ONLY WHEN THERE IS SOMETHING TO FOLD — and "something" is not
+// just "this parse added clauses".
+//
+// `ingest --resume` skips every (spec, version) its shard's ingest_log already
+// holds. So once the fold lived inside the same step, a fold that DIED left a
+// trap: the retry re-parses, finds every clause already in the shards, reports
+// "0 clause(s)" everywhere — and a decline keyed on that tally alone would record
+// success over a corpus that never received them. When `merge` was its own step
+// the runner remembered the failure; inside one step, fold-state.json does:
+//
+//	pending   set BEFORE the fold starts, cleared only after the corpus and its
+//	          delta anchor are published — a fold that died is retried, whatever
+//	          the parse says
+//	impl      the fold's own implementation (foldImpl) at the last completed
+//	          fold — editing merge.rs or the restore re-folds, as it re-ran
+//	          `merge` when that was a step
+//
+// A parse that added nothing, with no pending fold and an unchanged fold, is the
+// one case that DECLINES: the corpus is untouched and its provenance carries.
+func stepIngest3GPP() *Step {
 	return &Step{
 		Name:    "ingest",
-		Version: 2,
-		Doc:     "parse the converted HTML into per-series DuckDB shards",
-		Deps:    []string{"fetch", "build-rust"},
+		Version: 3,
+		Doc:     "parse the converted 3GPP HTML into per-series shards and fold them into the corpus DB",
+		// build-go because the fold is preceded by a restore, and that restore is a
+		// Go binary (cmd/migrate-paragraphs). It is also in Impl, for the same reason.
+		Deps: []string{"fetch", "build-rust", "build-go"},
+		// Test files are not determinants: no binary this step runs compiles them.
+		// cmd/migrate-paragraphs carries a main_test.go, and counting it is the
+		// defect TestNoStepCountsTestFilesByAccident exists for.
+		ExcludeTests: true,
 		// rust/ingest/src/main.rs, not the crate: this step runs `ingest` and nothing
-		// else. The crate also carries ingest-catalog, ingest-openapi, ingest-li and
-		// ingest-glossary in src/bin, which only `enrich` invokes — declaring the
-		// whole crate made a fix to ingest_li.rs invalidate this step too. Harmless
-		// here (it declines in 4 s when fetch found nothing) and an hour of rework on
-		// ingest-etsi, which had the same declaration. Measured 2026-09-06.
+		// else from it. The crate also carries ingest-catalog, ingest-openapi,
+		// ingest-li, ingest-glossary and ingest-crs in src/bin, which only `enrich`
+		// invokes — declaring the whole crate made a fix to ingest_li.rs invalidate
+		// this step too. Harmless here (it declines in 4 s when fetch found nothing)
+		// and an hour of rework on ingest-etsi, which had the same declaration.
+		// Measured 2026-09-06.
 		// Cargo.toml IS provenance: it selects the dependency versions and the
 		// features the binary is compiled with, so a manifest-only change produces a
-		// different `ingest` from identical sources. Narrowing to src/main.rs dropped
-		// it, and build-rust cannot cover the gap — build steps are Step.Tool by
-		// design, so a dirty tool never replays a data step. The result would have
-		// been a rebuilt binary and a corpus kept from the old one.
-		Impl: []string{
-			// The binary this step runs, and its manifest.
+		// different `ingest` from identical sources. build-rust cannot cover the gap
+		// — build steps are Step.Tool by design, so a dirty tool never replays a data
+		// step. The result would have been a rebuilt binary and a corpus kept from
+		// the old one.
+		Impl: append([]string{
+			// The binary the parse runs, and its manifest.
 			"rust/ingest/src/main.rs", "rust/ingest/Cargo.toml",
 			// The crates it links. rust/store/src/lib.rs, NOT rust/store/src: the
-			// latter also holds src/bin (embed-io, merge, overlay), binaries this
-			// step never runs — the same false positive that cost an hour of ETSI
-			// rework when it was rust/ingest/src. src holds only lib.rs and bin, so
-			// naming lib.rs loses nothing.
-			"rust/parse", "rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			// latter also holds src/bin (embed-io, overlay, …), binaries this step
+			// never runs — the same false positive that cost an hour of ETSI rework
+			// when it was rust/ingest/src. merge.rs, the one it does run, is in
+			// foldImpl below.
+			"rust/parse", "rust/store/Cargo.toml",
 			// identity3gpp is re-exported as store_rs::identity and decides release
 			// ordering; nothing else declared here contains it.
 			"rust/identity",
 			// The workspace manifest and the LOCKFILE. Cargo resolves every crate
 			// above through them, so `cargo update` alone — no source touched, no
-			// manifest touched — can produce a different binary. build-rust cannot
-			// cover it: build steps are Step.Tool by design and never replay a data
-			// step, so the corpus would be kept from the previous binary in silence.
+			// manifest touched — can produce a different binary.
 			"rust/Cargo.toml", "rust/Cargo.lock",
 			// The shape the rows are written into.
 			"internal/store/schema.sql",
-		},
+		}, foldImpl...),
 		Inputs: func(c *Ctx) ([]string, error) {
 			// The converted tree is the input. Enumerating every HTML file would
 			// make the fingerprint enormous; the per-series directories carry the
 			// same signal at a fraction of the cost, and `ingest --resume` is the
 			// real per-(spec,version) checkpoint via the ingest_log table.
+			//
+			// THE SHARDS ARE NOT INPUTS. They were `merge`'s, when it was a step;
+			// they are this step's scratch now, and what they hold that the corpus
+			// does not is exactly what the parse tally and fold-state.json report.
+			// Fingerprinting them by size and mtime replayed the 34-minute fold
+			// whenever a no-op parse touched a shard file.
+			//
+			// THE CORPUS IS NOT AN INPUT EITHER, although the fold writes into it.
+			// It is this step's OUTPUT, and paragraphs, sparse, compact and index
+			// all rewrite it afterwards: declaring it meant every build saw a changed
+			// input and replayed the fold — a 22 GB restore and a publish, about an
+			// hour with paragraphs behind it, on a corpus nothing had added to.
+			// Measured on 2026-09-03.
 			var dirs []string
 			base := c.dataPath("sources", "convert")
 			ents, err := os.ReadDir(base)
@@ -511,112 +562,8 @@ func stepIngest() *Step {
 			return dirs, nil
 		},
 		Heavy: true,
-		Outputs: func(c *Ctx) []string {
-			var out []string
-			for _, s := range seriesOf(c) {
-				out = append(out, filepath.Join(c.Local, "shards", s+".duckdb"))
-			}
-			return out
-		},
-		Run: func(c *Ctx) error {
-			series := seriesOf(c)
-			if len(series) == 0 {
-				c.Log.Printf("delta is empty — no shard to (re)build")
-				return nil
-			}
-			shardDir := filepath.Join(c.Local, "shards")
-			if err := os.MkdirAll(shardDir, 0o755); err != nil {
-				return err
-			}
-			for i, s := range series {
-				db := filepath.Join(shardDir, s+".duckdb")
-				c.Log.Printf("ingest series %s (%d/%d)", s, i+1, len(series))
-				// --resume consults ingest_log, stamped with PIPELINE_VERSION:
-				// already-ingested (spec, version) pairs are skipped, and a parser
-				// or schema change invalidates the log wholesale. That is the
-				// per-unit checkpoint; we do not add a second ledger beside it.
-				//
-				// --corpus widens that question from "did THIS shard ingest it" to
-				// "does the corpus already hold it". ingest_log lives in the shard,
-				// and a shard is scratch: delete it and the ledger is empty, so a
-				// series is parsed and written again in full. That re-ingested
-				// ~300 000 clauses on 2026-08-25 to acquire five specs.
-				ingestArgs := []string{
-					"--series", s,
-					"--convert", c.dataPath("sources", "convert"),
-					"--db", db,
-					"--resume",
-				}
-				if corpus := c.dataPath("3gpp.duckdb"); fileNonEmpty(corpus) {
-					ingestArgs = append(ingestArgs, "--corpus", corpus)
-				}
-				if err := c.Run(Cmd{Name: c.rbin("ingest"), Args: ingestArgs, Echo: true}); err != nil {
-					return err
-				}
-				c.Checkpoint("last_series", s)
-				c.Checkpoint("done", fmt.Sprintf("%d/%d", i+1, len(series)))
-			}
-
-			// Having parsed every series is not the same as having added anything.
-			// `--resume --corpus` skips whatever the corpus already holds, so a pass
-			// over a converted tree that is entirely already-held ends with every
-			// shard empty — and used to publish a fresh provenance anyway, which
-			// sends merge over 22 GB and enrich behind it to reproduce a corpus
-			// nobody changed. Measured on 2026-09-03: 19 series, every one of them
-			// "0 spec(s), 0 clause(s)", followed by a full merge.
-			//
-			// The binary's own per-series tally is the evidence; nothing else knows
-			// what --resume decided to skip.
-			if b, err := os.ReadFile(c.Log.Path()); err == nil && ingestedNothing(string(b)) {
-				return fmt.Errorf("%w: the corpus already held every converted spec in %d series — no shard gained a clause",
-					ErrDeclined, len(series))
-			}
-			return nil
-		},
-	}
-}
-
-// -------------------------------------------------------------------- merge
-
-func stepMerge() *Step {
-	return &Step{
-		Name:    "merge",
-		Version: 2,
-		Doc:     "fold the shards into the corpus DB and rewrite the delta anchor",
-		// build-go is a dependency because the fold is preceded by a restore, and
-		// that restore is a Go binary. cmd/migrate-paragraphs is in Impl for the
-		// same reason: what this step does to the corpus now depends on it.
-		Deps: []string{"ingest", "build-go"},
-		Impl: []string{"rust/store/src/bin/merge.rs", "rust/store/src/lib.rs", "cmd/migrate-paragraphs"},
-		Inputs: func(c *Ctx) ([]string, error) {
-			var in []string
-			shardDir := filepath.Join(c.Local, "shards")
-			ents, err := os.ReadDir(shardDir)
-			if err == nil {
-				for _, e := range ents {
-					if strings.HasSuffix(e.Name(), ".duckdb") {
-						in = append(in, filepath.Join(shardDir, e.Name()))
-					}
-				}
-			}
-			// The corpus itself is NOT an input, although merge folds into it.
-			//
-			// It is this step's OUTPUT, and paragraphs, sparse, compact and index all
-			// rewrite it afterwards. Folding it into the fingerprint therefore meant
-			// merge could never see a stable input: every build changed the corpus
-			// after merge recorded it, so the next build replayed merge — a 22 GB
-			// restore, a fold and a publish, about an hour with paragraphs behind it,
-			// on a corpus nothing had added to. Measured on 2026-09-03, where merge
-			// re-ran with `ingest` freshly DECLINED and no shard carrying a clause.
-			//
-			// The shards above ARE the inputs: they are what there is to fold. If
-			// there is nothing new in them, ingest declines, its provenance carries,
-			// and merge skips — which is the whole design. A corpus swapped from
-			// underneath (a fresh `seed`) still replays merge, because seed sits
-			// upstream of it and its provenance propagates down the chain.
-			return in, nil
-		},
-		Heavy: true,
+		// The corpus and its delta anchor, published together by the fold — the
+		// same pair ingest-etsi's single output stands for on the other arm.
 		Outputs: func(c *Ctx) []string {
 			return []string{c.dataPath("3gpp.duckdb"), filepath.Join(c.Local, "corpus-index.json")}
 		},
@@ -624,7 +571,7 @@ func stepMerge() *Step {
 			out, err := c.Output(Cmd{Name: c.bin("dbcount"), Args: []string{"--db", c.dataPath("3gpp.duckdb")}})
 			if err != nil {
 				return stillOpenElsewhere("3gpp.duckdb",
-					fmt.Errorf("the merged DB does not open: %w", err))
+					fmt.Errorf("the corpus DB does not open: %w", err))
 			}
 			if !strings.Contains(out, "spec_versions=") {
 				return fmt.Errorf("dbcount produced no counters")
@@ -632,106 +579,318 @@ func stepMerge() *Step {
 			return nil
 		},
 		Run: func(c *Ctx) error {
-			shardDir := filepath.Join(c.Local, "shards")
-			var shards []string
-			if ents, err := os.ReadDir(shardDir); err == nil {
-				for _, e := range ents {
-					if strings.HasSuffix(e.Name(), ".duckdb") {
-						shards = append(shards, filepath.Join(shardDir, e.Name()))
-					}
+			gained, nSeries, err := parseShards(c)
+			if err != nil {
+				return err
+			}
+
+			cur, err := foldIdentity(c)
+			if err != nil {
+				return err
+			}
+			st, err := loadFoldState(c, cur)
+			if err != nil {
+				return err
+			}
+			why := foldReason(gained, st, cur, c.Cfg("full") == "1")
+			if why == "" {
+				// The anchor must still exist for the next discover. A missing one
+				// used to replay `merge` for it; here it is regenerated from the
+				// corpus, which is cheap and folds nothing.
+				if err := ensureCorpusIndex(c); err != nil {
+					return err
 				}
+				return fmt.Errorf("%w: the corpus already held every converted spec in %d series — "+
+					"no shard gained a clause, and the last fold is current", ErrDeclined, nSeries)
 			}
-			db := c.dataPath("3gpp.duckdb")
-			if len(shards) == 0 {
-				c.Log.Printf("no shard to fold — the corpus is unchanged")
-				// The anchor must still exist for the next discover; if it does
-				// not, regenerate it from the current DB rather than leaving the
-				// delta unanchored.
-				return ensureCorpusIndex(c)
-			}
+			c.Log.Printf("fold: %s", why)
 
-			// GIVE THE WRITE SIDE BACK THE SHAPE IT KNOWS, BEFORE IT TOUCHES THE CORPUS.
-			//
-			// `merge --base` compact-copies the base table by table, from
-			// duckdb_tables(). A converted corpus serves `clauses` as a VIEW, which
-			// is not a table, so the copy leaves it behind and schema.sql recreates
-			// it EMPTY in the destination. merge then folds the changed buckets into
-			// that empty table, and the result is a corpus whose `clauses` holds the
-			// increment while `clause_occ` still holds every occurrence — with
-			// max_chunk_id() reading 0 and handing the shard chunk_ids that collide
-			// with the ones already there, and changed_buckets() seeing an empty
-			// table and calling every bucket changed.
-			//
-			// Restoring first costs one grouped reconstruction (1 m 47 for 2.87 GB,
-			// measured) and keeps ADR 0004's storage layout entirely on this side of
-			// the write/read split, which is where ADR 0001 put it. The `paragraphs`
-			// step converts again afterwards, from a `clauses` that is once more
-			// whole — so its own refusal to rebuild from a delta never has to fire.
-			//
-			// After the shard check on purpose: a run with nothing to fold must not
-			// restore, or every no-op run would undo the conversion and re-do it.
-			if err := ensureWriteShape(c, db); err != nil {
+			// PENDING BEFORE THE FOLD TOUCHES ANYTHING, so a fold that dies is
+			// retried even though the retry's parse will report nothing new.
+			pending := foldState{Pending: true}
+			if st != nil {
+				pending.Impl = st.Impl
+			}
+			if err := saveFoldState(c, pending); err != nil {
 				return err
 			}
-			tmp := db + ".new"
-			args := []string{
-				"--out", tmp,
-				"--index-out", filepath.Join(c.Local, "corpus-index.json.new"),
-				"--subject-index-out", filepath.Join(c.Local, "subject-index.json.new"),
-				"--build-index-out", filepath.Join(c.Local, "build-index.json.new"),
-				// HNSW is built by the `index` step, AFTER the vectors exist.
-				"--no-hnsw",
-			}
-			if fileNonEmpty(db) && c.Cfg("full") != "1" {
-				args = append(args, "--base", db)
-				c.Log.Printf("incremental merge on the existing corpus (bucket replacement per spec+release)")
-			}
-			args = append(args, shards...)
-			c.Log.Printf("folding %d shard(s)", len(shards))
-			if err := c.Run(Cmd{Name: c.rbin("merge"), Args: args, Echo: true}); err != nil {
+			if err := foldShards(c); err != nil {
 				return err
 			}
-
-			// A MERGE MUST NOT PUBLISH A SMALLER CORPUS THAN THE ONE IT REPLACES.
-			//
-			// merge folds shards by replacing the bucket for each (spec, release) it
-			// carries, so a shard built from an incomplete source tree replaces a full
-			// bucket with a partial one — and the loss is silent, because every later
-			// gate measures the corpus against ITSELF. This is the same shape as the
-			// paragraph migration that cut clause_occ to 5% with all gates green.
-			//
-			// It is not hypothetical on a machine that has already published. Sources
-			// are pruned once converted (purgeConvertedZips, and the archives go with
-			// them), so a box holding a finished 20 163-version corpus can be left
-			// with 1 410 converted files — 7%. Re-running the acquisition chain there
-			// rebuilds the corpus from what survived, and nothing downstream objects.
-			//
-			// The check runs BEFORE publishCorpus, which is the last moment the old
-			// corpus still exists. Refusing costs a failed step and the merge output
-			// on disk to inspect; not refusing costs the corpus.
-			if err := refuseCorpusShrink(c, db, tmp); err != nil {
-				return err
-			}
-
-			// Publish the new corpus and its anchor TOGETHER, and only after the
-			// merge succeeded. Publishing the index first would let a crash leave
-			// an anchor claiming a corpus state that was never written — the next
-			// discover would then believe it is up to date and silently skip work.
-			if err := publishCorpus(tmp, db); err != nil {
-				return err
-			}
-			for _, n := range []string{"corpus-index.json", "subject-index.json", "build-index.json"} {
-				src := filepath.Join(c.Local, n+".new")
-				if fileNonEmpty(src) {
-					if err := os.Rename(src, filepath.Join(c.Local, n)); err != nil {
-						return err
-					}
-				}
-			}
-			c.Log.Printf("corpus and delta anchor published atomically")
-			return nil
+			return saveFoldState(c, foldState{Impl: cur})
 		},
 	}
+}
+
+// parseShards runs the Rust parse once per series of the delta, each into its own
+// shard, and reports whether any shard GAINED a clause.
+func parseShards(c *Ctx) (gained bool, nSeries int, err error) {
+	series := seriesOf(c)
+	if len(series) == 0 {
+		c.Log.Printf("delta is empty — no shard to (re)build")
+		return false, 0, nil
+	}
+	shardDir := filepath.Join(c.Local, "shards")
+	if err := os.MkdirAll(shardDir, 0o755); err != nil {
+		return false, 0, err
+	}
+	for i, s := range series {
+		db := filepath.Join(shardDir, s+".duckdb")
+		c.Log.Printf("ingest series %s (%d/%d)", s, i+1, len(series))
+		// --resume consults ingest_log, stamped with PIPELINE_VERSION:
+		// already-ingested (spec, version) pairs are skipped, and a parser
+		// or schema change invalidates the log wholesale. That is the
+		// per-unit checkpoint; we do not add a second ledger beside it.
+		//
+		// --corpus widens that question from "did THIS shard ingest it" to
+		// "does the corpus already hold it". ingest_log lives in the shard,
+		// and a shard is scratch: delete it and the ledger is empty, so a
+		// series is parsed and written again in full. That re-ingested
+		// ~300 000 clauses on 2026-08-25 to acquire five specs.
+		ingestArgs := []string{
+			"--series", s,
+			"--convert", c.dataPath("sources", "convert"),
+			"--db", db,
+			"--resume",
+		}
+		if corpus := c.dataPath("3gpp.duckdb"); fileNonEmpty(corpus) {
+			ingestArgs = append(ingestArgs, "--corpus", corpus)
+		}
+		if err := c.Run(Cmd{Name: c.rbin("ingest"), Args: ingestArgs, Echo: true}); err != nil {
+			return false, len(series), err
+		}
+		c.Checkpoint("last_series", s)
+		c.Checkpoint("done", fmt.Sprintf("%d/%d", i+1, len(series)))
+	}
+
+	// Having parsed every series is not the same as having added anything.
+	// `--resume --corpus` skips whatever the corpus already holds, so a pass over a
+	// converted tree that is entirely already-held ends with every shard empty —
+	// and used to publish a fresh provenance anyway, which sent the fold over 22 GB
+	// and enrich behind it to reproduce a corpus nobody changed. Measured on
+	// 2026-09-03: 19 series, every one of them "0 spec(s), 0 clause(s)", followed by
+	// a full merge.
+	//
+	// The binary's own per-series tally is the evidence; nothing else knows what
+	// --resume decided to skip.
+	b, err := os.ReadFile(c.Log.Path())
+	if err != nil {
+		// Unreadable is not "nothing": treat it as work, as ingestedNothing does.
+		return true, len(series), nil
+	}
+	return !ingestedNothing(string(b)), len(series), nil
+}
+
+// foldImpl is the part of `ingest` that folds the shards into the corpus: the
+// Rust merge binary, the store library it links, and the Go restore that runs
+// before it. It is both declared in the step's Impl and hashed on its own, so the
+// step can tell "the parser changed" (re-parse, which --resume makes cheap) from
+// "the fold changed" (re-fold, which is what `merge` did when this was its Impl).
+var foldImpl = []string{"rust/store/src/bin/merge.rs", "rust/store/src/lib.rs", "cmd/migrate-paragraphs"}
+
+// foldState is what fold-state.json records between runs. See stepIngest3GPP.
+type foldState struct {
+	// Pending means shards may hold clauses the corpus does not: a fold was
+	// started and has not been seen to complete.
+	Pending bool `json:"pending"`
+	// Impl is the per-file identity of foldImpl at the last COMPLETED fold.
+	Impl map[string]string `json:"implementation,omitempty"`
+}
+
+func foldStatePath(c *Ctx) string { return c.statePath("fold-state.json") }
+
+// foldIdentity hashes foldImpl exactly as the fingerprint hashes Impl, test files
+// excluded as the step excludes them.
+func foldIdentity(c *Ctx) (map[string]string, error) {
+	_, per, err := implHash(c.Root, foldImpl, true)
+	return per, err
+}
+
+// loadFoldState reads fold-state.json.
+//
+// When there is none — the first run after `merge` stopped being a step — it
+// ADOPTS the last `merge` record rather than folding again: a successful merge
+// whose implementation matches the current fold file for file is precisely "the
+// last completed fold is current", and re-proving it would cost 34 minutes, a
+// rewritten corpus and a 22 GB layer re-push. Anything short of that match
+// returns nil, which folds.
+func loadFoldState(c *Ctx, cur map[string]string) (*foldState, error) {
+	b, err := os.ReadFile(foldStatePath(c))
+	if err == nil {
+		var st foldState
+		if err := json.Unmarshal(b, &st); err != nil {
+			// A state file nobody can read proves nothing: fold.
+			c.Log.Printf("fold-state.json is unreadable (%v) — folding to re-establish it", err)
+			return nil, nil
+		}
+		return &st, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	b, err = os.ReadFile(c.statePath("steps", "merge.json"))
+	if err != nil {
+		return nil, nil
+	}
+	var legacy Record
+	if json.Unmarshal(b, &legacy) != nil || legacy.Status != StatusSuccess || !implCovers(legacy.Impl, cur) {
+		return nil, nil
+	}
+	st := foldState{Impl: cur}
+	if err := saveFoldState(c, st); err != nil {
+		return nil, err
+	}
+	c.Log.Printf("fold state adopted from the last successful `merge` (%s)", legacy.FinishedAt.Format(time.RFC3339))
+	return &st, nil
+}
+
+// implCovers reports whether every file of cur carries the same identity in rec.
+// rec may hold MORE keys — the old `merge` record counted cmd/migrate-paragraphs'
+// main_test.go, which the fold no longer does — but none of cur's may be missing
+// or different.
+func implCovers(rec, cur map[string]string) bool {
+	if len(cur) == 0 {
+		return false
+	}
+	for k, v := range cur {
+		if rec[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func saveFoldState(c *Ctx, st foldState) error {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(foldStatePath(c)), 0o755); err != nil {
+		return err
+	}
+	return WriteAtomic(foldStatePath(c), append(b, '\n'))
+}
+
+// foldReason says why the shards must be folded, or "" when there is nothing to
+// fold. It is the whole decision, kept free of I/O so every case is testable.
+func foldReason(gained bool, st *foldState, cur map[string]string, full bool) string {
+	switch {
+	case full:
+		return "a full rebuild was requested"
+	case gained:
+		return "the parse added clauses to the shards"
+	case st == nil:
+		return "no completed fold is on record"
+	case st.Pending:
+		return "the previous fold did not complete"
+	case !sameMap(st.Impl, cur):
+		return "the fold's implementation changed: " + summarise(diffKeys(st.Impl, cur))
+	}
+	return ""
+}
+
+// foldShards folds every shard into data/3gpp.duckdb and publishes the corpus and
+// its delta anchor together. It is what the `merge` step's Run did, unchanged.
+func foldShards(c *Ctx) error {
+	shardDir := filepath.Join(c.Local, "shards")
+	var shards []string
+	if ents, err := os.ReadDir(shardDir); err == nil {
+		for _, e := range ents {
+			if strings.HasSuffix(e.Name(), ".duckdb") {
+				shards = append(shards, filepath.Join(shardDir, e.Name()))
+			}
+		}
+	}
+	db := c.dataPath("3gpp.duckdb")
+	if len(shards) == 0 {
+		c.Log.Printf("no shard to fold — the corpus is unchanged")
+		// The anchor must still exist for the next discover; if it does
+		// not, regenerate it from the current DB rather than leaving the
+		// delta unanchored.
+		return ensureCorpusIndex(c)
+	}
+
+	// GIVE THE WRITE SIDE BACK THE SHAPE IT KNOWS, BEFORE IT TOUCHES THE CORPUS.
+	//
+	// `merge --base` compact-copies the base table by table, from
+	// duckdb_tables(). A converted corpus serves `clauses` as a VIEW, which
+	// is not a table, so the copy leaves it behind and schema.sql recreates
+	// it EMPTY in the destination. merge then folds the changed buckets into
+	// that empty table, and the result is a corpus whose `clauses` holds the
+	// increment while `clause_occ` still holds every occurrence — with
+	// max_chunk_id() reading 0 and handing the shard chunk_ids that collide
+	// with the ones already there, and changed_buckets() seeing an empty
+	// table and calling every bucket changed.
+	//
+	// Restoring first costs one grouped reconstruction (1 m 47 for 2.87 GB,
+	// measured) and keeps ADR 0004's storage layout entirely on this side of
+	// the write/read split, which is where ADR 0001 put it. The `paragraphs`
+	// step converts again afterwards, from a `clauses` that is once more
+	// whole — so its own refusal to rebuild from a delta never has to fire.
+	//
+	// After the shard check on purpose: a run with nothing to fold must not
+	// restore, or every no-op run would undo the conversion and re-do it.
+	if err := ensureWriteShape(c, db); err != nil {
+		return err
+	}
+	tmp := db + ".new"
+	args := []string{
+		"--out", tmp,
+		"--index-out", filepath.Join(c.Local, "corpus-index.json.new"),
+		"--subject-index-out", filepath.Join(c.Local, "subject-index.json.new"),
+		"--build-index-out", filepath.Join(c.Local, "build-index.json.new"),
+		// HNSW is built by the `index` step, AFTER the vectors exist.
+		"--no-hnsw",
+	}
+	if fileNonEmpty(db) && c.Cfg("full") != "1" {
+		args = append(args, "--base", db)
+		c.Log.Printf("incremental fold on the existing corpus (bucket replacement per spec+release)")
+	}
+	args = append(args, shards...)
+	c.Log.Printf("folding %d shard(s)", len(shards))
+	if err := c.Run(Cmd{Name: c.rbin("merge"), Args: args, Echo: true}); err != nil {
+		return err
+	}
+
+	// A FOLD MUST NOT PUBLISH A SMALLER CORPUS THAN THE ONE IT REPLACES.
+	//
+	// merge folds shards by replacing the bucket for each (spec, release) it
+	// carries, so a shard built from an incomplete source tree replaces a full
+	// bucket with a partial one — and the loss is silent, because every later
+	// gate measures the corpus against ITSELF. This is the same shape as the
+	// paragraph migration that cut clause_occ to 5% with all gates green.
+	//
+	// It is not hypothetical on a machine that has already published. Sources
+	// are pruned once converted (purgeConvertedZips, and the archives go with
+	// them), so a box holding a finished 20 163-version corpus can be left
+	// with 1 410 converted files — 7%. Re-running the acquisition chain there
+	// rebuilds the corpus from what survived, and nothing downstream objects.
+	//
+	// The check runs BEFORE publishCorpus, which is the last moment the old
+	// corpus still exists. Refusing costs a failed step and the merge output
+	// on disk to inspect; not refusing costs the corpus.
+	if err := refuseCorpusShrink(c, db, tmp); err != nil {
+		return err
+	}
+
+	// Publish the new corpus and its anchor TOGETHER, and only after the
+	// merge succeeded. Publishing the index first would let a crash leave
+	// an anchor claiming a corpus state that was never written — the next
+	// discover would then believe it is up to date and silently skip work.
+	if err := publishCorpus(tmp, db); err != nil {
+		return err
+	}
+	for _, n := range []string{"corpus-index.json", "subject-index.json", "build-index.json"} {
+		src := filepath.Join(c.Local, n+".new")
+		if fileNonEmpty(src) {
+			if err := os.Rename(src, filepath.Join(c.Local, n)); err != nil {
+				return err
+			}
+		}
+	}
+	c.Log.Printf("corpus and delta anchor published atomically")
+	return nil
 }
 
 // corpusShrinkOverride names the escape hatch for the one legitimate case: an
