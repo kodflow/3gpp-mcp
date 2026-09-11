@@ -99,7 +99,7 @@ func goodServed() *fakeServed {
 // its own — and each arm's metrics come from its own answers.
 func TestTheServedGateScoresEachArmThroughSearchSpec(t *testing.T) {
 	f := goodServed()
-	run, err := scoreServed(servedSet, f.call, true)
+	run, err := scoreServed(servedSet, f.call, true, nil)
 	if err != nil {
 		t.Fatalf("a served path that ranks well was refused: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestTheServedGateScoresEachArmThroughSearchSpec(t *testing.T) {
 func TestTheServedGateRefusesADegradedMode(t *testing.T) {
 	f := goodServed()
 	f.mode = map[string]string{"hybrid": "lexical"}
-	if _, err := scoreServed(servedSet, f.call, true); err == nil || !strings.Contains(err.Error(), `was served "lexical"`) {
+	if _, err := scoreServed(servedSet, f.call, true, nil); err == nil || !strings.Contains(err.Error(), `was served "lexical"`) {
 		t.Fatalf("a hybrid arm answered in lexical mode and the gate scored it: %v", err)
 	}
 	// mode_degraded alone is enough, whatever `mode` says.
@@ -155,13 +155,13 @@ func TestTheServedGateRefusesADegradedMode(t *testing.T) {
 func TestTheServedGateRefusesARerankArmThatDidNotRerank(t *testing.T) {
 	f := goodServed()
 	f.pages["rerank"] = f.pages["hybrid"]
-	_, err := scoreServed(servedSet, f.call, true)
+	_, err := scoreServed(servedSet, f.call, true, nil)
 	if err == nil || !strings.Contains(err.Error(), "cross-encoder did not reorder") {
 		t.Fatalf("the rerank arm returned the hybrid pages and the gate scored it: %v", err)
 	}
 	// The control: ONE reordered page is a reranker that acted (goodServed differs
 	// on q1 only).
-	if _, err := scoreServed(servedSet, goodServed().call, true); err != nil {
+	if _, err := scoreServed(servedSet, goodServed().call, true, nil); err != nil {
 		t.Errorf("a reranker that reordered one page was refused: %v", err)
 	}
 }
@@ -174,12 +174,12 @@ func TestTheServedGateRefusesAnAnswerTheETSIHalfDroppedOutOf(t *testing.T) {
 	// The shape measured under DUCKDB_MEMORY_LIMIT=4GB: the ETSI half gone, and the
 	// relevant clause promoted because the noise left with it.
 	f.pages["hybrid"]["q2"] = [][2]string{{"33.128", "6.2.3.2"}, {"33.127", "6.2.3.3"}}
-	_, err := scoreServed(servedSet, f.call, true)
+	_, err := scoreServed(servedSet, f.call, true, nil)
 	if !errors.Is(err, errETSIDropped) || !strings.Contains(err.Error(), "hybrid") || !strings.Contains(err.Error(), "q2") {
 		t.Fatalf("a hybrid page with no ETSI hit was scored with etsi.duckdb attached: %v", err)
 	}
 	// Without the ETSI half attached, a 3GPP-only page is the product.
-	if _, err := scoreServed(servedSet, f.call, false); err != nil {
+	if _, err := scoreServed(servedSet, f.call, false, nil); err != nil {
 		t.Errorf("a 3GPP-only page was refused with no ETSI half attached: %v", err)
 	}
 }
@@ -195,11 +195,11 @@ func TestTheServedGateRefusesAnAnswerItCannotScore(t *testing.T) {
 		},
 		"transport": func(string, map[string]any) (map[string]any, error) { return nil, fmt.Errorf("EOF") },
 	} {
-		if _, err := scoreServed(servedSet, call, true); err == nil {
+		if _, err := scoreServed(servedSet, call, true, nil); err == nil {
 			t.Errorf("%s: the gate scored an answer it could not read", name)
 		}
 	}
-	if _, err := scoreServed(nil, goodServed().call, true); err == nil {
+	if _, err := scoreServed(nil, goodServed().call, true, nil); err == nil {
 		t.Error("an empty judged set was scored — nothing scored cannot regress")
 	}
 }

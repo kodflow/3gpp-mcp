@@ -127,9 +127,9 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, p := range passages {
-		enc, err := r.tok.EncodePair(query, p, true)
+		enc, err := encodePair(r.tok, forTokenizer(query), forTokenizer(p))
 		if err != nil {
-			return fmt.Errorf("tokenize pair: %w", err)
+			return fmt.Errorf("tokenize pair %d: %w", i, err)
 		}
 		ids := enc.Ids
 		if len(ids) > rrMaxTokens {
@@ -185,6 +185,21 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 		dst[i] = 1.0 / (1.0 + math.Exp(-float64(logits[i])))
 	}
 	return nil
+}
+
+// encodePair is the tokenizer call with its panics turned into errors.
+//
+// forTokenizer removes the input shape known to panic (see there); this is for
+// the next one. A panic here unwinds into mcp-go's stdio worker, which recovers
+// it and sends NO response, so the client hangs; an error makes Engine.rerank
+// keep the fused order and the call answers.
+func encodePair(tok *tokenizer.Tokenizer, query, passage string) (enc *tokenizer.Encoding, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("the tokenizer panicked on a %d-byte passage: %v", len(passage), r)
+		}
+	}()
+	return tok.EncodePair(query, passage, true)
 }
 
 func envOr(key, def string) string {
