@@ -35,9 +35,19 @@ func stepBuildEmbedder() *Step {
 		Run: func(c *Ctx) error {
 			target := filepath.Join(c.Local, "cargo-target")
 			c.Log.Printf("cargo build rust/embedder (pulls ONNX Runtime; first build is long)")
+			// --locked, the rule build-rust and test have followed since #323 and
+			// build-image.sh since 6cafdc7: without it cargo may re-resolve and
+			// REWRITE rust/embedder/Cargo.lock as a side effect of the build, the drift
+			// that moved rust/discover/Cargo.lock mid-step on 2026-09-10. This step's
+			// Impl names the whole crate, lockfile included, so a rewrite would also
+			// move the fingerprint it had just recorded. Verified before it was added
+			// (2026-09-11): `cargo metadata --locked --format-version 1 --manifest-path
+			// rust/embedder/Cargo.toml` exits 0, so no build that was correct changes.
+			// TestEveryCargoCommandThePipelineRunsIsLocked reads every cargo command
+			// in this package.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release", "--manifest-path", "rust/embedder/Cargo.toml", "--bin", "embedder"},
+				Args: []string{"build", "--release", "--locked", "--manifest-path", "rust/embedder/Cargo.toml", "--bin", "embedder"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
 				Echo: true,
 			}); err != nil {
@@ -1031,7 +1041,29 @@ func stepValidate(t corpusTarget) *Step {
 		Version: 2,
 		Doc:     "run the data-completeness contract against the finished corpus",
 		Deps:    t.validateDeps(),
-		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
+		Impl: []string{
+			"cmd/validate", "cmd/anchorcheck",
+			// THE PACKAGES BOTH BINARIES LINK, AND THE MODULE GRAPH, because the
+			// verdict is computed in them and build-go is a Tool dep.
+			//
+			// This list named the two commands and nothing they import. The verdict
+			// does not live in cmd/ alone: validate reads the embed floor through
+			// model.ReleaseOrdinal (cmd/validate/main.go:203), compares the corpus's
+			// sparse stamp against embed.SparseModelID() (:271), and decides the
+			// re-ingest check in store.SummariseReingested (:682); anchorcheck opens the
+			// corpus through internal/store. build-go relinks both binaries when any
+			// of these moves, and a dirty Tool dep invalidates no consumer. So an edit
+			// there left this step "fingerprint unchanged, outputs present and valid"
+			// — SKIP, the new check never run — while smoke and publish, which name
+			// the same packages, replayed and recorded the image as having passed a
+			// contract the edited validate never evaluated. A DuckDB bump in go.mod
+			// reached the gate the same way. Found by review on 2026-09-11;
+			// TestValidateDeclaresEveryPackageItsBinariesLink holds this list to
+			// `go list -deps` of both commands under build-go's own tags.
+			"internal/embed", "internal/model", "internal/store",
+			"go.mod", "go.sum",
+			"scripts/data-contract.sh", "contracts/accepted-absences.txt",
+		},
 		// The step RUNS cmd/validate and cmd/anchorcheck; a _test.go cannot change
 		// what either binary checks. Both arms counted them until 2026-09-11,
 		// recorded in countsTestFiles as cheap to replay — 2m32 and 17.6 s (build E).
@@ -1042,8 +1074,10 @@ func stepValidate(t corpusTarget) *Step {
 		// it before the first blob moved on 2026-09-10 (build-image.sh), for an image
 		// that differs from the last one by nothing but the commit stamped into its
 		// binary. cmd/validate holds six test files and cmd/anchorcheck one — seven
-		// of the eleven files this step hashed, four now — so a test-only commit in
-		// either paid all of that.
+		// of the eleven files this step hashed then — so a test-only commit in
+		// either paid all of that. It matters more since the three packages above
+		// joined the list: 44 files hashed, and 79 test artefacts left out, 45 of
+		// them internal/store's.
 		ExcludeTests: true,
 		// THE CONTRACT THE GATE APPLIED IS A DETERMINANT OF ITS VERDICT, and until
 		// 2026-09-11 it was not in the fingerprint.
@@ -1234,8 +1268,17 @@ func stepSmoke() *Step {
 			// "fingerprint unchanged, outputs present and valid" — SKIP, with no
 			// probe run — while publish, whose Impl DID move, republished the broken
 			// server recorded as gated. Eight packages, 47 source files, were in that
-			// gap: this step hashed 50 files and now hashes 97. Found by review on
+			// gap: this step hashed 50 files and then 97. Found by review on
 			// 2026-09-11; TestSmokeJudgesEveryPackagePublishShips counts them.
+			//
+			// A ninth came the same day: internal/onnxrt, which only the image's
+			// `-tags "onnx,embed_ffi"` build links, so the untagged graph both
+			// closure tests read did not contain it (99 files now). server.exe,
+			// built lexical by build-go, cannot exercise it, and smoke replays on it
+			// anyway: this is the gate in front of the image that links it, and a
+			// probe replay is under a minute (53.7 s on 2026-09-11) against the image
+			// it guards. TestSmokeDeclaresEveryPackageItsBinariesLink reads each graph
+			// under the tags its binary is built with.
 		}, serverImplPackages()...),
 		// The step RUNS binaries; a _test.go cannot change what either of them does.
 		// It counted them until now, recorded in countsTestFiles as cheap to replay
@@ -1941,11 +1984,23 @@ func stepParagraphs(t corpusTarget) *Step {
 // compiles the workspace with neither, so it can never produce this binary.
 func stepBuildSparse() *Step {
 	return &Step{
-		Name:      "build-sparse",
-		Version:   1,
-		Doc:       "build the learned-lexical (sparse) corpus producer",
-		Deps:      []string{"toolchain"},
-		Impl:      []string{"rust/embed-core/src"},
+		Name:    "build-sparse",
+		Version: 1,
+		Doc:     "build the learned-lexical (sparse) corpus producer",
+		Deps:    []string{"toolchain"},
+		// THE MANIFEST AND THE LOCKFILE, NOT ONLY src. The build below is --locked,
+		// and --locked is only loud if the step runs: with src alone declared, an ort
+		// bump in Cargo.toml or a `cargo update` that rewrote Cargo.lock left this
+		// step "fingerprint unchanged" and embed-core-sparse linked against the
+		// previous versions, the "a fix that was not built is inert" trap. The
+		// lockfile is the crate's own: rust/Cargo.toml excludes embed-core from the
+		// workspace. This is a Tool, so the replay it costs is a relink (4.5 s on
+		// 2026-09-03) and moves no data step.
+		// TestEveryLockedCargoBuildDeclaresTheLockfileItObeys holds it.
+		//
+		// THE sparse STEPS DO NOT DECLARE THEM, deliberately and for now. See
+		// stepSparse.
+		Impl:      []string{"rust/embed-core/src", "rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock"},
 		Toolchain: true,
 		Tool:      true,
 		// A box without the sparse model still completes every other step: the
@@ -1960,9 +2015,16 @@ func stepBuildSparse() *Step {
 				feats = "ort,cuda"
 			}
 			c.Log.Printf("cargo build embed-core-sparse (--features %s)", feats)
+			// --locked: rust/embed-core/Cargo.lock is the lockfile publish has
+			// fingerprinted since 6cafdc7, and an unlocked build here was free to
+			// re-resolve and rewrite it, moving publish's fingerprint from inside a
+			// Tool (the 2026-09-10 rust/discover drift). `cargo metadata --locked
+			// --format-version 1 --manifest-path rust/embed-core/Cargo.toml` exits 0
+			// (2026-09-11), and the lockfile does not depend on --features, so ort and
+			// ort,cuda resolve from the same file.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release",
+				Args: []string{"build", "--release", "--locked",
 					"--manifest-path", "rust/embed-core/Cargo.toml",
 					"--features", feats, "--bin", "embed-core-sparse"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
@@ -2015,6 +2077,19 @@ func stepSparse(t corpusTarget) *Step {
 		// rust/store/src/vectors.rs carries set_sparse_many, sparse_chunk_ids and
 		// the term_id index handling — the import this step's whole cost lives in.
 		// It was in lib.rs, which this step never declared.
+		//
+		// rust/embed-core/Cargo.toml AND Cargo.lock ARE NOT HERE, AND THAT IS
+		// DEFERRED, NOT DECIDED (2026-09-11). They decide the ort and tokenizers
+		// embed-core-sparse runs with, and build-sparse now declares both. Adding
+		// them here is not the fix it looks like, measured: the last replay of each
+		// arm (2026-09-10, .local/state/steps/sparse*.json) exported a work list of
+		// 0, DECLINED in 158.7 s and 10.4 s and carried its provenance forward. So
+		// the two lines would cost those ~2m49 once, move nothing downstream, and
+		// re-embed nothing either: runSparse declines whenever every clause carries
+		// a posting, whichever binary wrote it. Postings that follow a lockfile
+		// change need the step's decision, not only its fingerprint, to know which
+		// build wrote them, and the first time that holds it re-embeds both corpora
+		// on the GPU. That wants its own decision.
 		Impl: []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs",
 			"rust/store/src/vectors.rs"},
 		// The corpus is not an input here either: compact rewrites it after this
@@ -2405,7 +2480,13 @@ func stepBuildServe() *Step {
 		Version: 1,
 		Doc:     "build the semantic server (onnx + embed_ffi) and stage its DLLs",
 		Deps:    []string{"toolchain", "build-go"},
-		Impl:    []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
+		// rust/embed-core's Cargo.toml and Cargo.lock for the reason build-sparse
+		// names them: the cdylib build below is --locked, and a flag that refuses a
+		// re-resolution only helps if a manifest or lockfile change runs the step at
+		// all. With src alone, an ort bump left server-full linking the previous
+		// embedder.
+		Impl: []string{"cmd/server", "internal", "rust/embed-core/src",
+			"rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock", "go.mod", "go.sum"},
 		// It LINKS a binary, which is the case ExcludeTests was written for and the
 		// one build-go and build-rust already set. It names `internal` whole, so
 		// every test under it counted — and `go build` compiles none of them. The
@@ -2422,9 +2503,11 @@ func stepBuildServe() *Step {
 		Run: func(c *Ctx) error {
 			target := filepath.Join(c.Local, "cargo-target-embedcore")
 			c.Log.Printf("cargo build embed-core cdylib (--features ort)")
+			// --locked, as build-sparse and build-image.sh build the same crate: the
+			// same lockfile, the same rewrite it prevents.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release",
+				Args: []string{"build", "--release", "--locked",
 					"--manifest-path", "rust/embed-core/Cargo.toml", "--features", "ort"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
 				Echo: true,

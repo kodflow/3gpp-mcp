@@ -2,7 +2,6 @@ package goal
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -28,15 +27,20 @@ import (
 // It reads publish's DECLARATION, not serverImplPackages: a package added to
 // publish's Impl by hand, beside the function, ships just the same and is held to
 // the same rule. What it selects are the Go packages under cmd/ and internal/ —
-// the server's closure. The image build's own tools (scripts/local/imgtar, zigcc,
-// elfneeded) run in no probe, and rust/embed-core is loaded only by the image's
-// embed_ffi build, never by the lexical server.exe smoke drives.
+// the server's closure — minus imageGuardPackages, the two commands publish runs
+// on this machine to decide whether to push, which ship nothing and run in no
+// probe. The image build's own tools (scripts/local/imgtar, zigcc, elfneeded) run
+// in no probe either, and rust/embed-core is loaded only by the image's embed_ffi
+// build, never by the lexical server.exe smoke drives.
 func TestSmokeJudgesEveryPackagePublishShips(t *testing.T) {
 	root := repoRootForTest()
 	smoke := stepSmoke()
 	var shipped []string
 	for _, p := range stepPublish().Impl {
 		if !strings.HasPrefix(p, "cmd/") && !strings.HasPrefix(p, "internal/") {
+			continue
+		}
+		if slices.Contains(imageGuardPackages(), p) {
 			continue
 		}
 		st, err := os.Stat(filepath.Join(root, filepath.FromSlash(p)))
@@ -65,55 +69,32 @@ func TestSmokeJudgesEveryPackagePublishShips(t *testing.T) {
 }
 
 // TestSmokeDeclaresEveryPackageItsBinariesLink holds smoke's Impl to the real
-// package graph of the two binaries it runs: server.exe for the probes, bench.exe
-// for the retrieval gate.
+// package graphs of everything it answers for: server.exe for the probes and
+// bench.exe for the retrieval gate, as build-go builds them, and the server the
+// image ships, which smoke is the last gate in front of.
 //
 // The test above proves smoke covers what publish DECLARES; this one proves the
 // declaration covers what the binaries LINK, so neither a new import in the server
 // nor one in bench can sit outside the gate's fingerprint. bench is the half no
 // other test reaches: its closure is not publish's business, and smoke's list used
 // to leave two of its packages out by argument rather than by measurement.
+//
+// EACH GRAPH UNDER THE TAGS ITS BINARY IS BUILT WITH, found by review on
+// 2026-09-11. This test asked `go list -deps` with no tags, which is none of the
+// three builds: build-go passes GOTAGS (duckdb_use_lib on Windows, read out of
+// scripts/local/toolchain-env.sh), and the image's server is `-tags
+// "onnx,embed_ffi"` for GOOS=linux, read out of build-image.sh. The last one links
+// internal/onnxrt, which no untagged graph contains, so smoke and publish both
+// left it out and both tests agreed. The union is the right set because smoke
+// judges all three: an edit to a package only the image's server links cannot be
+// probed by server.exe, and still has to replay the gate in front of the image, or
+// publish ships it recorded as gated.
 func TestSmokeDeclaresEveryPackageItsBinariesLink(t *testing.T) {
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("no go on PATH — this test compares against `go list -deps`")
-	}
-	impl := stepSmoke().Impl
-	for _, bin := range []string{"./cmd/server", "./cmd/bench"} {
-		deps := moduleDepsOf(t, bin)
-		if len(deps) < 2 {
-			t.Fatalf("go list -deps %s named %d in-module package(s); the reader is broken and this "+
-				"test would pass while checking nothing", bin, len(deps))
-		}
-		for _, rel := range deps {
-			if !declaresPath(impl, rel) {
-				t.Errorf("%s links %s, which smoke does not fingerprint: a change there rebuilds the "+
-					"binary smoke runs through build-go, a Tool dep, and smoke SKIPs over it", bin, rel)
-			}
-		}
-	}
-}
-
-// moduleDepsOf lists, relative to the module root, every package of THIS module
-// that `go list -deps pkg` reports.
-func moduleDepsOf(t *testing.T, pkg string) []string {
-	t.Helper()
-	// From the repository root: pkg is relative, and running from this package's
-	// directory is what once made TestPublishCoversEveryPackageTheServerLinks skip
-	// itself.
-	cmd := exec.Command("go", "list", "-deps", pkg)
-	cmd.Dir = repoRootForTest()
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("go list -deps %s failed in %s: %v", pkg, cmd.Dir, err)
-	}
-	const mod = "github.com/kodflow/3gpp-mcp/"
-	var rels []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if p := strings.TrimSpace(line); strings.HasPrefix(p, mod) {
-			rels = append(rels, strings.TrimPrefix(p, mod))
-		}
-	}
-	return rels
+	requireGo(t)
+	builds := append(buildGoSpecs(t, "server", "bench"), imageServerBuild(t))
+	checkDeclaresWhatItsBinariesLink(t, "smoke", stepSmoke().Impl, builds,
+		"a change there rebuilds a binary smoke answers for, through build-go (a Tool dep) or inside "+
+			"publish, and smoke SKIPs over it with no probe run")
 }
 
 // declaresPath reports whether an Impl list fingerprints rel: named outright, or
