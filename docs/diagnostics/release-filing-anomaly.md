@@ -162,6 +162,15 @@ Measured against today's live report:
 | `--emit-worklist` lines | 20 225 | 20 224 (one duplicate of `33816-a00.zip` collapsed; 1 re-filed) |
 | `--repair-plan` lines (the production path) | 201 | 201, **byte-identical** |
 
+And replayed against the report as it must have stood at crawl time — today's
+Rel-18/Rel-19 rows for these 16 specs, plus the 16 Rel-20 rows the corpus
+recorded:
+
+| | before | after |
+|---|---:|---:|
+| lines filed under Rel-20 | **16** | **0** (16 re-filed) |
+| `26510-i40.zip` | `Rel-20 …` | `Rel-18 …` |
+
 ## 4. The existing corpus: repair and price
 
 The 16 rows are **not repaired here**, and deleting them would be wrong: 12 of them
