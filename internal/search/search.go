@@ -510,6 +510,10 @@ func RRF(k float64, lists ...[]model.SearchHit) []model.SearchHit {
 	// identical calls. Found by the served retrieval gate (2026-09-11): one query's
 	// hybrid nDCG@10 read 0.50, then 0.43, on the same corpus. Release and version
 	// come AFTER clause_path, so every order the old comparison decided is kept.
+	// This is a DETERMINISTIC order among exact ties, not a recency order: nothing
+	// here claims one version is newer (that is (release, version, freeze_date),
+	// CLAUDE.md §8.3, and the store's job) — it only stops the page from changing
+	// between two identical calls.
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i].Clause, out[j].Clause
 		if out[i].Score != out[j].Score {
