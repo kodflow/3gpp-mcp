@@ -93,6 +93,30 @@ var reason string
 // reranking is the arm that had no such answer.
 func Reason() string { return reason }
 
+// forTokenizer is what a query or a passage looks like when it reaches the
+// cross-encoder's tokenizer: its trailing whitespace removed.
+//
+// THE TOKENIZER PANICS ON TRAILING CONTROL WHITESPACE. github.com/sugarme/tokenizer
+// v0.3.0, loaded with bge-reranker-v2-m3's tokenizer.json, answers
+//
+//	"Foreword\n"    slice bounds out of range [21:17]
+//	"5.1 Scope\n"   slice bounds out of range [24:19]
+//	"Foreword\t"    slice bounds out of range [21:17]
+//	"Foreword\r\n"  index out of range [10] with length 10
+//
+// while "Foreword", "Foreword " and "\nForeword" encode (measured 2026-09-11). The
+// engine builds every passage as heading + "\n" + text, so EVERY clause with an
+// empty body — a heading-only clause, ETSI's "0 1 0 1 1 5" code rows — ends in
+// "\n" and takes the whole call down. The first run of the served retrieval gate
+// found it: search_spec(rerank=true) for a judged query panicked inside the
+// stdio worker, which mcp-go recovers WITHOUT answering, so the client waited
+// forever.
+//
+// Trimming is neutral for the model: XLM-R's sentencepiece normalisation folds
+// whitespace into the ▁ prefix of the NEXT piece, so a trailing run contributes no
+// token in the reference tokenizer either.
+func forTokenizer(s string) string { return strings.TrimRightFunc(s, unicode.IsSpace) }
+
 func tokenSet(s string) map[string]bool {
 	m := map[string]bool{}
 	for _, t := range tokenize(s) {

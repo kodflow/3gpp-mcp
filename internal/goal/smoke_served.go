@@ -239,7 +239,10 @@ type servedRun struct {
 // scoreServed scores every arm over the set through call. It is the whole of the
 // measurement, with the server abstracted away, so a test can drive it with
 // canned answers.
-func scoreServed(set eval.Set, call toolCaller, etsiAttached bool) (*servedRun, error) {
+// logf, when not nil, receives one line per call — the arm, the query, the
+// latency and the ETSI share of the page — so a slow or stuck call is visible in
+// the step log while the gate runs, not only in its verdict.
+func scoreServed(set eval.Set, call toolCaller, etsiAttached bool, logf func(string, ...any)) (*servedRun, error) {
 	if len(set) == 0 {
 		return nil, errors.New("the judged query set is empty — there is nothing to score, and nothing scored " +
 			"cannot regress")
@@ -249,6 +252,7 @@ func scoreServed(set eval.Set, call toolCaller, etsiAttached bool) (*servedRun, 
 	for _, a := range servedArms {
 		start := time.Now()
 		rank := func(_ context.Context, q eval.Query) ([]eval.Ref, error) {
+			t0 := time.Now()
 			m, err := call("search_spec", servedArgs(q, a))
 			if err != nil {
 				return nil, fmt.Errorf("%s arm, query %s: %w", a.Key, q.ID, err)
@@ -262,6 +266,15 @@ func scoreServed(set eval.Set, call toolCaller, etsiAttached bool) (*servedRun, 
 					"attached: %w", a.Key, q.ID, errETSIDropped)
 			}
 			run.Ranked[a.Key] = append(run.Ranked[a.Key], refs)
+			if logf != nil {
+				etsi := 0
+				for _, r := range refs {
+					if strings.HasPrefix(r.SpecID, "ETSI ") {
+						etsi++
+					}
+				}
+				logf("  %-8s %-22s %6.1fs  %d hit(s), %d from ETSI", a.Key, q.ID, time.Since(t0).Seconds(), len(refs), etsi)
+			}
 			return refs, nil
 		}
 		per, avg, err := eval.Run(context.Background(), set, rank)
@@ -532,7 +545,7 @@ func runServedRetrievalGate(c *Ctx) error {
 		si.Semantic, si.Reranker, si.Hnsw, si.Sparse, si.Model, si.Etsi.Attached, si.Etsi.Hnsw)
 
 	scoring := time.Now()
-	run, err := scoreServed(set, srv.call, etsiAttached)
+	run, err := scoreServed(set, srv.call, etsiAttached, c.Log.Printf)
 	if err != nil {
 		return fmt.Errorf("SERVED RETRIEVAL GATE FAILED: %w", err)
 	}
