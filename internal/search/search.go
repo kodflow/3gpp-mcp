@@ -208,8 +208,15 @@ func (e *Engine) State() State {
 // aliases returned by store.AttachShards; empty restores single-DB behaviour.
 func (e *Engine) UseVectorShards(aliases []string) { e.vecShards = aliases }
 
-// SetName names the corpus this engine answers for, as its Reports say it.
+// SetName names the corpus this engine answers for, as its Reports say it, and
+// Name gives it back.
 func (e *Engine) SetName(name string) { e.name = name }
+func (e *Engine) Name() string        { return e.name }
+
+// RerankEvery reports the always-rerank toggle (RERANK_ALL, or the dashboard):
+// this engine reranks whether or not a request asks for it. A caller that reranks
+// the fusion itself has to know, or the cross-encoder runs twice.
+func (e *Engine) RerankEvery() bool { return e.rerankAll.Load() }
 
 // NewSharing builds an Engine over st that SHARES o's models — the query embedder
 // (with its cache) and the cross-encoder — instead of loading its own.
@@ -287,6 +294,13 @@ type Request struct {
 	TopK   int
 	Mode   string // "" | "hybrid" | "lexical" | "semantic"
 	Rerank bool   // when true and a reranker is enabled, re-score the fused window
+	// DeferRerank says the CALLER will rerank what it builds from this search, so
+	// this one must not — not for Rerank, and not for the always-rerank toggle
+	// either. It is how a federated search_spec gets ONE cross-encoder pass over
+	// the merged head instead of one per half (internal/mcp/federated_rerank.go).
+	// Suppressing only Rerank would leave RERANK_ALL=1 — the profile
+	// deploy/labs-8c32g-env.conf ships — running a pass per half AND the fused one.
+	DeferRerank bool
 }
 
 // Search retrieves and fuses (RRF) the lexical and/or vector ranked lists per
@@ -516,7 +530,7 @@ func (e *Engine) search(ctx context.Context, r Request, rep *Report) ([]model.Se
 	// Optional cross-encoder rerank: re-score a broad window of fused candidates
 	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order, and
 	// the report says the order is the fused one.
-	if r.Rerank || e.rerankAll.Load() {
+	if (r.Rerank || e.rerankAll.Load()) && !r.DeferRerank {
 		hits = e.rerankHead(bctx, r.Text, hits, rep, budgetSpent)
 	}
 

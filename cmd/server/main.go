@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -320,10 +321,23 @@ func serve(args []string) error {
 		etsiReader = etsiSt
 	}
 	// Warm every half in the background (search.Engine.Warm): the first dense query
-	// of a session loads the HNSW index — 21-28 s on the 3GPP half, measured — and
+	// of a session loads the HNSW index — 19-28 s on the 3GPP half, measured — and
 	// did so inside the client's search budget. MCP3GPP_NO_WARMUP=1 declines it.
+	//
+	// IT IS STOPPED AND WAITED FOR BEFORE THE CORPORA CLOSE. This defer is
+	// registered AFTER both stores' Close defers, so it runs BEFORE them: an
+	// untracked warm-up would otherwise still be querying a store this function is
+	// closing on its way out (Qodo, #348). Cancelling stops it between arms and
+	// between halves — a DuckDB query in flight is never cancelled, by design
+	// (storeCtxNote) — so the wait is bounded by the one query it is running.
 	if os.Getenv("MCP3GPP_NO_WARMUP") != "1" {
-		mcpOpts = append(mcpOpts, mcp.WithWarmup(func(format string, args ...any) {
+		warmCtx, stopWarm := context.WithCancel(ctx)
+		var warmed sync.WaitGroup
+		defer func() {
+			stopWarm()
+			warmed.Wait()
+		}()
+		mcpOpts = append(mcpOpts, mcp.WithWarmup(warmCtx, &warmed, func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "[3gpp-mcp] "+format+"\n", args...)
 		}))
 	}
