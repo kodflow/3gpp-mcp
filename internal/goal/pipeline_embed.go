@@ -80,10 +80,9 @@ func stepEmbed(t corpusTarget) *Step {
 		Version: 2,
 		Doc:     "vectorise the corpus on the GPU, reusing every already-seen content hash",
 		Deps:    append([]string{"build-embedder"}, t.singleProducer()...),
-		// data/3gpp.duckdb has two producers, not one: `merge` folds local shards
-		// into it, `seed` downloads the published snapshot. Both are supported
-		// paths to a vectorisable corpus. ETSI has a single producer, so it goes
-		// through Deps instead (AnyDeps rejects a one-element set on purpose).
+		// Each corpus has two producers, not one: `ingest` writes what was
+		// converted locally, `seed` downloads the published snapshot. Both are
+		// supported paths to a vectorisable corpus, on both arms.
 		AnyDeps: t.multiProducer(),
 		// rust/store/src/vectors.rs closes a FALSE NEGATIVE, and it is the mirror
 		// image of the one this file's provenance work has been fixing all along.
@@ -512,7 +511,9 @@ func stepEnrich(t corpusTarget) *Step {
 		Name:    "enrich",
 		Version: 1,
 		Doc:     "overlay the DynaReport catalogue, the 5GC OpenAPI corpus and the LI registry",
-		Deps:    []string{"merge"},
+		// ingest is the data edge, as ingest-etsi is enrich-etsi's. The tools are the
+		// binaries this step launches: four Rust overlays and two Go seeders.
+		Deps: []string{"ingest", "build-rust", "build-go"},
 		// The two fetch scripts are part of this step's implementation now that it
 		// runs them: changing how an overlay is acquired must replay the overlay.
 		// internal/evolseed is implementation here because this step now APPLIES
@@ -1152,7 +1153,7 @@ func stepValidate(t corpusTarget) *Step {
 			}
 			// THE ANCHOR IS A 3GPP ARTEFACT, and this is not the ETSI arm being
 			// treated as second class. The delta anchor is .local/corpus-index.json,
-			// which `merge` writes out of the 3GPP shards; the ETSI ingest produces
+			// which the 3GPP ingest's fold writes out of its shards; the ETSI ingest produces
 			// one database directly and there is no anchor to check against. Running
 			// anchorcheck here would point it at the 3GPP corpus from the ETSI gate,
 			// which is the same check twice under a name that says otherwise.
@@ -1776,7 +1777,7 @@ func corpus3GPP() corpusTarget {
 		Snapshot: func() bootstrap.CorpusSource {
 			return bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
 		},
-		Producers: []string{"merge", "seed"},
+		Producers: []string{"ingest", "seed"},
 	}
 }
 
@@ -1790,7 +1791,7 @@ func corpusETSI() corpusTarget {
 		Snapshot: func() bootstrap.CorpusSource {
 			return bootstrap.CorpusETSI(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
 		},
-		// seed-etsi joins ingest-etsi exactly as seed joins merge on the other arm:
+		// seed-etsi joins ingest-etsi exactly as seed joins ingest on the other arm:
 		// two producers, so they land in AnyDeps and either one moving is enough.
 		Producers: []string{"ingest-etsi", "seed-etsi"},
 	}
@@ -1802,9 +1803,9 @@ func (t corpusTarget) ledgerPath(c *Ctx) string { return filepath.Join(c.Local, 
 // singleProducer / multiProducer split the producer list between Deps and AnyDeps.
 //
 // AnyDeps deliberately rejects a one-element set — one alternative is a Dep in
-// disguise and would lose the ordinary dependency semantics. 3GPP has two
-// producers (merge OR seed) and belongs in AnyDeps; ETSI has one and belongs in
-// Deps. Encoding that here keeps the rule in one place instead of at each call.
+// disguise and would lose the ordinary dependency semantics. Both arms have two
+// producers today (ingest OR seed), so both land in AnyDeps; the split stays so an
+// arm with one producer would still be expressed correctly.
 func (t corpusTarget) singleProducer() []string {
 	if len(t.Producers) == 1 {
 		return t.Producers
@@ -1819,14 +1820,18 @@ func (t corpusTarget) multiProducer() []string {
 	return nil
 }
 
-// indexDeps: the vector index needs the vectors, and for 3GPP it also waits on
-// `enrich` -- the catalogue overlay rewrites rows, and rebuilding the index before
-// it would index a corpus that is about to change.
+// indexDeps: the vector index needs the vectors, the content-addressed conversion
+// (the vectors move to `bodies` there, and an index built before it would index
+// the table the step is about to drop) and its own corpus's compaction. build-go
+// because the index is built by cmd/freeze-hnsw.
 //
-// The ETSI arm names its own enrich TRANSITIVELY, through paragraphs-etsi: that
-// step depends on enrich-etsi (see paragraphsDeps), and enrich-etsi writes only
-// `acronyms`, a table no vector index reads. Listing it again here would be a
-// dependency that documents nothing the DAG does not already enforce.
+// THE SAME LIST ON BOTH ARMS. The 3GPP arm used to add `enrich` here — the
+// catalogue overlay rewrites rows, and the index must not be built before it —
+// while the ETSI arm named its enrich only transitively. Both constraints are
+// enforced by `paragraphs`, which depends on its arm's enrich (paragraphsDeps), so
+// the extra edge documented nothing the DAG did not already guarantee and made the
+// two index steps stand on different lists. Dropping a determinant replays nothing
+// (onlyDroppedDeterminants).
 //
 // BOTH ARMS NAME THEIR OWN COMPACTION. `COPY FROM DATABASE` does not carry custom
 // indexes and the bin therefore resets hnsw_state to "building", so an index
@@ -1835,15 +1840,7 @@ func (t corpusTarget) multiProducer() []string {
 // it used to be expressed by both arms naming the SAME `compact` step -- which
 // worked, and coupled the ETSI freeze to the 3GPP conversion for no reason.
 func (t corpusTarget) indexDeps() []string {
-	deps := []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact" + t.Suffix, "build-go"}
-	if t.Suffix == "" {
-		// The 3GPP index is built AFTER the corpus is content-addressed: the
-		// vectors move to `bodies` in that step, and an index built before it
-		// would index the table the step is about to drop.
-		// build-go because the index is now built by cmd/freeze-hnsw.
-		deps = append(deps, "enrich")
-	}
-	return deps
+	return []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact" + t.Suffix, "build-go"}
 }
 
 // compactDeps: after every writer that leaves dead blocks behind in THIS corpus.

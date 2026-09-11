@@ -126,15 +126,17 @@ func stepPublish() *Step {
 		Name:    "publish",
 		Version: 1,
 		Doc:     "compose the OCI image from the finished corpus and push it to the registry",
-		// BOTH halves, and the proof that they serve.
+		// BOTH halves, and the proof that they serve — through ONE edge.
 		//
-		// smoke is the last gate on the 3GPP side and starts the real server over
-		// stdio; index-etsi is the last WRITE to the ETSI half. Depending on smoke
-		// alone would not be enough: smoke and index-etsi are siblings in the graph
-		// (smoke depends on validate, index-etsi on compact), so nothing would order
-		// a publish after the ETSI freeze, and the image could carry an ETSI corpus
-		// whose HNSW is still "building" — which serve refuses.
-		Deps: []string{"smoke", "index-etsi"},
+		// smoke starts the real server over both stores, and it stands on validate
+		// AND validate-etsi, each of which stands on its own arm's index. So smoke
+		// is ordered after BOTH freezes, and so is this step. It used to add
+		// index-etsi here, from the time smoke depended on the 3GPP gate alone and
+		// nothing else ordered a publish after the ETSI freeze (an image carrying an
+		// ETSI HNSW still "building" is one serve refuses). validate-etsi closed that
+		// gap one level down; naming one arm's index here and not the other's was
+		// the last place the product step still told the arms apart.
+		Deps: []string{"smoke"},
 		Impl: append([]string{
 			buildImageScript,
 			"scripts/local/imgtar",

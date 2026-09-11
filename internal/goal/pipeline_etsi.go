@@ -182,7 +182,7 @@ func stepFetchETSI() *Step {
 	}
 }
 
-// stepCorpusETSI ingests the converted ETSI deliverables into data/etsi.duckdb.
+// stepIngestETSI ingests the converted ETSI deliverables into data/etsi.duckdb.
 //
 // Acquisition is `fetch-etsi`; this step is the ETSI analogue of `ingest`, and it
 // declares the Rust chain and nothing else.
@@ -199,7 +199,14 @@ func stepIngestETSI() *Step {
 		Name:    "ingest-etsi",
 		Version: 3,
 		Doc:     "ingest the converted ETSI deliverables into data/etsi.duckdb",
-		Deps:    []string{"fetch-etsi", "build-rust"},
+		// build-go, as on the 3GPP ingest: the Run below restores the write shape
+		// with cmd/migrate-paragraphs before the parse writes a row, and that is a
+		// Go binary. Neither the edge nor the source was declared, so `--only
+		// ingest-etsi` launched whatever migrate-paragraphs sat on disk and a change
+		// to the restore could not replay this step.
+		Deps: []string{"fetch-etsi", "build-rust", "build-go"},
+		// Test files are not determinants: no binary this step runs compiles them.
+		ExcludeTests: true,
 		// NAMED FILES, NOT THE CRATE. This step runs exactly one binary, `ingest`,
 		// whose source is rust/ingest/src/main.rs. It never invokes anything from
 		// rust/ingest/src/bin — ETSI has no Lawful-Interception registry, no 5GC
@@ -229,6 +236,9 @@ func stepIngestETSI() *Step {
 			// the binary, and build-rust is a Tool that never replays a data step.
 			"rust/Cargo.toml", "rust/Cargo.lock",
 			"internal/store/schema.sql",
+			// The write-shape restore the Run performs first (ensureWriteShape) —
+			// the same binary the 3GPP ingest runs before its fold.
+			"cmd/migrate-paragraphs",
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
 			// THE CONVERTED TREE IS THE INPUT NOW, not the work list. The work list
