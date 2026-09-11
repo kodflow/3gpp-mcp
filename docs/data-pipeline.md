@@ -113,7 +113,7 @@ dated releases, no elaborate delta engine.
 
 **The incremental path is not the blocker — it exists.** `rust/ingest --resume`
 is ledger-backed and corpus-aware, and `goal run` drives the whole 20-step
-pipeline (discover → fetch → ingest → merge → embed → enrich → index →
+pipeline (discover → fetch → ingest → embed → enrich → index →
 validate → smoke, plus the ETSI arm). What is missing is only the scheduled
 workflow that runs it unattended, and the reason is the runner: the embed step
 wants a GPU and a hosted runner has ~14 GB disk / 7 GB RAM. A full rebuild runs

@@ -27,7 +27,7 @@ Restrict the blast radius when iterating:
 
 ```bash
 .local/bin/goal run --only build-go,smoke
-.local/bin/goal run --from merge
+.local/bin/goal run --from ingest
 .local/bin/goal invalidate embed     # forget a step; it and its dependants replay
 ```
 
@@ -39,7 +39,7 @@ declared output exists, and the cheap validation passes. A present file is not
 proof; a timestamp is not proof; an old success is not proof.
 
 `RUN` reasons name the actual cause — `implementation changed: rust/parse/src/lib.rs`,
-`dependency merge is re-running`, `output missing: data/3gpp.duckdb`,
+`dependency ingest is re-running`, `output missing: data/3gpp.duckdb`,
 `validation failed: 17 clause(s) at/above Rel-99 still have no vector`.
 
 ## Expectations
