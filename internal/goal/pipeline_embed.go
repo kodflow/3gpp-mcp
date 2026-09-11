@@ -1359,6 +1359,7 @@ func stepSmoke() *Step {
 				"served_arms":          servedArmKeys(),
 				"served_tol":           servedTol,
 				"served_search_budget": servedSearchBudget,
+				"served_memory_limit":  servedMemoryLimit,
 			}, nil
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
