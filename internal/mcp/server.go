@@ -269,7 +269,12 @@ const snippetLimit = 600
 // behaves like lexical. It recomputes the reason independently of the serve-time
 // coherence guard (which may already have disabled VSS on a model mismatch).
 func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	dbModel := h.st.GetMeta(ctx, "embedding_model")
+	// Identity keys are read through metaReads, not GetMeta: a read that fails
+	// is reported as such (read_errors, a null field, an *_unreadable reason)
+	// instead of as an empty identity — see meta_reads.go.
+	meta := newMetaReads(ctx, h.st)
+	dbModel, dbModelOK := meta.get("embedding_model")
+	sparseModel, sparseModelOK := meta.get("sparse_model")
 	clientModel := h.eng.EmbedderModelID()
 	vss := h.st.VSSAvailable()
 
@@ -278,6 +283,8 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 	switch {
 	case !h.eng.EmbedderEnabled():
 		reason = "embedder_disabled (lexical binary or EMBEDDER=off)"
+	case !dbModelOK:
+		reason = meta.reason("embedding_model")
 	case dbModel == "":
 		reason = "no_vectors_in_db"
 	case dbModel != clientModel:
@@ -298,7 +305,9 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 	switch {
 	case !st.SparseEnabled && !h.eng.EmbedderEnabled():
 		sparseReason = "embedder_disabled"
-	case !st.SparseEnabled && h.st.GetMeta(ctx, "sparse_model") == "":
+	case !st.SparseEnabled && !sparseModelOK:
+		sparseReason = meta.reason("sparse_model")
+	case !st.SparseEnabled && sparseModel == "":
 		sparseReason = "no_sparse_postings_in_db"
 	case !st.SparseEnabled:
 		sparseReason = "model_has_no_sparse_head (bake data/models/bge-m3-sparse as the ACTIVE model)"
@@ -320,27 +329,31 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 		"hnsw":                   vss,
 		"sparse":                 st.SparseEnabled && st.SparseOn,
 		"sparse_reason":          sparseReason,
-		"sparse_model":           h.st.GetMeta(ctx, "sparse_model"),
+		"sparse_model":           meta.value("sparse_model"),
 		"reranker":               h.eng.RerankerEnabled(),
 		"reranker_reason":        rerankReason(h.eng.RerankerEnabled()),
-		"embedding_model_db":     dbModel,
+		"embedding_model_db":     meta.value("embedding_model"),
 		"embedding_model_client": clientModel,
-		"embed_floor":            h.st.GetMeta(ctx, "embed_floor"),
+		"embed_floor":            meta.value("embed_floor"),
 	}
+	meta.report(info)
 	// The ETSI half is SERVED ALONGSIDE, never merged, and was invisible here too.
 	// Its embedding identity is reported because it is computed per store: an ETSI
 	// corpus at a stale identity answers lexically while the 3GPP one does not, and
 	// this is the only place a client can see that has happened.
 	if h.etsi != nil {
-		etsiModel := h.etsi.GetMeta(ctx, "embedding_model")
-		info["etsi"] = map[string]any{
+		etsiMeta := newMetaReads(ctx, h.etsi)
+		etsiModel, etsiModelOK := etsiMeta.get("embedding_model")
+		block := map[string]any{
 			"attached":           true,
 			"fts":                h.etsi.FTSAvailable(),
 			"hnsw":               h.etsi.VSSAvailable(),
 			"sparse":             h.etsi.SparseAvailable(),
-			"embedding_model":    etsiModel,
-			"embedding_model_ok": etsiModel != "" && etsiModel == clientModel,
+			"embedding_model":    etsiMeta.value("embedding_model"),
+			"embedding_model_ok": etsiModelOK && etsiModel != "" && etsiModel == clientModel,
 		}
+		etsiMeta.report(block)
+		info["etsi"] = block
 	} else {
 		info["etsi"] = h.etsiDetached()
 	}

@@ -53,12 +53,20 @@ func (h *handlers) help(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallTo
 func inventoryOf(ctx context.Context, st store.Reader) map[string]any {
 	inv := map[string]any{
 		"attached":          true,
-		"embedding_model":   st.GetMeta(ctx, "embedding_model"),
-		"sparse_model":      st.GetMeta(ctx, "sparse_model"),
 		"content_addressed": st.ContentAddressed(),
 		"fts":               st.FTSAvailable(),
 		"hnsw":              st.VSSAvailable(),
 		"sparse":            st.SparseAvailable(),
+	}
+	// The identities follow the same rule as the counts, which GetMeta could not:
+	// it returns "" for a failed read, and "" is what "no vectors" looks like.
+	meta := newMetaReads(ctx, st)
+	for _, key := range []string{"embedding_model", "sparse_model"} {
+		if v, ok := meta.get(key); ok {
+			inv[key] = v
+		} else {
+			inv[key] = "unavailable: " + meta.errs[key]
+		}
 	}
 	count := func(key, q string) {
 		var n int64
