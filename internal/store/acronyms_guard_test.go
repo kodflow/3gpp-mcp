@@ -57,7 +57,7 @@ func TestTheDiffNamesACataloguedSpecTheSweepNoLongerHearsFrom(t *testing.T) {
 		seeded("SMF", "Session Management Function", "23.501"),
 		seeded("UE", "User Equipment", "23.501"),
 	}
-	diff, err := s.PlanSeededAcronyms(batch)
+	diff, err := s.PlanSeededAcronyms(batch, cleared)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,11 +79,11 @@ func TestTheDiffNamesACataloguedSpecTheSweepNoLongerHearsFrom(t *testing.T) {
 // would be deciding blind.
 func TestARefusedApprovalWritesNothing(t *testing.T) {
 	s := openScratch(t)
-	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, nil); err != nil {
+	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, cleared, nil); err != nil {
 		t.Fatal(err)
 	}
 	refusal := errors.New("refused by the test")
-	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, uaClean}, func(GlossaryDiff) error { return refusal })
+	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, uaClean}, cleared, func(GlossaryDiff) error { return refusal })
 	if !errors.Is(err, refusal) {
 		t.Fatalf("the approval's refusal was not returned: %v", err)
 	}

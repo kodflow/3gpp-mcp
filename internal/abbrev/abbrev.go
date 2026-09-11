@@ -87,7 +87,37 @@ const maxTermLen = 16
 // skipped, never guessed: "NG-RAN 5G Radio Access Network" is lost because its
 // expansion does not open on N, and losing it is the right trade against
 // inventing a term boundary.
-func Parse(text string) []Entry {
+func Parse(text string) []Entry { return parse(text, true) }
+
+// ParseLines returns what a clause declares ONE LINE AT A TIME: Parse with the
+// wrap rule — shape 2 above — switched off, and nothing else changed. The split,
+// the space-aligned rule, the change markers, Plausible and the deduplication
+// are Parse's own, so a key the two return is a key in the same shape.
+//
+// IT IS NOT A BETTER PARSER, AND THE MINER DOES NOT USE IT. The wrap rule is what
+// keeps NSSAAF whole, and the miner needs it. What this answers is a narrower
+// question the glossary seed asks of TS 21.905 alone: does the clause carry this
+// pair on a line of its own? That is how TS 21.905's own writer reads it — the
+// Rust ingest takes each line on its own and joins nothing — and where the wrap
+// rule guesses wrong, the line is still there. Measured 2026-09-11 on
+// TS 21.905 v19.2.0, verbatim:
+//
+//	SN<TAB>Serial Number          then "Serving Network" and "Sequence Number",
+//	                              alternative expansions whose term cell lost its
+//	                              tab, so Parse returns ONE entry holding all three
+//	OSP<TAB>Octet Stream Protocol then OSP:IHOSS, which Plausible rejects, and its
+//	                              wrapped tail "Service" — which Parse glues onto
+//	                              OSP, the last entry it ACCEPTED
+//
+// REQ gains "AKA", the tail of a RES line Plausible rejects, and X2-U gains
+// "application in 3G AKA)", the tail of XMAC: the OSP shape twice more. Parse
+// returns each of the four with the stray text glued on; ParseLines returns the
+// pair as the line prints it.
+func ParseLines(text string) []Entry { return parse(text, false) }
+
+// parse is the one reading behind Parse and ParseLines; joinWraps is the only
+// rule on which the two differ.
+func parse(text string, joinWraps bool) []Entry {
 	var out []Entry
 	seen := make(map[Entry]bool)
 	started := false
@@ -139,7 +169,7 @@ func Parse(text string) []Entry {
 			// AND NEVER ACROSS A CHANGE-REQUEST BOUNDARY: what follows a marker
 			// belongs to another change, so it cannot be the rest of the entry
 			// the marker closed.
-			if tabbedClause && started && !closed && len(out) > 0 {
+			if joinWraps && tabbedClause && started && !closed && len(out) > 0 {
 				if j := join(out[len(out)-1].Expansion, strings.TrimSpace(line)); j != "" {
 					delete(seen, out[len(out)-1])
 					out[len(out)-1].Expansion = j
