@@ -26,8 +26,8 @@ scripts/
 - LibreOffice→HTML conversion is the corpus build path (DECISION 2026-05-25,
   overrides the §13 DOCX-only rule). `lib/convert.sh` is the shared converter;
   `corpus.sh` orchestrates, `recover-fails.sh` retries failures with a long timeout.
-- Corpus artifacts live under `data/` (gitignored, ~37GB raw + ~37GB HTML); only
-  `corpus.lock` is tracked. Never commit corpus or `*.duckdb`.
+- Corpus artifacts live under `data/` (gitignored, ~37GB raw + ~37GB HTML); none of
+  it is tracked. Never commit corpus or `*.duckdb`.
 - External fetches pin immutable versions (Forge commit SHA, model revision) for
   reproducibility (CLAUDE.md §1: reproducible ingestion).
 - `install.sh` is pure retrieval — no Python, no Ollama, no daemon.

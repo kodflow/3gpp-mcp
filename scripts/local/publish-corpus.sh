@@ -4,7 +4,7 @@
 #
 #   ./scripts/local/publish-corpus.sh --dry-run     # do everything except the push
 #   ./scripts/local/publish-corpus.sh               # publish 3gpp-corpus + etsi-corpus
-#   ./scripts/local/publish-corpus.sh --only etsi   # just the ETSI one (23 MB, fast)
+#   ./scripts/local/publish-corpus.sh --only etsi   # just the ETSI one (19.6 GB, every published version)
 #
 # WHY THIS EXISTS. The corpus is built locally (ADR 0003) and the images are baked
 # by .github/workflows/corpus-data-image.yml, which does NOT read this machine: it
@@ -197,16 +197,57 @@ publish_one() {
   esac
 }
 
-# The gate. Baking a corpus that fails its own contract produces an image that
-# serves lexically while claiming semantic capability, and a registry is a much
-# worse place to discover that than a terminal.
+# THE GATE IS THE PIPELINE'S CONTRACT, ARM BY ARM, ASKED OF THE SAME FILE.
+#
+# Baking a corpus that fails its own contract produces an image that serves
+# lexically while claiming semantic capability, and a registry is a much worse
+# place to discover that than a terminal. This gate used to be a hand-written
+# DENSE contract on the 3GPP half alone: no --require-sparse, no --require-etsi,
+# no --require-no-reingest (the guard against a corpus holding copies of whole
+# documents — the ETSI leak of 566 clauses per build), and --only etsi checked
+# nothing at all. So the snapshot `seed` hands a fresh clone could carry what
+# `validate` refuses on this very machine.
+#
+# Now each arm being published is held to what scripts/data-contract.sh says for
+# that arm — the single source `validate` and `validate-etsi` ask too — under the
+# pipeline's default embed floor, and every arm is checked before any is pushed,
+# so a failing half cannot leave a half-published pair. DATA_CONTRACT still
+# loosens it on purpose, as everywhere else.
+#
+# The arguments reach validate as the pipeline passes them (cmd/goal
+# dataContractFlags, internal/goal validateArgs and stepValidate): DATA_ETSI_DB
+# points --require-etsi at the local layout; ETSI_ABSENCES, the register's
+# writer-side key, is the reader's when only it is set; the floor is applied by
+# data-contract.sh to the 3GPP arm only; and --require-sparse selects the dual-head
+# registry entry, without which validate cannot resolve the sparse identity it
+# compares. cmd/validate is a native binary, so the MSYS paths data-contract.sh
+# emits are converted on the way in.
+# TestPublishCorpusHoldsEachArmToThePipelinesContract runs this block for real.
 VALIDATE="$ROOT/.local/bin/validate.exe"; [ -x "$VALIDATE" ] || VALIDATE="$ROOT/.local/bin/validate"
-if [ -x "$VALIDATE" ] && [ "$ONLY" != "etsi" ]; then
-  log "checking the corpus contract before publishing it"
-  "$VALIDATE" --db "$ROOT/data/3gpp.duckdb" --report text --require-fts --require-hnsw \
-      --require-embed-complete --embed-floor "${EMBED_FLOOR:-Rel-99}" \
-    || die "the corpus does not satisfy its own contract — refusing to publish it"
-elif [ "$ONLY" != "etsi" ]; then
+[ -n "${DATA_ETSI_ABSENCES:-}" ] || [ -z "${ETSI_ABSENCES:-}" ] || export DATA_ETSI_ABSENCES="$ETSI_ABSENCES"
+contract_gate() { # contract_gate <arm> <db>
+  local arm="$1" db="$2" flags
+  [ -s "$db" ] || return 0 # publish_one skips an absent corpus: nothing to push, nothing to check
+  flags="$(DATA_ETSI_DB="$ROOT/data/etsi.duckdb" DATA_EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}" \
+           bash "$ROOT/scripts/data-contract.sh" "$arm")" \
+    || die "scripts/data-contract.sh refused the $arm arm (DATA_CONTRACT='${DATA_CONTRACT:-}')"
+  log "checking $(basename "$db") against the pipeline's $arm contract: $flags"
+  case " $flags " in
+    *" --require-sparse "*)
+      # shellcheck disable=SC2086 # intentional word-split: the contract is a flag list
+      EMBED_MODEL=bge-m3-sparse "$VALIDATE" --db "$db" --report text $flags ;;
+    *)
+      # shellcheck disable=SC2086
+      "$VALIDATE" --db "$db" --report text $flags ;;
+  esac || die "$(basename "$db") does not satisfy the pipeline's $arm contract — refusing to publish it"
+}
+if [ -x "$VALIDATE" ]; then
+  case "$ONLY" in
+    both) contract_gate etsi "$ROOT/data/etsi.duckdb"; contract_gate 3gpp "$ROOT/data/3gpp.duckdb";;
+    etsi) contract_gate etsi "$ROOT/data/etsi.duckdb";;
+    3gpp) contract_gate 3gpp "$ROOT/data/3gpp.duckdb";;
+  esac
+else
   [ "$FORCE_UNVERIFIED" = 1 ] || die "validate is not built and the contract cannot be checked;
    build it, or pass --allow-unverified-visibility if you really mean to publish unchecked"
 fi
