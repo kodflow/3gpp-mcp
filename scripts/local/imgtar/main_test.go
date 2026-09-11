@@ -157,3 +157,38 @@ func TestTheCacheHitsOnlyOnItsOwnKey(t *testing.T) {
 		t.Fatal("a blob with no key hit: an interrupted store would be reused as complete")
 	}
 }
+
+// A LARGE FILE REWRITTEN UNDER ITS OLD SIZE AND MTIME MISSES: the content sample
+// covers offset 0, where a DuckDB file's header changes on every checkpoint.
+func TestALargeFileRewrittenUnderItsOldMtimeMisses(t *testing.T) {
+	root := t.TempDir()
+	big := filepath.Join(root, "corpus.duckdb")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(contentKeyMax + 1); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	st, _ := os.Stat(big)
+	before := key(t, root, "corpus.duckdb")
+
+	f, err = os.OpenFile(big, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("HEADER CHANGED BY A CHECKPOINT"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if err := os.Chtimes(big, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if st2, _ := os.Stat(big); st2.Size() != st.Size() || !st2.ModTime().Equal(st.ModTime()) {
+		t.Fatal("the test did not restore size and mtime, so it proves nothing")
+	}
+	if key(t, root, "corpus.duckdb") == before {
+		t.Fatal("a corpus rewritten under its old size and mtime kept its key: the stale layer would ship")
+	}
+}

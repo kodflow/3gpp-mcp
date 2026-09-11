@@ -288,8 +288,9 @@ func packedMode(e entry) int64 {
 //	                     layers are written invalidates every cached one
 //	--gzip, uid, gid
 //	every entry          member name, type, symlink target, and for a regular file
-//	                     its size plus its content hash (up to contentKeyMax) or
-//	                     its mtime to the nanosecond (above it)
+//	                     its size plus its content hash (up to contentKeyMax) or,
+//	                     above it, its mtime to the nanosecond and a content
+//	                     sample (sampleHash)
 //
 // SIZE AND MTIME, NOT CONTENT, and that is the same identity the pipeline already
 // trusts for these files (outputIdentity in internal/goal): hashing 42 GB to
@@ -326,7 +327,11 @@ func layerKey(entries []entry, uid, gid int, gz bool) (string, error) {
 			}
 			fmt.Fprintf(h, "F %q %d sha=%s\n", e.name, e.fi.Size(), sum)
 		default:
-			fmt.Fprintf(h, "F %q %d @%d\n", e.name, e.fi.Size(), e.fi.ModTime().UnixNano())
+			sample, err := sampleHash(e.path, e.fi.Size())
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(h, "F %q %d @%d sample=%s\n", e.name, e.fi.Size(), e.fi.ModTime().UnixNano(), sample)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -340,6 +345,49 @@ func layerKey(entries []entry, uid, gid int, gz bool) (string, error) {
 // would never be reused. Hashing 64 MiB costs a fraction of a second; the corpus
 // and the model weights are far above it and keep the cheap identity.
 const contentKeyMax = 64 << 20
+
+// sampleBlocks and sampleBlockSize define the content sample a large file's
+// identity carries: 17 blocks of 64 KiB, evenly spread, the first at offset 0.
+//
+// A FULL HASH IS WHAT THIS IS SPARING. Hashing the two corpora is 42 GB of reads
+// per publish, which is the cost being removed; size and mtime alone are what the
+// pipeline already trusts for these files (its own fingerprint of publish's
+// inputs). The sample closes the case an mtime can miss — bytes rewritten with the
+// size unchanged and the timestamp restored — for ~1 MiB of reads: a DuckDB file's
+// header, at offset 0, changes on every checkpoint, so any write to a corpus moves
+// it. A change confined to bytes no sampled block covers, with size and mtime
+// restored, is the residue, and it takes deliberate work on this machine.
+const (
+	sampleBlocks    = 17
+	sampleBlockSize = 64 << 10
+)
+
+// sampleHash hashes sampleBlocks blocks of the file, evenly spread; a file no
+// larger than the sample is hashed whole.
+func sampleHash(path string, size int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if size <= sampleBlocks*sampleBlockSize {
+		if _, err := io.Copy(h, f); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	buf := make([]byte, sampleBlockSize)
+	last := size - sampleBlockSize
+	for i := int64(0); i < sampleBlocks; i++ {
+		off := last * i / (sampleBlocks - 1)
+		if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+			return "", err
+		}
+		h.Write(buf)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 func fileSHA256(path string) (string, error) {
 	f, err := os.Open(path)

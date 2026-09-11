@@ -1,8 +1,11 @@
 package goal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -43,13 +46,19 @@ func certifiedFiles(c *Ctx) []string {
 	return []string{c.dataPath("3gpp.duckdb"), c.dataPath("etsi.duckdb")}
 }
 
-// fileIdentity is size and mtime to the nanosecond, or "absent".
+// fileIdentity is size, mtime to the nanosecond and a content sample (sampleHash),
+// or "absent". An unreadable sample is its own identity, which matches nothing a
+// passing validate wrote.
 func fileIdentity(p string) string {
 	st, err := os.Stat(p)
 	if err != nil {
 		return "absent"
 	}
-	return fmt.Sprintf("%d @%d", st.Size(), st.ModTime().UnixNano())
+	sample, err := sampleHash(p, st.Size())
+	if err != nil {
+		sample = "unreadable"
+	}
+	return fmt.Sprintf("%d @%d sample=%s", st.Size(), st.ModTime().UnixNano(), sample)
 }
 
 // voidContractCertificate is called BEFORE the contract runs: a failed or
@@ -84,6 +93,14 @@ func writeContractCertificate(c *Ctx, t corpusTarget) error {
 // knobs are separate today, and a certificate for another floor is not one for
 // this build.
 func contractCertified(c *Ctx, imageFloor string) string {
+	// THE SCRIPT BAKES <repo>/data, WHATEVER GOAL WAS POINTED AT. build-image.sh
+	// validates and stages data/3gpp.duckdb under its own root; goal can run with
+	// --data / GOAL_DATA elsewhere. A certificate for that other corpus must not
+	// excuse the one actually packaged, so it counts only when the two are the
+	// same directory.
+	if !sameDir(c.Data, filepath.Join(c.Root, "data")) {
+		return ""
+	}
 	b, err := os.ReadFile(contractCertificatePath(c))
 	if err != nil {
 		return ""
@@ -127,4 +144,59 @@ func contractEnv(c *Ctx, imageFloor string) []string {
 	}
 	c.Log.Printf("corpus contract: no certificate matches these bytes — build-image.sh re-runs it")
 	return []string{"CORPUS_CONTRACT_CERTIFIED="}
+}
+
+// sameDir reports whether a and b name the same directory.
+func sameDir(a, b string) bool {
+	sa, errA := os.Stat(a)
+	sb, errB := os.Stat(b)
+	if errA == nil && errB == nil {
+		return os.SameFile(sa, sb)
+	}
+	ca, _ := filepath.Abs(a)
+	cb, _ := filepath.Abs(b)
+	return strings.EqualFold(filepath.Clean(ca), filepath.Clean(cb))
+}
+
+// sampleBlocks and sampleBlockSize define the content sample a large file's
+// identity carries: 17 blocks of 64 KiB, evenly spread, the first at offset 0.
+//
+// A FULL HASH IS WHAT THIS IS SPARING. Hashing the two corpora is 42 GB of reads
+// per publish, which is the cost being removed; size and mtime alone are what the
+// pipeline already trusts for these files (its own fingerprint of publish's
+// inputs). The sample closes the case an mtime can miss — bytes rewritten with the
+// size unchanged and the timestamp restored — for ~1 MiB of reads: a DuckDB file's
+// header, at offset 0, changes on every checkpoint, so any write to a corpus moves
+// it. A change confined to bytes no sampled block covers, with size and mtime
+// restored, is the residue, and it takes deliberate work on this machine.
+const (
+	sampleBlocks    = 17
+	sampleBlockSize = 64 << 10
+)
+
+// sampleHash hashes sampleBlocks blocks of the file, evenly spread; a file no
+// larger than the sample is hashed whole.
+func sampleHash(path string, size int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if size <= sampleBlocks*sampleBlockSize {
+		if _, err := io.Copy(h, f); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	buf := make([]byte, sampleBlockSize)
+	last := size - sampleBlockSize
+	for i := int64(0); i < sampleBlocks; i++ {
+		off := last * i / (sampleBlocks - 1)
+		if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+			return "", err
+		}
+		h.Write(buf)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
