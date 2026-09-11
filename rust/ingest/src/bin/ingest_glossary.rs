@@ -264,7 +264,7 @@ const MINED_SCOPE: &str = "source_series = 'etsi' OR source_series LIKE 'ETSI %'
 fn row_hash(text: [Option<&str>; 6], declared_by: Option<i64>) -> u128 {
     use std::hash::Hasher;
     let mut out = 0u128;
-    for (i, tag) in [b'l', b'h'].into_iter().enumerate() {
+    for (i, tag) in b"lh".iter().copied().enumerate() {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write(b"etsi-glossary-row-v1");
         h.write_u8(tag);
