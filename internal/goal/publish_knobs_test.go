@@ -21,9 +21,10 @@ import (
 // fingerprint; TestPublishFingerprintsEveryKnobBuildImageReads fails on anything
 // that is in neither place, and on an entry here whose variable is gone.
 var notAnImageKnob = map[string]string{
-	"IMAGE_PUSH_ATTEMPTS": "how many times a failed push is retried: one that lands pushes the same digests whatever the count (imgtar fixes every timestamp, the registry dedupes), and one that never lands records nothing to skip on",
-	"PATH":                "where go, cargo, curl and crane are found — the script puts its own .local toolchain first — which is a question of toolchain identity, not an override of what the image holds",
-	"BASH_SOURCE":         "set by bash to the script's own path; no operator can set it",
+	"IMAGE_PUSH_ATTEMPTS":       "how many times a failed push is retried: one that lands pushes the same digests whatever the count (imgtar fixes every timestamp, the registry dedupes), and one that never lands records nothing to skip on",
+	"PATH":                      "where go, cargo, curl and crane are found — the script puts its own .local toolchain first — which is a question of toolchain identity, not an override of what the image holds",
+	"BASH_SOURCE":               "set by bash to the script's own path; no operator can set it",
+	"CORPUS_CONTRACT_CERTIFIED": "decides only whether the script re-runs the contract, never a byte of the image; runPublish always sets it — to a reason only when validate's certificate matches the files (contract_certificate.go), to empty otherwise, which disarms one inherited from the shell",
 }
 
 // EVERY VARIABLE build-image.sh READS FROM THE ENVIRONMENT MOVES publish's
