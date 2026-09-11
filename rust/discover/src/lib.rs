@@ -71,15 +71,20 @@ pub fn delta_series(
 
 /// emit_worklist returns the fetch worklist "<release> <url> <name>" for every
 /// (spec,release) the status report lists at/above the floor (by RELEASE, drafts
-/// kept). Returns (lines, emitted, skipped_unencodable) (== Go emitWorklist).
+/// kept). Returns (lines, emitted, skipped_unencodable, refiled) — see
+/// filing_release for the last one.
 pub fn emit_worklist(
     site: &BTreeMap<String, String>,
     floor_major: i64,
     series_filter: &str,
-) -> (String, usize, usize) {
+) -> (String, usize, usize, usize) {
     let allow = series_set(series_filter);
     let mut lines = String::new();
-    let (mut n, mut skipped) = (0usize, 0usize);
+    let (mut n, mut skipped, mut refiled) = (0usize, 0usize, 0usize);
+    // Re-filing can send two keys of the same spec to the same release with the same
+    // version — 33.816 is listed at 10.0.0 under both Rel-10 and Rel-11 — and the two
+    // then render the identical line. corpus.sh would fetch it twice; dedupe here.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for (key, ver) in site {
         let (spec, rel) = split_key(key);
         if rel.is_empty() || spec.len() < 2 || major(rel) < floor_major {
@@ -94,18 +99,97 @@ pub fn emit_worklist(
                 continue;
             }
         }
+        let mut file_under = rel;
+        let owned;
+        if let Some(own) = filing_release(site, spec, rel, ver) {
+            owned = own;
+            file_under = &owned;
+            refiled += 1;
+        }
         match encode_ver_code(ver) {
             Some(code) => {
                 let num = spec.replacen('.', "", 1);
                 let name = format!("{num}-{code}.zip");
                 let url = format!("{STATUS_BASE}/{pfx}_series/{spec}/{name}");
-                lines.push_str(&format!("{rel} {url} {name}\n"));
-                n += 1;
+                let line = format!("{file_under} {url} {name}\n");
+                if seen.insert(line.clone()) {
+                    lines.push_str(&line);
+                    n += 1;
+                }
             }
             None => skipped += 1,
         }
     }
-    (lines, n, skipped)
+    (lines, n, skipped, refiled)
+}
+
+/// A DOCUMENT IS ACQUIRED UNDER THE RELEASE ITS OWN VERSION NAMES.
+///
+/// The 3GPP archive URL carries no release at all —
+/// `…/archive/26_series/26.510/26510-i40.zip` — so `spec_versions.release` is
+/// decided HERE and nowhere else: the release SECTION of the DynaReport status
+/// report becomes this worklist's first column, becomes the
+/// `data/sources/convert/<Rel-NN>/` directory (scripts/corpus.sh), and
+/// `parse_filename_meta` reads it straight back off the parent directory. Whatever
+/// this function lets through is what the corpus will say and what the server will
+/// cite.
+///
+/// The report's per-release sections CARRY A VERSION FORWARD when a release has not
+/// re-issued a spec — `cmd/anchorcheck` calls the same thing by name: "3GPP
+/// routinely lists a spec's Rel-N entry at the Rel-(N-1) version, so this is
+/// bookkeeping, not a gap" (its NonContent verdict). Bookkeeping is all it is: the
+/// DOCUMENT still belongs to the release its version number names, and when the
+/// report files the same spec under that release too, that is where the file must
+/// be acquired. Acquiring it under the carrying release instead gives the WRONG
+/// release the only copy of the text.
+///
+/// Measured on the published corpus, 2026-09-12: 74 (spec, release, version) rows
+/// have a release the version's major contradicts. 51 are Rel-4 rows holding a
+/// 3.x.y Rel-99 document, and today's report still says so — the corpus has no
+/// Rel-99 section at all, so Rel-4 is their only home and they are left alone by
+/// the `site.contains_key` condition below. 16 are Rel-20 rows that today's report
+/// does not carry at all, and 12 of those hold 4 112 clauses of Rel-18/Rel-19 text
+/// that exists NOWHERE ELSE in the corpus: `get_spec(26.510, release=Rel-20)`
+/// serves 364 clauses of a document whose own cover says Release 18. Those 12 were
+/// acquired by the holes loop of emit_repair_worklist, which took the corpus's own
+/// key as proof of the release.
+///
+/// Returns the release the document belongs to, when that is not the key's release
+/// AND the report files this spec there. A draft (major < 3) is legitimately older
+/// than the release it is drafted for and is never re-filed — guarding drafts would
+/// have moved the three rows today's report carries in that shape (23.873 Rel-5
+/// 2.0.0, 33.900 Rel-5 0.4.1, 36.833-1 Rel-13 0.4.0).
+///
+/// This is the invariant `scripts/corpus.sh`'s download fallback has enforced since
+/// 812e7e1 — "NEVER a higher release's version that would then be mis-filed under
+/// Rel-6 … the version-major IS the release ordinal" — held one step earlier, where
+/// the release is actually chosen rather than where a failed download is patched.
+fn filing_release(
+    site: &BTreeMap<String, String>,
+    spec: &str,
+    rel: &str,
+    ver: &str,
+) -> Option<String> {
+    let vmaj = major(ver);
+    if vmaj < 3 || vmaj == major(rel) {
+        return None;
+    }
+    let own = release_from_major(vmaj);
+    if own == rel || !site.contains_key(&format!("{spec}|{own}")) {
+        return None;
+    }
+    Some(own)
+}
+
+/// release_from_major maps a version major to the release that publishes it:
+/// 3 → "Rel-99" (there is no Rel-98; the count jumps to Rel-4), else "Rel-<major>".
+/// The twin of `major`, and of rust/parse's release_from_major.
+pub fn release_from_major(vmaj: i64) -> String {
+    if vmaj == 3 {
+        "Rel-99".to_string()
+    } else {
+        format!("Rel-{vmaj}")
+    }
 }
 
 /// emit_draft_ledger returns absent-index-format JSON for every status-report key
@@ -796,7 +880,14 @@ pub fn emit_repair_worklist(
         // has nothing newer: fetching the site version would re-download something
         // the corpus already believes it has and leave the hole open.
         let want = if drifted { ver.as_str() } else { have };
-        match archive_line(spec, rel, &pfx, want) {
+        let mut file_under = rel;
+        let owned;
+        if let Some(own) = filing_release(site, spec, rel, want) {
+            owned = own;
+            file_under = &owned;
+            counts.refiled += 1;
+        }
+        match archive_line(spec, file_under, &pfx, want) {
             Some(line) => {
                 lines.push_str(&line);
                 counts.emitted += 1;
@@ -839,8 +930,26 @@ pub fn emit_repair_worklist(
             counts.unencodable += 1;
             continue;
         }
+        // THIS IS THE LOOP THAT WROTE THE MIS-FILINGS. The paragraph above reads the
+        // corpus's own key as proof that the document belongs to that release — "the
+        // hole is 29.558|Rel-20 anchored at 19.5.0" — but the key is the corpus
+        // quoting itself, and 19.5.0 is a Rel-19 document. Acquiring it under Rel-20
+        // gave Rel-20 the ONLY copy of 1 097 clauses of Rel-19 text; twelve holes
+        // were closed that way and all twelve are still in the published corpus.
+        //
+        // The hole is real and must still be closed — the fix is WHERE the file
+        // lands, not whether it is fetched. Filed under Rel-19, the same download
+        // makes 29.558@19.5.0 indexed, and anchorcheck reclassifies 29.558|Rel-20
+        // from MissingContent to NonContent: the bookkeeping row it always was.
+        let mut file_under = rel;
+        let owned;
+        if let Some(own) = filing_release(site, spec, rel, want) {
+            owned = own;
+            file_under = &owned;
+            counts.refiled += 1;
+        }
         counts.corpus_holes += 1;
-        match archive_line(spec, rel, &pfx, want) {
+        match archive_line(spec, file_under, &pfx, want) {
             Some(line) => {
                 lines.push_str(&line);
                 counts.emitted += 1;
@@ -895,6 +1004,9 @@ pub struct RepairCounts {
     pub emitted: usize,
     pub unencodable: usize,
     pub holes_not_in_report: usize,
+    /// Lines emitted under the release the version's own major names instead of the
+    /// key's release — see filing_release.
+    pub refiled: usize,
 }
 
 /// load_holes reads `anchorcheck --emit-repair` output: one "spec|Rel" per line.
@@ -1010,12 +1122,20 @@ mod repair_tests {
     /// A hole the status report does not list is STILL fetchable, because the anchor
     /// names the version and the archive keeps every version it published.
     ///
-    /// This is the real shape, taken from the corpus: the report carries one row per
-    /// spec — 29.558 at 19.7.0, which reads as Rel-19 — while the hole is Rel-20
-    /// anchored at 19.5.0. No report row can ever match it, and counting it and
-    /// moving on left the corpus permanently short.
+    /// This is the real shape, taken from the corpus: the report carries 29.558 at
+    /// 19.7.0 under Rel-19, while the hole is 29.558|Rel-20 anchored at 19.5.0. No
+    /// report row can ever match that key, and counting it and moving on left the
+    /// corpus permanently short.
+    ///
+    /// It is fetched — AND FILED UNDER Rel-19, because 19.5.0 is a Rel-19 document
+    /// and the report files 29.558 under Rel-19. Filing it under Rel-20 is what put
+    /// 1 097 clauses of Rel-19 text into the published corpus as Rel-20, the only
+    /// copy of that version anywhere in it (measured 2026-09-12). Once 29.558@19.5.0
+    /// is indexed under Rel-19, anchorcheck reclassifies 29.558|Rel-20 as NonContent
+    /// — "3GPP routinely lists a spec's Rel-N entry at the Rel-(N-1) version, so this
+    /// is bookkeeping, not a gap" — so the hole closes either way.
     #[test]
-    fn a_hole_absent_from_the_report_is_fetched_at_the_anchored_version() {
+    fn a_hole_absent_from_the_report_is_fetched_under_the_release_its_version_names() {
         let site = m(&[("29.558|Rel-19", "19.7.0")]);
         let idx = m(&[("29.558|Rel-19", "19.7.0"), ("29.558|Rel-20", "19.5.0")]);
         let holes: BTreeSet<String> = ["29.558|Rel-20".to_string()].into_iter().collect();
@@ -1023,13 +1143,87 @@ mod repair_tests {
         let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
         assert_eq!(c.holes_not_in_report, 1, "the population must stay visible");
         assert_eq!(c.emitted, 1, "and it must actually be fetched");
+        assert_eq!(c.refiled, 1, "and the re-filing must be visible too");
         assert!(
             lines.contains("29558-j50.zip"),
             "expected the ANCHOR's version (19.5.0 -> j50), not the report's 19.7.0; got: {lines}"
         );
         assert!(
-            lines.starts_with("Rel-20 "),
-            "the line must carry the hole's release, got: {lines}"
+            lines.starts_with("Rel-19 "),
+            "19.5.0 is a Rel-19 document; got: {lines}"
+        );
+    }
+
+    /// The hole's own release is kept when the report does NOT file that spec under
+    /// the release its version names. The corpus holds no Rel-99 section at all
+    /// (floor Rel-4), so its 51 Rel-4 rows at a 3.x.y version — 21.810 3.0.0, 29.198
+    /// 3.4.0, 32.005 3.7.0 … — are the ONLY copy of those documents, and today's
+    /// report still files them exactly there. Re-filing them would send 2 500+
+    /// clauses to a release below the floor, i.e. delete them.
+    #[test]
+    fn a_carried_forward_version_with_no_home_release_stays_where_it_is() {
+        let site = m(&[("21.810|Rel-4", "3.0.0")]);
+        let idx = m(&[("21.810|Rel-4", "")]);
+        let holes: BTreeSet<String> = ["21.810|Rel-4".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
+        assert_eq!(
+            c.refiled, 0,
+            "Rel-99 is not in the report: nothing to re-file"
+        );
+        assert!(
+            lines.starts_with("Rel-4 "),
+            "the only home this document has is Rel-4; got: {lines}"
+        );
+    }
+
+    /// 26.510, the case that named this defect. The report files it under Rel-18 at
+    /// 18.5.0 and under Rel-20 at 18.4.0 (the shape the published corpus recorded on
+    /// 2026-08-25; today's report has withdrawn the Rel-20 row). The Rel-20 request
+    /// must go to the archive AS Rel-18: v18.4.0's cover says Release 18, and 3GPP's
+    /// archive URL carries no release to contradict it.
+    #[test]
+    fn the_wholesale_worklist_files_a_version_under_the_release_it_names() {
+        let site = m(&[
+            ("26.510|Rel-18", "18.5.0"),
+            ("26.510|Rel-19", "19.2.0"),
+            ("26.510|Rel-20", "18.4.0"),
+        ]);
+        let (lines, n, skipped, refiled) = emit_worklist(&site, 4, "");
+        assert_eq!((n, skipped, refiled), (3, 0, 1), "lines: {lines}");
+        assert!(
+            lines.contains("Rel-18 https://www.3gpp.org/ftp/Specs/archive/26_series/26.510/26510-i40.zip 26510-i40.zip\n"),
+            "18.4.0 must be requested as Rel-18; got: {lines}"
+        );
+        assert!(
+            !lines.contains("Rel-20 "),
+            "nothing here is a Rel-20 document; got: {lines}"
+        );
+    }
+
+    /// A DRAFT is legitimately older than the release it is drafted for: 36.833-1 is
+    /// listed at 0.4.0 under Rel-13, and "Rel-0" is not a release. Drafts keep their
+    /// section. Today's live report carries three rows in this shape and the guard
+    /// must move none of them.
+    #[test]
+    fn a_draft_keeps_the_release_it_is_drafted_for() {
+        let site = m(&[("36.833-1|Rel-12", "12.0.0"), ("36.833-1|Rel-13", "0.4.0")]);
+        let (lines, _, _, refiled) = emit_worklist(&site, 4, "");
+        assert_eq!(refiled, 0, "a draft is not mis-filed; got: {lines}");
+        assert!(lines.contains("Rel-13 "), "got: {lines}");
+    }
+
+    /// Two keys of one spec that re-file onto the same release at the same version
+    /// render the identical line — 33.816 is listed at 10.0.0 under both Rel-10 and
+    /// Rel-11 in today's report. corpus.sh would fetch it twice.
+    #[test]
+    fn refiling_does_not_duplicate_a_line() {
+        let site = m(&[("33.816|Rel-10", "10.0.0"), ("33.816|Rel-11", "10.0.0")]);
+        let (lines, n, _, refiled) = emit_worklist(&site, 4, "");
+        assert_eq!((n, refiled), (1, 1), "lines: {lines}");
+        assert_eq!(
+            lines,
+            "Rel-10 https://www.3gpp.org/ftp/Specs/archive/33_series/33.816/33816-a00.zip 33816-a00.zip\n"
         );
     }
 
