@@ -233,6 +233,21 @@ lexically. It now **says so**: the response carries `mode` (what actually ran)
 and, when that differs from what you asked, `mode_requested` and
 `mode_degraded`. `server_info` gives the reason.
 
+The same goes for each retrieval arm of a call. `search_spec` answers with
+`arms` — per corpus half and pass, every requested arm (`lexical`, `dense`,
+`sparse`, `rerank`) with whether it ran, its hit count and its milliseconds — and
+an arm that contributed nothing is listed in `degraded` and appended to
+`mode_degraded`, with why: the search budget ran out before it
+(`SEARCH_BUDGET`, default 20 s, ONE budget for the whole call across both
+halves), its model or store call failed, or the capability is absent. A page
+that was not cross-encoded never comes back looking as if it had been.
+
+The budget is a SOFT deadline: it decides which arms still START, and it never
+interrupts one that is already running — a cross-encoder pass is a blocking call
+into ONNX Runtime, and cancelling a DuckDB query aborts the process instead of
+returning an error. So a call can answer after its budget has expired; what it
+cannot do is answer as if an arm the budget cut had run.
+
 To build the semantic pair yourself:
 
 ```sh

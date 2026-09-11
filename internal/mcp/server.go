@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -58,13 +59,23 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 				"pinned to the baseline release; get_spec also reports new_in_baseline "+
 				"(vs previous release) and added_in_later_releases (annex)."),
 	)
+	eng.SetName("3gpp")
 	var etsiEng *search.Engine
 	if etsi != nil {
-		etsiEng = search.New(etsi) // its own single-DB FTS/HNSW; no 3GPP vec shards
+		// Its own single-DB FTS/HNSW and no 3GPP vec shards — but the SAME models:
+		// a second cross-encoder session is 2.3 GB for no concurrency (NewSharing).
+		etsiEng = search.NewSharing(etsi, eng)
+		etsiEng.SetName("etsi")
 	}
 	h := &handlers{st: st, etsi: etsi, eng: eng, etsiEng: etsiEng, reg: registry.Default(), baseline: baseline, version: version}
 	for _, o := range opts {
 		o(h)
+	}
+	if h.warmLog != nil {
+		if h.warmWG != nil {
+			h.warmWG.Add(1)
+		}
+		go h.warmUp()
 	}
 
 	// EVERY TOOL IS SHIELDED, AND THAT IS WHY THE WRAPPER IS HERE RATHER THAN
@@ -219,6 +230,11 @@ type handlers struct {
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
 	etsiDown string // why the ETSI half asked for could not be opened; "" = not asked for, or attached
+	// warmLog, when set, warms every half at start and reports through it; warmCtx
+	// stops that warm-up and warmWG lets the caller wait for it (WithWarmup).
+	warmLog func(format string, args ...any)
+	warmCtx context.Context
+	warmWG  *sync.WaitGroup
 }
 
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
@@ -379,6 +395,13 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// ONE budget for the whole call, and a record of what every arm of every pass
+	// did (internal/search/report.go): the federation below runs up to three
+	// searches, and each used to start a SEARCH_BUDGET of its own and to drop a
+	// skipped arm without a word.
+	ctx, trace := search.WithTrace(ctx)
+	ctx, cancelBudget := search.WithBudget(ctx)
+	defer cancelBudget()
 	// Over-fetch the page window + 1 to detect "more exists" without a count.
 	mode, rerank := r.GetString("mode", ""), r.GetBool("rerank", false)
 	want := offset + pageSize + 1
@@ -390,13 +413,17 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	var hits []model.SearchHit
 	var unread []unreadHalf
 	federated := filter.SpecID == "" && filter.Series == ""
+	// ONE cross-encoder pass per call: each half used to rerank its own window
+	// before the rank-based merge discarded those scores (federated_rerank.go).
+	rr := h.planRerank(rerank, federated)
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
 		servingEng = h.etsiEng
-		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rr)
 	} else {
-		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
+		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode,
+			Rerank: rr.arm, DeferRerank: rr.defer_})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
@@ -411,7 +438,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 				unread = append(unread, unreadOf("3gpp", "", threeErr))
 				hits = nil
 			}
-			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rr)
 			unread = append(unread, partial...)
 			switch {
 			case eerr != nil && threeErr != nil:
@@ -427,6 +454,11 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		} else if u, down := h.etsiOpenFailure(); down && (federated || etsiScoped) {
 			unread = append(unread, u)
 		}
+	}
+	// The merged head, cross-encoded once (federated_rerank.go). A call that ran
+	// one search reranked inside it, over its own window, exactly as before.
+	if err == nil && rr.fused {
+		hits = h.rerankFused(ctx, q, hits)
 	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("search failed", err), nil
@@ -474,6 +506,21 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		resp["mode_requested"] = requested
 		resp["mode_degraded"] = fmt.Sprintf(
 			"requested %q, served %q — call server_info for why semantic is unavailable", requested, served)
+	}
+	// ModeServed says what the engine CAN run; the trace says what this call DID.
+	// A requested arm that contributed nothing — its budget spent, its embedder or
+	// store call failed, a capability absent — is named here and in mode_degraded,
+	// so an answer never claims a rerank (or a sparse pass) it did not get.
+	reps := trace.Reports()
+	resp["arms"] = reps
+	if deg := search.Degraded(reps); len(deg) > 0 {
+		resp["degraded"] = deg
+		note := "not served: " + strings.Join(deg, "; ")
+		if prev, ok := resp["mode_degraded"].(string); ok {
+			resp["mode_degraded"] = prev + "; " + note
+		} else {
+			resp["mode_degraded"] = note
+		}
 	}
 	if next != "" {
 		resp["next_cursor"] = next
@@ -1440,7 +1487,7 @@ func etsiDocTypes(specType string) []string {
 // the EN one succeeds, and the answer then holds no TS at all. The error is
 // returned only when EVERY type failed — the whole half is unread then.
 func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
-	topK int, mode string, rerank bool) ([]model.SearchHit, []unreadHalf, error) {
+	topK int, mode string, rr rerankPlan) ([]model.SearchHit, []unreadHalf, error) {
 	f.Release = ""
 
 	// A spec_id PINS the document, so the type default must not second-guess it.
@@ -1459,7 +1506,8 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 	for _, dt := range types {
 		ef := f
 		ef.DocType = dt
-		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode, Rerank: rerank})
+		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode,
+			Rerank: rr.arm, DeferRerank: rr.defer_})
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

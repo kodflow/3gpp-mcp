@@ -100,23 +100,14 @@ func (s *Store) SearchSparse(ctx context.Context, query model.SparseVec, f SpecF
 	if len(query) == 0 {
 		return nil, nil
 	}
-	var vb strings.Builder
-	args := make([]any, 0, len(query)*2+4)
-	i := 0
-	for term, w := range query {
-		if w <= 0 {
-			continue
-		}
-		if i > 0 {
-			vb.WriteString(",")
-		}
-		// CAST so the VALUES literals match clause_sparse's UINTEGER/FLOAT columns.
-		vb.WriteString("(CAST(? AS UINTEGER), CAST(? AS FLOAT))")
-		args = append(args, int64(term), float64(w))
-		i++
-	}
-	if i == 0 {
+	values, args, n := sparseQueryValues(query)
+	if n == 0 {
 		return nil, nil
+	}
+	// On a converted corpus `clauses` is the compatibility view, and joining it
+	// rebuilds the text of every scored clause (sparse_ca.go).
+	if s.contentAddressed {
+		return s.searchSparseCA(ctx, values, args, f, topK)
 	}
 	filterSQL, fargs := filterClause(f)
 	// Scored subquery exposes ONLY chunk_id + score, so the unqualified columns in
@@ -124,14 +115,14 @@ func (s *Store) SearchSparse(ctx context.Context, query model.SparseVec, f SpecF
 	sql := `SELECT cl.chunk_id, cl.spec_id, cl.release, cl.version, cl.clause_path,
 	               cl.heading, cl.text, cl.is_normative, sub.score
 	        FROM (
-	          SELECT cs.chunk_id AS chunk_id, SUM(q.qw * cs.weight) AS score
+	          SELECT cs.chunk_id AS chunk_id, ` + stableScore("SUM(q.qw * cs.weight)") + ` AS score
 	          FROM clause_sparse cs
-	          JOIN (VALUES ` + vb.String() + `) AS q(term_id, qw) ON cs.term_id = q.term_id
+	          JOIN (VALUES ` + values + `) AS q(term_id, qw) ON cs.term_id = q.term_id
 	          GROUP BY cs.chunk_id
 	        ) sub
 	        JOIN clauses cl ON cl.chunk_id = sub.chunk_id
 	        WHERE 1=1` + filterSQL + `
-	        ORDER BY sub.score DESC, cl.spec_id, cl.clause_path
+	        ORDER BY sub.score DESC, cl.spec_id, cl.clause_path, cl.release, cl.version, cl.chunk_id
 	        LIMIT ?`
 	args = append(args, fargs...)
 	args = append(args, topK)
