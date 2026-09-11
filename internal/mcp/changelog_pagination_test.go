@@ -226,3 +226,48 @@ func TestChangelogLimit(t *testing.T) {
 		}
 	}
 }
+
+// THE ORDER THE NOTE PROMISES IS THE ORDER SERVED (Qodo, #341). The note, the tool
+// description and CLAUDE.md say "to_version, then CR number"; the comparator used
+// to put from_version second, so two CRs landing in the same version from
+// different starting versions came out against the promised order.
+//
+// Falsified: with from_version compared before the CR number, CR 0010 (from
+// 17.9.0) sorts ahead of CR 0009 (from 18.0.0).
+func TestSortChangesKeepsThePromisedOrder(t *testing.T) {
+	cs := []model.Change{
+		{CRNumber: "0010", FromVersion: "17.9.0", ToVersion: "18.1.0"},
+		{CRNumber: "0009", FromVersion: "18.0.0", ToVersion: "18.1.0"},
+		{CRNumber: "0001", FromVersion: "9.0.0", ToVersion: "10.0.0"},
+		{CRNumber: "0100", FromVersion: "18.0.0", ToVersion: "9.0.0"},
+	}
+	sortChanges(cs)
+	var got []string
+	for _, c := range cs {
+		got = append(got, c.CRNumber)
+	}
+	if strings.Join(got, ",") != "0100,0001,0009,0010" {
+		t.Errorf("order = %v, want to_version numerically (9.0.0 < 10.0.0 < 18.1.0), then CR number", got)
+	}
+}
+
+// The shared page cutter: a window past the end is an empty last page, never a
+// crash, and a cursor bound to another query is refused.
+func TestPaginateCutsWithinTheListAndRefusesAForeignCursor(t *testing.T) {
+	items := []int{0, 1, 2, 3, 4}
+	page, start, next, err := paginate(items, "", "q", 2)
+	if err != nil || start != 0 || len(page) != 2 || next == "" {
+		t.Fatalf("first page: %v %d %q %v", page, start, next, err)
+	}
+	page, start, next, err = paginate(items, encodeCursor(pageCursor{Offset: 4, QHash: "q"}), "q", 2)
+	if err != nil || start != 4 || len(page) != 1 || next != "" {
+		t.Fatalf("last page: %v %d %q %v", page, start, next, err)
+	}
+	page, _, next, err = paginate(items, encodeCursor(pageCursor{Offset: 9, QHash: "q"}), "q", 2)
+	if err != nil || len(page) != 0 || next != "" {
+		t.Fatalf("past the end: %v %q %v", page, next, err)
+	}
+	if _, _, _, err = paginate(items, encodeCursor(pageCursor{Offset: 2, QHash: "other"}), "q", 2); err == nil {
+		t.Fatal("a cursor minted for another query was accepted")
+	}
+}

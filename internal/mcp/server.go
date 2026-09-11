@@ -589,18 +589,10 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	sortChanges(changes)
 	total := len(changes)
 	limit, clamped := changelogLimit(r.GetInt("limit", 0))
-	qh := changelogQueryHash(specID, from, to, clause)
-	offset, err := resolveOffset(r.GetString("cursor", ""), qh)
-	if err != nil || offset < 0 {
+	page, start, next, err := paginate(changes, r.GetString("cursor", ""), changelogQueryHash(specID, from, to, clause), limit)
+	if err != nil {
 		return mcp.NewToolResultError("invalid cursor for this query: pass the next_cursor of a get_changelog call " +
 			"with the same spec_id, from_release, to_release and clause"), nil
-	}
-	start := min(offset, total)
-	end := min(start+limit, total)
-	page := changes[start:end]
-	next := ""
-	if end < total {
-		next = encodeCursor(pageCursor{Offset: end, QHash: qh})
 	}
 	// An empty slice, not nil: `"changes": null` is a different JSON type from the
 	// list a caller iterates, and the count beside it already says there are none.
