@@ -113,7 +113,7 @@ func loadVecManifest(path string) ([]string, error) {
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dbPath := fs.String("db", "data/3gpp.duckdb", "DuckDB snapshot path")
-	etsiDB := fs.String("etsi-db", "", "optional ETSI corpus DuckDB (etsi.duckdb) served ALONGSIDE the 3GPP DB — kept SPLIT, not merged; get_spec/list_releases route 'ETSI …' ids here and list_specs unions it. Empty = 3GPP only.")
+	etsiDB := fs.String("etsi-db", "", "optional ETSI corpus DuckDB (etsi.duckdb) served ALONGSIDE the 3GPP DB — kept SPLIT, not merged; get_spec/list_releases route 'ETSI …' ids here and list_specs unions it. Empty = the etsi.duckdb beside the 3GPP DB when there is one; \"off\" = 3GPP only.")
 	release := fs.String("release", "", "baseline release every answer is scoped to (e.g. Rel-17); empty = latest")
 	writable := fs.Bool("writable", false, "open writable (default: read-only — the corruption-safe serve posture)")
 	noUpdate := fs.Bool("no-update", os.Getenv("MCP3GPP_NO_UPDATE") != "", "don't check the corpus package for a newer corpus at startup (air-gapped, or to pin what you have)")
@@ -274,11 +274,9 @@ func serve(args []string) error {
 	// exactly where `bootstrap --etsi` writes it, and without this default the
 	// 23 MB it downloads were ignored at serve time unless the user happened to
 	// pass --etsi-db as well — a flag they had no reason to think was required.
-	etsiPath, etsiWhy := *etsiDB, "--etsi-db"
-	if etsiPath == "" {
-		if beside := filepath.Join(filepath.Dir(effDB), "etsi.duckdb"); fileExists(beside) {
-			etsiPath, etsiWhy = beside, "found beside the corpus"
-		}
+	etsiPath, etsiWhy := resolveETSIPath(*etsiDB, effDB)
+	if etsiPath == "" && etsiWhy != "" {
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus not attached (%s): serving 3GPP only\n", etsiWhy)
 	}
 	var etsiSt *store.Store
 	if etsiPath != "" {
@@ -319,6 +317,35 @@ func serve(args []string) error {
 	fmt.Fprintf(os.Stderr, "[3gpp-mcp] serving MCP on stdio (db=%s, fts=%v, hnsw=%v, baseline=%s)\n",
 		effDB, st.FTSAvailable(), st.VSSAvailable(), scope)
 	return mcpserver.ServeStdio(srv)
+}
+
+// etsiOff is the --etsi-db value that serves the 3GPP half alone.
+const etsiOff = "off"
+
+// resolveETSIPath decides which ETSI corpus is attached: the one --etsi-db names,
+// else the etsi.duckdb beside the resolved 3GPP corpus (where `bootstrap --etsi`
+// writes it), else none. why says where the path came from — or, with no path,
+// why there is none when that was asked for.
+//
+// "off" EXISTS BECAUSE THE DEFAULT CANNOT BE DECLINED OTHERWISE. An empty flag
+// means "beside", so a host with an etsi.duckdb next to the corpus could not serve
+// 3GPP alone — and serving both halves semantically is a memory decision, not a
+// free one: measured 2026-09-11 with server-full over this corpus, both halves
+// under the store's default memory limit committed 39.8 GB on their first hybrid
+// query. The served retrieval gate (internal/goal/smoke_served.go) is the first
+// caller that needs it.
+func resolveETSIPath(flag, effDB string) (path, why string) {
+	switch flag {
+	case etsiOff:
+		return "", "--etsi-db " + etsiOff
+	case "":
+		if beside := filepath.Join(filepath.Dir(effDB), "etsi.duckdb"); fileExists(beside) {
+			return beside, "found beside the corpus"
+		}
+		return "", ""
+	default:
+		return flag, "--etsi-db"
+	}
 }
 
 func usage() {

@@ -187,9 +187,13 @@ func clipText(s string, n int) string {
 // numbers under semantic names. The real semantic scores, from a bench built
 // -tags onnx,embed_ffi in the prove-serving environment, were 0.101 / 0.417 /
 // 0.142 hybrid and 0.207 / 0.417 / 0.417 with the reranker — in 422 s and 18 GB
-// of working set, on a build that is Optional. It is the trade runSmoke already
-// makes for server_info's `semantic`: a gate that fails a correct corpus for want
-// of an environment is worse than no gate.
+// of working set, on a build that is Optional.
+//
+// THE SEMANTIC ARMS ARE GATED NOW, BUT NOT HERE: smoke_served.go drives
+// server-full.exe — the served path itself, federation included — rather than a
+// semantic bench, and holds it to its own baseline. This gate stays as it is: it
+// is the engine-level lexical measurement, cheap, and on the binary build-go
+// makes.
 //
 // Measured on the real corpus, 2026-09-10 and -11 (lexical, 6 queries):
 //

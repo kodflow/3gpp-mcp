@@ -127,9 +127,9 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 	rows := make([][]int64, b)
 	maxLen := 1
 	for i, p := range passages {
-		enc, err := r.tok.EncodePair(query, p, true)
+		enc, err := encodePair(r.tok, query, p)
 		if err != nil {
-			return fmt.Errorf("tokenize pair: %w", err)
+			return fmt.Errorf("tokenize pair %d: %w", i, err)
 		}
 		ids := enc.Ids
 		if len(ids) > rrMaxTokens {
@@ -185,6 +185,43 @@ func (r *onnxReranker) scoreBatch(query string, passages []string, dst []float64
 		dst[i] = 1.0 / (1.0 + math.Exp(-float64(logits[i])))
 	}
 	return nil
+}
+
+// encodePair tokenizes one (query, passage) pair, and survives the tokenizer's
+// panics.
+//
+// The pair is encoded AS IS first, so every input the library can encode gets
+// exactly the tokens it always got — the ranking the served baseline records does
+// not move. Only when that panics (see forTokenizer for the shapes and the
+// measurement) is it retried with its whitespace folded; and a panic on the folded
+// pair too becomes an error, never an unwinding: a panic here reaches mcp-go's
+// stdio worker, which recovers it and sends NO response, so the client hangs,
+// whereas an error makes Engine.rerank keep the fused order and the call answers.
+func encodePair(tok *tokenizer.Tokenizer, query, passage string) (*tokenizer.Encoding, error) {
+	if enc, panicked, err := tryEncodePair(tok, query, passage); !panicked {
+		return enc, err
+	}
+	// The passage first, alone: it is what the engine builds with a trailing
+	// "\n", and folding the QUERY too would change the query's tokens for every
+	// candidate of this call that reaches here (review of #340).
+	if enc, panicked, err := tryEncodePair(tok, query, forTokenizer(passage)); !panicked {
+		return enc, err
+	}
+	enc, panicked, err := tryEncodePair(tok, forTokenizer(query), forTokenizer(passage))
+	if panicked {
+		return nil, fmt.Errorf("the tokenizer panicked on a %d-byte passage, folded or not: %w", len(passage), err)
+	}
+	return enc, err
+}
+
+func tryEncodePair(tok *tokenizer.Tokenizer, query, passage string) (enc *tokenizer.Encoding, panicked bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			enc, panicked, err = nil, true, fmt.Errorf("%v", r)
+		}
+	}()
+	enc, err = tok.EncodePair(query, passage, true)
+	return enc, false, err
 }
 
 func envOr(key, def string) string {

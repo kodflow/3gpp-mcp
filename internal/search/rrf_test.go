@@ -57,3 +57,36 @@ func TestRRFSameClauseAcrossListsFuses(t *testing.T) {
 		t.Fatalf("fused score = %v, want %v (rank-1 in both lists)", out[0].Score, want)
 	}
 }
+
+// TWO VERSIONS OF ONE CLAUSE WITH EQUAL FUSED SCORES COME OUT IN ONE ORDER. The
+// tie-break used to stop at (spec_id, clause_path), below the fusion key, so the
+// pair was ordered by map iteration and the served page changed between two
+// identical calls. Every permutation of the input lists must give the same page.
+func TestRRFOrdersEqualScoresTotally(t *testing.T) {
+	v := func(ver string) model.SearchHit {
+		return model.SearchHit{Clause: model.Clause{SpecID: "33.128", Release: "Rel-17", Version: ver, ClausePath: "6.2.3.2"}}
+	}
+	other := model.SearchHit{Clause: model.Clause{SpecID: "33.127", Release: "Rel-17", Version: "17.1.0", ClausePath: "6.2.3.3"}}
+	// Rank 1 in one list each: equal fused scores for the two versions.
+	a := []model.SearchHit{v("17.15.0"), other}
+	b := []model.SearchHit{v("17.2.0"), other}
+	want := RRF(60, a, b)
+	if len(want) != 3 || want[0].Clause.SpecID != "33.127" {
+		t.Fatalf("unexpected fusion %v", want)
+	}
+	for i := 0; i < 200; i++ { // map iteration order is randomised per range
+		got := RRF(60, b, a)
+		for j := range want {
+			if rrfKey(got[j].Clause) != rrfKey(want[j].Clause) {
+				t.Fatalf("run %d: position %d is %s, was %s — equal scores ordered by map iteration",
+					i, j, rrfKey(got[j].Clause), rrfKey(want[j].Clause))
+			}
+		}
+	}
+	// The old order is kept where it decided: same score, different clause.
+	x := model.SearchHit{Clause: model.Clause{SpecID: "33.128", Release: "Rel-18", Version: "18.0.0", ClausePath: "5.1"}}
+	y := model.SearchHit{Clause: model.Clause{SpecID: "33.128", Release: "Rel-17", Version: "17.0.0", ClausePath: "6.1"}}
+	if got := RRF(60, []model.SearchHit{y}, []model.SearchHit{x}); got[0].Clause.ClausePath != "5.1" {
+		t.Errorf("equal scores in one spec are no longer ordered by clause_path first: %v", got)
+	}
+}
