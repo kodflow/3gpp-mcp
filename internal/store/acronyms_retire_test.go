@@ -44,10 +44,18 @@ var (
 // stays, the seeded rows are untouched, and the next identical run writes nothing.
 func TestAKeyTheNewestTS21905DroppedIsRetired(t *testing.T) {
 	s := openScratch(t)
-	for _, a := range []model.Acronym{ttcnV10, ttcnV19} {
-		if err := s.UpsertAcronym(a); err != nil {
-			t.Fatal(err)
-		}
+	if err := s.UpsertAcronym(ttcnV19); err != nil {
+		t.Fatal(err)
+	}
+	// The seeded glossary is already current, so the run below has NOTHING to do
+	// but the retirement: a retirement alone must be a change, or the write is
+	// skipped as "already correct" and the stale row stays.
+	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf}, newestStoresTTCN, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Then the stale row arrives, as the fold would leave it.
+	if err := s.UpsertAcronym(ttcnV10); err != nil {
+		t.Fatal(err)
 	}
 	plan, err := s.PlanSeededAcronyms([]model.Acronym{amf}, newestStoresTTCN)
 	if err != nil {
