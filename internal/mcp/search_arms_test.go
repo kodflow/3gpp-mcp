@@ -171,3 +171,75 @@ func TestWarmupRunsEachHalfAndSaysSo(t *testing.T) {
 		}
 	}
 }
+
+// slowReranker takes d per call and ignores the context, as an in-flight ONNX
+// Run does.
+type slowReranker struct{ d time.Duration }
+
+func (slowReranker) Enabled() bool { return true }
+func (s slowReranker) Score(_ context.Context, _ string, p []string) ([]float64, error) {
+	time.Sleep(s.d)
+	return make([]float64, len(p)), nil
+}
+
+// ONE BUDGET PER CALL, ACROSS BOTH HALVES. The 3GPP pass starts its rerank inside
+// the budget and overruns it; the ETSI pass that follows must find the budget
+// spent and say so — not start a fresh SEARCH_BUDGET of its own, which is how a
+// "20 s" federated call used to be able to spend three.
+//
+// Falsified: without search.WithBudget in searchSpec, the ETSI pass gets its own
+// budget, its rerank runs, and this fails.
+func TestAFederatedCallSpendsOneBudget(t *testing.T) {
+	t.Setenv("EMBEDDER", "off")
+	t.Setenv("SEARCH_BUDGET", "400ms")
+	ctx := context.Background()
+	open := func(spec, rel string) *store.Store {
+		s, err := store.Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		_ = s.UpsertSpec(model.Spec{SpecID: spec, DocType: "TS"})
+		_ = s.InsertClauses([]model.Clause{
+			{ChunkID: 1, SpecID: spec, Release: rel, Version: "1.0.0", ClausePath: "1", Heading: "A", Text: "registration one"},
+			{ChunkID: 2, SpecID: spec, Release: rel, Version: "1.0.0", ClausePath: "2", Heading: "B", Text: "registration two"},
+		})
+		return s
+	}
+	srv, _ := New(open("23.502", "Rel-19"), "test", "", nil, open("ETSI TS 103 221-1", "ETSI"),
+		WithReranker(slowReranker{d: 700 * time.Millisecond}))
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ir mcpgo.InitializeRequest
+	ir.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	ir.Params.ClientInfo = mcpgo.Implementation{Name: "test", Version: "1"}
+	if _, err := c.Initialize(ctx, ir); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, c, ctx, "search_spec", map[string]any{
+		"query": "registration", "mode": "lexical", "rerank": true, "spec_type": "any"})
+
+	ran := map[string]search.ArmRun{}
+	for _, r := range reportsOf(t, out) {
+		for _, a := range r.Arms {
+			if a.Arm == search.ArmRerank {
+				ran[r.Corpus] = a
+			}
+		}
+	}
+	if !ran["3gpp"].Ran {
+		t.Fatalf("the 3GPP rerank started inside the budget and must have run: %+v", ran["3gpp"])
+	}
+	if e := ran["etsi"]; e.Ran || !strings.Contains(e.Skipped, "SEARCH_BUDGET=400ms") {
+		t.Fatalf("the ETSI rerank = %+v, want skipped on the call's spent budget", e)
+	}
+	if md, _ := out["mode_degraded"].(string); !strings.Contains(md, "rerank (etsi") {
+		t.Fatalf("mode_degraded = %q, want the ETSI rerank named", md)
+	}
+}

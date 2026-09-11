@@ -97,8 +97,10 @@ func TestAFailingRerankIsReportedWithItsError(t *testing.T) {
 // the second search inherits what the first left: here nothing, so its rerank is
 // skipped — and says why.
 //
-// Falsified: with Search starting its own budget regardless of WithBudget, the
-// second search's rerank runs and the test fails.
+// Falsified: with WithBudget marking the context but starting no deadline, the
+// second search runs its rerank and the test fails. (The handler side — that
+// search_spec starts ONE budget for all its passes — is
+// TestAFederatedCallSpendsOneBudget in internal/mcp.)
 func TestSearchesUnderOneRequestShareItsBudget(t *testing.T) {
 	t.Setenv("EMBEDDER", "off")
 	t.Setenv("SEARCH_BUDGET", "150ms")
