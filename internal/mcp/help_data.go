@@ -14,7 +14,7 @@ var helpTools = []map[string]string{
 	{"tool": "trace_clause", "use_when": "how a clause's TEXT changed, paragraph by paragraph",
 		"note": "from_release+to_release gives the +/- between two points; reports the axis it used"},
 	{"tool": "trace_evolution", "use_when": "how a 4G element maps onto its 5GC network function(s)"},
-	{"tool": "get_changelog", "use_when": "the change records between two releases of one spec"},
+	{"tool": "get_changelog", "use_when": "the change records between two releases or versions of one spec (paged: limit + next_cursor)"},
 	{"tool": "list_releases", "use_when": "which releases/versions of a spec exist in the corpus"},
 	{"tool": "list_specs", "use_when": "browse the catalogue by release, series or working group"},
 	{"tool": "find_cross_references", "use_when": "which specs a spec or clause points at"},
