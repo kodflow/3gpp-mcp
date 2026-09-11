@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -383,6 +384,52 @@ func TestTraceEvolutionReportsItsUnreadHalvesToo(t *testing.T) {
 		t.Fatalf("the 3GPP edge was lost: count = %v", out["count"])
 	}
 	wantNamed(t, "trace_evolution", out, "etsi", "the ETSI half could not be read")
+
+	// Review round (#344). A half whose edges were READ but whose count failed
+	// still has edges to serve: the every-half-failed gate counted it as a
+	// failure and discarded them when the other half's lookup failed.
+	if err := e.InsertEvolutions([]model.Evolution{{FromTerm: "MME", ToTerm: "ADMF", EvolutionType: "EXTENDED_BY",
+		JustificationSpec: "ETSI TS 103 221-1", JustificationClause: "5", Confidence: 0.5}}); err != nil {
+		t.Fatal(err)
+	}
+	closed := memStore(t)
+	_ = closed.Close()
+	c, ctx = clientOver(t, &brokenHalf{Reader: st}, &countlessHalf{Reader: e, closed: closed})
+	out, text, isErr := callAny(t, c, ctx, "trace_evolution", map[string]any{"entity": "MME"})
+	if isErr {
+		t.Fatalf("the ETSI edge was read and then discarded: %s", text)
+	}
+	if n, _ := out["count"].(float64); n != 1 {
+		t.Errorf("want the one ETSI edge; count = %v", out["count"])
+	}
+	if u := unreadOfAnswer(out); u["3gpp"] == "" || u["etsi/edge count"] == "" {
+		t.Errorf("want the 3GPP lookup and the ETSI count named; got %v", u)
+	}
+
+	// An ETSI half that could not be opened is named even when the 3GPP lookup
+	// fails too — the error then names both — and it is not called "not attached".
+	why := "etsi.duckdb could not be opened at startup: IO Error"
+	c, ctx = clientOver(t, &brokenHalf{Reader: st}, nil, WithETSIUnavailable(why))
+	_, text, isErr = callAny(t, c, ctx, "trace_evolution", map[string]any{"entity": "MME"})
+	if !isErr || !strings.Contains(text, "Out of Memory") || !strings.Contains(text, "could not be opened") {
+		t.Errorf("both halves unread must be an error naming both; isError=%v %q", isErr, text)
+	}
+	c, ctx = clientOver(t, st, nil, WithETSIUnavailable(why))
+	out, _, _ = callAny(t, c, ctx, "trace_evolution", map[string]any{"entity": "UICC"})
+	if n := noteOf(out); strings.Contains(n, "not attached") || !strings.Contains(n, "the ETSI half could not be read") {
+		t.Errorf("an ETSI half asked for and unavailable must be named as unread, not as never attached; note = %q", n)
+	}
+}
+
+// countlessHalf reads its edges but cannot count them: its raw-SQL accessor is a
+// closed store's.
+type countlessHalf struct {
+	store.Reader
+	closed *store.Store
+}
+
+func (c *countlessHalf) QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row {
+	return c.closed.QueryRowContext(ctx, q, args...)
 }
 
 // AN ETSI HALF ASKED FOR AND NEVER OPENED. cmd/server logged it and served the
