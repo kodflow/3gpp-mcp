@@ -762,7 +762,19 @@ func stepEnrichETSI(t corpusTarget) *Step {
 			// dependency or feature change produces a different binary from identical
 			// sources, and build-rust is a Tool that never replays a data step.
 			"rust/parse/src/glossary.rs", "rust/parse/src/etsi.rs", "rust/parse/Cargo.toml",
+			// The crate root, where parse_html_clauses — the walker every deliverable
+			// goes through before a line is mined — lives, and the decoder that reads
+			// each file first. Both were missing: a fix to either changed the ETSI
+			// glossary with this step reported current. The list is no longer kept by
+			// hand: TestEnrichETSIDeclaresEverythingItsBinaryIsBuiltFrom derives what
+			// ingest-glossary is built from and fails on any file missing here.
+			"rust/parse/src/lib.rs", "rust/parse/src/html_bytes.rs",
 			"rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			// Named by the store's crate root (`pub use changes::ChangeRow`, and the
+			// identity crate it re-exports), so compiled into this binary from code
+			// it can reach. Cheap to over-declare since ingest-glossary writes nothing
+			// when the glossary is unchanged: a replay here costs ~2 min, 0 bytes.
+			"rust/store/src/changes.rs", "rust/identity",
 			// The workspace manifest and LOCKFILE: `cargo update` alone can change
 			// the binary, and build-rust is a Tool that never replays a data step.
 			"rust/Cargo.toml", "rust/Cargo.lock",
