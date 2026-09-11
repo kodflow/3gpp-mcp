@@ -123,7 +123,24 @@ func packLayer(root, out, cacheDir string, uid, gid int, gz bool, paths []string
 				if err := linkOrCopy(cached, out); err != nil {
 					return identity{}, 0, false, err
 				}
-				id.Key = ""
+				// --cache may BE the output directory: then the record beside out
+				// is the cache's own, and rewriting it without its key would turn
+				// the next run into a miss.
+				if sameFile(cached+idSuffix, out+idSuffix) {
+					id.Key = ""
+					return id, len(entries), true, nil
+				}
+				// A hard link carries the blob's mtime; a copy (no hard links on
+				// this filesystem) has its own, made here from the blob just
+				// verified. The staged record describes the staged file.
+				st, err := os.Stat(out)
+				if err != nil {
+					return identity{}, 0, false, err
+				}
+				id.Key, id.MTime = "", st.ModTime().UnixNano()
+				if err := id.describes(out); err != nil {
+					return identity{}, 0, false, err
+				}
 				return id, len(entries), true, writeIdentity(out, id)
 			}
 			fmt.Printf("  %s: cached under this key, but its identity record does not hold (%v) — packing it again\n",
@@ -241,6 +258,11 @@ func writeLayer(dst string, entries []entry, uid, gid int, gz bool) (identity, e
 		if id.Sample, err = sampleHash(dst, id.Size); err != nil {
 			return identity{}, err
 		}
+		st, err := os.Stat(dst)
+		if err != nil {
+			return identity{}, err
+		}
+		id.MTime = st.ModTime().UnixNano()
 		return id, id.wellFormed()
 	}
 	var w io.Writer = io.MultiWriter(f, dig)
@@ -484,14 +506,24 @@ func store(blob, key, layer string, id identity) error {
 	}
 	_ = os.Remove(blob + ".key")
 	_ = os.Remove(blob + idSuffix)
-	tmp := blob + ".tmp"
-	_ = os.Remove(tmp)
-	if err := linkOrCopy(layer, tmp); err != nil {
+	// --cache may be the output directory, and then the layer IS the blob.
+	if !sameFile(layer, blob) {
+		tmp := blob + ".tmp"
+		_ = os.Remove(tmp)
+		if err := linkOrCopy(layer, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, blob); err != nil {
+			return err
+		}
+	}
+	// A copy (no hard links here) has its own mtime: the record describes the
+	// cache's file.
+	st, err := os.Stat(blob)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, blob); err != nil {
-		return err
-	}
+	id.MTime = st.ModTime().UnixNano()
 	id.Key = key
 	if err := writeIdentity(blob, id); err != nil {
 		return err
@@ -515,10 +547,26 @@ func cachedIdentity(blob, key string) (identity, error) {
 	return id, nil
 }
 
+// sameFile reports whether a and b both exist and are one file.
+func sameFile(a, b string) bool {
+	sa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	sb, err := os.Stat(b)
+	return err == nil && os.SameFile(sa, sb)
+}
+
 // linkOrCopy makes dst the same bytes as src: a hard link when the filesystem
 // allows it (no copy of a 16 GB blob), a copy otherwise. NOTHING WRITES THROUGH
 // EITHER NAME: a layer is written once, to a temporary name, and renamed.
 func linkOrCopy(src, dst string) error {
+	// Already the same file — one path, or a link to it. Removing dst first would
+	// delete the only copy when the two are one path (--cache pointing at the
+	// output directory; found by review of #336).
+	if sameFile(src, dst) {
+		return nil
+	}
 	_ = os.Remove(dst)
 	if err := os.Link(src, dst); err == nil {
 		return nil

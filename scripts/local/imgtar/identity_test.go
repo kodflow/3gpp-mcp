@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // reread is what `crane append` computed for a layer by reading it: the sha256
@@ -102,6 +103,7 @@ func TestWriteLayerObservesWhatAReReadFinds(t *testing.T) {
 func TestARecordDescribesOnlyItsOwnBlob(t *testing.T) {
 	root := bigTree(t)
 	entries, _ := collect(root, []string{"usr", "data"})
+	past := time.Unix(1_700_000_000, 0)
 	fresh := func(t *testing.T) (string, identity) {
 		t.Helper()
 		p := filepath.Join(t.TempDir(), "l.tar.gz")
@@ -109,6 +111,12 @@ func TestARecordDescribesOnlyItsOwnBlob(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// An mtime well in the past, so that any later write moves it even on a
+		// filesystem whose clock ticks coarser than this test runs.
+		if err := os.Chtimes(p, past, past); err != nil {
+			t.Fatal(err)
+		}
+		id.MTime = past.UnixNano()
 		if err := writeIdentity(p, id); err != nil {
 			t.Fatal(err)
 		}
@@ -165,25 +173,62 @@ func TestARecordDescribesOnlyItsOwnBlob(t *testing.T) {
 			t.Fatal("a record accepted a blob of another size")
 		}
 	})
-	// The same size, one byte changed — where the gzip header is, and where the
-	// trailer's CRC-32 of the whole tar is. This is the replaced-under-the-same-name
-	// case; the byte flipped is covered by the sample by construction.
+	// The same size AND the same mtime, one byte changed — where the gzip header
+	// is, and where the trailer's CRC-32 of the whole tar is: a blob replaced under
+	// the same name with its timestamp put back. Only the sample can see it, and
+	// the byte flipped is covered by the sample by construction.
 	for _, where := range []string{"header", "trailer"} {
-		t.Run("one byte of the "+where+" changed, size kept", func(t *testing.T) {
+		t.Run("one byte of the "+where+" changed, size and mtime kept", func(t *testing.T) {
 			p, id := fresh(t)
 			off := int64(4) // gzip MTIME field
 			if where == "trailer" {
 				off = id.Size - 6 // inside the CRC-32
 			}
 			flip(t, p, off)
-			if st, _ := os.Stat(p); st.Size() != id.Size {
-				t.Fatal("the test changed the size, so it proves nothing about the sample")
+			if err := os.Chtimes(p, past, past); err != nil {
+				t.Fatal(err)
+			}
+			if st, _ := os.Stat(p); st.Size() != id.Size || st.ModTime().UnixNano() != id.MTime {
+				t.Fatal("the test changed the size or the mtime, so it proves nothing about the sample")
 			}
 			if _, err := readIdentity(p); err == nil {
-				t.Fatal("a record accepted a blob whose content changed under the same size")
+				t.Fatal("a record accepted a blob whose content changed under the same size and mtime")
 			}
 		})
 	}
+	// A byte NO sampled block covers, written in place, size kept: the case review
+	// of #336 raised. The sample cannot see it; the write moved the mtime.
+	t.Run("a byte outside every sampled block written in place", func(t *testing.T) {
+		p, id := fresh(t)
+		off := unsampledOffset(t, id.Size)
+		flip(t, p, off)
+		if st, _ := os.Stat(p); st.Size() != id.Size {
+			t.Fatal("the test changed the size, so it proves nothing")
+		}
+		if s, _ := sampleHash(p, id.Size); s != id.Sample {
+			t.Fatalf("offset %d is inside a sampled block, so this case is the sample's, not the mtime's", off)
+		}
+		if _, err := readIdentity(p); err == nil {
+			t.Fatal("a record accepted a blob written in place after it was made")
+		}
+	})
+}
+
+// unsampledOffset is an offset of a size-byte file that no block of sampleHash
+// reads.
+func unsampledOffset(t *testing.T, size int64) int64 {
+	t.Helper()
+	if size <= sampleBlocks*sampleBlockSize {
+		t.Fatalf("a %d-byte file is hashed whole", size)
+	}
+	last := size - sampleBlockSize
+	// Halfway between the end of block 7 and the start of block 8.
+	end7 := last*7/(sampleBlocks-1) + sampleBlockSize
+	start8 := last * 8 / (sampleBlocks - 1)
+	if start8 <= end7 {
+		t.Fatalf("blocks 7 and 8 touch in a %d-byte file", size)
+	}
+	return (end7 + start8) / 2
 }
 
 // THE CACHE HANDS BACK A LAYER ONLY WITH ITS OWN IDENTITY: the record must name the
@@ -312,7 +357,7 @@ func TestAsyncHashIsTheSHA256OfEveryByteWritten(t *testing.T) {
 		for j := range q {
 			q[j] = byte(i*131 + j*7)
 		}
-		want.Write(q)
+		_, _ = want.Write(q)
 		total += int64(n)
 	}
 	got, n := a.sum()
@@ -349,5 +394,37 @@ func TestLayerIdentityComputesAMissingOrFalseRecord(t *testing.T) {
 	id, recorded, err = layerIdentity(p)
 	if err != nil || recorded || id != want {
 		t.Fatalf("false record: %+v recorded=%v %v; its diff_id must not reach the image", id, recorded, err)
+	}
+}
+
+// --cache MAY BE THE OUTPUT DIRECTORY (review of #336): the cache blob and the
+// layer are then one path, and a hit that removed the destination before linking
+// deleted the only copy. Three packs: a miss, then two hits — the second proves
+// the hit left the cache's record, key included, in place.
+func TestPackingIntoTheCacheDirectoryKeepsTheLayer(t *testing.T) {
+	root := tree(t)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "10-x.tar.gz")
+	var first identity
+	for i, wantCached := range []bool{false, true, true} {
+		id, _, cached, err := packLayer(root, out, dir, 10001, 10001, true, []string{"usr", "data"})
+		if err != nil {
+			t.Fatalf("pack %d: %v", i+1, err)
+		}
+		if cached != wantCached {
+			t.Fatalf("pack %d: cached=%v, want %v", i+1, cached, wantCached)
+		}
+		d, diff, n := reread(t, out)
+		if id.Digest != d || id.DiffID != diff || id.Size != n {
+			t.Fatalf("pack %d reported %s/%s/%d; the layer on disk is %s/%s/%d", i+1, id.Digest, id.DiffID, id.Size, d, diff, n)
+		}
+		if i == 0 {
+			first = id
+		} else if id.Digest != first.Digest {
+			t.Fatalf("pack %d handed back %s for a tree packed as %s", i+1, id.Digest, first.Digest)
+		}
+		if _, recorded, err := layerIdentity(out); err != nil || !recorded {
+			t.Fatalf("pack %d: imgtar oci finds no valid record beside the layer (recorded=%v, %v)", i+1, recorded, err)
+		}
 	}
 }

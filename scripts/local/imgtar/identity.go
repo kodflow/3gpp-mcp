@@ -31,7 +31,7 @@ import (
 // are never inferred from the layer key, from a file name or from a timestamp,
 // so a recorded diff_id always belongs to the digest recorded beside it. What
 // can go stale is the link between the record and the FILE it sits next to, and
-// Sample is the cheap witness for that link (see describes).
+// MTime and Sample are the cheap witnesses for that link (see describes).
 type identity struct {
 	Digest string `json:"digest"`  // "sha256:<hex>" of the .tar.gz
 	Size   int64  `json:"size"`    // bytes of the .tar.gz
@@ -40,6 +40,10 @@ type identity struct {
 	// last included, so the gzip header and its trailer — the CRC-32 and length of
 	// the whole tar — are always among the bytes compared.
 	Sample string `json:"sample"`
+	// MTime is the blob's modification time, in nanoseconds, when the record was
+	// made. A layer is written once, to a temporary name, renamed and hard-linked,
+	// and never written again; any in-place write moves this.
+	MTime int64 `json:"mtime"`
 	// Key is the layer key the blob was packed under. Set on the CACHE's record
 	// only: a record is valid for the cache entry whose key it names, so a record
 	// left behind by another key can never vouch for this one's blob.
@@ -67,17 +71,27 @@ func (id identity) wellFormed() error {
 }
 
 // describes reports whether id is the record of the file at blob, WITHOUT reading
-// the file: same size, and the same content sample (~1 MiB of reads).
+// the file: same size, same modification time, and the same content sample (~1 MiB
+// of reads).
 //
-// A FULL HASH IS WHAT THIS IS SPARING. Re-hashing the blob is the 26 GB read the
-// record exists to remove. What the check has to catch is a record that outlived
-// its file — a blob replaced or rewritten under the same name — and a different
-// gzip stream differs in its header, its trailer (CRC-32 and length of the whole
-// tar) or its size. What slips past is a same-size edit confined to bytes no
-// sampled block covers, and it does not become a wrong image even then: a blob
-// the registry already holds is served from the registry's own copy, whose
-// diff_id is the recorded one, and a blob it lacks is uploaded under the recorded
-// digest, which the registry verifies and refuses on mismatch.
+// A FULL HASH IS WHAT THIS IS SPARING, AND IT WOULD COST MORE THAN IT SAVES.
+// Re-hashing the blobs is the 26 GB read the record exists to remove: sha256 of the
+// 4 GB model layer took 117 s on this machine (2026-09-11), so ~12 minutes for all
+// of them, against the 7m42 of `crane append` this replaces. What the check has to
+// catch is a record that outlived its file — a blob replaced or rewritten under the
+// same name. A replaced file differs in size, header, trailer (CRC-32 and length
+// of the whole tar) or mtime; a file written in place has a new mtime. It is the
+// identity the pipeline already trusts for these very files: size, mtime and a
+// content sample (layerKey here, outputIdentity and the contract certificate in
+// internal/goal).
+//
+// WHAT SLIPS PAST, and what it costs. A same-size edit confined to bytes no
+// sampled block covers, with the mtime put back by hand. Even that does not make
+// an inconsistent image: a blob the registry already holds is served from the
+// registry's own copy — the layer as imgtar wrote it, whose diff_id is the recorded
+// one — and a blob it lacks is uploaded under the recorded digest, which the
+// registry verifies (a corrupted blob was refused with DIGEST_INVALID by a local
+// registry, 2026-09-11).
 func (id identity) describes(blob string) error {
 	if err := id.wellFormed(); err != nil {
 		return err
@@ -91,6 +105,9 @@ func (id identity) describes(blob string) error {
 	}
 	if st.Size() != id.Size {
 		return fmt.Errorf("%s is %d bytes, the record says %d", blob, st.Size(), id.Size)
+	}
+	if st.ModTime().UnixNano() != id.MTime {
+		return fmt.Errorf("%s was modified after its record was made", blob)
 	}
 	sample, err := sampleHash(blob, st.Size())
 	if err != nil {
@@ -177,6 +194,7 @@ func computeIdentity(blob string) (identity, error) {
 		Size:   st.Size(),
 		DiffID: "sha256:" + hex.EncodeToString(diff.Sum(nil)),
 		Sample: sample,
+		MTime:  st.ModTime().UnixNano(),
 	}
 	return id, id.wellFormed()
 }
@@ -228,7 +246,7 @@ func newAsyncHash() *asyncHash {
 	a.cur = <-a.free
 	go func() {
 		for b := range a.full {
-			a.h.Write(b)
+			_, _ = a.h.Write(b) // hash.Hash.Write never returns an error
 			// Never blocks: only asyncBufs buffers exist, and free holds that many.
 			a.free <- b[:0]
 		}
