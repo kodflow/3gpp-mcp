@@ -16,6 +16,51 @@ func TestAddKeepsTheNumericallyHighestVersion(t *testing.T) {
 	}
 }
 
+// THE FOLD'S ORDER, NOT A LOOK-ALIKE. rust/identity cmp_ver compares the first
+// three components, each parsed whole as an i64, garbage as 0. Every row below is
+// that function's answer, read off its code (`split('.').take(3)`,
+// `p.parse().unwrap_or(0)`); the last group is where a leading-digits reading —
+// cmd/anchorcheck's — would answer differently, and would have written a
+// different anchor than the fold for the same corpus.
+func TestCmpVerIsTheFoldsOrder(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want int
+	}{
+		{"2.10.0", "2.9.0", 1},
+		{"19.14.0", "19.9.0", 1},
+		{"18.5.1", "18.5.0", 1},
+		{"19.0.0", "20.0.0", -1},
+		{"19.1", "19.1.0", 0},
+		{"", "0.0.0", 0},
+		{"1.0.0", "", 1},
+		{"-1.0.0", "0.0.0", -1}, // i64 parse takes the sign
+		{"+1.0.0", "1.0.0", 0},
+		{"99999999999999999999.0.0", "0.0.0", 0}, // overflow is garbage: 0
+		// Where the fold and a leading-digits reading part:
+		{"1.2.3.4", "1.2.3", 0},   // the fourth component is never looked at
+		{"1.2.3.9", "1.2.3.1", 0}, //   … in either argument
+		{"19x.0.0", "0.0.0", 0},   // a component is parsed whole: "19x" is 0, not 19
+		{"19.1a.0", "19.0.0", 0},
+		{" 1.0.0", "0.0.0", 0}, // no trimming
+	} {
+		if got := CmpVer(c.a, c.b); got != c.want {
+			t.Errorf("CmpVer(%q, %q) = %d, want %d (the fold's cmp_ver)", c.a, c.b, got, c.want)
+		}
+		if got := CmpVer(c.b, c.a); got != -c.want {
+			t.Errorf("CmpVer(%q, %q) = %d, want %d (antisymmetry)", c.b, c.a, got, -c.want)
+		}
+	}
+	// On a tie the fold keeps the FIRST row it read (it replaces only on Greater);
+	// so does Add. (No key of the real corpus has two versions that tie — measured.)
+	ix := Index{}
+	ix.Add("x", "R", "1.2.3.4")
+	ix.Add("x", "R", "1.2.3")
+	if ix["x|R"] != "1.2.3.4" {
+		t.Errorf("a tie replaced the first row read: %q", ix["x|R"])
+	}
+}
+
 // THE BYTES ARE THE FOLD'S: sorted keys, one-space indent, no trailing newline.
 // The anchor is an Input of discover (size + mtime), and the byte-identity with
 // merge --index-out is what the 554 235-byte measurement on the real corpus rests on.

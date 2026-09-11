@@ -69,8 +69,8 @@ func TestTheAnchorIsReadOffTheCorpus(t *testing.T) {
 	if string(got) != want {
 		t.Fatalf("anchor:\n%s\nwant:\n%s", got, want)
 	}
-	if _, err := os.Stat(out + ".tmp"); err == nil {
-		t.Error("the temporary file was left behind")
+	if left, _ := filepath.Glob(out + ".*.tmp"); len(left) > 0 {
+		t.Errorf("the temporary file was left behind: %v", left)
 	}
 	after, err := os.Stat(db)
 	if err != nil {

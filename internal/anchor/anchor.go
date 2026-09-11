@@ -21,33 +21,35 @@
 // the fold's corpus-index.json are the same 554 235 bytes.
 //
 // This package is pure (no DuckDB): the rule and the format. cmd/derive-anchor
-// reads spec_versions and applies them.
+// reads spec_versions and applies them. Where the anchor sits in the pipeline —
+// seed, discover, ingest's fold — is CLAUDE.md §6 ("Pipeline d'ingestion") and
+// docs/local-pipeline.md; why it is derived is ADR 0003's second 2026-09-11
+// amendment.
 package anchor
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
-// CmpVer orders dotted numeric versions component-wise: "2.10.0" is AFTER
-// "2.9.0", which string order gets wrong. A missing or non-numeric component
-// counts as 0 (digits up to the first non-digit), so a malformed version never
-// panics and never sorts above a real one.
+// CmpVer orders versions the way the FOLD does — rust/identity cmp_ver, which
+// writes the canonical anchor: the first THREE dotted components, each parsed
+// whole as a signed integer, anything unparseable (or absent) counting as 0.
+// "2.10.0" is after "2.9.0", which string order gets wrong; "1.2.3.4" equals
+// "1.2.3", because the fold never looks past the third component; "19x" is 0,
+// not 19, because the fold parses the component whole.
 //
-// It is the rule cmd/anchorcheck judges an anchor by, and the one the fold's
-// identity::cmp_ver applies when it writes one; cmd/anchorcheck's tests hold the
-// two Go copies to each other, and the byte-identity measurement above holds the
-// derivation to the fold.
+// Matching the fold, not merely agreeing with it on today's data, is the point:
+// the derived anchor must be the file the fold would have written. (On the real
+// corpus every one of the 20 163 versions is a plain numeric triple, measured
+// 2026-09-11, so the two readings coincide there; outside that shape they did
+// not, and it is the fold's reading that discover has always been given.)
 func CmpVer(a, b string) int {
-	as, bs := strings.Split(a, "."), strings.Split(b, ".")
-	n := len(as)
-	if len(bs) > n {
-		n = len(bs)
-	}
-	for i := 0; i < n; i++ {
-		x, y := part(as, i), part(bs, i)
-		if x != y {
-			if x < y {
+	x, y := triple(a), triple(b)
+	for i := range x {
+		if x[i] != y[i] {
+			if x[i] < y[i] {
 				return -1
 			}
 			return 1
@@ -56,18 +58,20 @@ func CmpVer(a, b string) int {
 	return 0
 }
 
-func part(s []string, i int) int {
-	if i >= len(s) {
-		return 0
-	}
-	n := 0
-	for _, r := range s[i] {
-		if r < '0' || r > '9' {
-			return n
+// triple is cmp_ver's `v.split('.').take(3)` with `p.parse().unwrap_or(0)`:
+// strconv.ParseInt accepts and refuses what Rust's i64 parse does (an optional
+// sign, decimal digits, no spaces, no overflow).
+func triple(v string) [3]int64 {
+	var t [3]int64
+	for i, p := range strings.SplitN(v, ".", 4) {
+		if i == 3 {
+			break
 		}
-		n = n*10 + int(r-'0')
+		if n, err := strconv.ParseInt(p, 10, 64); err == nil {
+			t[i] = n
+		}
 	}
-	return n
+	return t
 }
 
 // Index is an anchor: "spec|release" -> highest version.
