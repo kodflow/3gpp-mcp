@@ -146,11 +146,28 @@ func etsiChangelogNote(ctx context.Context, etsi store.Reader, specID string, al
 		return "the ETSI half is not attached to this server (it was started without --etsi-db), so nothing " +
 			"about " + specID + " can be answered here: count 0 is the absence of that corpus, not of changes."
 	}
-	source := strings.TrimSpace(etsi.GetMeta(ctx, "changes_source"))
-	if source == "" {
+	// A STAMP THAT COULD NOT BE READ IS NOT AN ABSENT STAMP. Through GetMeta, a
+	// failed read came back as "", and "" selects the branch below that says the
+	// ETSI half holds no change record at all — printed beside the records the
+	// same call had just served. metaReads keeps the failure apart (meta_reads.go),
+	// and the no-records branch now also requires that there ARE no records.
+	meta := newMetaReads(ctx, etsi)
+	source, sourceOK := meta.get("changes_source")
+	source = strings.TrimSpace(source)
+	switch {
+	case !sourceOK:
+		source = "the ETSI half's changes_source stamp could not be read: " + meta.errs["changes_source"]
+		if len(all) == 0 {
+			return "this corpus holds no change-request record for " + specID + " — and " + source +
+				", so this answer cannot say whether the ETSI half carries change records at all. A count of 0 " +
+				"means \"no record here\", not \"never changed\". " + useTraceClause
+		}
+	case source == "" && len(all) == 0:
 		return "this corpus holds no change-request records for the ETSI half: ETSI publishes PDFs, " +
 			"and the change-history table does not survive text extraction well enough to cite. " +
 			"A count of 0 means \"no record here\", not \"never changed\". " + useTraceClause
+	case source == "":
+		source = "no changes_source stamp is recorded"
 	}
 	if len(all) == 0 {
 		return "this corpus holds no change-request record for " + specID + ". ETSI publishes PDFs, and its " +

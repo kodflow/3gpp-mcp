@@ -508,6 +508,10 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	if len(clauses) == 0 {
 		return mcp.NewToolResultError("no such spec/clause in corpus: " + specID), nil
 	}
+	// A version filed under several releases comes back once per filing; serve
+	// one, and say where else it is filed (filings.go).
+	all := len(clauses)
+	clauses, filedUnder := oneFiling(clauses, release)
 	// Release lineage per clause (present_in / introduced / last_seen / obsolete)
 	// so every fragment says where it lives across releases and whether it's gone.
 	full := r.GetBool("full", false)
@@ -566,6 +570,11 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 			resp["added_in_later_releases"] = rv.AddedLater
 			resp["removed_before_baseline"] = rv.RemovedBefore
 		}
+	}
+	if len(filedUnder) > 0 {
+		resp["filed_under"] = filedUnder
+		note, _ := resp["note"].(string)
+		resp["note"] = joinNotes(filingNote(specID, version, filedUnder, clauses[0].Release, len(clauses) < all), note)
 	}
 	return jsonResult(resp)
 }
@@ -767,9 +776,17 @@ func changelogNote(ctx context.Context, st store.Reader, specID string, changes 
 	// stop a number from being read as more than it is. The export STAMP is not a
 	// count — it is read from the corpus being served, so it cannot go stale
 	// against it.
-	source := strings.TrimSpace(st.GetMeta(ctx, "changes_source"))
+	//
+	// Read through metaReads, not GetMeta: a stamp that could not be read is said
+	// to be unreadable, not dropped as if there were none (meta_reads.go).
+	meta := newMetaReads(ctx, st)
+	source, sourceOK := meta.get("changes_source")
+	source = strings.TrimSpace(source)
 	from := " from the 3GPP change-request database"
-	if source != "" {
+	switch {
+	case !sourceOK:
+		from += " (its export stamp could not be read: " + meta.errs["changes_source"] + ")"
+	case source != "":
 		from += " (" + source + ")"
 	}
 	if len(changes) == 0 {
