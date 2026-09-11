@@ -37,21 +37,43 @@ func main() {
 	}
 }
 
-func run() error {
+// goalFlags are goal's command-line flags.
+type goalFlags struct {
+	floor, scope, jobs, embedFloor, etsiScope, dataDir, only, from *string
+	full, repair, dry, forceOnly                                   *bool
+}
+
+// newFlagSet declares goal's flags. It is a function of its own so that a test can
+// read the defaults goal actually applies (TestEveryEmbedFloorDefaultIsThePipelines
+// holds --embed-floor's to the scripts' ${EMBED_FLOOR:-…}).
+func newFlagSet() (*flag.FlagSet, goalFlags) {
 	fs := flag.NewFlagSet("goal", flag.ContinueOnError)
+	f := goalFlags{
+		floor: fs.String("floor", env("GOAL_FLOOR", "Rel-99"), "lowest 3GPP release to index (Rel-99 = every real release)"),
+		scope: fs.String("scope", env("GOAL_SCOPE", ""), "explicit series scope, space separated (empty = automatic delta)"),
+		jobs:  fs.String("jobs", env("GOAL_JOBS", "4"), "conversion workers (LibreOffice is RAM-hungry)"),
+		// ONE floor for embed, validate and the published image: publish passes the
+		// floor validate applied to build-image.sh, and refuses an EMBED_FLOOR that
+		// disagrees with it (internal/goal/embed_floor.go).
+		embedFloor: fs.String("embed-floor", env("GOAL_EMBED_FLOOR", goal.DefaultEmbedFloor), "embed clauses at or above this release; validate and the published image are held to the same floor"),
+		etsiScope:  fs.String("etsi-scope", env("GOAL_ETSI_SCOPE", ""), "ETSI deliverables to index: empty = the whole /deliver archive with EVERY published version (the analogue of keeping every 3GPP release); 'all' = the archive at the latest version of each; 'li-suite' = only the fourteen built-in Lawful-Interception deliverables; else a comma-separated id list"),
+		dataDir:    fs.String("data", env("GOAL_DATA", ""), "corpus/DB directory (default <repo>/data)"),
+		full:       fs.Bool("full", false, "ignore the delta anchor and reindex everything"),
+		repair:     fs.Bool("repair", false, "require the proportionate work list (upstream drift UNION corpus holes) and fail if it cannot be computed; it is the DEFAULT wherever a corpus and an index exist"),
+		dry:        fs.Bool("dry-run", false, "decide but do not execute"),
+		only:       fs.String("only", "", "restrict to these steps, comma separated (preconditions are still checked)"),
+		forceOnly:  fs.Bool("force-only", false, "run the selected steps even when their preconditions are unmet — loudly, and the result is not reproducible"),
+		from:       fs.String("from", "", "run this step and everything after it"),
+	}
+	return fs, f
+}
+
+func run() error {
+	fs, f := newFlagSet()
 	var (
-		floor      = fs.String("floor", env("GOAL_FLOOR", "Rel-99"), "lowest 3GPP release to index (Rel-99 = every real release)")
-		scope      = fs.String("scope", env("GOAL_SCOPE", ""), "explicit series scope, space separated (empty = automatic delta)")
-		jobs       = fs.String("jobs", env("GOAL_JOBS", "4"), "conversion workers (LibreOffice is RAM-hungry)")
-		embedFloor = fs.String("embed-floor", env("GOAL_EMBED_FLOOR", "Rel-99"), "embed clauses at or above this release")
-		etsiScope  = fs.String("etsi-scope", env("GOAL_ETSI_SCOPE", ""), "ETSI deliverables to index: empty = the whole /deliver archive with EVERY published version (the analogue of keeping every 3GPP release); 'all' = the archive at the latest version of each; 'li-suite' = only the fourteen built-in Lawful-Interception deliverables; else a comma-separated id list")
-		dataDir    = fs.String("data", env("GOAL_DATA", ""), "corpus/DB directory (default <repo>/data)")
-		full       = fs.Bool("full", false, "ignore the delta anchor and reindex everything")
-		repair     = fs.Bool("repair", false, "require the proportionate work list (upstream drift UNION corpus holes) and fail if it cannot be computed; it is the DEFAULT wherever a corpus and an index exist")
-		dry        = fs.Bool("dry-run", false, "decide but do not execute")
-		only       = fs.String("only", "", "restrict to these steps, comma separated (preconditions are still checked)")
-		forceOnly  = fs.Bool("force-only", false, "run the selected steps even when their preconditions are unmet — loudly, and the result is not reproducible")
-		from       = fs.String("from", "", "run this step and everything after it")
+		floor, scope, jobs, embedFloor = f.floor, f.scope, f.jobs, f.embedFloor
+		etsiScope, dataDir, only, from = f.etsiScope, f.dataDir, f.only, f.from
+		full, repair, dry, forceOnly   = f.full, f.repair, f.dry, f.forceOnly
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, "usage: goal <plan|run|status|invalidate|manifest> [flags]\n\n")

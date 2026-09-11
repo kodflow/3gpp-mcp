@@ -72,8 +72,11 @@ func voidContractCertificate(c *Ctx) {
 // anchorcheck both succeeded.
 func writeContractCertificate(c *Ctx, t corpusTarget) error {
 	cert := contractCertificate{
-		Flags:       c.Cfg(t.ContractKey),
-		EmbedFloor:  t.Floor(c),
+		Flags: c.Cfg(t.ContractKey),
+		// The floor cmd/validate was GIVEN, not the config's: a contract carrying its
+		// own --embed-floor (DATA_EMBED_FLOOR) wins in validateArgs, and a certificate
+		// naming the config floor would then vouch for a check that never ran.
+		EmbedFloor:  appliedEmbedFloor(c, t),
 		Files:       map[string]string{},
 		CertifiedAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -88,10 +91,11 @@ func writeContractCertificate(c *Ctx, t corpusTarget) error {
 }
 
 // contractCertified says why the image build may skip re-running the contract, or
-// "" when it must run it. imageFloor is the floor build-image.sh would apply
-// (${EMBED_FLOOR:-…}), which is not necessarily the one `validate` used: the two
-// knobs are separate today, and a certificate for another floor is not one for
-// this build.
+// "" when it must run it. imageFloor is the floor build-image.sh will apply — the
+// --embed-floor runPublish passes it, which is validate's own applied floor
+// (embed_floor.go), so on the pipeline's path the two agree by construction. The
+// comparison stays: a certificate written under another configuration (an
+// earlier run, a --force-only publish) is not one for this build.
 func contractCertified(c *Ctx, imageFloor string) string {
 	// THE SCRIPT BAKES <repo>/data, WHATEVER GOAL WAS POINTED AT. build-image.sh
 	// validates and stages data/3gpp.duckdb under its own root; goal can run with

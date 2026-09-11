@@ -69,7 +69,7 @@ func TestFetchCorpusSkipsTransferWhenCacheIsCurrent(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), member)
 	quiet := func(string, ...any) {}
 
-	if err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
+	if _, err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
 	got, err := os.ReadFile(dest)
@@ -84,7 +84,7 @@ func TestFetchCorpusSkipsTransferWhenCacheIsCurrent(t *testing.T) {
 	}
 
 	// Same package, same cache: the transfer is what must not happen again.
-	if err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
+	if _, err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
 		t.Fatalf("second fetch: %v", err)
 	}
 	if n := atomic.LoadInt32(&blobHits); n != 1 {
@@ -137,11 +137,11 @@ func TestFetchCorpusTransfersWhenThePublishedLayerChanges(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), member)
 	quiet := func(string, ...any) {}
 
-	if err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
+	if _, err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
 	current = second // a new corpus is published
-	if err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
+	if _, err := FetchCorpus(context.Background(), src, "pat", dest, quiet); err != nil {
 		t.Fatalf("second fetch: %v", err)
 	}
 	if n := atomic.LoadInt32(&blobHits); n != 2 {

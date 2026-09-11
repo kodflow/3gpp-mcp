@@ -11,8 +11,9 @@
 // The behaviour lives in internal/glossaryseed; this is the thin CLI around it
 // (cmd/CLAUDE.md). It REPLACES the rows it owns — those citing a spec id — and
 // nothing else: what the sweep declares is written, a seeded row no spec declares
-// any more is removed, and the TS 21.905 and ETSI entries stay exactly where they
-// are. It is idempotent: re-running over an unchanged corpus writes nothing. What
+// any more is removed, and the TS 21.905 and ETSI entries stay where they are —
+// except a TS 21.905 row whose key the newest TS 21.905 no longer stores, which is
+// retired (a version corrected or dropped it). It is idempotent: re-running over an unchanged corpus writes nothing. What
 // changes is which meaning a reader is shown first.
 //
 // A SEEDED ROW WHOSE KEY TS 21.905'S WRITER STORES IS NEVER REMOVED. When a spec
@@ -106,12 +107,12 @@ func emit(rep glossaryseed.Report, format string) {
 	case !rep.Applied:
 		fmt.Printf("seed-glossary: parsed=%d (check-only, floor %d)\n", rep.Parsed, rep.Min)
 		if rep.OK {
-			fmt.Printf("seed-glossary: a write would rewrite %d row(s), remove %d and hand %d back "+
-				"to TS 21.905\n", rep.Rewritten, rep.Removed, rep.Restored)
+			fmt.Printf("seed-glossary: a write would rewrite %d row(s), remove %d, hand %d back "+
+				"to TS 21.905 and retire %d of its own\n", rep.Rewritten, rep.Removed, rep.Restored, rep.Retired)
 		}
 	case rep.Changed:
-		fmt.Printf("seed-glossary: parsed=%d written=%d rewritten=%d removed=%d restored=%d (floor %d)\n",
-			rep.Parsed, rep.Written, rep.Rewritten, rep.Removed, rep.Restored, rep.Min)
+		fmt.Printf("seed-glossary: parsed=%d written=%d rewritten=%d removed=%d restored=%d retired=%d (floor %d)\n",
+			rep.Parsed, rep.Written, rep.Rewritten, rep.Removed, rep.Restored, rep.Retired, rep.Min)
 	default:
 		// Said out loud, because "written=679" used to be printed either way. A
 		// reader of the enrich log needs to tell a corpus left untouched from a
@@ -125,29 +126,35 @@ func emit(rep glossaryseed.Report, format string) {
 	// a run by; --report json carries every one. The rows handed back and the rows
 	// withheld are named the same way: each is a row whose citation moved, or a
 	// release a failed read stopped.
-	removed, restored := "removed", "handed back"
+	removed, restored, retired := "removed", "handed back", "retired"
 	if !rep.Applied {
-		removed, restored = "would remove", "would hand back"
+		removed, restored, retired = "would remove", "would hand back", "would retire"
 	}
 	name(rep.RemovedRows, removed, "")
 	name(rep.RestoredRows, restored, " -> TS 21.905")
+	name(rep.RetiredRows, retired, ", no longer in the newest TS 21.905")
 	name(rep.WithheldRows, "withheld", ", TS 21.905 unread")
 	// The guard's verdict is printed on every run that reached it, pass included:
 	// "pass" with its numbers is what tells a reader of the enrich log how far this
 	// run was from being refused, which a silent pass never would. It counts
-	// deletions and nothing else — see massRemoval — so its line says removed.
+	// deletions and nothing else — see massRemoval — so its line says removed, and
+	// names the TS 21.905 rows retired, which are deletions too.
+	retiredToo := ""
+	if rep.Retired > 0 {
+		retiredToo = fmt.Sprintf(" and %d TS 21.905 row(s) retired", rep.Retired)
+	}
 	switch rep.Guard {
 	case "pass":
-		fmt.Printf("seed-glossary: mass-removal guard: pass — %d of %d seeded row(s) removed "+
-			"(bound %d), no catalogued spec silenced\n", rep.Removed, rep.Owned, rep.RemovalBound)
+		fmt.Printf("seed-glossary: mass-removal guard: pass — %d of %d seeded row(s) removed%s "+
+			"(bound %d), no catalogued spec silenced\n", rep.Removed, rep.Owned, retiredToo, rep.RemovalBound)
 	case "overridden":
 		fmt.Printf("seed-glossary: mass-removal guard: OVERRIDDEN by --allow-mass-removal — "+
-			"%d of %d seeded row(s) (bound %d), %d catalogued spec(s) silenced\n",
-			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+			"%d of %d seeded row(s)%s (bound %d), %d catalogued spec(s) silenced\n",
+			rep.Removed, rep.Owned, retiredToo, rep.RemovalBound, len(rep.Vanished))
 	case "refused":
 		fmt.Printf("seed-glossary: mass-removal guard: REFUSED — nothing written "+
-			"(%d of %d seeded row(s), bound %d, %d catalogued spec(s) silenced)\n",
-			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+			"(%d of %d seeded row(s)%s, bound %d, %d catalogued spec(s) silenced)\n",
+			rep.Removed, rep.Owned, retiredToo, rep.RemovalBound, len(rep.Vanished))
 	}
 	// WITHHELD ROWS ARE SAID APART, AND LOUDLY. The guard no longer counts them —
 	// they are not deletions — so this line is what keeps them from passing

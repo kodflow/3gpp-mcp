@@ -72,9 +72,37 @@ fn is_descendant(root: &str, path: &str) -> bool {
 /// (TAB or 2+ spaces) is what keeps prose out, and a definition line is
 /// "term: prose" with single spaces. Measured on TS 102 221 v18.4.0 when this
 /// extractor was written: ZERO rows from the prose of 3.1.
+///
+/// AN UNNUMBERED CLAUSE CONTINUES THE REGION; only a numbered clause that is not
+/// under the heading ends it. That is the shape of TS 21.905 itself, the document
+/// this extractor was written for, in every one of the 16 versions the corpus
+/// holds (Rel-4 to Rel-19):
+///
+/// ```text
+/// 4    Abbreviations     <- matched here, EMPTY body
+///      0-9               <- clause_path "": the list, letter by letter
+///      A … Z             <- clause_path ""
+/// 5    Equations         <- numbered, not under 4: the region ends
+/// ```
+///
+/// The descendant rule above, as first written, walked only NUMBERED
+/// sub-clauses: "" is not a descendant of "4", so the walk stopped at "0-9" and
+/// the region was the empty heading. Run on the converted v19.2.0 and v10.3.0 on
+/// 2026-09-11, it returned ZERO rows where the rule before it returned 1 300 and
+/// 1 255 distinct keys — the 1 300 being exactly the 404 rows the corpus stamps
+/// "21" plus the 896 a spec has since taken over. The corpus kept them only
+/// because `ingest --resume` never parses an ingested version again; the next
+/// TS 21.905 to arrive, or a corpus built from nothing, would have been written
+/// without a vocabulary. glossaryseed's generalRegion (Go) reads TS 21.905 with
+/// this same region rule, and the two must not disagree about what the region is.
+///
+/// It changes nothing on the ETSI side, and that was measured rather than
+/// assumed: the newest version of each of the 5 142 deliverables, extracted with
+/// and without the continuation, gives the same 159 475 rows in every file.
 pub fn extract_acronyms(clauses: &[ParsedClause], release: &str) -> Vec<Acronym> {
     // The regions to read: each clause whose heading mentions abbreviations, plus
-    // everything numbered under it. A document can have more than one (a Symbols
+    // what follows it up to the first numbered clause NOT under it — its numbered
+    // sub-clauses and any unnumbered ones. A document can have more than one (a Symbols
     // clause and an Abbreviations clause under the same parent), and the rows are
     // deduplicated by the caller's primary key anyway.
     let mut in_region = vec![false; clauses.len()];
@@ -91,7 +119,8 @@ pub fn extract_acronyms(clauses: &[ParsedClause], release: &str) -> Vec<Acronym>
             continue;
         }
         for (j, d) in clauses.iter().enumerate().skip(i + 1) {
-            if !is_descendant(&root, &d.clause_path) {
+            // Unnumbered (TS 21.905's letter clauses) or numbered under the root.
+            if !d.clause_path.is_empty() && !is_descendant(&root, &d.clause_path) {
                 break;
             }
             in_region[j] = true;
@@ -231,6 +260,116 @@ mod tests {
         let ac = extract_acronyms(&clauses, "1.0.0");
         let terms: Vec<&str> = ac.iter().map(|a| a.term.as_str()).collect();
         assert_eq!(terms, vec!["UICC"]);
+    }
+
+    /// TS 21.905 v19.2.0 AS LIBREOFFICE CONVERTED IT — the lines below are copied
+    /// from data/sources/convert/Rel-19/21905-j20.html, tabs included, with each
+    /// letter's list cut short. Clause 4 has an empty body and its list sits in
+    /// UNNUMBERED letter clauses, the shape of all 16 stored versions. The rule
+    /// that read numbered sub-clauses only stopped at "0-9" and returned nothing
+    /// for the whole document (0 rows on v19.2.0, where 1 300 keys are printed).
+    ///
+    /// Through the real parser rather than hand-built clauses, so that the test
+    /// also holds the shape itself: if the walker ever numbered these letters the
+    /// region would change for a reason this test would name.
+    const TS21905_V19_2_0: &str = r#"<html><body>
+<h1 class="western"><a name="_Toc232691870"></a>3	Terms and
+definitions</h1>
+<h2 class="western"><a name="_Toc232691871"></a><a name="_Toc11152815"></a>
+0-9</h2>
+<p style="margin-bottom: 0.32cm; margin-left: 4cm; text-indent: -4cm">
+<b>1.8V technology Smart Card:</b> A Smart Card operating at 1.8V ±
+10% and 3V ± 10%.</p>
+<h2 class="western"><a name="_Toc232691897"></a><a name="_Toc11152841"></a>
+<span lang="fr-FR">Z</span></h2>
+<p style="margin-bottom: 0.32cm"><span lang="fr-FR">&lt;void&gt;</span></p>
+<h1 class="western"><a name="_Toc232691898"></a><a name="_Toc11152842"></a>
+4	Abbreviations</h1>
+<h2 class="western"><a name="_Toc232691899"></a><a name="_Toc11152843"></a>
+0-9</h2>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+2G	2<sup>nd</sup> Generation</p>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+3GPP	Third Generation Partnership Project</p>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+5GC	Fifth Generation Core network</p>
+<h2 class="western"><a name="_Toc232691900"></a><a name="_Toc11152844"></a>
+A</h2>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+A-SGW	Access Signalling Gateway</p>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+AC	Access Class (C0 to C15)</p>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+	Access Condition</p>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+ACC	Automatic Congestion Control</p>
+<h2 class="western"><a name="_Toc232691925"></a><a name="_Toc11152869"></a>
+<span lang="fr-FR">Z</span></h2>
+<p style="page-break-inside: avoid; text-indent: -2.5cm; margin-left: 3cm; margin-bottom: 0cm">
+<span lang="fr-FR">ZC	Zone Code </span>
+</p>
+<h1 class="western"><a name="_Toc232691926"></a><a name="_Toc11152870"></a>
+5	Equations</h1>
+<p align="left" style="page-break-inside: avoid; page-break-after: auto">
+<font face="Arial, sans-serif"><span style="font-weight: normal">The
+ratio of the received energy per PN chip of the CPICH to the total
+transmit power spectral density at the Node_B (SS) antenna
+connector.</span></font></p>
+</body></html>"#;
+
+    #[test]
+    fn ts_21905_reads_its_unnumbered_letter_clauses() {
+        let (clauses, _, _) =
+            crate::parse_html_clauses(TS21905_V19_2_0, GLOSSARY_SPEC_ID, "Rel-19", "19.2.0");
+        let ac = extract_acronyms(&clauses, "Rel-19");
+        let got: Vec<(&str, &str)> = ac
+            .iter()
+            .map(|a| (a.term.as_str(), a.expansion.as_str()))
+            .collect();
+        // Exactly the keys the corpus holds for these lines (stamped "21", or
+        // taken over by a spec): the continuation line "\tAccess Condition" has
+        // no term and stays out, as it always has.
+        assert_eq!(
+            got,
+            vec![
+                ("2G", "2nd Generation"),
+                ("3GPP", "Third Generation Partnership Project"),
+                ("5GC", "Fifth Generation Core network"),
+                ("A-SGW", "Access Signalling Gateway"),
+                ("AC", "Access Class (C0 to C15)"),
+                ("ACC", "Automatic Congestion Control"),
+                ("ZC", "Zone Code"),
+            ],
+            "clauses: {:?}",
+            clauses
+                .iter()
+                .map(|c| (c.clause_path.as_str(), c.heading.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(ac
+            .iter()
+            .all(|a| a.source_series == "21" && a.first_release == "Rel-19"));
+    }
+
+    /// The continuation is for clauses with NO number. A numbered clause that is
+    /// not under the heading still ends the region, and what comes after it —
+    /// numbered or not — belongs to that clause, not to the list.
+    #[test]
+    fn a_numbered_sibling_still_ends_the_region() {
+        let clauses = vec![
+            clause("4", "Abbreviations", ""),
+            clause("", "A", "AMF\tAccess and Mobility Management Function"),
+            clause("4.1", "Sub-clause", "SMF\tSession Management Function"),
+            clause("5", "Equations", ""),
+            clause(
+                "",
+                "Unrelated",
+                "AAA\tShould not be captured (after clause 5)",
+            ),
+        ];
+        let ac = extract_acronyms(&clauses, "Rel-19");
+        let terms: Vec<&str> = ac.iter().map(|a| a.term.as_str()).collect();
+        assert_eq!(terms, vec!["AMF", "SMF"]);
     }
 
     /// Two matching headings under one parent — a Symbols clause and an

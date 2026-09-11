@@ -123,12 +123,28 @@ To serve from a mirror you host yourself, bypass the package entirely:
 mcp-3gpp bootstrap --db-url https://your-host/3gpp.duckdb.zst --db-sha256 <sha>
 ```
 
-To point at a fork or a dated tag without rebuilding:
+The binary follows `latest` on purpose: `serve` checks it at each start (one
+manifest request) and pulls a newer corpus when one is published — logging the
+digest it resolved to. To point elsewhere without rebuilding:
 
 ```sh
 export MCP3GPP_GHCR_OWNER=your-org      # default: kodflow
-export MCP3GPP_CORPUS_TAG=2026-08-26    # default: latest
+export MCP3GPP_CORPUS_TAG=2026-08-26    # one TAG for both packages; default: latest
+# To FREEZE a corpus, pin it by digest — one variable per package, because a
+# digest names one manifest of one package (MCP3GPP_CORPUS_TAG refuses a digest):
+export MCP3GPP_CORPUS_REF_3GPP=sha256:<64 hex>   # `@sha256:…` is accepted too
+export MCP3GPP_CORPUS_REF_ETSI=sha256:<64 hex>
 ```
+
+A digest reference is verified: the manifest the registry serves must hash to
+it, or nothing is transferred. `crane digest --full-ref ghcr.io/kodflow/3gpp-corpus:latest`
+prints the current one. `--no-update` / `MCP3GPP_NO_UPDATE=1` keeps whatever the
+cache already holds.
+
+The **pipeline** (`make build`) does not follow `latest`: its `seed` steps pull
+the digests committed in `contracts/corpus-pin.txt`, which
+`scripts/local/publish-corpus.sh` bumps when it pushes a snapshot. The same
+variables override the pin there.
 
 ## 4. Wire it into your MCP client
 

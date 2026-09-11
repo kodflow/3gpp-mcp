@@ -110,9 +110,31 @@ impl Store {
     /// clauses_needing_embedding but keys on the sparse table instead of `embedding`, so a
     /// `--sparse-only` pass is resumable and additive (== Go embed --sparse-only worklist).
     pub fn clauses_needing_sparse(&self, limit: usize, floor_ord: i64) -> Result<Vec<WorkItem>> {
+        self.clauses_for_sparse(limit, floor_ord, false)
+    }
+
+    /// clauses_for_sparse is clauses_needing_sparse with the posting filter made a
+    /// choice. `include_posted` exports EVERY embeddable clause at the floor, posted
+    /// or not — what a re-encode needs when the postings already there were written
+    /// by another producer (a new sparse model, a new ort or tokenizers, a fix to the
+    /// pooling). "Has no posting" cannot see that: a clause_sparse row does not say
+    /// who computed it, so the ordinary work list is empty exactly when every posting
+    /// is stale. The pipeline records the producer beside the corpus and asks for
+    /// this list when it changes (internal/goal/sparse_producer.go).
+    pub fn clauses_for_sparse(
+        &self,
+        limit: usize,
+        floor_ord: i64,
+        include_posted: bool,
+    ) -> Result<Vec<WorkItem>> {
+        let posting_filter = if include_posted {
+            ""
+        } else {
+            "chunk_id NOT IN (SELECT chunk_id FROM clause_sparse) AND "
+        };
         let sql = format!(
             "SELECT chunk_id, COALESCE(release,''), COALESCE(heading,''), COALESCE(text,'') FROM clauses
-             WHERE chunk_id NOT IN (SELECT chunk_id FROM clause_sparse) AND {EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
+             WHERE {posting_filter}{EMBEDDABLE_TEXT_SQL} ORDER BY chunk_id"
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare sparse worklist")?;
         let rows = stmt
@@ -389,6 +411,29 @@ impl Store {
             out.insert(r.context("scan sparse chunk_id")?);
         }
         Ok(out)
+    }
+
+    /// clear_sparse deletes EVERY posting and returns how many clauses carried one.
+    ///
+    /// It exists for one caller: `embed-io --import-sparse --import-sparse-replace`,
+    /// the import of a re-encode. The ordinary import replaces the postings of each
+    /// chunk_id the ledger names and leaves every other row alone, which is right
+    /// when all the rows come from one producer. After a producer change a row the
+    /// ledger does not name — a clause below the floor, one the corpus has since
+    /// dropped — is the OLD producer's, and would be served under the new stamp.
+    pub fn clear_sparse(&self) -> Result<u64> {
+        let n: u64 = self
+            .conn
+            .query_row(
+                "SELECT count(DISTINCT chunk_id) FROM clause_sparse",
+                [],
+                |r| r.get(0),
+            )
+            .context("count the postings to clear")?;
+        self.conn
+            .execute_batch("DELETE FROM clause_sparse;")
+            .context("clear clause_sparse")?;
+        Ok(n)
     }
 
     pub fn drop_sparse_term_index(&self) -> Result<()> {
