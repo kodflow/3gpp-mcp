@@ -58,7 +58,7 @@ func TestTheShieldIsActuallyUsed(t *testing.T) {
 		want int
 	}{
 		{"server.go", 12},
-		{"resources.go", 2},
+		{"resources.go", 3},
 	} {
 		b, err := os.ReadFile(c.file)
 		if err != nil {
