@@ -49,13 +49,21 @@ the clause actually SAYS differently, paragraph by paragraph: which releases
 carry each statement, when it was introduced, and whether it is gone from the
 newest release.
 
-**PREFER `trace_clause`, and treat `get_changelog` as a bonus.** The change-request
-table has had no writer since the ingest write-side moved to Rust: it covers
-**311 of the 3 568 3GPP specs** and **none of the ETSI half** (ETSI ships PDFs,
-and the change-history table does not survive text extraction well enough to
-cite). A count of 0 there means "not recorded here", never "never changed" — and
-the tool says so in a `note` rather than leaving you to guess. `trace_clause`
-answers the same question from the corpus text, so it is never stale.
+**PREFER `trace_clause` for WHAT changed; use `get_changelog` for WHICH change
+requests.** On the 3GPP half the change records come from the 3GPP CR database
+(approved CRs that produced a version; measured 2026-09-11: 256 471 records over
+2 169 specs). They name the version transition, not the clauses touched, so a
+`clause` filter cannot match them — the note says so. On the ETSI half, records
+exist only where a deliverable's own change-history annex lists one CR per line
+(mostly TC LI: TS 103 221-1, TS 103 120, TS 102 232-x…). A count of 0 means "not
+recorded here", never "never changed", and the tool says so in a `note`.
+
+**`get_changelog` is PAGED.** A core spec's history is thousands of records (TS
+23.501: 3 064, ~1 MB of JSON), so a call returns at most `limit` records
+(default 100, max 500) with `total`, and a `next_cursor` to pass back as `cursor`
+for the next page. Narrow with `from_release`/`to_release` (a release or a
+version) before paging through a whole history. `trace_clause` answers from the
+corpus text, so it is never stale.
 
 Use it whenever the question is about evolution rather than about current state:
 
@@ -88,7 +96,7 @@ ambiguous: `list_specs` / `list_releases` to pin `(release, version)`.
 3. one reformulation from a different angle (synonym, the procedure name instead
    of the NF, the EN canonical term instead of the user's wording).
 Add the domain tools when they apply: `search_api` (5GC SBI/OpenAPI, TS 29.5xx),
-`li_events` (LI, TS 33.128), `get_changelog` (which CRs touched a clause),
+`li_events` (LI, TS 33.128), `get_changelog` (which CRs produced which version — paged),
 `trace_clause` (what the clause SAYS differently, paragraph by paragraph),
 `trace_evolution` (NE↔NF lineage, e.g. MME → AMF+SMF).
 

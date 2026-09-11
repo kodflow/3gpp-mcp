@@ -46,7 +46,7 @@ wrong or out of date.
 TOOLS:
 - search_spec(query, release?, series?, spec_type=TS, top_k=10, mode=hybrid|lexical|semantic) — your default entry point; hybrid retrieval with citations.
 - get_spec(spec_id, release?, version?, clause?, full?) — verbatim clause/subtree + release lineage.
-- get_changelog(spec_id, from_release, to_release, clause?) — Change Requests between releases.
+- get_changelog(spec_id, from_release?, to_release?, clause?, limit?, cursor?) — Change Requests between releases or versions, paged (default 100, next_cursor).
 - list_releases(spec_id) — every (release, version, freeze_date), newest first.
 - resolve_term(term, release?) — glossary/acronym definition (TS 21.905).
 - trace_evolution(entity, from_release?, to_release?) — NE↔NF evolution (e.g. MME → AMF+SMF).
