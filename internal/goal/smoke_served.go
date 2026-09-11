@@ -1,0 +1,651 @@
+package goal
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/kodflow/3gpp-mcp/internal/eval"
+)
+
+// ------------------------------------------------- served-path retrieval gate
+//
+// THE GATE ON WHAT THE USER RECEIVES. The retrieval gate in smoke_gate.go scores
+// -systems lexical through bench.exe, the only system build-go's lexical bench can
+// score, and the log said so. That left the path the product actually serves —
+// hybrid fusion of BM25, dense HNSW and sparse, plus the cross-encoder — measured
+// by nothing. Measured 2026-09-10 through bench (-tags onnx,embed_ffi, 3GPP half
+// only): lexical nDCG@10 0.072, hybrid 0.101, hybrid+rerank 0.207 / MRR 0.417 —
+// the served ranking is three times the lexical one, and a regression of the
+// reranker, the embedder, the ONNX Runtime or the fusion passed every gate.
+//
+// WHY IT DRIVES server-full.exe AND NOT A SEMANTIC BENCH. A bench built with the
+// right tags would score store+search, not the product: search_spec adds the
+// normative doc-type default, the ETSI federation (a second engine, RRF-merged —
+// on these queries it puts an ETSI hit at every other rank), the page size a
+// client gets by default, and the server's own startup guards (the embedding
+// identity check refuses to start on a mismatch). A gate that measures a proxy of
+// that path approves the proxy. So this one starts the binary build-serve builds —
+// onnx + embed_ffi, the tags the image compiles — over BOTH corpus halves, with the
+// environment .mcp.json and scripts/local/prove-serving.sh give it, and asks
+// search_spec, over JSON-RPC, exactly what a client asks.
+//
+// WHAT IT REFUSES BEFORE IT SCORES, because each is a way to record one ranking
+// under another's name — the defect that kept the semantic arms out of the lexical
+// gate:
+//
+//   - a server_info that does not say semantic=true and reranker=true (with the
+//     reason it gives when it does not);
+//   - an answer whose `mode` is not the one the arm asked for, or that carries
+//     `mode_degraded` — Search degrades semantic to lexical on purpose, and says so
+//     only there;
+//   - a rerank arm that returned the hybrid order for EVERY query. Engine.rerank
+//     keeps the RRF order when the cross-encoder fails, silently: this is the one
+//     place the difference is observable.
+//
+// Baseline missing, empty or incomplete = FAILURE, never seeded: eval.Judge, the
+// verdict the lexical gate and bench share.
+const (
+	// servedBaseline is the committed bar, per arm. It is a file of its own, not
+	// three more keys in retrievalBaseline: that file is also bench's -baseline, and
+	// bench scores the engine directly, without federation and with its own page
+	// size — the same key holding numbers from two instruments would fail one of
+	// them on every run.
+	servedBaseline = "docs/inputs/eval/served_baseline.json"
+	// servedTol is the absolute drop a tracked metric may take: the 0.02 of the
+	// lexical gate and bench. On six queries it reads as follows. A relevant clause
+	// that LEAVES the page costs recall@10 at least 1/12 = 0.083. One that slips at
+	// the top of one query's page costs MRR@10 0.083 from rank 1 to 2 and 0.028 from
+	// 2 to 3 — both fail; from 3 to 4 it costs 0.014 and passes, as does any
+	// shuffle deeper down. The served path answered identically on two runs (see
+	// stepSmoke), so the tolerance absorbs no noise that was measured; it is the
+	// slack below which a movement is not called a regression.
+	servedTol = "0.02"
+	// servedSearchBudget disables the per-request budget in the gate's server. The
+	// budget is a LATENCY guard: when it expires, Search skips the embed, the sparse
+	// and the rerank passes and returns the fusion it has, without saying so. Under
+	// the served default (20 s) the verdict would then depend on how loaded this
+	// machine was — the first cold query took 22 s on the lexical arm alone — and a
+	// flaky gate is one that gets skipped. The budget's own behaviour is pinned by
+	// internal/search's tests; this gate measures the ranking.
+	servedSearchBudget = "0"
+	// servedCallTimeout bounds one tools/call. The first semantic query pays the
+	// embedder's session start and the cold HNSW; see the measurements on
+	// stepSmoke.
+	servedCallTimeout = 10 * time.Minute
+)
+
+// servedArm is one retrieval configuration scored through search_spec.
+type servedArm struct {
+	Key    string // the baseline key
+	Mode   string // search_spec's `mode`, and the mode the answer must report
+	Rerank bool   // search_spec's `rerank`
+}
+
+// servedArms are scored in this order. The first two exist so a failure can be
+// located: rerank down and hybrid steady is the cross-encoder; hybrid down and
+// lexical steady is the embedder, the vectors or the fusion.
+var servedArms = []servedArm{
+	{Key: "lexical", Mode: "lexical"},
+	{Key: "hybrid", Mode: "hybrid"},
+	{Key: "rerank", Mode: "hybrid", Rerank: true},
+}
+
+func servedArmKeys() string {
+	keys := make([]string, 0, len(servedArms))
+	for _, a := range servedArms {
+		keys = append(keys, a.Key)
+	}
+	return strings.Join(keys, ",")
+}
+
+// servedArgs is the search_spec call for one judged query under one arm: what a
+// client sends, and nothing a client would not. No top_k — the default page is
+// what a client receives — and the query's release, as the judgement was made
+// against it.
+func servedArgs(q eval.Query, a servedArm) map[string]any {
+	args := map[string]any{"query": q.Query, "mode": a.Mode}
+	if q.Release != "" {
+		args["release"] = q.Release
+	}
+	if a.Rerank {
+		args["rerank"] = true
+	}
+	return args
+}
+
+// servedPinnedEnv are the knobs that would change the ranking this gate records,
+// set to the value the IMAGE runs with (unset), so an operator's shell cannot
+// leak one in: RERANK_ALL=1 would rerank the hybrid arm too, RERANK_WINDOW would
+// move what the cross-encoder sees, EMBEDDER/RERANKER=off would switch an arm off
+// (server_info would catch that one, the others it would not), and
+// EMBED_MODELS_CONFIG would swap the registry the query embedder resolves.
+//
+// DUCKDB_MEMORY_LIMIT too, and that one was measured rather than argued. It caps
+// each store's buffer pool, which also holds the frozen HNSW index; at 4GB the
+// ETSI half (1 138 341 vectors) no longer fits, its first semantic query loads
+// the index and every later ETSI search FAILS — which search_spec swallows (see
+// errETSIDropped). Twice on 2026-09-11, with the cap exported for the run. Unset,
+// the store applies its own 16GB default, which is what the image serves with.
+var servedPinnedEnv = []string{"RERANK_ALL", "RERANK_WINDOW", "EMBEDDER", "RERANKER", "EMBED_MODELS_CONFIG",
+	"DUCKDB_MEMORY_LIMIT"}
+
+// servedServerEnv is the environment server-full is started with. Two ONNX
+// Runtimes, and they are not interchangeable (scripts/local/prove-serving.sh has
+// the measurement): ORT_DYLIB_PATH is the Rust embed-core crate's, pointed at the
+// runtime the embed steps use (gpuEnv); ONNXRUNTIME_SHARED_LIBRARY_PATH is the Go
+// binding's, for the cross-encoder, pointed at the pinned runtime the image
+// stages under data/models/onnxruntime.
+func servedServerEnv(c *Ctx) []string {
+	env := gpuEnv(c)
+	for _, k := range servedPinnedEnv {
+		env = append(env, k+"=")
+	}
+	return append(env,
+		"EMBED_MODEL="+sparseModelName,
+		"EMBED_MODEL_DIR="+c.dataPath("models", sparseModelName),
+		"BGE_RERANKER_DIR="+c.dataPath("models", rerankModelName),
+		"ONNXRUNTIME_SHARED_LIBRARY_PATH="+c.dataPath("models", "onnxruntime", "lib", ortLibName()),
+		"SEARCH_BUDGET="+servedSearchBudget,
+		"MCP3GPP_NO_UPDATE=1",
+	)
+}
+
+// servedRuntimeInputs are the files the served server loads that no Impl can
+// see: the Rust side's ONNX Runtime, which gpuEnv finds under .local/toolchain.
+// The models and the Go side's runtime are imageModelDirs(), listed by the caller.
+func servedRuntimeInputs(c *Ctx) []string {
+	for _, kv := range gpuEnv(c) {
+		if p, ok := strings.CutPrefix(kv, "ORT_DYLIB_PATH="); ok {
+			return []string{p}
+		}
+	}
+	return nil
+}
+
+// servedMetricsPath is where the gate leaves what it measured: a CANDIDATE
+// baseline, as retrievalMetricsPath is for the lexical gate.
+func servedMetricsPath(c *Ctx) string { return c.statePath("served-retrieval-metrics.json") }
+
+// toolCaller asks the served server one tools/call and returns the raw response.
+type toolCaller func(tool string, args map[string]any) (map[string]any, error)
+
+// servedHits is what one search_spec answer says, as far as the gate reads it.
+type servedHits struct {
+	Mode         string `json:"mode"`
+	ModeDegraded string `json:"mode_degraded"`
+	Hits         []struct {
+		SpecID string `json:"spec_id"`
+		Clause string `json:"clause"`
+	} `json:"hits"`
+}
+
+// readServedHits turns one search_spec response into ranked refs, refusing an
+// answer that is not the ranking the arm asked for.
+func readServedHits(a servedArm, q eval.Query, m map[string]any) ([]eval.Ref, error) {
+	text, _, err := judgeToolAnswer("search_spec", m, true)
+	if err != nil {
+		return nil, err
+	}
+	var h servedHits
+	if err := json.Unmarshal([]byte(text), &h); err != nil {
+		return nil, fmt.Errorf("search_spec answered %s/%s with a payload the gate cannot read: %w", a.Key, q.ID, err)
+	}
+	if h.Mode != a.Mode || h.ModeDegraded != "" {
+		return nil, fmt.Errorf("the %s arm asked search_spec for mode %q on %q and was served %q (%s) — scoring "+
+			"it would record one ranking under another's name", a.Key, a.Mode, q.ID, h.Mode, h.ModeDegraded)
+	}
+	refs := make([]eval.Ref, len(h.Hits))
+	for i, x := range h.Hits {
+		refs[i] = eval.Ref{SpecID: x.SpecID, Clause: x.Clause}
+	}
+	return refs, nil
+}
+
+// servedRun is one scoring pass: the macro metrics per arm, and what each arm
+// ranked per query (in set order), for the checks that compare arms.
+type servedRun struct {
+	Metrics eval.Baseline
+	Ranked  map[string][][]eval.Ref
+	Per     map[string][]eval.Metrics
+	Secs    map[string]float64
+}
+
+// scoreServed scores every arm over the set through call. It is the whole of the
+// measurement, with the server abstracted away, so a test can drive it with
+// canned answers.
+func scoreServed(set eval.Set, call toolCaller, etsiAttached bool) (*servedRun, error) {
+	if len(set) == 0 {
+		return nil, errors.New("the judged query set is empty — there is nothing to score, and nothing scored " +
+			"cannot regress")
+	}
+	run := &servedRun{Metrics: eval.Baseline{}, Ranked: map[string][][]eval.Ref{},
+		Per: map[string][]eval.Metrics{}, Secs: map[string]float64{}}
+	for _, a := range servedArms {
+		start := time.Now()
+		rank := func(_ context.Context, q eval.Query) ([]eval.Ref, error) {
+			m, err := call("search_spec", servedArgs(q, a))
+			if err != nil {
+				return nil, fmt.Errorf("%s arm, query %s: %w", a.Key, q.ID, err)
+			}
+			refs, err := readServedHits(a, q, m)
+			if err != nil {
+				return nil, err
+			}
+			if etsiAttached && !carriesETSI(refs) {
+				return nil, fmt.Errorf("the %s arm's page for %q carries no ETSI hit although etsi.duckdb is "+
+					"attached: %w", a.Key, q.ID, errETSIDropped)
+			}
+			run.Ranked[a.Key] = append(run.Ranked[a.Key], refs)
+			return refs, nil
+		}
+		per, avg, err := eval.Run(context.Background(), set, rank)
+		if err != nil {
+			return nil, err
+		}
+		run.Metrics[a.Key] = avg
+		run.Per[a.Key] = per
+		run.Secs[a.Key] = time.Since(start).Seconds()
+	}
+	if err := rerankActed(set, run.Ranked["hybrid"], run.Ranked["rerank"]); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+// errETSIDropped is the federation failing without a word.
+//
+// search_spec federates the attached ETSI index into every query not scoped to a
+// spec or a series, and RRF-merges the two pages — which interleaves them: on the
+// judged set, a healthy page carries an ETSI hit at every other rank (5 of 10, on
+// all eighteen answers measured 2026-09-11). When the ETSI search FAILS the
+// handler drops it without a trace (`eerr == nil && len(eh) > 0`, internal/mcp
+// searchSpec), and the page comes back 3GPP-only. Measured the same day with
+// DUCKDB_MEMORY_LIMIT=4GB: the ETSI half failed after the first semantic query and
+// every later page, in all three arms, was 3GPP-only.
+//
+// And that failure RAISES every metric this gate tracks, because the judgements
+// are 3GPP clauses and the ETSI hits were the ones pushing them down. A gate that
+// only compared numbers would have passed the loss of half the product, and
+// recorded the improvement.
+var errETSIDropped = errors.New("the ETSI half was dropped from the federated answer — search_spec swallows " +
+	"the ETSI search's error, and a 3GPP-only page scores HIGHER on this 3GPP-judged set, so the metrics " +
+	"cannot be trusted to see it")
+
+// carriesETSI reports whether a page holds at least one hit from the ETSI half.
+func carriesETSI(refs []eval.Ref) bool {
+	for _, r := range refs {
+		if strings.HasPrefix(r.SpecID, "ETSI ") {
+			return true
+		}
+	}
+	return false
+}
+
+// rerankActed refuses a rerank arm that returned the hybrid order for every
+// query. Engine.rerank falls back to the RRF order on any cross-encoder error,
+// and server_info reports the reranker enabled whether or not its passes succeed,
+// so without this the rerank row could be the hybrid ranking scored twice. ONE
+// reordered query is enough: an identical page is legitimate for a query whose
+// window the cross-encoder happens to agree with.
+func rerankActed(set eval.Set, hybrid, rerank [][]eval.Ref) error {
+	if len(hybrid) != len(set) || len(rerank) != len(set) {
+		return fmt.Errorf("the arms did not rank every query (hybrid %d, rerank %d, set %d)", len(hybrid), len(rerank), len(set))
+	}
+	for i := range set {
+		if !sameRefs(hybrid[i], rerank[i]) {
+			return nil
+		}
+	}
+	return fmt.Errorf("the rerank arm returned the hybrid order for all %d queries — the cross-encoder did not "+
+		"reorder a single page. Engine.rerank keeps the fused order when it fails, silently, so this is the "+
+		"hybrid ranking scored under the rerank name", len(set))
+}
+
+func sameRefs(a, b []eval.Ref) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// servedInfo is the part of server_info the gate requires before it scores.
+type servedInfo struct {
+	Semantic       bool   `json:"semantic"`
+	Reranker       bool   `json:"reranker"`
+	RerankerReason string `json:"reranker_reason"`
+	Hnsw           bool   `json:"hnsw"`
+	Sparse         bool   `json:"sparse"`
+	SparseReason   string `json:"sparse_reason"`
+	Model          string `json:"embedding_model_db"`
+	Etsi           struct {
+		Attached bool `json:"attached"`
+		ModelOK  bool `json:"embedding_model_ok"`
+		Hnsw     bool `json:"hnsw"`
+	} `json:"etsi"`
+}
+
+// requireServedArms refuses a server that cannot serve the arms the gate scores.
+// Every refusal names what the server said, because "reranker false" with its
+// reason is a diagnosis and "gate failed" is not.
+func requireServedArms(m map[string]any, etsiAttached bool) (servedInfo, error) {
+	var si servedInfo
+	text, _, err := judgeToolAnswer("server_info", m, false)
+	if err != nil {
+		return si, err
+	}
+	if err := json.Unmarshal([]byte(text), &si); err != nil {
+		return si, fmt.Errorf("server_info answered a payload the gate cannot read: %w", err)
+	}
+	var missing []string
+	if !si.Semantic {
+		missing = append(missing, "semantic=false (no query embedder: the hybrid arms would be BM25)")
+	}
+	if !si.Reranker {
+		missing = append(missing, fmt.Sprintf("reranker=false (%s)", si.RerankerReason))
+	}
+	if etsiAttached && (!si.Etsi.Attached || !si.Etsi.ModelOK) {
+		missing = append(missing, fmt.Sprintf("the ETSI half is not served semantically (attached=%v, "+
+			"embedding_model_ok=%v)", si.Etsi.Attached, si.Etsi.ModelOK))
+	}
+	if len(missing) > 0 {
+		return si, fmt.Errorf("server-full cannot serve what the served gate scores: %s — scoring it would "+
+			"record lexical numbers under semantic names:\n%s", strings.Join(missing, "; "), clipText(text, 1200))
+	}
+	return si, nil
+}
+
+// requireServedBaseline refuses to START without a complete committed bar
+// covering every arm — the verdict at the end would refuse anyway, but only after
+// minutes of scoring. It never writes the file.
+func requireServedBaseline(path string) error {
+	if !fileNonEmpty(path) {
+		return fmt.Errorf("the served retrieval gate has no baseline at %s — it will not hold the served path "+
+			"against nothing, and it will not seed one from the run it is judging; restore the committed file", path)
+	}
+	base, err := eval.LoadBaseline(path)
+	if err != nil {
+		return fmt.Errorf("the served retrieval gate cannot use %s: %w", path, err)
+	}
+	var uncovered []string
+	for _, a := range servedArms {
+		if _, ok := base[a.Key]; !ok {
+			uncovered = append(uncovered, a.Key)
+		}
+	}
+	if len(uncovered) > 0 {
+		return fmt.Errorf("%s has no entry for the %s arm(s) — an arm with no bar can never regress", path,
+			strings.Join(uncovered, ", "))
+	}
+	return nil
+}
+
+// judgeServed holds a run to the committed bar and says, per arm, what moved.
+func judgeServed(c *Ctx, run *servedRun) error {
+	base := filepath.Join(c.Root, filepath.FromSlash(servedBaseline))
+	if err := eval.WriteBaseline(servedMetricsPath(c), run.Metrics); err != nil {
+		c.Log.Printf("WARNING: could not write the candidate baseline %s: %v", servedMetricsPath(c), err)
+	}
+	var tol float64
+	if _, err := fmt.Sscan(servedTol, &tol); err != nil {
+		return fmt.Errorf("servedTol %q is not a number: %w", servedTol, err)
+	}
+	regs, err := eval.Judge(base, run.Metrics, tol)
+	if err != nil {
+		return fmt.Errorf("SERVED RETRIEVAL GATE CANNOT PASS: %w", err)
+	}
+	if len(regs) == 0 {
+		c.Log.Printf("served retrieval gate: no tracked metric below %s (tol %s); candidate baseline in %s",
+			servedBaseline, servedTol, servedMetricsPath(c))
+		return nil
+	}
+	var lines []string
+	for _, r := range regs {
+		lines = append(lines, fmt.Sprintf("  %-8s %-18s baseline=%.3f current=%.3f delta=%.3f",
+			r.System, r.Metric, r.Baseline, r.Current, r.Delta))
+	}
+	return fmt.Errorf("SERVED RETRIEVAL QUALITY GATE FAILED — the path a client receives ranks the judged queries "+
+		"worse than %s allows (tol %s):\n%s\nIf the drop is deliberate, commit %s as %s in the same change",
+		servedBaseline, servedTol, strings.Join(lines, "\n"), servedMetricsPath(c), servedBaseline)
+}
+
+// logServedRun prints the per-arm table and each query's rank of its best
+// judgement, so a failure is read in the log rather than re-run by hand.
+func logServedRun(c *Ctx, set eval.Set, run *servedRun) {
+	c.Log.Printf("served retrieval (%d queries, search_spec over JSON-RPC):", len(set))
+	c.Log.Printf("  %-8s %7s %7s %9s %7s %9s %7s", "arm", "nDCG@5", "nDCG@10", "Recall@10", "MRR@10", "Success@1", "secs")
+	for _, a := range servedArms {
+		m := run.Metrics[a.Key]
+		c.Log.Printf("  %-8s %7.3f %7.3f %9.3f %7.3f %9.3f %7.1f", a.Key, m.NDCG5, m.NDCG10, m.Recall10, m.MRR,
+			m.Success1, run.Secs[a.Key])
+	}
+	for i, q := range set {
+		var cells []string
+		for _, a := range servedArms {
+			cells = append(cells, fmt.Sprintf("%s=%.2f", a.Key, run.Per[a.Key][i].NDCG10))
+		}
+		c.Log.Printf("  nDCG@10 %-20s %s", q.ID, strings.Join(cells, " "))
+	}
+}
+
+// buildServeSucceeded refuses a server-full.exe that build-serve did not just
+// vouch for. build-serve is Optional, so the runner continues past its failure —
+// and leaves the PREVIOUS server-full.exe in .local/bin, built from another tree.
+// Scoring that would gate a binary that is not the one this tree produces.
+func buildServeSucceeded(c *Ctx) error {
+	st, err := NewStore(c.Local)
+	if err != nil {
+		return err
+	}
+	rec, err := st.Load("build-serve")
+	if err != nil {
+		return err
+	}
+	switch {
+	case rec == nil:
+		return errors.New("build-serve has never run, so there is no server-full to score — the served gate " +
+			"will not pass for want of the binary it measures")
+	case rec.Status != StatusSuccess:
+		return fmt.Errorf("build-serve's last run is %s, so %s is whatever an earlier tree left there — the "+
+			"served gate will not score a binary this tree did not build", rec.Status, c.bin("server-full"))
+	}
+	if !fileNonEmpty(c.bin("server-full")) {
+		return fmt.Errorf("%s is missing although build-serve recorded success", c.bin("server-full"))
+	}
+	return nil
+}
+
+// runServedRetrievalGate starts server-full over both halves and holds the
+// served ranking to the committed per-arm baseline.
+func runServedRetrievalGate(c *Ctx) error {
+	base := filepath.Join(c.Root, filepath.FromSlash(servedBaseline))
+	if err := requireServedBaseline(base); err != nil {
+		return err
+	}
+	_ = os.Remove(servedMetricsPath(c)) // a stale file is never "what this run measured"
+	if err := buildServeSucceeded(c); err != nil {
+		return err
+	}
+	set, err := eval.Load(filepath.Join(c.Root, filepath.FromSlash(retrievalQuerySet)))
+	if err != nil {
+		return fmt.Errorf("load the judged query set: %w", err)
+	}
+
+	args := []string{"serve", "--db", c.dataPath("3gpp.duckdb")}
+	etsiAttached := false
+	if etsi := c.dataPath("etsi.duckdb"); fileNonEmpty(etsi) {
+		args = append(args, "--etsi-db", etsi)
+		etsiAttached = true
+	}
+	c.Log.Printf("served retrieval gate: %s %s (arms %s, tol %s, SEARCH_BUDGET=%s) vs %s",
+		c.bin("server-full"), strings.Join(args, " "), servedArmKeys(), servedTol, servedSearchBudget, servedBaseline)
+	start := time.Now()
+	srv, err := startStdio(c, c.bin("server-full"), args, servedServerEnv(c))
+	if err != nil {
+		return err
+	}
+	defer srv.close()
+	if err := srv.initialize("goal-served-gate"); err != nil {
+		return fmt.Errorf("server-full did not initialise: %w", err)
+	}
+	c.Log.Printf("server-full initialised in %.1fs", time.Since(start).Seconds())
+	info, err := srv.call("server_info", map[string]any{})
+	if err != nil {
+		return fmt.Errorf("server_info failed: %w", err)
+	}
+	si, err := requireServedArms(info, etsiAttached)
+	if err != nil {
+		return err
+	}
+	c.Log.Printf("server-full serves semantic=%v reranker=%v hnsw=%v sparse=%v model=%s (ETSI attached=%v hnsw=%v)",
+		si.Semantic, si.Reranker, si.Hnsw, si.Sparse, si.Model, si.Etsi.Attached, si.Etsi.Hnsw)
+
+	scoring := time.Now()
+	run, err := scoreServed(set, srv.call, etsiAttached)
+	if err != nil {
+		return fmt.Errorf("SERVED RETRIEVAL GATE FAILED: %w", err)
+	}
+	logServedRun(c, set, run)
+	c.Log.Printf("served retrieval gate: scored in %.1fs, %.1fs with startup", time.Since(scoring).Seconds(),
+		time.Since(start).Seconds())
+	return judgeServed(c, run)
+}
+
+// ------------------------------------------------------------ stdio session
+
+// lockedBuffer is a strings.Builder os/exec's copier can fill while a failure
+// message reads it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// stdioSession is one MCP server driven over stdio, one request at a time — as
+// a client drives it, and so the latency of each call is its own.
+type stdioSession struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	lines  chan string
+	stderr *lockedBuffer
+	id     int
+}
+
+func startStdio(c *Ctx, bin string, args, env []string) (*stdioSession, error) {
+	cmd := exec.CommandContext(c.Context, bin, args...)
+	cmd.Dir = c.Root
+	// A later duplicate wins, so the pinned values override the operator's.
+	cmd.Env = append(os.Environ(), env...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	s := &stdioSession{cmd: cmd, stdin: stdin, lines: make(chan string, 16), stderr: &lockedBuffer{}, id: 1}
+	cmd.Stderr = s.stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start %s: %w", bin, err)
+	}
+	go func() {
+		rd := bufio.NewReaderSize(stdout, 1<<20)
+		for {
+			l, err := rd.ReadString('\n')
+			if l != "" {
+				s.lines <- l
+			}
+			if err != nil {
+				close(s.lines)
+				return
+			}
+		}
+	}()
+	return s, nil
+}
+
+func (s *stdioSession) close() {
+	_ = s.stdin.Close()
+	_ = s.cmd.Process.Kill()
+	_, _ = s.cmd.Process.Wait()
+}
+
+func (s *stdioSession) send(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = s.stdin.Write(append(b, '\n'))
+	return err
+}
+
+// request sends one JSON-RPC request and returns the response carrying its id.
+// Lines without that id (a notification, a log line on stdout) are skipped.
+func (s *stdioSession) request(method string, params any) (map[string]any, error) {
+	s.id++
+	id := s.id
+	if err := s.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+		return nil, fmt.Errorf("write %s: %w — %s", method, err, serverPostmortem(s.cmd, s.stderr))
+	}
+	deadline := time.After(servedCallTimeout)
+	for {
+		select {
+		case l, ok := <-s.lines:
+			if !ok {
+				return nil, fmt.Errorf("%s: the server closed its stdout — %s", method, serverPostmortem(s.cmd, s.stderr))
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(l), &m); err != nil {
+				return nil, fmt.Errorf("server sent a non-JSON line: %q", clipText(l, 300))
+			}
+			if got, _ := m["id"].(float64); int(got) == id {
+				return m, nil
+			}
+		case <-deadline:
+			return nil, fmt.Errorf("%s: no answer within %s (stderr: %s)", method, servedCallTimeout,
+				tailString(s.stderr.String(), 12))
+		}
+	}
+}
+
+func (s *stdioSession) initialize(client string) error {
+	if _, err := s.request("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": client, "version": "1"},
+	}); err != nil {
+		return err
+	}
+	return s.send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+}
+
+// call is a toolCaller over this session.
+func (s *stdioSession) call(tool string, args map[string]any) (map[string]any, error) {
+	return s.request("tools/call", map[string]any{"name": tool, "arguments": args})
+}

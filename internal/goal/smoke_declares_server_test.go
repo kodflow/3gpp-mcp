@@ -30,8 +30,9 @@ import (
 // the server's closure — minus imageGuardPackages, the two commands publish runs
 // on this machine to decide whether to push, which ship nothing and run in no
 // probe. The image build's own tools (scripts/local/imgtar, zigcc, elfneeded) run
-// in no probe either, and rust/embed-core is loaded only by the image's embed_ffi
-// build, never by the lexical server.exe smoke drives.
+// in no probe either. rust/embed-core is not a Go package; since the served gate
+// runs server-full, which loads it, TestTheServedGateReplaysWhenItsJudgementMoves
+// holds smoke to publish's rust/embed-core entries instead.
 func TestSmokeJudgesEveryPackagePublishShips(t *testing.T) {
 	root := repoRootForTest()
 	smoke := stepSmoke()
@@ -89,9 +90,16 @@ func TestSmokeJudgesEveryPackagePublishShips(t *testing.T) {
 // judges all three: an edit to a package only the image's server links cannot be
 // probed by server.exe, and still has to replay the gate in front of the image, or
 // publish ships it recorded as gated.
+//
+// And server-full, since the served gate: build-serve's build of cmd/server,
+// under GOTAGS plus onnx,embed_ffi (serveBuildTags), for the host.
 func TestSmokeDeclaresEveryPackageItsBinariesLink(t *testing.T) {
 	requireGo(t)
 	builds := append(buildGoSpecs(t, "server", "bench"), imageServerBuild(t))
+	for _, tags := range buildGoTagSets(t) {
+		builds = append(builds, goBuildSpec{Pkg: "./cmd/server", Tags: serveBuildTags(tags),
+			From: "build-serve, GOTAGS=" + tags})
+	}
 	checkDeclaresWhatItsBinariesLink(t, "smoke", stepSmoke().Impl, builds,
 		"a change there rebuilds a binary smoke answers for, through build-go (a Tool dep) or inside "+
 			"publish, and smoke SKIPs over it with no probe run")
