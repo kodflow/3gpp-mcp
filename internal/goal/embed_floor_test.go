@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -250,12 +251,50 @@ func TestLastFlagValueReadsEverySpellingTheFlagPackageAccepts(t *testing.T) {
 		{[]string{"--embed-floor="}, "", true},
 		{[]string{"--embed-floor", ""}, "", true},
 		{[]string{"--embed-floor", "Rel-15", "--embed-floor", "Rel-18"}, "Rel-18", true},
+		{[]string{"--embed-floor", "Rel-15", "--", "--embed-floor", "Rel-18"}, "Rel-15", true},
+		{[]string{"--", "--embed-floor=Rel-18"}, "", false},
 		{[]string{"--embed-floor-extra", "x"}, "", false},
 		{[]string{"--db", "--embed-floor"}, "", false},
 		{nil, "", false},
 	} {
 		if got, ok := lastFlagValue(tc.args, "embed-floor"); got != tc.want || ok != tc.ok {
 			t.Errorf("lastFlagValue(%q) = %q, %v; want %q, %v", tc.args, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// THE FLOOR THIS PACKAGE CALLS APPLIED IS THE ONE THE FLAG PACKAGE APPLIES, over the
+// argument lists validateArgs actually builds — parsed here by a real flag.FlagSet,
+// the parser cmd/validate runs its arguments through. The terminator cases are the
+// ones review of #330 found: a floor after "--" is a positional argument, never
+// applied.
+func TestLastFlagValueAgreesWithTheFlagPackage(t *testing.T) {
+	for _, tc := range []struct{ configFloor, contract string }{
+		{"Rel-99", "--require-fts --require-hnsw"},
+		{"Rel-99", "--require-fts --embed-floor Rel-15"},
+		{"Rel-99", "--require-fts -embed-floor=Rel-15 --embed-floor Rel-17"},
+		{"", "--require-fts"},
+		{"Rel-99", "--require-fts -- --embed-floor=Rel-15"},
+		{"Rel-99", "--require-fts --embed-floor Rel-15 -- --embed-floor Rel-17"},
+	} {
+		c, _ := newTestCtx(t)
+		c.Config["embed_floor"] = tc.configFloor
+		c.Config["contract_flags"] = tc.contract
+		args := validateArgs(c, corpus3GPP())
+
+		fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+		fs.String("db", "", "")
+		fs.String("report", "", "")
+		floor := fs.String("embed-floor", "", "")
+		fs.Bool("require-fts", false, "")
+		fs.Bool("require-hnsw", false, "")
+		if err := fs.Parse(args); err != nil {
+			t.Fatalf("%q: %v", args, err)
+		}
+		if got := appliedEmbedFloor(c, corpus3GPP()); got != *floor {
+			t.Errorf("validate runs %q, which the flag package reads as floor %q; appliedEmbedFloor says %q — "+
+				"the certificate, the fingerprint and the image would name a floor the gate did not apply",
+				args, *floor, got)
 		}
 	}
 }
