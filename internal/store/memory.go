@@ -49,6 +49,48 @@ const MemoryLimitEnv = "DUCKDB_MEMORY_LIMIT"
 // The ETSI half verifies in 17 s well under either cap; do not size on it.
 const DefaultMemoryLimit = "16GB"
 
+// ServeMemoryLimit is the per-corpus buffer-pool cap `serve` applies when the
+// operator names none, and it is SMALLER than DefaultMemoryLimit on purpose.
+//
+// DefaultMemoryLimit (16 GB) is sized for the largest WRITER — migrate-paragraphs
+// rebuilding every body with an aggregate DuckDB cannot spill. A server is the
+// opposite shape: it answers bounded queries, and what it must hold is the frozen
+// HNSW index, which lives in that same pool (duckdb_memory(), tag ART_INDEX:
+// 3.59 GB on the 3GPP half, 3.95 GB on the ETSI one). Everything else the pool
+// holds is CACHE.
+//
+// And serve opens TWO corpora. With the writer's default on each, the pools alone
+// could claim 32 GB: measured on the published halves, the served process reached
+// 39.8 GB committed on its first hybrid query and was killed (#340). At 6 GB per
+// corpus the same queries peak at 24.4 GB committed, warm-up included, on a
+// machine that has to hold the models beside them — and the arms answer in
+// 3-8 s warm. 6 GB is also what the served retrieval gate measured itself
+// against; below 4 GB the ETSI index no longer fits its pool and that half's
+// semantic arm fails.
+//
+// DUCKDB_MEMORY_LIMIT still wins, for the box with more room or less.
+const ServeMemoryLimit = "6GB"
+
+// ServeMemoryLimitFor is serve's policy: the operator's value when set, else
+// ServeMemoryLimit.
+func ServeMemoryLimitFor(raw string) string {
+	if v := strings.TrimSpace(raw); v != "" {
+		return v
+	}
+	return ServeMemoryLimit
+}
+
+// LimitMemory caps this store's buffer pool. It is the serve-side counterpart of
+// BoundMemory, which runs at open with the writer's default: a reader that has
+// already opened can still be held to the server's own ceiling.
+func (s *Store) LimitMemory(limit string) error {
+	q := strings.ReplaceAll(limit, "'", "''")
+	if _, err := s.db.Exec(fmt.Sprintf("SET memory_limit = '%s'", q)); err != nil {
+		return fmt.Errorf("set memory_limit %q: %w", limit, err)
+	}
+	return nil
+}
+
 // PickMemoryLimit is the whole policy, as a pure function of its input.
 //
 // Pure ON PURPOSE. The obvious shape reads os.Getenv inside, and then the only

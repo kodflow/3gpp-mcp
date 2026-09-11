@@ -173,6 +173,19 @@ func serve(args []string) error {
 
 	// Best-effort: load the persisted BM25 index (built at ingest). We LOAD,
 	// never rebuild — rebuilding on a 700k-clause corpus would stall startup.
+	// THE SERVER'S OWN CEILING, ON EACH CORPUS IT OPENS. store.OpenReadOnly bounds
+	// the pool with the WRITER's default (16 GB); serve holds two corpora and needs
+	// only the frozen index plus a working set, so it applies the serve ceiling
+	// unless the operator named one. See store.ServeMemoryLimit for the numbers.
+	limitMemory := func(what string, s *store.Store) {
+		lim := store.ServeMemoryLimitFor(os.Getenv(store.MemoryLimitEnv))
+		if err := s.LimitMemory(lim); err != nil {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] could not cap the %s buffer pool at %s (%v)\n", what, lim, err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] %s buffer pool capped at %s (%s)\n", what, lim, store.MemoryLimitEnv)
+	}
+	limitMemory("3GPP", st)
 	if err := st.LoadFTS(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] FTS unavailable, lexical search uses LIKE: %v\n", err)
 	}
@@ -288,6 +301,7 @@ func serve(args []string) error {
 			mcpOpts = append(mcpOpts, mcp.WithETSIUnavailable(
 				fmt.Sprintf("%s (%s) could not be opened at startup: %v", etsiPath, etsiWhy, eerr)))
 		} else {
+			limitMemory("ETSI", es)
 			_ = es.LoadFTS(ctx)
 			_ = es.LoadVSS(ctx)
 			_ = es.LoadSparse(ctx)
