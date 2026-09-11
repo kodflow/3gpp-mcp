@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
+	"github.com/kodflow/3gpp-mcp/internal/store"
 )
 
 // registerResources exposes clause/spec bodies as addressable, on-demand MCP
@@ -146,6 +147,33 @@ func (h *handlers) readSpecResource(ctx context.Context, req mcp.ReadResourceReq
 	return h.readResource(ctx, req.Params.URI)
 }
 
+// versionIsInRelease refuses a URI whose release and version name two different
+// documents (Qodo, #345). GetClauses selects by spec and version only, so
+// 3gpp://33.128/Rel-18@19.5.0 served the Rel-19 publication under a Rel-18
+// address. A version the spec does not hold at all is left to GetClauses, which
+// answers not found.
+func versionIsInRelease(ctx context.Context, st store.Reader, specID, release, version string) error {
+	vs, err := st.ListReleases(ctx, specID)
+	if err != nil {
+		return fmt.Errorf("list the releases of %s: %w", specID, err)
+	}
+	other := ""
+	for _, v := range vs {
+		if v.Version != version {
+			continue
+		}
+		if v.Release == release {
+			return nil
+		}
+		other = v.Release
+	}
+	if other != "" {
+		return fmt.Errorf("%w: %s version %s is published in %s, not %s", server.ErrResourceNotFound,
+			specID, version, other, release)
+	}
+	return nil
+}
+
 // readResource resolves a 3gpp:// URI to the verbatim clause(s) as markdown.
 // Both templates share it (the only difference is whether ref.clause is set).
 func (h *handlers) readResource(ctx context.Context, uri string) ([]mcp.ResourceContents, error) {
@@ -161,10 +189,22 @@ func (h *handlers) readResource(ctx context.Context, uri string) ([]mcp.Resource
 	st := h.storeFor(ref.specID)
 	version := ref.version
 	if version == "" {
-		if v, ok, _ := st.VersionForRelease(ctx, ref.specID, ref.release); ok {
-			version = v
-		} else if _, v, ok, _ := st.LatestVersion(ctx, ref.specID); ok {
-			version = v
+		// A release with no version of the spec is NOT FOUND. This fell back to the
+		// spec's latest version, so 3gpp://33.128/Rel-15 served Rel-19 text under a
+		// Rel-15 address (Qodo, #345). VersionForRelease already answers the
+		// newest version for an empty release, which is the only fallback meant.
+		v, ok, verr := st.VersionForRelease(ctx, ref.specID, ref.release)
+		switch {
+		case verr != nil:
+			return nil, fmt.Errorf("resolve the version of %s in %s: %w", ref.specID, ref.release, verr)
+		case !ok:
+			return nil, fmt.Errorf("%w: %s holds no version of %s in %s", server.ErrResourceNotFound,
+				firstLine(uri, errorTextLimit), ref.specID, ref.release)
+		}
+		version = v
+	} else if ref.release != "" {
+		if err := versionIsInRelease(ctx, st, ref.specID, ref.release, version); err != nil {
+			return nil, err
 		}
 	}
 	clauses, err := st.GetClauses(ctx, ref.specID, version, ref.clause)

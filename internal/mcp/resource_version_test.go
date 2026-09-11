@@ -88,6 +88,21 @@ func TestAWholeSpecURIWithAVersionReadsThatVersion(t *testing.T) {
 		}
 	}
 
+	// A URI whose release and version name two different documents is refused,
+	// not served as the version's release (Qodo, #345); and a release that holds
+	// no version of the spec is not found, not the newest version under its name.
+	for _, tc := range []struct{ uri, want string }{
+		{"3gpp://33.128/Rel-18@19.5.0", "published in Rel-19, not Rel-18"},
+		{"3gpp://33.128/Rel-18/2@19.5.0", "published in Rel-19, not Rel-18"},
+		{"3gpp://33.128/Rel-15", "no version of 33.128 in Rel-15"},
+		{"3gpp://ETSI%20TS%20103%20221-1/Rel-19@1.22.1", "published in ETSI, not Rel-19"},
+	} {
+		body, errMsg := read(tc.uri)
+		if !strings.Contains(errMsg, tc.want) {
+			t.Errorf("resources/read %s: want an error saying %q; got error %q, body %q", tc.uri, tc.want, errMsg, body)
+		}
+	}
+
 	// The template list says so too: the versioned form is advertised by a
 	// template that can match it.
 	rep := rig.request(t, "resources/templates/list", map[string]any{})
