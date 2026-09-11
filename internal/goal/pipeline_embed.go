@@ -1134,6 +1134,11 @@ func stepValidate(t corpusTarget) *Step {
 		Run: func(c *Ctx) error {
 			args := validateArgs(c, t)
 			c.Log.Printf("contract: %s (embed floor %q)", c.Cfg(t.ContractKey), t.Floor(c))
+			// The certificate publish reads (contract_certificate.go) is void from
+			// here until the verdict is in.
+			if t.Suffix == "" {
+				voidContractCertificate(c)
+			}
 			// SELECT THE SPARSE-CAPABLE REGISTRY ENTRY when the contract asks about
 			// the sparse layer, exactly as runSparse does to resolve the identity it
 			// stamps. cmd/validate compares schema_meta.sparse_model against
@@ -1160,7 +1165,10 @@ func stepValidate(t corpusTarget) *Step {
 			if t.Suffix != "" {
 				return nil
 			}
-			return validateAnchor(c)
+			if err := validateAnchor(c); err != nil {
+				return err
+			}
+			return writeContractCertificate(c, t)
 		},
 	}
 }

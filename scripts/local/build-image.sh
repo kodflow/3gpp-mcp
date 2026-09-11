@@ -356,9 +356,22 @@ if [ "$WITH_CORPUS" = 1 ]; then
     # b13103bce7ae under EMBED_MODEL=bge-m3-sparse, while the DENSE identity stays
     # 38067f8c6efe under both — so selecting the dual-head entry costs nothing and
     # names the model the image actually bakes.
-    # shellcheck disable=SC2086 # intentional word-split: the contract is a flag list
-    EMBED_MODEL=bge-m3-sparse "$VALIDATE" --db data/3gpp.duckdb --report text $CONTRACT_FLAGS \
-      || die "the corpus does not satisfy its own contract — refusing to bake it"
+    #
+    # NOT RE-RUN WHEN THE PIPELINE CERTIFIED THESE BYTES. `goal`'s validate step
+    # runs this same binary under these same flags minutes earlier and leaves a
+    # certificate naming the flags, the floor and the size+mtime of both corpus
+    # files; the publish step checks all of it against the files as they are now
+    # and passes CORPUS_CONTRACT_CERTIFIED only when nothing differs
+    # (internal/goal/contract_certificate.go). It was 8m15 of a 40m38 publish on
+    # 2026-09-11, spent re-deriving a verdict nothing could have changed. A run of
+    # this script by hand has no certificate and validates as it always did.
+    if [ -n "${CORPUS_CONTRACT_CERTIFIED:-}" ]; then
+      say "corpus contract NOT re-run: $CORPUS_CONTRACT_CERTIFIED"
+    else
+      # shellcheck disable=SC2086 # intentional word-split: the contract is a flag list
+      EMBED_MODEL=bge-m3-sparse "$VALIDATE" --db data/3gpp.duckdb --report text $CONTRACT_FLAGS \
+        || die "the corpus does not satisfy its own contract — refusing to bake it"
+    fi
   else
     say "WARNING: validate is not built; baking WITHOUT the contract check"
   fi
@@ -456,12 +469,25 @@ fi
 # in the tar rather than by a RUN chown: uid/gid 10001 is what the entrypoint and
 # the read-only data path expect.
 
+# LAYERS ARE WRITTEN GZIPPED, AND REUSED WHEN NOTHING IN THEM MOVED.
+#
+# Measured on the 2026-09-11 publish (40m38): 6m18 packing 42 GB of tars, then
+# ~15 minutes of crane gzipping them again to compute digests — for layers the
+# registry answered "existing blob" to. imgtar now writes the gzip stream crane
+# itself would (compress/gzip, BestSpeed, default header: the same blob digest,
+# measured), so crane uses each .tar.gz as-is; and --cache hands back last run's
+# .tar.gz, by hard link, when every file of the layer has the same name, size and
+# content-or-mtime (see layerKey in scripts/local/imgtar). An unchanged corpus half
+# is then neither re-read nor re-compressed. The cache lives OUTSIDE $STAGE, which
+# `rm -rf` clears on every run.
+LAYER_CACHE="$ROOT/.local/image-cache"
 layer() { # layer <name> <uid> <path…>
   local name="$1" uid="$2"; shift 2
   local present=0 p
   for p in "$@"; do [ -e "$ROOTFS/$p" ] && present=1; done
   [ "$present" = 1 ] || return 0
-  "$IMGTAR" pack --root "$ROOTFS" --out "$LAYERS/$name.tar" --uid "$uid" --gid "$uid" "$@"
+  "$IMGTAR" pack --root "$ROOTFS" --out "$LAYERS/$name.tar.gz" --gzip --cache "$LAYER_CACHE" \
+    --uid "$uid" --gid "$uid" "$@"
 }
 
 # ---- 7b. will the container's loader find everything? ------------------------
@@ -519,7 +545,7 @@ layer 30-ort        10001 data/mcp-3gpp/models/onnxruntime
 layer 60-bin        0     usr/local/bin usr/local/lib
 
 LAYER_ARGS=()
-for f in "$LAYERS"/*.tar; do LAYER_ARGS+=(-f "$f"); done
+for f in "$LAYERS"/*.tar.gz; do LAYER_ARGS+=(-f "$f"); done
 [ "${#LAYER_ARGS[@]}" -gt 0 ] || die "no layers were produced"
 
 # ---- 8. assemble + push ------------------------------------------------------
