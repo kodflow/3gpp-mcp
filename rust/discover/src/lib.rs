@@ -1393,6 +1393,31 @@ mod repair_tests {
         );
     }
 
+    /// AND THE COLLISION CROSSES THE TWO LOOPS. The second loop only sees keys the
+    /// report does not carry, so no KEY reaches both — but a hole key and a report
+    /// key of the same spec can still render the same LINE once re-filing sends them
+    /// to the same release. `seen` is therefore shared by both loops, not per-loop.
+    #[test]
+    fn the_two_repair_loops_share_one_seen_set() {
+        let site = m(&[("33.816|Rel-10", "10.0.0")]);
+        let idx = m(&[("33.816|Rel-11", "10.0.0")]);
+        let holes: BTreeSet<String> = ["33.816|Rel-11".to_string()].into_iter().collect();
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 4, "");
+        assert_eq!(
+            c.holes_not_in_report, 1,
+            "the hole key is not in the report"
+        );
+        assert_eq!(
+            c.deduped, 1,
+            "the two loops rendered the same line; {lines}"
+        );
+        assert_eq!(
+            lines,
+            "Rel-10 https://www.3gpp.org/ftp/Specs/archive/33_series/33.816/33816-a00.zip 33816-a00.zip
+"
+        );
+    }
+
     /// Two keys of one spec that re-file onto the same release at the same version
     /// render the identical line — 33.816 is listed at 10.0.0 under both Rel-10 and
     /// Rel-11 in today's report. corpus.sh would fetch it twice.
