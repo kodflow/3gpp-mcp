@@ -25,8 +25,12 @@
 #     MANIFEST_UNKNOWN and publishes an empty corpus. The empty base IS scratch.
 #   - the package must be PRIVATE. It carries verbatim 3GPP/ETSI text.
 #
-# AFTER THIS, in .github/workflows: run `corpus-data-image` then `corpus-image`
-# (both workflow_dispatch). They do the rest on a runner that has Docker.
+# WHO READS WHAT THIS PUSHES (2026-09-11). Not the product image: `make publish`
+# packs the corpus from data/ directly, and the two bake workflows this used to
+# hand over to are gone from .github/workflows. The packages serve two consumers:
+# the pipeline's `seed` / `seed-etsi` on a clone with no corpus — by the DIGEST
+# this script writes into contracts/corpus-pin.txt — and `mcp-3gpp bootstrap` /
+# `serve`, which follow :latest on purpose (cmd/server/bootstrap.go).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +62,14 @@ trap cleanup EXIT
 
 log() { printf '[publish] %s\n' "$*"; }
 die() { printf '[publish][error] %s\n' "$*" >&2; exit 1; }
+
+# THIS SCRIPT BUMPS THE PIN. contracts/corpus-pin.txt names, by digest, the
+# snapshot each pipeline arm seeds a fresh clone from; the push below is the only
+# thing that creates a new snapshot, so it is the thing that rewrites the line.
+# shellcheck source=scripts/lib/corpus-pin.sh
+. "$ROOT/scripts/lib/corpus-pin.sh"
+PIN_FILE="$ROOT/contracts/corpus-pin.txt"
+PINNED=""
 
 CRANE="$ROOT/.local/bin/crane.exe"; [ -x "$CRANE" ] || CRANE="$ROOT/.local/bin/crane"
 [ -x "$CRANE" ] || die "crane is not at .local/bin/crane — fetch it from
@@ -158,7 +170,7 @@ publish_one() {
 
   local date_tag; date_tag="$(date -u +%F)"
   if [ "$DRY" = 1 ]; then
-    log "DRY RUN — would push $repo:$date_tag and retag :latest"
+    log "DRY RUN — would push $repo:$date_tag, retag :latest, and pin its digest in contracts/corpus-pin.txt"
     return 0
   fi
 
@@ -195,6 +207,19 @@ publish_one() {
    It carries verbatim standards text. CHECK IT:
    https://github.com/users/$OWNER/packages/container/$pkg/settings" >&2;;
   esac
+
+  # PIN WHAT WAS JUST PUSHED, BY DIGEST — read back from the registry rather than
+  # computed here, so the pin names the manifest the registry actually serves. The
+  # dated tag is not a pin either: two publishes on one day move it.
+  #
+  # LAST, after the anti-leak guard: a pin that could not be written must not be
+  # the reason the visibility of a freshly pushed package goes unchecked.
+  local full
+  full="$("$CRANE" digest --full-ref "$repo:$date_tag")" || die "could not read back the digest of $repo:$date_tag"
+  pin_corpus_snapshot "$PIN_FILE" "$pkg" "$full" \
+    || die "$pkg was pushed but contracts/corpus-pin.txt could not be updated — pin $full by hand"
+  log "$pkg: pinned $full"
+  PINNED="$PINNED $pkg"
 }
 
 # The gate. Baking a corpus that fails its own contract produces an image that
@@ -219,14 +244,12 @@ case "$ONLY" in
   *) die "--only takes: both | etsi | 3gpp";;
 esac
 
-cat <<EOF
+if [ -n "$PINNED" ]; then
+  cat <<EOF
 
-Next, on GitHub (both are workflow_dispatch):
-
-  gh workflow run corpus-data-image.yml -f corpus_tag=latest
-  gh workflow run corpus-image.yml   -f release_tag=latest
-
-The first bakes 3gpp-data from the images just pushed (it copies /3gpp.duckdb and
-/etsi.duckdb out of them); the second builds 3gpp-mcp on top, inheriting that data
-layer by digest.
+contracts/corpus-pin.txt now pins:${PINNED}
+COMMIT IT (git diff contracts/corpus-pin.txt). Until it is merged, a fresh clone's
+seed keeps pulling the snapshot the previous pin names — which is the point: what a
+clone starts from is decided by a reviewed commit, not by whoever last moved :latest.
 EOF
+fi
