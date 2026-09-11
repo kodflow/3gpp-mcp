@@ -579,9 +579,18 @@ func runPublish(c *Ctx) error {
 
 	c.Log.Printf("publishing %s — the corpus layer is ~40 GB, and only the blobs the "+
 		"registry does not already hold are transferred", tag)
+	// SKIP THE SCRIPT'S RE-RUN OF THE CONTRACT only when `validate` certified these
+	// exact bytes under the flags and floor the script would use. See
+	// contract_certificate.go; every doubt leaves the re-run in place.
+	floor, err := imageKnob{Env: "EMBED_FLOOR", Key: "embed_floor", DefaultIn: buildImageScript}.effective(c.Root)
+	if err != nil {
+		return err
+	}
+	env := contractEnv(c, floor)
 	if err := c.Run(Cmd{
 		Name: "bash",
 		Args: []string{buildImageScript, "--tag", tag},
+		Env:  env,
 		Echo: true,
 	}); err != nil {
 		return err
