@@ -29,7 +29,11 @@ today's status report does not file 26.510 under Rel-20 at all.
 | 5 | `rust/ingest/src/main.rs:274` → `rust/store/src/lib.rs:1230` | `upsert_version(…)` — `ON CONFLICT DO NOTHING` |
 
 So **the DynaReport section decides, and `rust/discover` is where that decision is
-made**. Two consequences fall straight out of step 5:
+made** — that is the chain as it stood when the corpus in §2 was written, and step 2
+copied the section verbatim. (§3 changes step 2, and only step 2: the report still
+supplies the release, and `filing_release` may then send the file to the release the
+version's own major names. Steps 3-5 are unchanged — they still read whatever column
+1 says.) Two consequences fall straight out of step 5:
 
 - `upsert_version` and `fold_shard_buckets` (`rust/store/src/lib.rs:1162`) are both
   `ON CONFLICT DO NOTHING`. **Nothing in the write path ever retires a filing.** The
@@ -177,7 +181,7 @@ Measured against today's live report:
 
 | | before | after |
 |---|---:|---:|
-| `--emit-worklist` lines | 20 225 | 20 224 (one duplicate of `33816-a00.zip` collapsed; 1 re-filed) |
+| `--emit-worklist` lines | 20 225 | 20 224 — the `Rel-11` duplicate of `33816-a00.zip` re-files onto the `Rel-10` line already there and is dropped: `0 re-filed, 1 deduped` |
 | `--repair-plan` lines (the production path) | 201 | 201, **byte-identical** |
 | series delta (the ingest matrix) | `["21","23","28","30","33","55"]` | identical |
 

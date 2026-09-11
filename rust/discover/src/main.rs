@@ -142,11 +142,12 @@ fn main() {
 
     match a.mode {
         Mode::Worklist => {
-            let (lines, n, skipped, refiled) = emit_worklist(&site, floor_major, &a.series);
+            let (lines, c) = emit_worklist(&site, floor_major, &a.series);
             print!("{lines}");
             eprintln!(
-                "emit-worklist: {n} entries ({skipped} un-encodable versions skipped, \
-                 {refiled} re-filed under the release their version names)"
+                "emit-worklist: {} entries ({} un-encodable versions skipped, \
+                 {} re-filed under the release their version names, {} deduped)",
+                c.emitted, c.unencodable, c.refiled, c.deduped
             );
         }
         Mode::DraftLedger => {

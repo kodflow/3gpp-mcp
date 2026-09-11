@@ -81,18 +81,33 @@ pub fn delta_series(
     series
 }
 
+/// WorklistCounts is what emit_worklist DID, not merely how many lines came out.
+/// Every term is about a line that was emitted or a reason one was not, so
+///     keys in scope = emitted + unencodable + deduped
+/// and `refiled` counts emitted lines, never attempts: reporting a re-filing that
+/// was then deduplicated away would claim work the work list does not contain.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorklistCounts {
+    pub emitted: usize,
+    pub unencodable: usize,
+    /// Lines emitted under the release the version's own major names instead of the
+    /// key's release — see filing_release.
+    pub refiled: usize,
+    /// Lines a re-filing made identical to one already emitted, and so dropped.
+    pub deduped: usize,
+}
+
 /// emit_worklist returns the fetch worklist "<release> <url> <name>" for every
 /// (spec,release) the status report lists at/above the floor (by RELEASE, drafts
-/// kept). Returns (lines, emitted, skipped_unencodable, refiled) — see
-/// filing_release for the last one.
+/// kept), and what it did — see WorklistCounts.
 pub fn emit_worklist(
     site: &BTreeMap<String, String>,
     floor_major: i64,
     series_filter: &str,
-) -> (String, usize, usize, usize) {
+) -> (String, WorklistCounts) {
     let allow = series_set(series_filter);
     let mut lines = String::new();
-    let (mut n, mut skipped, mut refiled) = (0usize, 0usize, 0usize);
+    let mut counts = WorklistCounts::default();
     // Re-filing can send two keys of the same spec to the same release with the same
     // version — 33.816 is listed at 10.0.0 under both Rel-10 and Rel-11 — and the two
     // then render the identical line. corpus.sh would fetch it twice; dedupe here.
@@ -113,11 +128,14 @@ pub fn emit_worklist(
         }
         let mut file_under = rel;
         let owned;
-        if let Some(own) = filing_release(site, spec, rel, ver, floor_major) {
-            owned = own;
-            file_under = &owned;
-            refiled += 1;
-        }
+        let refiled = match filing_release(site, spec, rel, ver, floor_major) {
+            Some(own) => {
+                owned = own;
+                file_under = &owned;
+                true
+            }
+            None => false,
+        };
         match encode_ver_code(ver) {
             Some(code) => {
                 let num = spec.replacen('.', "", 1);
@@ -126,13 +144,18 @@ pub fn emit_worklist(
                 let line = format!("{file_under} {url} {name}\n");
                 if seen.insert(line.clone()) {
                     lines.push_str(&line);
-                    n += 1;
+                    counts.emitted += 1;
+                    if refiled {
+                        counts.refiled += 1;
+                    }
+                } else {
+                    counts.deduped += 1;
                 }
             }
-            None => skipped += 1,
+            None => counts.unencodable += 1,
         }
     }
-    (lines, n, skipped, refiled)
+    (lines, counts)
 }
 
 /// A DOCUMENT IS ACQUIRED UNDER THE RELEASE ITS OWN VERSION NAMES.
@@ -1282,8 +1305,12 @@ mod repair_tests {
             ("26.510|Rel-19", "19.2.0"),
             ("26.510|Rel-20", "18.4.0"),
         ]);
-        let (lines, n, skipped, refiled) = emit_worklist(&site, 4, "");
-        assert_eq!((n, skipped, refiled), (3, 0, 1), "lines: {lines}");
+        let (lines, c) = emit_worklist(&site, 4, "");
+        assert_eq!(
+            (c.emitted, c.unencodable, c.refiled, c.deduped),
+            (3, 0, 1, 0),
+            "lines: {lines}"
+        );
         assert!(
             lines.contains("Rel-18 https://www.3gpp.org/ftp/Specs/archive/26_series/26.510/26510-i40.zip 26510-i40.zip\n"),
             "18.4.0 must be requested as Rel-18; got: {lines}"
@@ -1306,8 +1333,8 @@ mod repair_tests {
     #[test]
     fn a_draft_keeps_the_release_it_is_drafted_for() {
         let site = m(&[("36.833-1|Rel-2", "2.9.0"), ("36.833-1|Rel-13", "2.0.0")]);
-        let (lines, _, _, refiled) = emit_worklist(&site, 0, "");
-        assert_eq!(refiled, 0, "a draft is not mis-filed; got: {lines}");
+        let (lines, c) = emit_worklist(&site, 0, "");
+        assert_eq!(c.refiled, 0, "a draft is not mis-filed; got: {lines}");
         assert!(
             lines.contains(
                 "Rel-13 https://www.3gpp.org/ftp/Specs/archive/36_series/36.833-1/36833-1-200.zip"
@@ -1324,9 +1351,9 @@ mod repair_tests {
     #[test]
     fn refiling_never_sends_a_document_below_the_floor() {
         let site = m(&[("21.810|Rel-99", "3.0.0"), ("21.810|Rel-4", "3.0.0")]);
-        let (lines, n, _, refiled) = emit_worklist(&site, major("Rel-4"), "");
-        assert_eq!(refiled, 0, "Rel-99 is below the floor; got: {lines}");
-        assert_eq!(n, 1, "only the Rel-4 key is in scope; got: {lines}");
+        let (lines, c) = emit_worklist(&site, major("Rel-4"), "");
+        assert_eq!(c.refiled, 0, "Rel-99 is below the floor; got: {lines}");
+        assert_eq!(c.emitted, 1, "only the Rel-4 key is in scope; got: {lines}");
         assert!(
             lines.starts_with("Rel-4 "),
             "the document must still be fetched, as Rel-4; got: {lines}"
@@ -1393,6 +1420,50 @@ mod repair_tests {
         );
     }
 
+    /// TWO `filing_release` CALLS, BECAUSE TWO DIFFERENT VERSIONS ARE AT STAKE.
+    /// `drifted` asks about the version the REPORT carries; `want` may instead be
+    /// the version the ANCHOR carries, when the key is a hole the report has not
+    /// moved past. Each is filed under the release ITS OWN major names, and the two
+    /// can legitimately differ.
+    ///
+    /// The mixed-major fixture: the report lists 26.510 at 18.4.0 under Rel-20, the
+    /// corpus holds 18.5.0 under Rel-18 and claims 17.2.0 under Rel-20 with no text.
+    /// 18.4.0 is not drift — Rel-18 already holds something newer — so the only work
+    /// is the hole, and the hole is 17.2.0. Fetching 17.2.0 as Rel-17 is what closes
+    /// it: once 26.510@17.2.0 is indexed anywhere, anchorcheck reclassifies
+    /// 26.510|Rel-20 from MissingContent to NonContent. Fetching it as Rel-20 would
+    /// close the same hole by putting a Release-17 document under Rel-20, which is
+    /// the defect this whole change exists to stop.
+    #[test]
+    fn a_hole_is_filed_by_the_version_the_anchor_names_not_the_report() {
+        let site = m(&[
+            ("26.510|Rel-17", "17.4.0"),
+            ("26.510|Rel-18", "18.5.0"),
+            ("26.510|Rel-20", "18.4.0"),
+        ]);
+        let idx = m(&[
+            ("26.510|Rel-17", "17.4.0"),
+            ("26.510|Rel-18", "18.5.0"),
+            ("26.510|Rel-20", "17.2.0"),
+        ]);
+        let holes: BTreeSet<String> = ["26.510|Rel-20".to_string()].into_iter().collect();
+
+        let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 4, "");
+        assert_eq!(
+            c.upstream_stale + c.upstream_missing,
+            0,
+            "18.4.0 is not drift: Rel-18 holds 18.5.0; {lines}"
+        );
+        assert_eq!(c.corpus_holes, 1, "{lines}");
+        assert_eq!(c.refiled, 1, "{lines}");
+        assert_eq!(
+            lines,
+            "Rel-17 https://www.3gpp.org/ftp/Specs/archive/26_series/26.510/26510-h20.zip 26510-h20.zip
+",
+            "the ANCHOR's 17.2.0, filed under the release 17.x names"
+        );
+    }
+
     /// AND THE COLLISION CROSSES THE TWO LOOPS. The second loop only sees keys the
     /// report does not carry, so no KEY reaches both — but a hole key and a report
     /// key of the same spec can still render the same LINE once re-filing sends them
@@ -1424,8 +1495,12 @@ mod repair_tests {
     #[test]
     fn refiling_does_not_duplicate_a_line() {
         let site = m(&[("33.816|Rel-10", "10.0.0"), ("33.816|Rel-11", "10.0.0")]);
-        let (lines, n, _, refiled) = emit_worklist(&site, 4, "");
-        assert_eq!((n, refiled), (1, 1), "lines: {lines}");
+        let (lines, c) = emit_worklist(&site, 4, "");
+        assert_eq!(
+            (c.emitted, c.refiled, c.deduped),
+            (1, 0, 1),
+            "the line that survives is the Rel-10 key's own, not the re-filing; {lines}"
+        );
         assert_eq!(
             lines,
             "Rel-10 https://www.3gpp.org/ftp/Specs/archive/33_series/33.816/33816-a00.zip 33816-a00.zip\n"
