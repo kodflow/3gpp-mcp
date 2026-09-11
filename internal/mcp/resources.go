@@ -28,31 +28,63 @@ func registerResources(s *server.MCPServer, h *handlers) {
 	}
 
 	// Clause subtree: 3gpp://<spec>/<release>/<clause>[@<version>]. {+clause}
-	// (RFC6570 reserved expansion) matches dotted paths literally.
+	// (RFC6570 reserved expansion) matches dotted paths literally — and the
+	// "@<version>" suffix with them, since reserved expansion admits "@".
 	s.AddResourceTemplate(
 		mcp.NewResourceTemplate(
 			"3gpp://{spec_id}/{release}/{+clause}",
 			"3GPP clause body",
 			mcp.WithTemplateDescription(
-				"Verbatim text of a 3GPP clause (or clause-prefix subtree). "+
-					"URI: 3gpp://<spec_id>/<release>/<clause>[@<version>]."),
+				"Verbatim text of a clause (or clause-prefix subtree), 3GPP or ETSI. "+
+					"URI: 3gpp://<spec_id>/<release>/<clause>[@<version>]. "+specIDInURI),
 			mcp.WithTemplateMIMEType("text/markdown"),
 		),
 		shielded(h.readClauseResource),
 	)
-	// Whole spec at a release: 3gpp://<spec>/<release>[@<version>].
+	// Whole spec at a release: 3gpp://<spec>/<release>, and at one version:
+	// 3gpp://<spec>/<release>@<version>.
+	//
+	// TWO TEMPLATES, BECAUSE ONE COULD NOT MATCH WHAT IT ADVERTISED. This used to
+	// be the first one alone, described as "3gpp://<spec_id>/<release>[@<version>]"
+	// — but {release} is a simple expansion, whose RFC 6570 character class has no
+	// "@", so every URI written the way the description said answered "handler
+	// not found for resource URI", on both halves. The version is not decoration:
+	// an ETSI deliverable has no releases (its release is the constant "ETSI"), so
+	// the version is the ONLY way to name one of its published versions.
+	//
+	// {+release} would have matched too, and was not used: reserved expansion
+	// also admits "/", so that template would match every clause URI as well, and
+	// mcp-go picks among matching templates in map order. These two and the
+	// clause template above match disjoint sets.
 	s.AddResourceTemplate(
 		mcp.NewResourceTemplate(
 			"3gpp://{spec_id}/{release}",
 			"3GPP spec body",
 			mcp.WithTemplateDescription(
-				"Verbatim text of an entire 3GPP spec at a release. "+
-					"URI: 3gpp://<spec_id>/<release>[@<version>]."),
+				"Verbatim text of an entire spec, 3GPP or ETSI, at its newest version in a release. "+
+					"URI: 3gpp://<spec_id>/<release>. For one version, use 3gpp://<spec_id>/<release>@<version>. "+
+					specIDInURI),
+			mcp.WithTemplateMIMEType("text/markdown"),
+		),
+		shielded(h.readSpecResource),
+	)
+	s.AddResourceTemplate(
+		mcp.NewResourceTemplate(
+			"3gpp://{spec_id}/{release}@{version}",
+			"3GPP spec body at a version",
+			mcp.WithTemplateDescription(
+				"Verbatim text of an entire spec, 3GPP or ETSI, at one version. "+
+					"URI: 3gpp://<spec_id>/<release>@<version>, e.g. 3gpp://23.501/Rel-18@18.5.0. "+specIDInURI),
 			mcp.WithTemplateMIMEType("text/markdown"),
 		),
 		shielded(h.readSpecResource),
 	)
 }
+
+// specIDInURI tells a client how to write an id that carries spaces — every
+// ETSI id does — in a URI a template can match.
+const specIDInURI = "spec_id is written as in a citation, with each space as %20 " +
+	"(ETSI TS 103 221-1 -> ETSI%20TS%20103%20221-1); the ETSI release is ETSI."
 
 // specRef is a parsed 3gpp:// URI.
 type specRef struct{ specID, release, clause, version string }
