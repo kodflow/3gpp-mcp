@@ -146,3 +146,52 @@ multi-hour GPU pass is never stomped by a TTL.
   surgery, to be done once the chain is green. See `docs/local-pipeline.md` §9.
 - **`truncate` windowing is kept.** Changing it flips the embed identity and costs
   a full re-embed; the decision is recorded rather than taken by accident.
+
+## Amendment — 2026-09-11: a seed pulls a digest, and the publisher moves it
+
+**Context.** `seed` / `seed-etsi` pulled `ghcr.io/<owner>/{3gpp,etsi}-corpus` by
+tag, `latest` by default (`MCP3GPP_CORPUS_TAG`, one variable for both arms). A tag
+is moved by whoever publishes, so the pipeline's starting point was not a
+function of the commit — against §1 of this ADR and CLAUDE.md's "reproducibility
+of ingestion" — and the step's record could not say what it had pulled. Measured
+on the registry that day: both `latest` were last moved on 2026-08-30 (3GPP
+14:48Z, 8.1 GB layer; ETSI 14:33Z, 32 MB layer) with **no dated tag beside them**,
+so the snapshot a clone received could not be named after the fact; the only
+writer, `scripts/local/publish-corpus.sh`, is run by hand and nothing has run it
+since, because the product image packs the corpus from `data/` directly.
+
+**Decision.**
+
+1. **The pin is a file in the tree:** `contracts/corpus-pin.txt`, one
+   `ghcr.io/<owner>/<package>@sha256:<hex>` per package. What a fresh clone seeds
+   from is decided by a reviewed commit.
+2. **The publisher bumps it.** `publish-corpus.sh` reads the digest of what it
+   just pushed back from the registry and rewrites that package's line
+   (`scripts/lib/corpus-pin.sh`); the operator commits it. Nothing else writes it.
+3. **The pull is verified.** The manifest served for a digest reference must hash
+   to that digest before any layer is transferred (`bootstrap.ghcrManifest`);
+   without the check a pin is a request, not a guarantee.
+4. **Two determinants, in two places.** The configured reference (the pin, or an
+   override) is an `Extra` of its own arm's seed — offline, so `goal plan` needs no
+   network. The digest ACTUALLY pulled exists only after the run, so it is
+   recorded through `Ctx.Produced` and folded into the step's provenance: a
+   different snapshot replays what stands on it, even under an override naming a
+   moving tag.
+5. **A bump costs a decline, not a rebuild.** `seed` declines whenever a corpus is
+   on disk and a decline carries the previous provenance, so on a machine that has
+   built once a pin bump re-runs the two seeds (≈1 s each) and nothing behind
+   them. `TestAPinBumpOnAMachineWithACorpusReplaysNothingBehindSeed` holds that.
+6. **Overrides stay, per package.** `MCP3GPP_CORPUS_REF_3GPP` / `_ETSI` take a tag
+   or a digest; `MCP3GPP_CORPUS_TAG` stays one tag for both and refuses a digest,
+   which names one manifest of one package.
+7. **The server keeps following `latest`.** `mcp-3gpp bootstrap` / `serve` are
+   released on their own cadence and exist to pick up the next corpus without a
+   re-release; compatibility is guarded by the embedding identity at open, not by
+   the tag. They share the reference grammar and the digest check, and log the
+   digest a tag resolved to.
+
+**Not done here.** The published snapshots are twelve days behind the corpus the
+image serves; republishing them is a push, and bumps the pin when it happens. The
+3GPP delta anchor that `seed` adopts beside a fresh snapshot still comes from the
+`latest` GitHub release (`corpus-index.json`, last written 2026-06-05) and is not
+paired with the pinned corpus by digest.

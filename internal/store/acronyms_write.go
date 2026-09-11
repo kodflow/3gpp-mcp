@@ -65,7 +65,8 @@ import (
 // The second line is the one exception to "the seed stamps spec ids", and it is
 // not a second owned shape: a row handed back is TS 21.905's again, byte for byte
 // what the Rust ingest writes for it (see GeneralVocabulary), and the seed never
-// touches it after that unless a spec declares its key again.
+// touches it after that unless a spec declares its key again — or the newest
+// TS 21.905 stops storing it, when it is retired (GlossaryDiff.Retired).
 //
 // Measured the same day on the shipped corpus: 14 127 rows, of which 13 722 cite a
 // spec id (13 027 "NN.NNN" over 1 857 specs, 695 "NN.NNN-N" over 127) and 405
@@ -255,6 +256,26 @@ type GlossaryDiff struct {
 	// A withheld row is judged the first time TS 21.905 is read again: it is then
 	// removed or handed back, and the guard counts the removals.
 	Withheld []model.Acronym
+	// Retired are TS 21.905's OWN rows — stamped "21" — whose key the newest
+	// version of TS 21.905 no longer stores, and that no spec of the batch
+	// declares either. The write deletes them. Same order as Removed; empty
+	// whenever TS 21.905 could not be read, because no key can be cleared then.
+	//
+	// WHY THE SEED, WHICH OTHERWISE NEVER TOUCHES A "21" ROW, TAKES THESE OUT.
+	// The Rust ingest writes TS 21.905's rows when a version of it is ingested,
+	// and the fold copies them into the corpus ON CONFLICT DO NOTHING: a new
+	// version's keys are ADDED, and a key it corrected or dropped keeps its old
+	// row for good, served by resolve_term as TS 21.905's entry beside the
+	// current one. Measured 2026-09-11 over the 16 stored versions: 7 of the 15
+	// successive issues dropped keys (1 to 8 each, 3 at v16.1.0, 2 at v17.2.0),
+	// and a corpus built from all 16 would carry 25 keys v19.2.0 no longer
+	// prints. Nothing else removes them: the ingest never deletes an acronym and
+	// the seed owned only spec-stamped rows. This is the one reader that already
+	// knows what the newest TS 21.905 stores (GeneralVocabulary), with the floor
+	// and the unread state that make that knowledge safe to act on.
+	//
+	// A DELETION, and the mass-removal guard counts it as one.
+	Retired []model.Acronym
 	// Owned is how many seeded rows the table held BEFORE the replacement — the
 	// base a removal is measured against.
 	Owned int
@@ -296,7 +317,7 @@ type VanishedSpec struct {
 // Changed reports whether applying the diff moves the corpus at all. A withheld
 // row is not a change: it is exactly the row the table already holds.
 func (d GlossaryDiff) Changed() bool {
-	return d.Written > 0 || len(d.Removed) > 0 || len(d.Restored) > 0
+	return d.Written > 0 || len(d.Removed) > 0 || len(d.Restored) > 0 || len(d.Retired) > 0
 }
 
 // PlanSeededAcronyms computes what ReplaceSeededAcronyms would do, and writes
@@ -453,6 +474,10 @@ func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, general GeneralVocabul
 		_ = tx.Rollback()
 		return GlossaryDiff{}, err
 	}
+	if err := stageAcronyms(tx, "retired_acronyms", diff.Retired); err != nil {
+		_ = tx.Rollback()
+		return GlossaryDiff{}, err
+	}
 	// THE RELEASE IS KEYED ON THE PROVENANCE IT WAS PLANNED FROM, not on the key
 	// alone. A row whose source_series is no longer the one planSeededAcronyms
 	// classified as seeded is not deleted here — so ownership is decided in ONE
@@ -472,6 +497,9 @@ func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, general GeneralVocabul
 	}{
 		{"released_acronyms", "remove", len(diff.Removed)},
 		{"restored_acronyms", "hand back to TS 21.905", len(diff.Restored)},
+		// Keyed on "21" like the others on their spec id: a row that stopped being
+		// TS 21.905's between the plan and the write is not deleted.
+		{"retired_acronyms", "retire from TS 21.905", len(diff.Retired)},
 	} {
 		res, err := tx.Exec(`DELETE FROM acronyms WHERE (term, expansion, domain, source_series) IN
 			(SELECT term, expansion, domain, source_series FROM ` + r.table + `)`)
@@ -561,11 +589,21 @@ func (s *Store) planSeededAcronyms(as []model.Acronym, general GeneralVocabulary
 	// with no evidence, no key can be cleared, and "we could not tell" must never
 	// read as "TS 21.905 does not declare it" — which is what a failed read that
 	// returned an empty set would otherwise say, for every row at once.
-	var removed, restored, withheld []model.Acronym
+	var removed, restored, withheld, retired []model.Acronym
 	owned := map[string]int{}
 	lost := map[string]int{}
 	back := map[string]int{}
 	for k, cur := range existing {
+		// TS 21.905's own row, which the newest TS 21.905 no longer stores and no
+		// spec of the batch declares: retired (GlossaryDiff.Retired). One the batch
+		// declares is rewritten as the spec's below, exactly as before; with
+		// TS 21.905 unread nothing is known, and nothing is retired.
+		if cur.SourceSeries == generalSource {
+			if _, declared := want[k]; !declared && general.Read && !general.declares(k) {
+				retired = append(retired, cur)
+			}
+			continue
+		}
 		if !seededBySpec(cur.SourceSeries) {
 			continue
 		}
@@ -584,7 +622,7 @@ func (s *Store) planSeededAcronyms(as []model.Acronym, general GeneralVocabulary
 			lost[cur.SourceSeries]++
 		}
 	}
-	for _, rows := range [][]model.Acronym{removed, restored, withheld} {
+	for _, rows := range [][]model.Acronym{removed, restored, withheld, retired} {
 		sort.Slice(rows, func(i, j int) bool {
 			a, b := rows[i], rows[j]
 			if a.Term != b.Term {
@@ -596,7 +634,8 @@ func (s *Store) planSeededAcronyms(as []model.Acronym, general GeneralVocabulary
 			return a.Domain < b.Domain
 		})
 	}
-	diff := GlossaryDiff{Written: len(pending), Removed: removed, Restored: restored, Withheld: withheld}
+	diff := GlossaryDiff{Written: len(pending), Removed: removed, Restored: restored, Withheld: withheld,
+		Retired: retired}
 	for _, n := range owned {
 		diff.Owned += n
 	}

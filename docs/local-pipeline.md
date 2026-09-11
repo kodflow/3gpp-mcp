@@ -80,6 +80,22 @@ it. What `seed-etsi` does NOT close: ETSI has no delta anchor, so `discover-etsi
 and `fetch-etsi` still re-enumerate the archive. The expensive half —
 `embed-etsi` and `sparse-etsi` — declines against the restored vectors.
 
+**The seeds pull a DIGEST, and `publish-corpus.sh` is what moves it** (2026-09-11,
+ADR 0003 amendment). Both arms used to seed from `latest`, a tag the publisher
+moves, so two fresh clones of one commit could start from different corpora and
+the step's record could not say which. `contracts/corpus-pin.txt` now names one
+`ghcr.io/<owner>/<package>@sha256:…` per package; each arm's line is an `Extra`
+determinant of its own seed (bumping ETSI leaves `seed` alone), resolved offline
+so `goal plan` needs neither network nor credential. The pull checks the manifest
+against that digest before any layer moves, and the digest actually pulled is
+recorded in the step's record (`produced.snapshot`) and folded into its
+provenance. **A bump costs two declines**: on any machine that holds a corpus the
+seeds re-run, decline in about a second, and carry their provenance forward, so
+`discover`, `discover-etsi` and everything behind them skip — pinned by
+`TestAPinBumpOnAMachineWithACorpusReplaysNothingBehindSeed`. Overrides:
+`MCP3GPP_CORPUS_REF_3GPP` / `MCP3GPP_CORPUS_REF_ETSI` (tag or digest, per package),
+`MCP3GPP_CORPUS_TAG` (one tag for both, digest refused).
+
 **DO NOT BUILD AN ETSI ANCHOR.** Measured on build F (2026-09-09): `discover-etsi`
 39.6 s + `fetch-etsi` 3m54 = **4m34 of a 1h45 build, 4 %** — and those 3m54 are
 not downloads (11 822 deliverables in 234 s is impossible); it is the on-disk skip
@@ -105,8 +121,8 @@ has run once, the register exists and the check is a real gate.
 | `test` | `go test ./...` | ~1 min |
 | `build-rust` | ingest, merge (the fold `ingest` runs), overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
-| `seed` | adopt the published 3GPP snapshot **and its delta anchor** | one-off |
-| `seed-etsi` | adopt the published `etsi-corpus` snapshot. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off |
+| `seed` | adopt the published 3GPP snapshot **and its delta anchor** — the snapshot named BY DIGEST in `contracts/corpus-pin.txt`, never `latest` (see below). Declines when a corpus is already on disk | one-off; ~1 s decline |
+| `seed-etsi` | adopt the published `etsi-corpus` snapshot, pinned the same way. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off; ~0 s decline |
 | `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
 | `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
 | `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
@@ -116,7 +132,7 @@ has run once, the register exists and the check is a real gate.
 | `enrich` | DynaReport catalogue, 5GC OpenAPI, LI registry, CR database | minutes (`ingest-crs` alone: 1m54 for 256 471 rows, measured 2026-09-10) |
 | `enrich-etsi` | mine each deliverable's own Abbreviations clause into the glossary | **21.5 s** (measured 2026-09-08 over all 5 142 deliverables; it was 2 h 29 before the quadratic fix) |
 | `paragraphs` / `paragraphs-etsi` | store each paragraph once and point at it (ADR 0004) | ~9 min |
-| `sparse` / `sparse-etsi` | learned lexical postings (additive layer) | ~30 min |
+| `sparse` / `sparse-etsi` | learned lexical postings (additive layer). Declines when every clause carries a posting **written by the current producer** — the sparse model plus embed-core's sources, `Cargo.toml` and `Cargo.lock`, recorded in `.local/state/sparse-producer[-etsi].json`. A different producer re-encodes every clause and replaces the layer (a corpus rewrite, so a layer re-push) | ~30 min; ~2 min to decline |
 | `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
 | `index` / `index-etsi` | build and freeze the HNSW cosine index | RAM-bound |
 | `validate` / `validate-etsi` | the data-completeness contract (+ `anchorcheck` on the 3GPP arm) | seconds |
@@ -129,6 +145,16 @@ pull was the corpus the machine had built, and twice in two days it went out
 stale or unbootable while every local gate was green. It now depends on `smoke`
 **and** `index-etsi` — both halves frozen and proved — and `make plan` states
 whether the published image is behind the corpus before anything runs.
+
+Two things in its fingerprint are not files. **The embed floor**: the image is
+held to the floor `validate` applied (`--embed-floor` / `GOAL_EMBED_FLOOR`), which
+`publish` hands `build-image.sh` as `--embed-floor`; an `EMBED_FLOOR` exported with
+another value refuses the plan instead of publishing under a contract nobody
+checked (`EMBED_FLOOR` still sets the floor of a standalone `make image`). **The
+toolchain that writes the image** — go (it compiles imgtar, whose gzip writes every
+layer blob: a Go upgrade can re-upload the whole corpus), zig, rustc, cargo, crane
+and the Debian sysroot libraries — as `build-image.sh --print-toolchain` reports
+them, so a toolchain upgrade replays `publish` and the record says why.
 
 ---
 
@@ -161,6 +187,7 @@ Long steps checkpoint internally, so an interruption costs minutes, not hours:
 | `ingest` | per `(spec, version)` via the `ingest_log` table, stamped `PIPELINE_VERSION` |
 | `ingest` (fold) | per `(spec_id, release)` bucket via `merge --base`; a fold that died is retried from `fold-state.json` |
 | `embed` | per clause **and per content hash**, via `.local/vecs/ledger.jsonl` |
+| `sparse` | per clause and text hash, via `.local/vecs/sparse[-etsi].jsonl`; the sidecar `.producer` says which producer appended to it, and a re-encode that died is finished from `sparse-producer[-etsi].json` (`pending`) |
 
 State lives in `.local/state/steps/*.json`, written tmp→fsync→rename. A fresh
 process — a new agent, a new terminal, a rebooted machine — reads those files and

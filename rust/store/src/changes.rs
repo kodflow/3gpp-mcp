@@ -14,10 +14,12 @@
 //! actually runs `ingest-crs`. That is the narrow direction, and the narrow
 //! direction is the dangerous one when it is wrong — a step that does not replay
 //! ships a stale corpus and nothing says so. It is correct here for a reason that
-//! can be checked rather than asserted: `replace_changes` is called by
-//! `ingest-crs` and by nothing else, and `ingest-crs` is run by `enrich` and by
-//! nothing else. Adding a second caller means adding this file to that caller's
-//! step, and `TestEnrichDeclaresTheChangelogWriter` fails until it is.
+//! can be checked rather than asserted: each caller of `replace_changes` is run by
+//! exactly one step, and that step declares this file. There are two, one per arm
+//! (2026-09-11): `ingest-crs` (3GPP, from the CR database, run by `enrich`) and
+//! `ingest-etsi-changes` (ETSI, from the deliverables' change-history annexes, run
+//! by `enrich-etsi`). A third caller means adding this file to its step, and
+//! `TestEveryChangelogWriterIsDeclaredByTheStepThatRunsIt` fails until it is.
 //!
 //! Declaring `pub mod` in lib.rs is a one-time cost paid deliberately: it moves
 //! merge's fingerprint once, and every later edit to the changelog costs one

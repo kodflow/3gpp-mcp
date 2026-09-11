@@ -143,14 +143,24 @@ func removalBound(owned int) int {
 
 // massRemoval says why a diff would be refused, or "" when it passes.
 //
-// It reads the rows the write DELETES (Removed) and the specs it would delete
-// from (Vanished) — see the paragraph above removalBoundPct for why hand-backs
-// and withheld rows are not among them.
+// It reads the rows the write DELETES — seeded rows (Removed) and TS 21.905 rows
+// its newest version no longer stores (Retired) — and the specs it would delete
+// from (Vanished). See the paragraph above removalBoundPct for why hand-backs and
+// withheld rows are not among them.
+//
+// A RETIREMENT IS A DELETION and is counted as one, against the same bound. It
+// rests on one read of one document, and a read that passed the floor while
+// losing a letter clause would retire that letter's rows: the bound is what
+// stops it from doing so in bulk. Measured over the 16 stored versions, one
+// issue of TS 21.905 retires at most 8 keys.
 func massRemoval(d store.GlossaryDiff) string {
 	var why []string
-	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
-		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
-			n, d.Owned, bound))
+	if n, bound := len(d.Removed)+len(d.Retired), removalBound(d.Owned); n > bound {
+		what := fmt.Sprintf("it would remove %d of the %d seeded rows", len(d.Removed), d.Owned)
+		if len(d.Retired) > 0 {
+			what += fmt.Sprintf(" and retire %d of TS 21.905's", len(d.Retired))
+		}
+		why = append(why, fmt.Sprintf("%s, above the bound of %d", what, bound))
 	}
 	if len(d.Vanished) > 0 {
 		// The first twenty by name; the JSON report carries every one. A broken
@@ -225,6 +235,12 @@ type Report struct {
 	// until it can.
 	Withheld     int          `json:"withheld_total"`
 	WithheldRows []RemovedRow `json:"withheld,omitempty"`
+	// Retired counts TS 21.905's own rows the write took out because the newest
+	// TS 21.905 no longer stores their key and no spec declares it
+	// (store.GlossaryDiff.Retired), and RetiredRows names them. Deletions, and
+	// counted by the guard.
+	Retired     int          `json:"retired_total"`
+	RetiredRows []RemovedRow `json:"retired,omitempty"`
 	// General is what the run read of TS 21.905 — the evidence every release was
 	// checked against. See readGeneral.
 	General GeneralReport `json:"ts21905"`
@@ -450,8 +466,10 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 				// The owning SPEC, not its two-digit series: it is what makes
 				// the precedence above auditable, and it is what marks the row as
 				// this package's to replace (store.seededSource). The series form
-				// belongs to TS 21.905's rows, which this package never removes —
-				// and writes only to hand a row back to TS 21.905 (readGeneral).
+				// belongs to TS 21.905's rows, which this package removes only
+				// when the newest TS 21.905 no longer stores their key
+				// (store.GlossaryDiff.Retired) — and writes only to hand a row
+				// back to TS 21.905 (readGeneral).
 				SourceSeries: todo[i].sr.Spec,
 			})
 		}
@@ -521,6 +539,10 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 	rep.Withheld = len(diff.Withheld)
 	for _, a := range diff.Withheld {
 		rep.WithheldRows = append(rep.WithheldRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
+	}
+	rep.Retired = len(diff.Retired)
+	for _, a := range diff.Retired {
+		rep.RetiredRows = append(rep.RetiredRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
@@ -702,8 +724,8 @@ const ts21905Min = 1210
 // readGeneral reads which keys TS 21.905's writer stores NOW — the evidence a
 // release is checked against — and says why when it cannot.
 //
-// WHAT IS READ: the newest version's region under the clause headed exactly
-// "Abbreviations" (the miner's own heading test), which in TS 21.905 is not one
+// WHAT IS READ: the newest version's region under each clause whose heading
+// contains "abbreviation" (the writer's own heading test), which in TS 21.905 is not one
 // clause but 28: "4 Abbreviations" with an empty body, then "0-9" and "A" to "Z"
 // as UNNUMBERED clauses — clause_path "" — up to "5 Equations". Measured on all
 // 16 stored versions: that shape, every time.
@@ -853,11 +875,13 @@ type abbreviationsRegion struct {
 // unnumbered or numbered under it, up to the first numbered clause that is not.
 //
 // UNNUMBERED CLAUSES BELONG TO THE REGION, which is what TS 21.905's letter
-// clauses need, and what the Rust rule no longer grants them: rust/parse's
-// extract_acronyms stops at the first clause that is not a DESCENDANT, and ""
-// is not a descendant of "4" (is_descendant), so under today's rule it reads
-// "4 Abbreviations" — an empty body — and nothing after it. The rows stamped
-// "21" in the corpus predate that rule; this reading does not depend on it.
+// clauses need — and the same rule as rust/parse's extract_acronyms, the
+// writer. From 2026-09-07 to 2026-09-11 the Rust rule walked numbered
+// sub-clauses only: "" is not a descendant of "4", so it read "4 Abbreviations"
+// — an empty body — and nothing after it, 0 rows on every stored version. The
+// rows stamped "21" in the corpus predate that rule, which is why they were
+// still there; the writer grants the continuation again, and the two readers
+// agree on the region once more.
 //
 // A version holding two documents would yield both regions; none of the 16
 // stored versions does — each has the one 28-clause region described in
@@ -878,7 +902,14 @@ func generalRegion(clauses []model.Clause) abbreviationsRegion {
 	}
 	sort.SliceStable(doc, func(i, j int) bool { return doc[i].ChunkID < doc[j].ChunkID })
 	for i := 0; i < len(doc); i++ {
-		if !strings.EqualFold(strings.TrimSpace(doc[i].Heading), "abbreviations") {
+		// THE WRITER'S HEADING TEST, not the seed's: extract_acronyms anchors on
+		// any heading that CONTAINS "abbreviation", and this set is what the
+		// writer stores — it decides hand-backs and, since the retirement, which
+		// "21" rows are deleted. The seed's exact "Abbreviations" test (readSpec)
+		// would miss a region under "Definitions and abbreviations" that the
+		// writer reads, and retire its keys. Identical on all 16 stored versions
+		// (one such heading each, "4 Abbreviations"); the difference is latent.
+		if !strings.Contains(strings.ToLower(doc[i].Heading), "abbreviation") {
 			continue
 		}
 		root := doc[i].ClausePath

@@ -150,6 +150,15 @@ The DB has no version number — the **digests of its layer are its identity**.
 The same comparison guards `bootstrap` itself and the pipeline's `seed` step:
 it lives in `bootstrap.FetchCorpus`, so no caller has to remember it.
 
+**The pipeline does not follow `latest`; the binary does.** The `seed` steps pull
+the digest committed in `contracts/corpus-pin.txt` — a build is reproducible from
+its commit — and `publish-corpus.sh` rewrites that file when it pushes. The
+binary is released on its own cadence and is meant to pick up the next corpus
+without a re-release, so it keeps following the tag; a deployment freezes it with
+`MCP3GPP_CORPUS_REF_3GPP` / `_ETSI` (a digest per package) or `--no-update`. In
+both cases a digest reference is checked against the manifest the registry serves
+before a byte moves (ADR 0003, amendment of 2026-09-11).
+
 ## Open items
 
 - Implement `ingest --append` + wire the corpus-sync workflow.

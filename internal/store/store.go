@@ -1365,7 +1365,7 @@ func (s *Store) LatestVersion(ctx context.Context, specID string) (release, vers
 		return "", "", false, nil
 	}
 	for _, v := range vs {
-		if model.IsStableVersion(v.Version) {
+		if model.IsStableSpecVersion(specID, v.Version) {
 			return v.Release, v.Version, true, nil
 		}
 	}
@@ -1391,7 +1391,7 @@ func (s *Store) VersionForRelease(ctx context.Context, specID, release string) (
 		if v.Release != release {
 			continue
 		}
-		if model.IsStableVersion(v.Version) {
+		if model.IsStableSpecVersion(specID, v.Version) {
 			return v.Version, true, nil
 		}
 		if !haveFallback {

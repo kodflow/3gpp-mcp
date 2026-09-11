@@ -4,6 +4,7 @@
 //	imgtar pack --root <dir> --out <layer.tar[.gz]> [--uid N --gid N] [--gzip] [--cache <dir>] <path>…
 //	imgtar cat   --in <archive.tar> <member>
 //	imgtar untar --in <archive.tar[.gz]> --dest <dir> [--strip N]
+//	imgtar oci   --base <layout> --out <layout> <layer.tar.gz>…   (see oci.go)
 //
 // WHY NOT tar(1). Git for Windows ships GNU tar, and it is wrong here in two
 // ways that both produce a broken image rather than an error:
@@ -58,6 +59,8 @@ func main() {
 		cat(os.Args[2:])
 	case "untar":
 		untar(os.Args[2:])
+	case "oci":
+		ociCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -66,6 +69,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: imgtar pack --root <dir> --out <layer.tar> [--uid N --gid N] <path>…")
 	fmt.Fprintln(os.Stderr, "       imgtar cat  --in <archive.tar> <member>")
+	fmt.Fprintln(os.Stderr, "       imgtar oci  --base <layout> --out <layout> <layer.tar.gz>…")
 	os.Exit(2)
 }
 
@@ -81,39 +85,94 @@ func pack(args []string) {
 	if *root == "" || *out == "" || fs.NArg() == 0 {
 		usage()
 	}
-
-	entries, err := collect(*root, fs.Args())
+	id, n, cached, err := packLayer(*root, *out, *cacheDir, *uid, *gid, *gz, fs.Args())
 	must(err)
+	how := ""
+	if cached {
+		how = "  (cached: every packed file unchanged)"
+	}
+	fmt.Printf("  %s  %d entries  %.1f MiB  uid=%d  %s%s\n",
+		filepath.Base(*out), n, float64(id.Size)/(1<<20), *uid, short(id.Digest), how)
+}
+
+// packLayer writes the layer for paths under root to out — or hands back the one
+// cached for the same inputs — and records its identity next to it (out + ".id",
+// which `imgtar oci` reads). It returns that identity, the number of entries, and
+// whether the layer came from the cache.
+func packLayer(root, out, cacheDir string, uid, gid int, gz bool, paths []string) (identity, int, bool, error) {
+	entries, err := collect(root, paths)
+	if err != nil {
+		return identity{}, 0, false, err
+	}
 
 	var key, cached string
-	if *cacheDir != "" {
-		key, err = layerKey(entries, *uid, *gid, *gz)
-		must(err)
-		cached = filepath.Join(*cacheDir, filepath.Base(*out))
+	if cacheDir != "" {
+		if key, err = layerKey(entries, uid, gid, gz); err != nil {
+			return identity{}, 0, false, err
+		}
+		cached = filepath.Join(cacheDir, filepath.Base(out))
 		if hit(cached, key) {
-			must(linkOrCopy(cached, *out))
-			st, err := os.Stat(*out)
-			must(err)
-			fmt.Printf("  %s  %d entries  %.1f MiB  uid=%d  (cached: every packed file unchanged)\n",
-				filepath.Base(*out), len(entries), float64(st.Size())/(1<<20), *uid)
-			return
+			// THE KEY SAYS THE INPUTS ARE UNCHANGED; THE IDENTITY RECORD SAYS THE
+			// BLOB IS STILL THE ONE PACKED FROM THEM. Both, or it is packed again:
+			// a blob whose record is missing, names another key, or no longer
+			// matches the file's size and content sample is not one this program
+			// wrote for these inputs, and its digest is not known without reading
+			// it — which costs what repacking it does.
+			id, ierr := cachedIdentity(cached, key)
+			if ierr == nil {
+				if err := linkOrCopy(cached, out); err != nil {
+					return identity{}, 0, false, err
+				}
+				// --cache may BE the output directory: then the record beside out
+				// is the cache's own, and rewriting it without its key would turn
+				// the next run into a miss.
+				if sameFile(cached+idSuffix, out+idSuffix) {
+					id.Key = ""
+					return id, len(entries), true, nil
+				}
+				// A hard link carries the blob's mtime; a copy (no hard links on
+				// this filesystem) has its own, made here from the blob just
+				// verified. The staged record describes the staged file.
+				st, err := os.Stat(out)
+				if err != nil {
+					return identity{}, 0, false, err
+				}
+				id.Key, id.MTime = "", st.ModTime().UnixNano()
+				if err := id.describes(out); err != nil {
+					return identity{}, 0, false, err
+				}
+				return id, len(entries), true, writeIdentity(out, id)
+			}
+			fmt.Printf("  %s: cached under this key, but its identity record does not hold (%v) — packing it again\n",
+				filepath.Base(out), ierr)
 		}
 	}
 
 	// WRITE ASIDE, THEN RENAME. A layer name that exists is a layer that is whole:
 	// the cache below links to this file, and a half-written blob reachable under
 	// the final name would be reused by the next build as if it were complete.
-	tmp := *out + ".tmp"
-	must(writeLayer(tmp, entries, *uid, *gid, *gz))
-	must(os.Rename(tmp, *out))
-
-	if cached != "" {
-		must(store(cached, key, *out))
+	tmp := out + ".tmp"
+	id, err := writeLayer(tmp, entries, uid, gid, gz)
+	if err != nil {
+		return identity{}, 0, false, err
 	}
-	st, err := os.Stat(*out)
-	must(err)
-	fmt.Printf("  %s  %d entries  %.1f MiB  uid=%d\n",
-		filepath.Base(*out), len(entries), float64(st.Size())/(1<<20), *uid)
+	// A record from an earlier pack of this name must not outlive it. It could not
+	// vouch for the new file anyway — `imgtar oci` trusts a record only when it
+	// describes the file beside it — but it is removed before the rename so it
+	// never even sits next to one.
+	_ = os.Remove(out + idSuffix)
+	if err := os.Rename(tmp, out); err != nil {
+		return identity{}, 0, false, err
+	}
+	if err := writeIdentity(out, id); err != nil {
+		return identity{}, 0, false, err
+	}
+	if cached != "" {
+		if err := store(cached, key, out, id); err != nil {
+			return identity{}, 0, false, err
+		}
+	}
+	return id, len(entries), false, nil
 }
 
 // entry is one member of a layer, in the order it is written.
@@ -170,13 +229,43 @@ func collect(root string, paths []string) ([]entry, error) {
 	return out, nil
 }
 
-// writeLayer writes the entries as one tar, optionally gzip-compressed.
-func writeLayer(dst string, entries []entry, uid, gid int, gz bool) error {
+// writeLayer writes the entries as one tar, optionally gzip-compressed, and
+// returns the layer's identity — observed on the way out, never read back.
+//
+// Two hashes ride along: one over the tar stream before it reaches the
+// compressor (the diff_id), one over the bytes that reach the file (the digest).
+// Both are asyncHash, so they run beside the compressor rather than in front of
+// it. For an uncompressed layer the two streams are one and so are the hashes.
+func writeLayer(dst string, entries []entry, uid, gid int, gz bool) (identity, error) {
 	f, err := os.Create(dst)
 	if err != nil {
-		return err
+		return identity{}, err
 	}
-	var w io.Writer = f
+	dig := newAsyncHash()
+	diff := dig
+	finish := func(err error) (identity, error) {
+		d, n := dig.sum()
+		id := identity{Digest: d, Size: n, DiffID: d}
+		if diff != dig {
+			id.DiffID, _ = diff.sum()
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return identity{}, err
+		}
+		if id.Sample, err = sampleHash(dst, id.Size); err != nil {
+			return identity{}, err
+		}
+		st, err := os.Stat(dst)
+		if err != nil {
+			return identity{}, err
+		}
+		id.MTime = st.ModTime().UnixNano()
+		return id, id.wellFormed()
+	}
+	var w io.Writer = io.MultiWriter(f, dig)
 	var zw *gzip.Writer
 	if gz {
 		// LAYERGZIP: the stream crane itself produces. go-containerregistry
@@ -188,19 +277,18 @@ func writeLayer(dst string, entries []entry, uid, gid int, gz bool) error {
 		// already holds — nothing is re-uploaded for having moved the compression
 		// out of crane — and crane no longer spends ~15 minutes recompressing 40
 		// GB to learn digests it could have been handed.
-		zw, err = gzip.NewWriterLevel(f, gzip.BestSpeed)
+		zw, err = gzip.NewWriterLevel(w, gzip.BestSpeed)
 		if err != nil {
-			_ = f.Close()
-			return err
+			return finish(err)
 		}
-		w = zw
+		diff = newAsyncHash()
+		w = io.MultiWriter(zw, diff)
 	}
 	tw := tar.NewWriter(w)
 	for _, e := range entries {
 		hdr, err := tar.FileInfoHeader(e.fi, e.link)
 		if err != nil {
-			_ = f.Close()
-			return err
+			return finish(err)
 		}
 		hdr.Name = e.name
 		hdr.Uid, hdr.Gid = uid, gid
@@ -222,34 +310,29 @@ func writeLayer(dst string, entries []entry, uid, gid int, gz bool) error {
 			hdr.Mode = packedMode(e)
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			_ = f.Close()
-			return err
+			return finish(err)
 		}
 		if e.fi.Mode().IsRegular() {
 			src, err := os.Open(e.path)
 			if err != nil {
-				_ = f.Close()
-				return err
+				return finish(err)
 			}
 			_, cerr := io.Copy(tw, src)
 			_ = src.Close()
 			if cerr != nil {
-				_ = f.Close()
-				return cerr
+				return finish(cerr)
 			}
 		}
 	}
 	if err := tw.Close(); err != nil {
-		_ = f.Close()
-		return err
+		return finish(err)
 	}
 	if zw != nil {
 		if err := zw.Close(); err != nil {
-			_ = f.Close()
-			return err
+			return finish(err)
 		}
 	}
-	return f.Close()
+	return finish(nil)
 }
 
 // packedMode is the mode an entry is written with.
@@ -413,28 +496,77 @@ func hit(blob, key string) bool {
 	return err == nil && st.Mode().IsRegular() && st.Size() > 0
 }
 
-// store records layer as the cached blob for key: the old key goes first, so an
-// interruption anywhere leaves a miss, never a key pointing at the wrong blob.
-func store(blob, key, layer string) error {
+// store records layer as the cached blob for key, with its identity: the old key
+// and the old record go first, the new record before the new key, so an
+// interruption anywhere leaves a miss — never a key, nor a record, pointing at
+// another blob.
+func store(blob, key, layer string, id identity) error {
 	if err := os.MkdirAll(filepath.Dir(blob), 0o755); err != nil {
 		return err
 	}
 	_ = os.Remove(blob + ".key")
-	tmp := blob + ".tmp"
-	_ = os.Remove(tmp)
-	if err := linkOrCopy(layer, tmp); err != nil {
+	_ = os.Remove(blob + idSuffix)
+	// --cache may be the output directory, and then the layer IS the blob.
+	if !sameFile(layer, blob) {
+		tmp := blob + ".tmp"
+		_ = os.Remove(tmp)
+		if err := linkOrCopy(layer, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, blob); err != nil {
+			return err
+		}
+	}
+	// A copy (no hard links here) has its own mtime: the record describes the
+	// cache's file.
+	st, err := os.Stat(blob)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, blob); err != nil {
+	id.MTime = st.ModTime().UnixNano()
+	id.Key = key
+	if err := writeIdentity(blob, id); err != nil {
 		return err
 	}
 	return os.WriteFile(blob+".key", []byte(key+"\n"), 0o644)
+}
+
+// cachedIdentity is the identity recorded for the cache entry blob, provided it
+// was recorded under key and still describes the file. A cache written before
+// identities were recorded has no record, and misses: its blobs were keyed by an
+// earlier imgtar, whose executable hash is part of every key, so they would miss
+// on the key anyway.
+func cachedIdentity(blob, key string) (identity, error) {
+	id, err := readIdentity(blob)
+	if err != nil {
+		return identity{}, err
+	}
+	if id.Key != key {
+		return identity{}, fmt.Errorf("the record was made under another key")
+	}
+	return id, nil
+}
+
+// sameFile reports whether a and b both exist and are one file.
+func sameFile(a, b string) bool {
+	sa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	sb, err := os.Stat(b)
+	return err == nil && os.SameFile(sa, sb)
 }
 
 // linkOrCopy makes dst the same bytes as src: a hard link when the filesystem
 // allows it (no copy of a 16 GB blob), a copy otherwise. NOTHING WRITES THROUGH
 // EITHER NAME: a layer is written once, to a temporary name, and renamed.
 func linkOrCopy(src, dst string) error {
+	// Already the same file — one path, or a link to it. Removing dst first would
+	// delete the only copy when the two are one path (--cache pointing at the
+	// output directory; found by review of #336).
+	if sameFile(src, dst) {
+		return nil
+	}
 	_ = os.Remove(dst)
 	if err := os.Link(src, dst); err == nil {
 		return nil

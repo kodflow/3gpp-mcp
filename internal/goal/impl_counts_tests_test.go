@@ -20,6 +20,19 @@ import (
 // cheap, is not obviously right — so the ones left are left ON PURPOSE, with
 // their price written down, and this test stops the list from growing by
 // accident.
+//
+// A PRICE WRITTEN HERE IS A MEASUREMENT OR IT IS A GUESS. `paragraphs` and
+// `paragraphs-etsi` sat below as "expensive, and deliberately deferred" on the
+// strength of "replaying paragraphs rewrites the corpus". Measured on 2026-09-11,
+// on copies of both corpora and with the binary the step launches, it does not:
+// migrate-paragraphs --drop-clauses on a converted, attested corpus exits in
+// 0.2 s and leaves the file identical to the byte (sha256 and mtime), and so do
+// the sparse export (0 work items), compact's block count (1 free block, so it
+// declines) and freeze-hnsw ("already frozen … leaving the corpus untouched")
+// that its fresh provenance replays behind it. The price of the fix was the gates
+// and one re-composed image pushing no corpus byte — not a 42 GB layer. What
+// that sentence described was a conversion that really runs (498 s this morning,
+// after the pre-#327 ingest-etsi restore); a test file cannot cause one.
 var countsTestFiles = map[string]string{
 	"test": "runs the suites; test files are its INPUT, not noise — the reason ExcludeTests exists",
 
@@ -34,14 +47,9 @@ var countsTestFiles = map[string]string{
 	// test-only commit in cmd/validate. That is the reasoning #324 applied to smoke.
 	"discover-etsi": "internal/etsicat; replaying it is 39.6 s and it re-enumerates anyway",
 
-	// Expensive, and deliberately deferred: fixing it costs one replay of the
-	// thing it protects.
-	// `merge` sat here too, until the fold became the second half of `ingest`:
-	// that change replays the step anyway, so it was the free moment to stop
-	// counting cmd/migrate-paragraphs' main_test.go — ingest and ingest-etsi both
-	// set ExcludeTests.
-	"paragraphs":      "cmd/migrate-paragraphs, the binary ingest's fold also runs; replaying paragraphs rewrites the corpus, which then costs a 42 GB image re-push",
-	"paragraphs-etsi": "cmd/migrate-paragraphs, the ETSI twin; replaying it is 8m07 and rewrites etsi.duckdb, which drags compact-etsi, index-etsi and a 19 GB layer re-push",
+	// Nothing expensive is left. `merge` sat here until the fold became the
+	// second half of `ingest` (ingest and ingest-etsi set ExcludeTests), and
+	// `paragraphs`/`paragraphs-etsi` until 2026-09-11 — see the price above.
 }
 
 // TestNoStepCountsTestFilesByAccident walks every step's Impl and fails when one

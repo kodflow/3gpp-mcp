@@ -396,6 +396,27 @@ func publishedProvenance(rec *Record) string {
 	return rec.Fingerprint
 }
 
+// producedProvenance is the provenance of a run that did its work: the
+// fingerprint, plus whatever the run recorded through Ctx.Produced. With nothing
+// recorded it IS the fingerprint, which is what every step published before the
+// field existed — so its introduction moved no provenance anywhere.
+func producedProvenance(fp string, produced map[string]string) string {
+	if len(produced) == 0 {
+		return fp
+	}
+	keys := make([]string, 0, len(produced))
+	for k := range produced {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	x := newHasher()
+	x.add("fingerprint", fp)
+	for _, k := range keys {
+		x.add("produced:"+k, produced[k])
+	}
+	return x.sum()
+}
+
 // carriedProvenance keeps a step's published identity across a run that changed
 // nothing. With no previous record there is nothing to carry: a first run is a
 // change by definition.
@@ -617,6 +638,7 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	stepCtx := *r.ctx
 	stepCtx.Log = log
 	stepCtx.record = rec
+	stepCtx.previous = prev
 
 	fmt.Fprintf(os.Stderr, "\n\033[1mSTEP %s\033[0m — %s\n", s.Name, s.Doc)
 	fmt.Fprintf(os.Stderr, "  reason       %s\n", d.Reason)
@@ -640,6 +662,13 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 		// vector, and that decline used to re-freeze the HNSW index and re-compact
 		// 22 GB to reproduce bytes nobody had touched.
 		rec.Provenance = carriedProvenance(prev)
+		// And WHAT it carries: the provenance above was computed from the previous
+		// run's Produced, so the record keeps naming it — otherwise the first decline
+		// after a seed would forget which snapshot the corpus came from.
+		rec.Produced = nil
+		if rec.Provenance != "" {
+			rec.Produced = prev.Produced
+		}
 		if err := r.store.Save(rec); err != nil {
 			return err
 		}
@@ -690,7 +719,7 @@ func (r *Runner) runStep(s *Step, d Decision, _ *Result) error {
 	// Did this run change anything a dependant could observe? Only a step that has
 	// declared its outputs to BE its effect may answer that from them; for every
 	// other step, having run at all is the honest answer.
-	rec.Provenance = rec.Fingerprint
+	rec.Provenance = producedProvenance(rec.Fingerprint, rec.Produced)
 	if s.OutputsComplete && comparable && prev != nil && prev.Status == StatusSuccess &&
 		!prev.Declined && len(prev.Outputs) > 0 && sameOutputs(prev.Outputs, outs) {
 		rec.Provenance = carriedProvenance(prev)
