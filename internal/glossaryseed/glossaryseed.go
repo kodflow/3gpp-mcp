@@ -724,8 +724,8 @@ const ts21905Min = 1210
 // readGeneral reads which keys TS 21.905's writer stores NOW — the evidence a
 // release is checked against — and says why when it cannot.
 //
-// WHAT IS READ: the newest version's region under the clause headed exactly
-// "Abbreviations" (the miner's own heading test), which in TS 21.905 is not one
+// WHAT IS READ: the newest version's region under each clause whose heading
+// contains "abbreviation" (the writer's own heading test), which in TS 21.905 is not one
 // clause but 28: "4 Abbreviations" with an empty body, then "0-9" and "A" to "Z"
 // as UNNUMBERED clauses — clause_path "" — up to "5 Equations". Measured on all
 // 16 stored versions: that shape, every time.
@@ -902,7 +902,14 @@ func generalRegion(clauses []model.Clause) abbreviationsRegion {
 	}
 	sort.SliceStable(doc, func(i, j int) bool { return doc[i].ChunkID < doc[j].ChunkID })
 	for i := 0; i < len(doc); i++ {
-		if !strings.EqualFold(strings.TrimSpace(doc[i].Heading), "abbreviations") {
+		// THE WRITER'S HEADING TEST, not the seed's: extract_acronyms anchors on
+		// any heading that CONTAINS "abbreviation", and this set is what the
+		// writer stores — it decides hand-backs and, since the retirement, which
+		// "21" rows are deleted. The seed's exact "Abbreviations" test (readSpec)
+		// would miss a region under "Definitions and abbreviations" that the
+		// writer reads, and retire its keys. Identical on all 16 stored versions
+		// (one such heading each, "4 Abbreviations"); the difference is latent.
+		if !strings.Contains(strings.ToLower(doc[i].Heading), "abbreviation") {
 			continue
 		}
 		root := doc[i].ClausePath
