@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/kodflow/3gpp-mcp/internal/model"
@@ -75,6 +76,16 @@ func oneFiling(clauses []model.Clause, prefer string) ([]model.Clause, []string)
 	return byRelease[keep], releases
 }
 
+// sameRelease reports whether every clause carries the same release.
+func sameRelease(cs []model.Clause) bool {
+	for _, c := range cs[1:] {
+		if c.Release != cs[0].Release {
+			return false
+		}
+	}
+	return true
+}
+
 // sortReleases orders release labels by their ordinal; a label with none (a
 // draft bucket, "GSM") sorts first, alphabetically.
 func sortReleases(rs []string) {
@@ -97,7 +108,9 @@ func sortReleases(rs []string) {
 func textsOf(cs []model.Clause) []string {
 	out := make([]string, len(cs))
 	for i, c := range cs {
-		out[i] = strings.Join([]string{c.ClausePath, c.Heading, c.Text}, "\x1f")
+		// is_normative is part of what get_spec returns per clause, so two filings
+		// that disagree on it are not interchangeable (Qodo, #347).
+		out[i] = strings.Join([]string{c.ClausePath, c.Heading, c.Text, strconv.FormatBool(c.IsNormative)}, "\x1f")
 	}
 	sort.Strings(out)
 	return out
@@ -116,12 +129,26 @@ func sameTexts(a, b []string) bool {
 }
 
 // filingNote says what filed_under means for the answer.
-func filingNote(specID, version string, releases []string, served string, folded bool) string {
+//
+// scope is what was actually compared. A clause filter is applied by the store
+// BEFORE these rows reach the fold, so on a filtered call the comparison covers
+// the returned clauses and not the whole document, and the note must not claim
+// more than it checked (Qodo, #347).
+func filingNote(specID, version string, releases []string, served string, folded bool, scope string) string {
 	list := strings.Join(releases, ", ")
 	if folded {
-		return specID + " " + version + " is filed under " + list + " in the 3GPP catalogue, with identical " +
-			"text in each: it is served once, cited as " + served + "."
+		return specID + " " + version + " is filed under " + list + " in the 3GPP catalogue, and " + scope +
+			" is identical in each: it is served once, cited as " + served + "."
 	}
-	return specID + " " + version + " is filed under " + list + ", and the copies DIFFER: every copy is " +
-		"served, each cited with its own release."
+	return specID + " " + version + " is filed under " + list + ", and " + scope + " DIFFERS between them: " +
+		"every copy is served, each cited with its own release."
+}
+
+// filingScope names what a call compared: the whole document, or the clauses a
+// clause filter left.
+func filingScope(clause string) string {
+	if strings.TrimSpace(clause) == "" {
+		return "the text"
+	}
+	return "the text under clause " + clause
 }
