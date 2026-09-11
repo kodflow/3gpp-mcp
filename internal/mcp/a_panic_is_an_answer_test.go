@@ -294,6 +294,21 @@ func TestAResourceReadThatPanicsAnswersWithItsID(t *testing.T) {
 	if rep := rig.request(t, "tools/list", map[string]any{}); rep.Error != nil {
 		t.Errorf("the server stopped answering after a resource panic: %+v", rep.Error)
 	}
+
+	// The URI is the client's text and no transport bounds it: it is quoted
+	// bounded, in the reply and in the log (CodeRabbit, #344).
+	long := "3gpp://33.128/Rel-19/" + strings.Repeat("9.", 5000)
+	logged.Reset()
+	rep = rig.request(t, "resources/read", map[string]any{"uri": long})
+	if rep.Error == nil {
+		t.Fatalf("a panicking read of a long URI returned a result")
+	}
+	if len(rep.Error.Message) > 2*errorTextLimit {
+		t.Errorf("a %d-byte URI came back in a %d-byte error", len(long), len(rep.Error.Message))
+	}
+	if first, _, _ := strings.Cut(logged.String(), "\n"); len(first) > 2*errorTextLimit {
+		t.Errorf("a %d-byte URI was logged in a %d-byte line", len(long), len(first))
+	}
 }
 
 // The HTTP transport (server --http, the landing page's /mcp) runs the same
