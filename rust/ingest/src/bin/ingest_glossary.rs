@@ -240,6 +240,146 @@ impl Tally {
     }
 }
 
+/// THE SCOPE replace_mined_acronyms DELETES, spelled exactly as its DELETE spells
+/// it (rust/store/src/lib.rs). The guard reads the rows this pass owns through
+/// the same predicate, so "what the pass would replace" and "what the guard
+/// compares" cannot be two different sets. `mined_scope_is_the_delete_scope`
+/// holds the two together by behaviour, not by text.
+const MINED_SCOPE: &str = "source_series = 'etsi' OR source_series LIKE 'ETSI %'";
+
+/// row_hash reduces one glossary row — every column the write sets — to a number,
+/// so the stored glossary and the one about to be written can be compared without
+/// sorting either.
+///
+/// NULL IS NOT "" AND IS NOT 0: each slot carries a presence byte before its
+/// value, and each string a length prefix, so ("ab","c") and ("a","bc") differ by
+/// construction. The same shape as rust/store/src/changes.rs, which could not be
+/// reused without touching lib.rs — see `already_written`.
+///
+/// std's SipHash, not SHA-256: the ingest crate does not link sha2, and adding it
+/// would move Cargo.lock, which four data steps declare. The sums are compared
+/// inside ONE process, so the hasher's lack of a cross-release guarantee does not
+/// matter; two independently tagged 64-bit hashes make a 128-bit row hash, far
+/// beyond what 28 154 rows can collide on by accident.
+fn row_hash(text: [Option<&str>; 6], declared_by: Option<i64>) -> u128 {
+    use std::hash::Hasher;
+    let mut out = 0u128;
+    for (i, tag) in [b'l', b'h'].into_iter().enumerate() {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(b"etsi-glossary-row-v1");
+        h.write_u8(tag);
+        for f in text {
+            match f {
+                Some(s) => {
+                    h.write_u8(1);
+                    h.write_u64(s.len() as u64);
+                    h.write(s.as_bytes());
+                }
+                None => h.write_u8(0),
+            }
+        }
+        match declared_by {
+            Some(v) => {
+                h.write_u8(1);
+                h.write_i64(v);
+            }
+            None => h.write_u8(0),
+        }
+        out |= (h.finish() as u128) << (64 * i);
+    }
+    out
+}
+
+/// already_written answers whether the rows this pass owns ARE, column for column,
+/// the rows replace_mined_acronyms would leave behind — in which case writing them
+/// again changes nothing but the file.
+///
+/// WHY IT EXISTS: THE TABLE WAS IDEMPOTENT, THE FILE WAS NOT. The replace is a
+/// DELETE of every mined row and an INSERT of the same rows, and DuckDB does not
+/// put them back in the blocks they came from. Measured 2026-09-11 on a copy of
+/// the published etsi.duckdb: the same 28 154 rows, and the file went from
+/// 19 570 896 896 to 19 574 829 056 bytes. The corpus is ONE image layer per half,
+/// addressed by content, so every replay of `enrich-etsi` — an edit to the
+/// extraction rule, to the ETSI header parser, to a manifest, to the lockfile —
+/// re-pushed the whole ETSI half (~19.5 GB) for a glossary that had not moved.
+/// `ingest-crs` paid for the same lesson on the 3GPP half (#323).
+///
+/// IT READS THE TABLE. No ledger, no stamp: a glossary replaced out of band by a
+/// different one of the same size must not pass. The comparison is a count plus
+/// an order-independent WRAPPING SUM of row hashes over every column the write
+/// sets — addition, not XOR, so a row held twice does not cancel itself out.
+///
+/// WHAT "WOULD LEAVE BEHIND" MEANS: the write's INSERT is ON CONFLICT DO NOTHING
+/// against rows this pass does not own, so a mined key already held by such a row
+/// never lands. Leaving those out of the expected set is what keeps the guard
+/// idempotent on a table that has them; counting them would make it rewrite the
+/// corpus on every run, forever, over a row it can never write.
+///
+/// IN THIS FILE AND NOT IN rust/store, on purpose. The natural home is a store
+/// method beside replace_mined_acronyms, but a new store file needs a `mod` line
+/// in rust/store/src/lib.rs, and lib.rs is part of the 3GPP fold's identity
+/// (internal/goal foldImpl, recorded in .local/state/fold-state.json): editing it
+/// re-folds the 3GPP corpus — 34 min, a rewritten 3gpp.duckdb, a 22 GB layer —
+/// to change a pass that only ever writes etsi.duckdb. Store::raw() already
+/// exposes the connection for read paths, which is all this needs.
+fn already_written(store: &store_rs::Store, rows: &[store_rs::MinedAcronym]) -> Result<bool> {
+    let mut st = store.raw().prepare(&format!(
+        "SELECT term, expansion, domain, first_release, last_release, source_series,
+                CAST(declared_by AS BIGINT), coalesce({MINED_SCOPE}, false)
+           FROM acronyms"
+    ))?;
+    let it = st.query_map([], |r| {
+        Ok((
+            [
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ],
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, bool>(7)?,
+        ))
+    })?;
+    // A DISCARDED ROW ERROR WOULD READ AS A SHORTER GLOSSARY, and a shorter
+    // glossary only ever makes the guard rewrite — never skip — so it would be
+    // safe; it would also be silent. Propagated, as in changes_sum.
+    let (mut have, mut have_n) = (0u128, 0usize);
+    let mut foreign: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    for r in it {
+        let (text, declared, mine) = r.context("read the glossary etsi.duckdb already holds")?;
+        if mine {
+            let parts: [Option<&str>; 6] = std::array::from_fn(|i| text[i].as_deref());
+            have = have.wrapping_add(row_hash(parts, declared));
+            have_n += 1;
+        } else if let [Some(t), Some(e), Some(d), ..] = &text {
+            // Only a non-NULL domain can conflict: the key is (term, expansion,
+            // domain) and a NULL never equals the "" the write stages.
+            foreign.insert((t.clone(), e.clone(), d.clone()));
+        }
+    }
+    let (mut want, mut want_n) = (0u128, 0usize);
+    for r in rows {
+        // The domain the write stages is "" (replace_mined_acronyms).
+        if foreign.contains(&(r.term.clone(), r.expansion.clone(), String::new())) {
+            continue;
+        }
+        let parts = [
+            Some(r.term.as_str()),
+            Some(r.expansion.as_str()),
+            Some(""),
+            Some(r.version.as_str()),
+            Some(r.version.as_str()),
+            Some(r.source.as_str()),
+        ];
+        want = want.wrapping_add(row_hash(parts, Some(r.declared_by)));
+        want_n += 1;
+    }
+    Ok(have_n == want_n && have == want)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let store = store_rs::Store::open_rw(&args.db)?;
@@ -350,6 +490,35 @@ fn main() -> Result<()> {
             declared_by: c.declared_by,
         })
         .collect();
+    // A PASS THAT MINED NOTHING is a regression, not "no work": every ETSI TS/EN
+    // carries clause 3. Fail loudly rather than leave resolve_term silently
+    // 3GPP-only, which is the state this pass exists to end — and fail BEFORE the
+    // write, which is a replacement: reaching it with nothing would delete the
+    // whole ETSI glossary and only then report the failure. (This check used to
+    // sit after the write, on its return value.)
+    if mined.is_empty() {
+        anyhow::bail!("no acronym was extracted from {} — the abbreviations heuristic or the corpus is broken", args.convert);
+    }
+    let agreed = tally.rows.values().filter(|c| c.declared_by > 1).count();
+    let summary = format!(
+        "ingest-glossary: {candidates} candidate row(s); dropped {dropped_rows} \
+         (of which {dropped_files} whole file(s) whose columns did not line up); \
+         kept {rows} declaration(s) from {specs} deliverable(s) -> {} row(s), \
+         {agreed} of them declared by more than one deliverable",
+        mined.len()
+    );
+
+    // NOTHING TO WRITE IS NOT A WRITE. No replace and no checkpoint on this path:
+    // either one moves the file, and the file is an image layer. See
+    // already_written for the 3.9 MB a same-rows replace was measured to add.
+    if already_written(&store, &mined)? {
+        eprintln!("{summary}");
+        eprintln!(
+            "ingest-glossary: the glossary already carries exactly these rows — corpus untouched"
+        );
+        return Ok(());
+    }
+
     // SAY WHAT IS ABOUT TO BE WRITTEN, BEFORE WRITING IT.
     //
     // Between the last "N/5142 file(s)" line and the end of the pass there was NO
@@ -362,21 +531,8 @@ fn main() -> Result<()> {
         "ingest-glossary: mined {} distinct (term, expansion) pair(s); writing them",
         mined.len()
     );
-    let written = store.replace_mined_acronyms(&mined)?;
-
-    let agreed = tally.rows.values().filter(|c| c.declared_by > 1).count();
-    eprintln!(
-        "ingest-glossary: {candidates} candidate row(s); dropped {dropped_rows} \
-         (of which {dropped_files} whole file(s) whose columns did not line up); \
-         kept {rows} declaration(s) from {specs} deliverable(s) -> {written} row(s), \
-         {agreed} of them declared by more than one deliverable"
-    );
-    // A pass that writes nothing is a regression, not "no work": every ETSI TS/EN
-    // carries clause 3. Fail loudly rather than leave resolve_term silently
-    // 3GPP-only, which is the state this pass exists to end.
-    if written == 0 {
-        anyhow::bail!("no acronym was extracted from {} — the abbreviations heuristic or the corpus is broken", args.convert);
-    }
+    store.replace_mined_acronyms(&mined)?;
+    eprintln!("{summary}");
     Ok(())
 }
 
@@ -523,6 +679,193 @@ mod tests {
     fn the_guard_is_known_to_be_conservative() {
         assert!(!initials_match("CAPEX", "Capital Expenditure"));
         assert!(!initials_match("N/A", "not supported"));
+    }
+
+    fn mined(term: &str, expansion: &str, source: &str, n: i64) -> store_rs::MinedAcronym {
+        store_rs::MinedAcronym {
+            term: term.into(),
+            expansion: expansion.into(),
+            version: "1.1.1".into(),
+            source: source.into(),
+            declared_by: n,
+        }
+    }
+
+    fn batch() -> Vec<store_rs::MinedAcronym> {
+        vec![
+            mined(
+                "MSC",
+                "Mobile-services Switching Centre",
+                "ETSI TS 101 200",
+                3,
+            ),
+            mined(
+                "UICC",
+                "Universal Integrated Circuit Card",
+                "ETSI TS 102 221",
+                1,
+            ),
+        ]
+    }
+
+    /// A glossary the pass itself just wrote is recognised as written — the second
+    /// run of an unchanged archive writes nothing. This is the property the whole
+    /// guard exists for: measured on a copy of the published etsi.duckdb, a
+    /// same-rows replace added 3.9 MB to the file, i.e. a new 19.5 GB image layer.
+    #[test]
+    fn a_glossary_the_pass_wrote_is_already_written() {
+        let s = store_rs::Store::in_memory().unwrap();
+        assert!(
+            !already_written(&s, &batch()).unwrap(),
+            "an empty table holds none of it"
+        );
+        s.replace_mined_acronyms(&batch()).unwrap();
+        assert!(already_written(&s, &batch()).unwrap());
+    }
+
+    /// EVERY COLUMN THE WRITE SETS IS COMPARED — a guard keyed on fewer would skip a
+    /// write whose only change is the column it forgot, and report the corpus
+    /// current. Each edit below leaves the row count unchanged.
+    #[test]
+    fn a_change_in_any_written_column_is_seen() {
+        for (what, sql) in [
+            (
+                "expansion",
+                "UPDATE acronyms SET expansion = 'Mobile Switching Centre' WHERE term = 'MSC'",
+            ),
+            (
+                "domain",
+                "UPDATE acronyms SET domain = 'RAN' WHERE term = 'MSC'",
+            ),
+            (
+                "first_release",
+                "UPDATE acronyms SET first_release = '1.2.1' WHERE term = 'MSC'",
+            ),
+            (
+                "last_release",
+                "UPDATE acronyms SET last_release = '1.2.1' WHERE term = 'MSC'",
+            ),
+            (
+                "citation",
+                "UPDATE acronyms SET source_series = 'ETSI TS 102 221' WHERE term = 'MSC'",
+            ),
+            (
+                "count",
+                "UPDATE acronyms SET declared_by = 4 WHERE term = 'MSC'",
+            ),
+            (
+                "count NULL is not a number",
+                "UPDATE acronyms SET declared_by = NULL WHERE term = 'MSC'",
+            ),
+        ] {
+            let s = store_rs::Store::in_memory().unwrap();
+            s.replace_mined_acronyms(&batch()).unwrap();
+            s.raw().execute_batch(sql).unwrap();
+            assert!(
+                !already_written(&s, &batch()).unwrap(),
+                "a changed {what} went unnoticed"
+            );
+        }
+    }
+
+    /// A row too many, or a row missing, is a different glossary even when every
+    /// other row matches.
+    #[test]
+    fn an_extra_or_a_missing_row_is_seen() {
+        let s = store_rs::Store::in_memory().unwrap();
+        s.replace_mined_acronyms(&batch()).unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO acronyms VALUES ('TC', 'Transmission Convergence', '', '1.1.1', '1.1.1', 'ETSI TS 102 221', 1)",
+            )
+            .unwrap();
+        assert!(
+            !already_written(&s, &batch()).unwrap(),
+            "an extra mined row went unnoticed"
+        );
+
+        let s = store_rs::Store::in_memory().unwrap();
+        s.replace_mined_acronyms(&batch()).unwrap();
+        let mut more = batch();
+        more.push(mined(
+            "TC",
+            "Transmission Convergence",
+            "ETSI TS 102 221",
+            1,
+        ));
+        assert!(
+            !already_written(&s, &more).unwrap(),
+            "a row the archive gained went unnoticed"
+        );
+    }
+
+    /// Rows the pass does not own are not its glossary: a 3GPP row beside the mined
+    /// ones changes nothing — and a mined key that collides with such a row, which
+    /// the write's ON CONFLICT DO NOTHING never lands, must not make every later
+    /// run rewrite the corpus over a row it cannot write.
+    #[test]
+    fn rows_the_pass_does_not_own_are_not_compared() {
+        let s = store_rs::Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO acronyms VALUES ('UICC', 'Universal Integrated Circuit Card', '', 'Rel-19', 'Rel-19', '21', NULL);
+                 INSERT INTO acronyms VALUES ('AMF', 'Access and Mobility Management Function', '', '19.0.0', '19.0.0', '23.501', 79);",
+            )
+            .unwrap();
+        s.replace_mined_acronyms(&batch()).unwrap();
+        assert!(already_written(&s, &batch()).unwrap());
+    }
+
+    /// THE GUARD READS THE SAME SET THE WRITE REPLACES. MINED_SCOPE is spelled like
+    /// replace_mined_acronyms' DELETE; this holds the two together by behaviour: a
+    /// row the DELETE removes is one the guard counts, and a row it leaves is one
+    /// the guard ignores — the legacy constant "etsi", a NULL provenance and a
+    /// look-alike ("ETSI" with no space) included.
+    #[test]
+    fn mined_scope_is_the_delete_scope() {
+        let s = store_rs::Store::in_memory().unwrap();
+        s.raw()
+            .execute_batch(
+                "INSERT INTO acronyms VALUES ('A1', 'x one', '', 'v', 'v', 'etsi', 1);
+                 INSERT INTO acronyms VALUES ('A2', 'x two', '', 'v', 'v', 'ETSI TS 102 221', 1);
+                 INSERT INTO acronyms VALUES ('A3', 'x three', '', 'v', 'v', 'ETSIX', 1);
+                 INSERT INTO acronyms VALUES ('A4', 'x four', '', 'v', 'v', NULL, 1);
+                 INSERT INTO acronyms VALUES ('A5', 'x five', '', 'v', 'v', '21', NULL);",
+            )
+            .unwrap();
+        let in_scope = |s: &store_rs::Store| -> Vec<String> {
+            let mut st = s
+                .raw()
+                .prepare(&format!(
+                    "SELECT term FROM acronyms WHERE coalesce({MINED_SCOPE}, false) ORDER BY term"
+                ))
+                .unwrap();
+            let v: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            v
+        };
+        let scoped = in_scope(&s);
+        assert_eq!(scoped, vec!["A1", "A2"]);
+        s.replace_mined_acronyms(&[mined("Z", "Zed", "ETSI TS 1", 1)])
+            .unwrap();
+        let mut left: Vec<String> = {
+            let mut st = s.raw().prepare("SELECT term FROM acronyms").unwrap();
+            let v: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            v
+        };
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["A3", "A4", "A5", "Z"],
+            "the DELETE removed exactly the rows MINED_SCOPE selects"
+        );
     }
 
     /// 18.10.0 is NEWER than 18.9.0, and a string sort says otherwise. Picking the
