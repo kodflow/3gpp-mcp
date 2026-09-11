@@ -547,14 +547,16 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	}
 	inRange := len(changes)
 	clause := r.GetString("clause", "")
-	clauseKnown := false // does any record in range name the clauses it touched?
+	// How many records in range name NO clause: the filter cannot test those, so
+	// they leave the answer whether or not they touched the clause.
+	clauseless := 0
 	if clause != "" {
 		var filtered []model.Change
 		for _, c := range changes {
 			// A list holding only "" names no clause: it is what an empty list
 			// becomes when it is written through string_split('', sep).
-			if strings.TrimSpace(strings.Join(c.Clauses, "")) != "" {
-				clauseKnown = true
+			if strings.TrimSpace(strings.Join(c.Clauses, "")) == "" {
+				clauseless++
 			}
 			for _, cl := range c.Clauses {
 				if strings.HasPrefix(cl, clause) {
@@ -609,18 +611,28 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	switch {
 	case bounded && inRange == 0 && len(all) > 0:
 		narrowed = fmt.Sprintf("none of the %d records held for %s falls inside the requested range.", len(all), specID)
-	case clause != "" && len(changes) == 0 && inRange > 0 && !clauseKnown:
+	case clause != "" && clauseless > 0:
 		// A FILTER THAT CANNOT MATCH IS NOT A NEGATIVE ANSWER. The 3GPP records
 		// come from the CR database, which records a version transition and not
 		// the clause paths a change touched — so `clauses` is NULL on every one of
 		// them, and a clause filter answered 0 for every clause of every spec.
+		//
+		// And a PARTLY blind filter is not a complete answer either (Qodo, #332):
+		// when only some records name their clauses, the others were dropped
+		// untested, and a count built from the rest — zero or not — must say so.
 		scope := ""
 		if bounded {
 			scope = " in range"
 		}
-		narrowed = fmt.Sprintf("none of the %d records%s names the clauses it touched, so the clause "+
-			"filter cannot match any of them: count 0 says nothing about clause %s. trace_clause answers "+
-			"that from the clause text.", inRange, scope, clause)
+		if clauseless == inRange {
+			narrowed = fmt.Sprintf("none of the %d records%s names the clauses it touched, so the clause "+
+				"filter cannot match any of them: count 0 says nothing about clause %s. trace_clause answers "+
+				"that from the clause text.", inRange, scope, clause)
+		} else {
+			narrowed = fmt.Sprintf("%d of the %d records%s name no clause, so the clause filter could not "+
+				"test them: they are left out of this answer whether or not they touched clause %s. "+
+				"trace_clause answers that from the clause text.", clauseless, inRange, scope, clause)
+		}
 	}
 	if n := joinNotes(joinNotes(boundsNote(from, to), narrowed), note); n != "" {
 		out["note"] = n

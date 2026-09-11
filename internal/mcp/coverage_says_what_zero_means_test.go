@@ -186,6 +186,60 @@ func TestAClauseFilterOverClauselessRecordsSaysItCannotMatch(t *testing.T) {
 	}
 }
 
+// A PARTLY BLIND FILTER IS NOT A COMPLETE ANSWER (Qodo, #332). When some records
+// name their clauses and others do not, the filter drops the others untested; a
+// count built from the rest — zero or not — must say how many it could not test.
+//
+// Falsified: with the partial branch removed (only the all-clauseless wording
+// kept), both calls below come back with no note.
+func TestAPartlyBlindClauseFilterSaysWhatItCouldNotTest(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	_ = st.UpsertSpec(model.Spec{SpecID: "24.501", Series: "24", DocType: "TS"})
+	_ = st.UpsertVersion(model.SpecVersion{SpecID: "24.501", Release: "Rel-18", Version: "18.3.0"})
+	if err := st.InsertChanges([]model.Change{
+		{CRNumber: "0100", SpecID: "24.501", FromVersion: "18.1.0", ToVersion: "18.2.0", Clauses: []string{"5.4.1"}, Summary: "named"},
+		{CRNumber: "0101", SpecID: "24.501", FromVersion: "18.2.0", ToVersion: "18.3.0", Summary: "unnamed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE changes SET clauses = NULL WHERE cr_number = '0101'`); err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := New(st, "test", "", nil, nil)
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ir mcpgo.InitializeRequest
+	ir.Params.ProtocolVersion = mcpgo.LATEST_PROTOCOL_VERSION
+	ir.Params.ClientInfo = mcpgo.Implementation{Name: "test", Version: "1"}
+	if _, err := c.Initialize(ctx, ir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		clause string
+		count  float64
+	}{{"5.4", 1}, {"9.9", 0}} {
+		out := call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "24.501", "clause": tc.clause})
+		if n, _ := out["count"].(float64); n != tc.count {
+			t.Errorf("clause %s: count = %v, want %v", tc.clause, out["count"], tc.count)
+		}
+		if n := noteOf(out); !strings.Contains(n, "1 of the 2 records name no clause") {
+			t.Errorf("clause %s: the note must say one record could not be tested; got %q", tc.clause, n)
+		}
+	}
+}
+
 // THE ETSI NOTE FOLLOWS THE CORPUS IT IS SERVED FROM. Three states, three answers:
 // no ETSI half attached (the old code said nothing at all — both branches
 // declined), an ETSI half with no change records (the published state), and an
