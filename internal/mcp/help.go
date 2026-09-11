@@ -24,7 +24,7 @@ func (h *handlers) help(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallTo
 	if h.etsi != nil {
 		corpus["etsi"] = inventoryOf(ctx, h.etsi)
 	} else {
-		corpus["etsi"] = map[string]any{"attached": false}
+		corpus["etsi"] = h.etsiDetached()
 	}
 	out := map[string]any{
 		"what_this_is": "3GPP + ETSI specification corpus served over MCP: full clause text, " +
