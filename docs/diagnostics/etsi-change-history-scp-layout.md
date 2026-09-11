@@ -85,6 +85,10 @@ The most favourable possible shape was used: a single line carrying **every** fi
 date, meeting, tdoc, CR number, optional revision, category, subject, old and new version. Across
 the newest version of all 137 table deliverables, 8 708 annex lines yield **268** such lines.
 
+Loosening the shape buys nothing. Making the subject and the category optional raises the CRs read
+at least once on TS 102 221 from 81 to 104 — and the ones whose readings *contradict each other*
+(§3.1) from 19 to 29. Coverage and error grow together, which is what "the row is lost" means.
+
 ### 3.1 The flattening contradicts itself
 
 The annex is cumulative, so the row for CR 004 is re-typeset and re-flattened in every later
@@ -103,7 +107,9 @@ deny.
 ### 3.2 Against the published PDF
 
 Ground truth was built by running `pdftotext -table` over the annex pages of the PDF downloaded from
-`etsi.org/deliver` and comparing, CR by CR, with what the corpus's `-layout` text says:
+`etsi.org/deliver` and comparing, CR by CR, with what the corpus's `-layout` text says. Tdoc,
+category and both versions are compared exactly; the subject is compared with all whitespace
+removed, so neither reading is penalised for where it broke a line:
 
 | deliverable | rows in the table | `-layout` full rows | coverage | tdoc | cat | `old → new` | subject | **all four right** |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
