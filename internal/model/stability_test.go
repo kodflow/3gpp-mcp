@@ -27,6 +27,11 @@ func TestAnEtsiPublicationIsStableWhateverItsMajor(t *testing.T) {
 		// An empty version is a deliverable the corpus does not hold: not a
 		// version, so nothing to call stable.
 		{"ETSI TS 103 280", "", false},
+		// A shape the /deliver crawl cannot produce is vouched for by nothing
+		// (Qodo, #338): not a folder "VV.VV.VV_60", so not called stable.
+		{"ETSI TS 103 221-1", "1.23", false},
+		{"ETSI TS 103 221-1", "1.x.1", false},
+		{"ETSI TS 103 221-1", "draft", false},
 	} {
 		if got := IsStableSpecVersion(c.spec, c.ver); got != c.want {
 			t.Errorf("IsStableSpecVersion(%q, %q) = %v, want %v", c.spec, c.ver, got, c.want)
