@@ -37,7 +37,7 @@ Example line: `V1.23.1  March 2026  Publication`. The page is read from the newe
 
 #### Cross-check 1: the cover stamp `V1.23.1 (2026-03)`
 
-The cover date is found in 4 134 versions. The converter drops most page headers, so it is rarely available. Where both dates are present, they agree in **1 831 of 1 853 cases (98.8 %)**. Of the 22 disagreements, 12 are ENs. In 10 of them the History month comes before the cover month, and in 12 it comes after. Examples: EN 300 330 V1.2.2 (History 1997-01, cover 1999-05), EN 301 102 V1.1.1 (1997-12 / 1998-06), EN 301 087 V8.1.1 (2000-09 / 2000-08).
+The cover date is found in 4 134 versions. The converter drops most page headers, so it is rarely available. Where both dates are present, they agree in **1 831 of 1 853 cases (98.8 %)**. Of the 22 disagreements, 12 are ENs. Across all 22, the History month comes before the cover month in 10 cases and after it in 12. Examples: EN 300 330 V1.2.2 (History 1997-01, cover 1999-05), EN 301 102 V1.1.1 (1997-12 / 1998-06), EN 301 087 V8.1.1 (2000-09 / 2000-08).
 
 #### Cross-check 2: the ETSI Work Programme
 
