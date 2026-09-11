@@ -402,7 +402,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	federated := filter.SpecID == "" && filter.Series == ""
 	// ONE cross-encoder pass per call: each half used to rerank its own window
 	// before the rank-based merge discarded those scores (federated_rerank.go).
-	rr := h.planRerank(rerank, federated, etsiScoped)
+	rr := h.planRerank(rerank, federated)
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.

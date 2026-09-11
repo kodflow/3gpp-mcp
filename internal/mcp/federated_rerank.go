@@ -45,8 +45,12 @@ type rerankPlan struct {
 	fused  bool // …and it is wanted (asked for, or always-on)
 }
 
-func (h *handlers) planRerank(rerank, federated, etsiScoped bool) rerankPlan {
-	if h.etsiEng == nil || !federated || etsiScoped {
+// planRerank takes `federated` — the caller's own predicate for "this call asks
+// both halves" — and nothing else about the query. An ETSI-scoped call is never
+// federated (it names a spec_id), so it lands in the single-search branch by that
+// fact rather than by a second test of its own.
+func (h *handlers) planRerank(rerank, federated bool) rerankPlan {
+	if h.etsiEng == nil || !federated {
 		// One search feeds the page: it reranks its own window, as it always did —
 		// including for the always-rerank toggle, which Search reads itself.
 		return rerankPlan{arm: rerank}
