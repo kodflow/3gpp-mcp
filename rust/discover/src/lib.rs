@@ -59,7 +59,19 @@ pub fn delta_series(
         if major(rel) < floor_major {
             continue;
         }
-        let have = idx.get(key).map(String::as_str).unwrap_or("");
+        // "Changed" means "we do not hold this document", and filing_release decides
+        // WHERE we would hold it — so the comparison belongs there, exactly as in
+        // emit_repair_worklist. A carrying row the corpus can never mirror (26.510
+        // listed at 18.4.0 under Rel-20, the file landing under Rel-18, so no Rel-20
+        // key is ever written) would otherwise read as a changed series on EVERY
+        // build for ever, and put its whole series back in the matrix each time.
+        let have = match filing_release(site, spec, rel, ver, floor_major) {
+            Some(own) => idx
+                .get(&format!("{spec}|{own}"))
+                .map(String::as_str)
+                .unwrap_or(""),
+            None => idx.get(key).map(String::as_str).unwrap_or(""),
+        };
         if full || cmp_ver(ver, have) == Ordering::Greater {
             if let Some(s) = series_prefix(spec) {
                 series.insert(s);
@@ -596,6 +608,30 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(got, vec!["23".to_string()]);
+    }
+
+    /// A CARRYING ROW THE CORPUS CAN NEVER MIRROR IS NOT A CHANGED SERIES. The
+    /// report lists 26.510 at 18.4.0 under Rel-20; the file lands under Rel-18, so
+    /// no `26.510|Rel-20` key is ever written and the key's own entry stays empty
+    /// for ever. Asked of the key, that is a changed series on every build, and
+    /// series 26 goes back into the ingest matrix each time for nothing.
+    #[test]
+    fn delta_is_measured_at_the_release_the_document_lands_in() {
+        let site = idx(&[
+            ("26.510|Rel-18", "18.5.0"),
+            ("26.510|Rel-19", "19.2.0"),
+            ("26.510|Rel-20", "18.4.0"),
+        ]);
+        let i = idx(&[("26.510|Rel-18", "18.5.0"), ("26.510|Rel-19", "19.2.0")]);
+        assert!(
+            delta_series(&site, &i, 4, false).is_empty(),
+            "the corpus already holds 18.4.0's home release at a newer version"
+        );
+
+        // One version behind at the landing release: the document really is missing.
+        let i2 = idx(&[("26.510|Rel-18", "18.3.0"), ("26.510|Rel-19", "19.2.0")]);
+        let got: Vec<String> = delta_series(&site, &i2, 4, false).into_iter().collect();
+        assert_eq!(got, vec!["26".to_string()]);
     }
 
     #[test]
