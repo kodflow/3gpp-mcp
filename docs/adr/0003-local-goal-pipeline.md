@@ -195,3 +195,35 @@ image serves; republishing them is a push, and bumps the pin when it happens. Th
 3GPP delta anchor that `seed` adopts beside a fresh snapshot still comes from the
 `latest` GitHub release (`corpus-index.json`, last written 2026-06-05) and is not
 paired with the pinned corpus by digest.
+
+## Amendment — 2026-09-11 (second): the anchor is derived from the corpus it describes
+
+**Context.** The amendment above left one artefact of a clone's starting point
+untied to the pinned snapshot: the 3GPP delta anchor, which `seed` downloaded from
+the `latest` GitHub release. That asset was last written on 2026-06-05 and nothing
+republishes it; the "corpus manifest" meant to pair it with a snapshot was verified
+by `seed` but never written by anyone. Measured against the corpus the next
+snapshot will be published from: the release anchor is behind it on 645 keys and
+lacks 140, so discover on a fresh clone would re-acquire ~785 spec versions the
+snapshot already holds. Independently, the path that was to regenerate a missing
+anchor (`merge --index-out --base <corpus>` with no shard) is refused by merge
+before it starts, so it failed `ingest` whenever it was reached.
+
+**Decision.** The anchor is a function of the corpus — `spec|release -> highest
+version` over `spec_versions`, the exact rule the fold applies — so it is DERIVED
+from the corpus (`cmd/derive-anchor`, `internal/anchor`), never downloaded:
+
+1. `seed`, after pulling a snapshot, derives that snapshot's anchor and replaces
+   any anchor on disk, naming the drift (and the over-claims, if any) in the log.
+2. A corpus already present keeps the anchor the fold wrote beside it; one with no
+   anchor gets one derived (`seed` and `ingest`'s no-fold path alike).
+3. An anchor identical to the derived one is not rewritten (discover fingerprints
+   it by size and mtime).
+
+Measured on the live corpus: the derivation takes 0.99 s and is byte-identical to
+the fold's `.local/corpus-index.json` (554 235 bytes, 20 057 keys). Nothing is
+published for it, so `publish-corpus.sh` needs no second artefact and no release
+asset is consulted; `corpus-manifest.json` and its reader are removed.
+
+§7 above still holds: the fold publishes corpus and anchor together. This makes
+the other producer of the anchor — a seed — hold to the same rule by construction.

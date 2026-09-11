@@ -121,7 +121,7 @@ has run once, the register exists and the check is a real gate.
 | `test` | `go test ./...` | ~1 min |
 | `build-rust` | ingest, merge (the fold `ingest` runs), overlay, freeze-hnsw, embed-io, compact, discover | ~15 min cold |
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
-| `seed` | adopt the published 3GPP snapshot **and its delta anchor** — the snapshot named BY DIGEST in `contracts/corpus-pin.txt`, never `latest` (see below). Declines when a corpus is already on disk | one-off; ~1 s decline |
+| `seed` | adopt the published 3GPP snapshot — the one named BY DIGEST in `contracts/corpus-pin.txt`, never `latest` (see below) — and **derive its delta anchor from it** (`cmd/derive-anchor`, 0.99 s, byte-identical to what the fold writes), replacing an anchor of another generation. Declines when a corpus is already on disk (and derives an anchor only if it has none) | one-off; ~1 s decline |
 | `seed-etsi` | adopt the published `etsi-corpus` snapshot, pinned the same way. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off; ~0 s decline |
 | `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
 | `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
