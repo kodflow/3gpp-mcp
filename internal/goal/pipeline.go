@@ -1,11 +1,8 @@
 package goal
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,7 +42,7 @@ func exe(name string) string {
 
 // goBins are the Go commands the pipeline needs on disk. cmd/server is the
 // product; the others are the offline tools the steps call.
-var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "discover-etsi", "migrate-paragraphs", "freeze-hnsw", "seed-evolutions", "seed-glossary"}
+var goBins = []string{"server", "validate", "dbcount", "embedid", "export-delta", "split", "li-audit", "bench", "anchorcheck", "derive-anchor", "discover-etsi", "migrate-paragraphs", "freeze-hnsw", "seed-evolutions", "seed-glossary"}
 
 // rustBins maps a cargo manifest to the binaries built from it. The embedder is
 // deliberately absent: it pulls ONNX Runtime and CUDA, and is built by its own
@@ -400,8 +397,13 @@ func stepSeed(t corpusTarget) *Step {
 		Version: 2, // bumped: the source changed, so a cached success must not carry over
 		Doc:     "seed the corpus from the published snapshot on the private GHCR package (skipped when a local corpus already exists, or when no credential is available)",
 		Deps:    []string{"build-go"},
-		Impl:    []string{"internal/goal/pipeline.go", "internal/goal/seed_pin.go"},
-		Heavy:   true,
+		// The anchor this step installs is derived by cmd/derive-anchor from the
+		// corpus (anchor_derive.go), so that tool and its rule are part of what the
+		// step produces. It LAUNCHES the tool: its tests are not.
+		Impl: []string{"internal/goal/pipeline.go", "internal/goal/seed_pin.go",
+			"internal/goal/anchor_derive.go", "cmd/derive-anchor", "internal/anchor"},
+		ExcludeTests: true,
+		Heavy:        true,
 		// WHICH SNAPSHOT, as configured: the digest this arm's line of
 		// contracts/corpus-pin.txt names (or an operator override). Resolved
 		// offline, and per arm. See seed_pin.go for why a change here costs a
@@ -426,8 +428,8 @@ func stepSeed(t corpusTarget) *Step {
 		Run: func(c *Ctx) error {
 			db := t.dbPath(c)
 			// seededNow records whether THIS run produced the corpus from the
-			// published package. It is what lets seedAnchor adopt the published
-			// anchor without hashing 12.36 GB to re-derive a fact we already know.
+			// published package. It is what tells seedAnchor that an anchor already
+			// on disk describes some OTHER corpus and must be re-derived.
 			seededNow := false
 
 			// NEVER clobber a corpus that is more advanced than the snapshot.
@@ -631,82 +633,23 @@ func stepDiscover3GPP() *Step {
 // lets discover ask for only what moved. Getting it WRONG in the optimistic
 // direction is the dangerous failure: an anchor that over-claims makes discover
 // skip specs that were never ingested, and no later step notices — the corpus
-// simply has a hole. So the published anchor is used only when the local DB is
-// PROVABLY the published snapshot, byte for byte.
+// simply has a hole.
 //
-// When it cannot be proven, the anchor is deliberately left absent: discover then
-// does a full pass, which is slow but never silently incomplete. Erring towards
-// "do too much" is the only acceptable direction here.
+// So it is DERIVED FROM THE CORPUS (deriveAnchor), never taken from anywhere
+// else. It used to be downloaded from the `latest` GitHub release and paired with
+// a snapshot pulled by digest — two artefacts, two generations, nothing tying one
+// to the other (anchor_derive.go has the measurement).
+//
+//   - A snapshot seeded by THIS run gets the anchor of that snapshot, replacing
+//     any anchor already on disk: whatever was there described a different corpus.
+//   - A corpus already present keeps the anchor beside it — the fold wrote both
+//     together — and gets one derived only if it has none.
 func seedAnchor(c *Ctx, db string, seededNow bool) error {
-	idx := filepath.Join(c.Local, "corpus-index.json")
-	if fileNonEmpty(idx) {
+	if !seededNow && fileNonEmpty(anchorPath(c)) {
 		c.Log.Printf("delta anchor already present")
 		return nil
 	}
-
-	// corpus-index.json is "spec|release -> highest indexed version" — a version
-	// list, no clause text — so it stays a public release asset. The published
-	// `3gpp.duckdb.sha256` beside it does NOT: it existed only to identify the
-	// full-text asset that DATA_NOTICE forbids, and it goes with it.
-	const idxURL = "https://github.com/kodflow/3gpp-mcp/releases/download/latest/corpus-index.json"
-
-	// The question this used to answer by downloading a checksum and hashing
-	// 12.36 GB — "is the local corpus the published one?" — is already answered
-	// by whether THIS run just seeded it. Deriving a fact we hold is how the
-	// checksum became a second, drifting source of truth about the same thing.
-	if !seededNow {
-		c.Log.Printf("the local corpus was not seeded from the published package, so the published anchor would over-claim — not using it")
-		c.Log.Printf("the next discover will be a FULL pass; the first merge then writes a correct anchor")
-		return nil
-	}
-
-	c.Log.Printf("the corpus was just seeded from the published package — adopting its anchor")
-	tmp := idx + ".new"
-	if err := c.Run(Cmd{Name: "curl", Args: []string{"-fsSL", "--max-time", "120", "-o", tmp, idxURL}}); err != nil {
-		c.Log.Printf("published anchor unavailable — leaving it absent (FULL pass)")
-		return nil
-	}
-	// The DB was verified against its own sidecar above; the anchor had no
-	// checksum at all, so a corpus proven authentic could still be paired with an
-	// anchor from another generation. The manifest asserts both in one document.
-	// Its absence is tolerated (older publishes predate it) but SAID, because a
-	// silent fallback to the unverified path is indistinguishable from a verified
-	// one in the log — and that is the whole failure pattern of this pipeline.
-	if err := verifyAnchorAgainstManifest(c, tmp); err != nil {
-		_ = os.Remove(tmp)
-		c.Log.Printf("anchor rejected: %v", err)
-		c.Log.Printf("leaving the anchor absent; the next discover is a FULL pass, which is slow and correct")
-		return nil
-	}
-	// Publish only after it parses: a truncated anchor is worse than none.
-	b, err := os.ReadFile(tmp)
-	if err != nil {
-		return err
-	}
-	var probe map[string]any
-	if err := json.Unmarshal(b, &probe); err != nil {
-		_ = os.Remove(tmp)
-		c.Log.Printf("published anchor is not valid JSON — ignored")
-		return nil
-	}
-	c.Checkpoint("anchor_entries", strconv.Itoa(len(probe)))
-	c.Log.Printf("anchor adopted: %d (spec, release) entries", len(probe))
-	return os.Rename(tmp, idx)
-}
-
-// sha256File streams a file through SHA-256. The corpus is multi-gigabyte, so it
-// is read in chunks rather than loaded.
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return deriveAnchor(c, db)
 }
 
 // stepTest keeps the unit and contract suites inside the goal, not beside it.

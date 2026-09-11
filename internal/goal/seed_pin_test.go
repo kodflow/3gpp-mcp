@@ -246,11 +246,13 @@ func TestTheSnapshotASeedPulledIsItsProvenance(t *testing.T) {
 			ctx, store := newTestCtx(t)
 			writePins(t, ctx.Root, digestN('3'), digestN('e'))
 			write(t, filepath.Join(ctx.Root, "src", "discover.go"), "package discover")
-			// Present, so the 3GPP seed never reaches for the published anchor.
 			write(t, filepath.Join(ctx.Local, "corpus-index.json"), `{"23.501|Rel-18":"18.0.0"}`)
 			for _, f := range stepSeed(arm).Impl {
 				write(t, filepath.Join(ctx.Root, f), "package goal")
 			}
+			// A real seed derives the anchor of what it pulled (anchor_derive_test.go
+			// covers that); only the snapshot's provenance is under test here.
+			stubDerive(t, func(string) string { return `{"23.501|Rel-18": "18.0.0"}` })
 
 			served := digestN('1') // what `latest` resolves to right now
 			var asked []string

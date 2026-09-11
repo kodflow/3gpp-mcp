@@ -525,6 +525,10 @@ func stepIngest3GPP() *Step {
 			"rust/Cargo.toml", "rust/Cargo.lock",
 			// The shape the rows are written into.
 			"internal/store/schema.sql",
+			// The anchor is one of this step's Outputs, and when there is nothing to
+			// fold it is restored by cmd/derive-anchor rather than by merge
+			// (ensureCorpusIndex). The tool and its rule are what produce it then.
+			"cmd/derive-anchor", "internal/anchor", "internal/goal/anchor_derive.go",
 		}, foldImpl...),
 		Inputs: func(c *Ctx) ([]string, error) {
 			// The converted tree is the input. Enumerating every HTML file would
@@ -1012,9 +1016,14 @@ func publishCorpus(tmp, db string) error {
 // ensureCorpusIndex regenerates the anchor from the current DB when it is
 // missing, so a fresh clone with a seeded corpus does not fall back to a full
 // discover forever.
+//
+// It used to ask `merge --index-out --base <corpus>` with no shard, which merge
+// refuses before doing anything ("pass at least one shard path") — so every run
+// that reached this with no anchor failed the step — and which, had it run, would
+// have copied the 23 GB corpus to learn 20 057 version strings. The anchor is a
+// read of spec_versions; deriveAnchor does exactly that.
 func ensureCorpusIndex(c *Ctx) error {
-	idx := filepath.Join(c.Local, "corpus-index.json")
-	if fileNonEmpty(idx) {
+	if fileNonEmpty(anchorPath(c)) {
 		return nil
 	}
 	db := c.dataPath("3gpp.duckdb")
@@ -1022,15 +1031,7 @@ func ensureCorpusIndex(c *Ctx) error {
 		return nil
 	}
 	c.Log.Printf("regenerating the delta anchor from the current corpus")
-	tmp := idx + ".new"
-	if err := c.Run(Cmd{Name: c.rbin("merge"), Args: []string{
-		"--out", filepath.Join(c.Local, "tmp", "index-only.duckdb"),
-		"--index-out", tmp, "--no-index", "--no-hnsw", "--base", db,
-	}}); err != nil {
-		return err
-	}
-	_ = os.RemoveAll(filepath.Join(c.Local, "tmp", "index-only.duckdb"))
-	return os.Rename(tmp, idx)
+	return deriveAnchor(c, db)
 }
 
 // repairKeys asks anchorcheck for the (spec|release) keys the anchor claims and
