@@ -8,6 +8,7 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
@@ -130,6 +131,7 @@ type Engine struct {
 	sp        embed.SparseEmbedder // non-nil when the embedder also produces sparse weights
 	rr        rerank.Reranker
 	vecShards []string // Option B: attached sub-base aliases; empty = single-DB vectors
+	name      string   // the corpus this engine answers for, as reports name it ("3gpp", "etsi")
 
 	offLexical atomic.Bool // true → skip the BM25 arm
 	offVector  atomic.Bool // true → skip the vector (dense) arm
@@ -206,6 +208,28 @@ func (e *Engine) State() State {
 // aliases returned by store.AttachShards; empty restores single-DB behaviour.
 func (e *Engine) UseVectorShards(aliases []string) { e.vecShards = aliases }
 
+// SetName names the corpus this engine answers for, as its Reports say it.
+func (e *Engine) SetName(name string) { e.name = name }
+
+// NewSharing builds an Engine over st that SHARES o's models — the query embedder
+// (with its cache) and the cross-encoder — instead of loading its own.
+//
+// The ETSI half is a second engine over a second store, and New loads a second
+// cross-encoder for it: another ONNX session holding the same bge-reranker-v2-m3
+// weights (2.3 GB of fp32 on disk) and its own arena, for a model that is
+// read-only and whose Run is already serialised by its own mutex. The two halves
+// answer one request one after the other, so a second copy bought no concurrency
+// — only memory, on the process that has to fit both corpora's HNSW indexes
+// besides. The scores are the same model's on the same inputs either way.
+//
+// Only the models are shared: the store, the vector shards, the name and the
+// runtime toggles stay the engine's own.
+func NewSharing(st store.Reader, o *Engine) *Engine {
+	e := &Engine{st: st, emb: o.emb, sp: o.sp, rr: o.rr}
+	e.rerankAll.Store(o.rerankAll.Load())
+	return e
+}
+
 // EmbedderEnabled reports whether this engine can vectorise a query (so the
 // server can tell, and report, whether semantic search is actually reachable).
 func (e *Engine) EmbedderEnabled() bool { return e.emb.Enabled() }
@@ -268,7 +292,22 @@ type Request struct {
 // Search retrieves and fuses (RRF) the lexical and/or vector ranked lists per
 // r.Mode. Each arm is best-effort; a "semantic" request with no usable vectors
 // degrades to lexical rather than returning nothing (degrade, never block).
+//
+// What each arm did is recorded in a Report, appended to the Trace the context
+// carries (WithTrace): an arm that is skipped says so there, never only by its
+// absence from the fusion.
 func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, error) {
+	began := time.Now()
+	rep := Report{Corpus: e.name, DocType: r.Filter.DocType}
+	hits, err := e.search(ctx, r, &rep)
+	rep.Ms = msSince(began)
+	if t := traceFrom(ctx); t != nil {
+		t.add(rep)
+	}
+	return hits, err
+}
+
+func (e *Engine) search(ctx context.Context, r Request, rep *Report) ([]model.SearchHit, error) {
 	// Per-request time budget: cap the wall-clock the EXPENSIVE arms (CPU query
 	// embed, sparse, cross-encoder rerank) may spend, so a slow pass under
 	// concurrency degrades to whatever it has rather than running to the edge
@@ -305,12 +344,10 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// What is lost is the ability to cut a long DuckDB query short by any means.
 	// What is kept is a process that survives a client pressing Ctrl-C.
 	dbctx := context.WithoutCancel(ctx)
-	bctx := ctx
-	if budget := searchBudgetFor(); budget > 0 {
-		var cancel context.CancelFunc
-		bctx, cancel = context.WithTimeout(ctx, budget)
-		defer cancel()
-	}
+	// The budget is the request's when the caller started one (WithBudget, so a
+	// federated call spends ONE budget across its passes), else this Search's own.
+	bctx, cancel, budgetSpent := budgetCtx(ctx)
+	defer cancel()
 
 	topK := max(r.TopK, 10)
 	wantLex := r.Mode != "semantic" && !e.offLexical.Load()
@@ -332,11 +369,14 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	// unavailable and each arm embeds as before.
 	var preDense []float32
 	var preSparse model.SparseVec
+	var embedTook time.Duration // the combined pass, charged to the dense arm below
 	if wantVec && wantSparse && e.emb.Enabled() && bctx.Err() == nil {
 		if dual, ok := e.emb.(embed.DualEmbedder); ok {
+			t0 := time.Now()
 			if d, s, ok := dual.EmbedBoth(bctx, r.Text); ok {
 				preDense, preSparse = d, s
 			}
+			embedTook = time.Since(t0)
 		}
 	}
 
@@ -349,37 +389,62 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 		// hands a cancelled context to DuckDB: an error on Windows, a process abort
 		// on Linux. The arm that exists to guarantee "degrade, never block" was the
 		// one that could block hardest.
+		t0 := time.Now()
 		lex, err := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
 		if err != nil {
+			rep.skip(ArmLexical, failed("lexical search failed", err), t0)
 			return nil, err
 		}
+		rep.ran(ArmLexical, len(lex), t0)
 		lists = append(lists, lex)
 	}
-	if wantVec && e.emb.Enabled() && bctx.Err() == nil {
-		vecs, err := [][]float32{preDense}, error(nil)
-		if preDense == nil {
-			vecs, err = e.emb.Embed(bctx, []string{r.Text})
-		}
-		if err == nil && len(vecs) == 1 {
-			var vhits []model.SearchHit
-			var verr error
-			// dbctx, NOT bctx AND NOT ctx — see storeCtxNote above.
-			switch {
-			case len(e.vecShards) > 0:
-				// Option B: scatter-gather across the attached per-series sub-bases.
-				vhits, verr = e.st.SearchVectorsSharded(dbctx, vecs[0], e.vecShards, r.Filter, topK)
-			case e.st.VSSAvailable() && !e.offHNSW.Load():
-				vhits, verr = e.st.SearchVectors(dbctx, vecs[0], r.Filter, topK) // single-DB HNSW
-			default:
-				// No HNSW: exact cosine over the BM25 candidate set only (bounded),
-				// never a full-corpus scan.
-				cand, cerr := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
-				if cerr == nil {
-					vhits, verr = e.st.SearchVectorsAmong(dbctx, vecs[0], chunkIDsOf(cand), topK)
-				}
+	if r.Mode != "lexical" {
+		t0 := time.Now().Add(-embedTook)
+		switch {
+		case e.offVector.Load():
+			rep.skip(ArmDense, "turned off at runtime (dashboard)", t0)
+		case !e.emb.Enabled():
+			rep.skip(ArmDense, "no query embedder in this server (call server_info for why)", t0)
+		case bctx.Err() != nil:
+			rep.skip(ArmDense, budgetSpent(), t0)
+		default:
+			vecs, err := [][]float32{preDense}, error(nil)
+			if preDense == nil {
+				vecs, err = e.emb.Embed(bctx, []string{r.Text})
 			}
-			if verr == nil && len(vhits) > 0 {
-				lists = append(lists, vhits)
+			switch {
+			case err != nil:
+				rep.skip(ArmDense, failed("the query embedding failed", err), t0)
+			case len(vecs) != 1:
+				rep.skip(ArmDense, fmt.Sprintf("the query embedder returned %d vectors for one query", len(vecs)), t0)
+			default:
+				var vhits []model.SearchHit
+				var verr error
+				// dbctx, NOT bctx AND NOT ctx — see storeCtxNote above.
+				switch {
+				case len(e.vecShards) > 0:
+					// Option B: scatter-gather across the attached per-series sub-bases.
+					vhits, verr = e.st.SearchVectorsSharded(dbctx, vecs[0], e.vecShards, r.Filter, topK)
+				case e.st.VSSAvailable() && !e.offHNSW.Load():
+					vhits, verr = e.st.SearchVectors(dbctx, vecs[0], r.Filter, topK) // single-DB HNSW
+				default:
+					// No HNSW: exact cosine over the BM25 candidate set only (bounded),
+					// never a full-corpus scan.
+					cand, cerr := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: vecCandidateN})
+					if cerr != nil {
+						verr = cerr
+					} else {
+						vhits, verr = e.st.SearchVectorsAmong(dbctx, vecs[0], chunkIDsOf(cand), topK)
+					}
+				}
+				if verr != nil {
+					rep.skip(ArmDense, failed("the vector search failed", verr), t0)
+				} else {
+					rep.ran(ArmDense, len(vhits), t0)
+					if len(vhits) > 0 {
+						lists = append(lists, vhits)
+					}
+				}
 			}
 		}
 	}
@@ -394,35 +459,85 @@ func (e *Engine) Search(ctx context.Context, r Request) ([]model.SearchHit, erro
 	if wantSparse && bctx.Err() != nil {
 		wantSparse = false
 	}
-	if wantSparse {
-		svecs, err := []model.SparseVec{preSparse}, error(nil)
-		if preSparse == nil {
-			svecs, err = e.sp.EmbedSparse(bctx, []string{r.Text})
-		}
-		if err == nil && len(svecs) == 1 && len(svecs[0]) > 0 {
-			// dbctx: the store call must never be interrupted mid-query, by anyone.
-			if shits, serr := e.st.SearchSparse(dbctx, svecs[0], r.Filter, topK); serr == nil && len(shits) > 0 {
-				lists = append(lists, shits)
+	if r.Mode != "lexical" {
+		t0 := time.Now()
+		switch {
+		case wantSparse:
+			svecs, err := []model.SparseVec{preSparse}, error(nil)
+			if preSparse == nil {
+				svecs, err = e.sp.EmbedSparse(bctx, []string{r.Text})
 			}
+			switch {
+			case err != nil:
+				rep.skip(ArmSparse, failed("the sparse query embedding failed", err), t0)
+			case len(svecs) != 1:
+				rep.skip(ArmSparse, fmt.Sprintf("the sparse embedder returned %d vectors for one query", len(svecs)), t0)
+			case len(svecs[0]) == 0:
+				rep.ran(ArmSparse, 0, t0) // a query with no weighted term matches nothing
+			default:
+				// dbctx: the store call must never be interrupted mid-query, by anyone.
+				shits, serr := e.st.SearchSparse(dbctx, svecs[0], r.Filter, topK)
+				if serr != nil {
+					rep.skip(ArmSparse, failed("the sparse search failed", serr), t0)
+				} else {
+					rep.ran(ArmSparse, len(shits), t0)
+					if len(shits) > 0 {
+						lists = append(lists, shits)
+					}
+				}
+			}
+		case e.offSparse.Load():
+			rep.skip(ArmSparse, "turned off at runtime (dashboard)", t0)
+		case e.sp == nil:
+			rep.skip(ArmSparse, "the query embedder has no sparse head (call server_info for why)", t0)
+		case !e.st.SparseAvailable():
+			rep.skip(ArmSparse, "this corpus carries no sparse postings", t0)
+		default:
+			rep.skip(ArmSparse, budgetSpent(), t0)
 		}
 	}
 	// Degrade: a mode that produced no list (e.g. "semantic" with no embedder /
 	// vectors) falls back to lexical so a query never silently returns nothing.
+	// dbctx, like every other store call here: ctx is the caller's, and a caller
+	// that has gone — or a request budget that has run out — must not reach DuckDB
+	// (storeCtxNote).
 	if len(lists) == 0 {
-		lex, err := e.st.SearchClauses(ctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
+		t0 := time.Now()
+		lex, err := e.st.SearchClauses(dbctx, store.SearchQuery{Text: r.Text, Filter: r.Filter, TopK: topK})
 		if err != nil {
+			rep.skip(ArmLexical, failed("lexical search failed", err), t0)
 			return nil, err
 		}
+		rep.ran(ArmLexical, len(lex), t0)
 		lists = append(lists, lex)
 	}
 	hits := RRF(60, lists...)
 
 	// Optional cross-encoder rerank: re-score a broad window of fused candidates
-	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order.
-	if (r.Rerank || e.rerankAll.Load()) && e.rr.Enabled() && len(hits) > 1 && bctx.Err() == nil {
-		window := min(rerankWindowFor(), len(hits))
-		if reordered, err := e.rerank(bctx, r.Text, hits[:window]); err == nil {
-			hits = append(reordered, hits[window:]...)
+	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order, and
+	// the report says the order is the fused one.
+	if r.Rerank || e.rerankAll.Load() {
+		t0 := time.Now()
+		switch {
+		case !e.rr.Enabled():
+			rep.skip(ArmRerank, "no cross-encoder in this server: "+rerank.Reason(), t0)
+		case len(hits) <= 1:
+			rep.ran(ArmRerank, len(hits), t0) // nothing to reorder
+		case bctx.Err() != nil:
+			rep.skip(ArmRerank, budgetSpent(), t0)
+		default:
+			window := min(rerankWindowFor(), len(hits))
+			reordered, err := e.rerank(bctx, r.Text, hits[:window])
+			switch {
+			case err == nil:
+				hits = append(reordered, hits[window:]...)
+				rep.ran(ArmRerank, window, t0)
+			case bctx.Err() != nil:
+				// The budget ran out BETWEEN the cross-encoder's batches.
+				rep.skip(ArmRerank, budgetSpent()+" — it expired while the cross-encoder was running; the page keeps the fused order", t0)
+			default:
+				rep.skip(ArmRerank, failed("the cross-encoder failed, the page keeps the fused order", err), t0)
+			}
 		}
 	}
 
@@ -441,8 +556,11 @@ func (e *Engine) rerank(ctx context.Context, query string, cand []model.SearchHi
 		passages[i] = h.Clause.Heading + "\n" + h.Clause.Text
 	}
 	scores, err := e.rr.Score(ctx, query, passages)
-	if err != nil || len(scores) != len(cand) {
-		return nil, errRerank
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("%w: %v", errRerank, err)
+	case len(scores) != len(cand):
+		return nil, fmt.Errorf("%w: %d scores for %d passages", errRerank, len(scores), len(cand))
 	}
 	out := make([]model.SearchHit, len(cand))
 	copy(out, cand)
