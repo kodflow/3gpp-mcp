@@ -21,11 +21,11 @@
 #   MCP3GPP_CORPUS_REF_3GPP / MCP3GPP_CORPUS_REF_ETSI  — a tag or a digest, per package
 #   MCP3GPP_CORPUS_TAG                                 — one TAG for both (no digest)
 #
-# 2026-09-11: these are the `latest` of 2026-08-30 (3gpp 14:48Z, ETSI 14:33Z),
-# pinned as found. Both predate the 2026-09 corpus (the 3GPP layer is 8.1 GB
-# compressed against a 23 GB 3gpp.duckdb today; the ETSI layer is 32 MB, from
-# before the all-versions campaign, against a 19.5 GB etsi.duckdb): they seed a
-# starting point that the rest of each arm completes. Republishing is what
-# refreshes them — and what bumps these lines.
-ghcr.io/kodflow/3gpp-corpus@sha256:b515c60ded1d85729435edf8e5ef6dd2a88074497fc57b08208b96703f85b96b
-ghcr.io/kodflow/etsi-corpus@sha256:cc10d09117799a279fc728054f368dd4f0e1812bd54976234a1691ed0fa8a31e
+# 2026-09-11 (evening): republished by publish-corpus.sh from the corpus of image
+# sha256:f38b5875… (both halves passed the pipeline's contract first, #339). They
+# replace the `latest` of 2026-08-30, which predated the 2026-09 corpus (3GPP 8.1 GB
+# compressed; ETSI 32 MB, 14 versions, from before the all-versions campaign).
+# Also tagged :2026-09-11. A fresh clone now seeds the full corpus of both halves
+# and derives its anchor from it (#342).
+ghcr.io/kodflow/3gpp-corpus@sha256:8746007bdf214b2e2f27022416c6f033693043fc410fc975d9f94603036c4ebd
+ghcr.io/kodflow/etsi-corpus@sha256:94db691d2a1e1ebcd5ff8ca427831e6239aba31830d70bb3a854a10397555357
