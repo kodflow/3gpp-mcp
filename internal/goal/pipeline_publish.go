@@ -582,22 +582,11 @@ func runPublish(c *Ctx) error {
 	// SKIP THE SCRIPT'S RE-RUN OF THE CONTRACT only when `validate` certified these
 	// exact bytes under the flags and floor the script would use. See
 	// contract_certificate.go; every doubt leaves the re-run in place.
-	var env []string
 	floor, err := imageKnob{Env: "EMBED_FLOOR", Key: "embed_floor", DefaultIn: buildImageScript}.effective(c.Root)
 	if err != nil {
 		return err
 	}
-	if why := contractCertified(c, floor); why != "" {
-		c.Log.Printf("corpus contract: %s", why)
-		env = append(env, "CORPUS_CONTRACT_CERTIFIED="+why)
-	} else {
-		c.Log.Printf("corpus contract: no certificate matches these bytes — build-image.sh re-runs it")
-		// CLEARED, NOT OMITTED. Ctx.Run hands the child append(os.Environ(), …), so
-		// a CORPUS_CONTRACT_CERTIFIED left in the operator's shell would reach the
-		// script and skip the contract with no certificate behind it. The script
-		// tests -n, so an explicit empty value disarms an inherited one.
-		env = append(env, "CORPUS_CONTRACT_CERTIFIED=")
-	}
+	env := contractEnv(c, floor)
 	if err := c.Run(Cmd{
 		Name: "bash",
 		Args: []string{buildImageScript, "--tag", tag},

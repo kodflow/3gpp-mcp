@@ -99,14 +99,31 @@ func TestTheCertificateIsWrittenOnlyAfterEveryVerdict(t *testing.T) {
 }
 
 // AN INHERITED VARIABLE MUST NOT SKIP THE CONTRACT. runPublish hands the script
-// os.Environ() plus its own additions, so the uncertified path has to set the
-// variable EMPTY — the script tests -n — rather than leave it out.
+// os.Environ() plus contractEnv, so the uncertified answer has to SET the variable
+// empty — the script tests -n — rather than leave it out.
 func TestPublishDisarmsAnInheritedCertificate(t *testing.T) {
-	src := readRepoFile(t, "internal/goal/pipeline_publish.go")
-	if !strings.Contains(src, `"CORPUS_CONTRACT_CERTIFIED="`) {
-		t.Fatal(`runPublish never sets CORPUS_CONTRACT_CERTIFIED="" — one exported in the operator's shell ` +
-			"would reach build-image.sh and skip the contract with no certificate behind it")
+	c, _ := newTestCtx(t)
+	c.Config["contract_flags"] = "--require-fts"
+	t.Setenv("CORPUS_CONTRACT_CERTIFIED", "exported by hand in the operator's shell")
+
+	env := contractEnv(c, "Rel-99")
+	if len(env) != 1 || env[0] != "CORPUS_CONTRACT_CERTIFIED=" {
+		t.Fatalf("with no certificate, contractEnv gave %q — an inherited CORPUS_CONTRACT_CERTIFIED would "+
+			"reach build-image.sh and skip the contract", env)
 	}
+
+	for _, f := range certifiedFiles(c) {
+		write(t, f, "corpus bytes")
+	}
+	c.Config["embed_floor"] = "Rel-99"
+	if err := writeContractCertificate(c, corpus3GPP()); err != nil {
+		t.Fatal(err)
+	}
+	env = contractEnv(c, "Rel-99")
+	if len(env) != 1 || !strings.HasPrefix(env[0], "CORPUS_CONTRACT_CERTIFIED=certified by the validate step") {
+		t.Fatalf("with a matching certificate, contractEnv gave %q", env)
+	}
+
 	script := readRepoFile(t, buildImageScript)
 	if !strings.Contains(script, `if [ -n "${CORPUS_CONTRACT_CERTIFIED:-}" ]; then`) {
 		t.Fatal("build-image.sh no longer tests CORPUS_CONTRACT_CERTIFIED with -n, so an empty value " +
