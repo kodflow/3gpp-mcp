@@ -157,6 +157,39 @@ func TestATagPullReportsTheSnapshotItResolvedTo(t *testing.T) {
 	}
 }
 
+// A PIN THAT NAMES NOTHING FAILS AT ONCE. A 404 on a manifest is the registry's
+// answer ("no such tag or digest here"), and retrying it cost 36 s of backoff
+// against ghcr.io before saying the same thing — the likeliest way to meet it is
+// a pin copied from the other package.
+func TestAMissingManifestIsNotRetried(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			fmt.Fprint(w, `{"token":"test-token"}`)
+		case strings.Contains(r.URL.Path, "/manifests/"):
+			atomic.AddInt32(&hits, 1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	oldBase, oldService := registryBase, registryService
+	registryBase, registryService = srv.URL, "test"
+	defer func() { registryBase, registryService = oldBase, oldService }()
+
+	src := CorpusETSI("o", digestOf([]byte("the 3GPP manifest")))
+	dest := filepath.Join(t.TempDir(), "etsi.duckdb")
+	_, err := FetchCorpus(context.Background(), src, "pat", dest, func(string, ...any) {})
+	if err == nil || !strings.Contains(err.Error(), "no manifest") {
+		t.Fatalf("want a 'no manifest' error, got %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("a 404 manifest was requested %d times, want 1", n)
+	}
+}
+
 // RefOverride is the ONE place both consumers (the pipeline's seed steps and
 // cmd/server) read the environment, so the rules are pinned here once.
 func TestRefOverride(t *testing.T) {

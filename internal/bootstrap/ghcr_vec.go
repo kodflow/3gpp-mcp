@@ -153,6 +153,12 @@ func ghcrManifest(ctx context.Context, repo, ref, token string) (string, []ghcrL
 			return err
 		}
 		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusNotFound {
+			// No such tag or digest in this package: an answer, not a hiccup.
+			// Retried, a mistyped pin cost 36 s of backoff (measured against
+			// ghcr.io, 2026-09-11) before saying the same thing.
+			return retry.Permanent(fmt.Errorf("ghcr manifest %s: %s — this package has no manifest %q", repo, resp.Status, ref))
+		}
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("ghcr manifest: %s", resp.Status)
 		}
