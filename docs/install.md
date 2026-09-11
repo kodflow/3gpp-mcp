@@ -233,6 +233,15 @@ lexically. It now **says so**: the response carries `mode` (what actually ran)
 and, when that differs from what you asked, `mode_requested` and
 `mode_degraded`. `server_info` gives the reason.
 
+The same goes for each retrieval arm of a call. `search_spec` answers with
+`arms` — per corpus half and pass, every requested arm (`lexical`, `dense`,
+`sparse`, `rerank`) with whether it ran, its hit count and its milliseconds — and
+an arm that contributed nothing is listed in `degraded` and appended to
+`mode_degraded`, with why: the search budget ran out before it
+(`SEARCH_BUDGET`, default 20 s, ONE budget for the whole call across both
+halves), its model or store call failed, or the capability is absent. A page
+that was not cross-encoded never comes back looking as if it had been.
+
 To build the semantic pair yourself:
 
 ```sh

@@ -199,8 +199,11 @@ func servedArgs(q eval.Query, a servedArm) map[string]any {
 var servedPinnedEnv = []string{"RERANK_ALL", "RERANK_WINDOW", "EMBEDDER", "RERANKER", "EMBED_MODELS_CONFIG"}
 
 // servedMemoryLimit is the DUCKDB_MEMORY_LIMIT the gate's server runs with. The
-// image leaves it unset, and the store's default is 16GB — a CACHE ceiling that a
-// scan-heavy query fills (39.8 GB committed over both halves, above). The limit
+// image leaves it unset, and `serve` then applies store.ServeMemoryLimit — the
+// same 6GB, since the measurement below is what set it; before that the unset
+// value meant the writer's 16GB per corpus (39.8 GB committed over both halves,
+// above). Setting it here keeps the gate pinned whatever that default becomes.
+// The limit
 // caps the buffer pool, and the frozen HNSW index lives IN that pool
 // (duckdb_memory(), tag ART_INDEX, after one k-NN: 3.37 GB on the 3GPP half, with
 // 5.5 GB of table pages cached beside it); 6GB leaves the 3GPP index 2.6 GB to
