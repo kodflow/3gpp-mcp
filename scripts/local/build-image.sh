@@ -21,8 +21,9 @@
 #
 # HOW IT WORKS WITHOUT A CONTAINER RUNTIME. An OCI image is a base manifest plus
 # layer tarballs plus a config blob, and crane can compose all three. So instead of
-# RUN steps we stage a rootfs overlay on disk, tar it, and hand the tarballs to
-# `crane append`. Everything a Dockerfile RUN would have done at build time is
+# RUN steps we stage a rootfs overlay on disk, tar it, append the tarballs to the
+# base (imgtar oci, step 8), and hand the result to `crane push` and the config to
+# `crane mutate`. Everything a Dockerfile RUN would have done at build time is
 # either done here (the extension prefetch becomes a download of the same files)
 # or does not need doing (apt: the two libraries the binary needs travel in the
 # overlay rather than being installed).
@@ -305,7 +306,19 @@ cp "$SYSROOT/libstdc++.so.6" "$SYSROOT/libgomp.so.1" "$ROOTFS/usr/lib/x86_64-lin
 # matters: a hand-written passwd would drop root, daemon and nobody, and anything
 # in the image that resolves a uid would start answering wrong.
 say "deriving /etc/passwd and /etc/group from $BASE"
-go build -o "$ROOT/.local/bin/imgtar.exe" ./scripts/local/imgtar
+# -buildvcs=false -trimpath: THE SAME SOURCE MUST BE THE SAME BINARY ON EVERY COMMIT.
+#
+# imgtar's layer cache keys every layer on the hash of imgtar's own executable
+# (layerKey: a change to how layers are written must invalidate them). A plain
+# `go build` in a git checkout stamps vcs.revision, vcs.time and vcs.modified into
+# the binary — the one published on 2026-09-11 carries vcs.revision=2cfa4a70… —
+# so ANY commit, to any file, gave imgtar a new hash and every cached layer a new
+# key: the ~12 minutes of packing came back on the first publish after every
+# merge, for byte-identical layers. Without the stamp (and without the checkout's
+# path) the binary moves only when its source or the Go toolchain does, which is
+# what the key is meant to follow. TestImgtarIsBuiltWithoutTheCommitInIt runs
+# this exact command and holds it to that.
+go build -trimpath -buildvcs=false -o "$ROOT/.local/bin/imgtar.exe" ./scripts/local/imgtar
 IMGTAR="$ROOT/.local/bin/imgtar.exe"
 "$CRANE" export "$BASE" "$STAGE/base.tar" --platform linux/amd64
 "$IMGTAR" cat --in "$STAGE/base.tar" etc/passwd > "$STAGE/passwd"
@@ -597,6 +610,11 @@ fi
 # content-or-mtime (see layerKey in scripts/local/imgtar). An unchanged corpus half
 # is then neither re-read nor re-compressed. The cache lives OUTSIDE $STAGE, which
 # `rm -rf` clears on every run.
+#
+# EACH LAYER LEAVES ITS IDENTITY BESIDE IT (<layer>.id: digest, size, diff_id),
+# hashed by imgtar on the way out while it writes the layer, and kept in the cache
+# with the blob. Step 8 assembles the image from those records instead of letting
+# crane re-read 26 GB of blobs and gunzip 42 GB to learn them (see identity.go).
 LAYER_CACHE="$ROOT/.local/image-cache"
 layer() { # layer <name> <uid> <path…>
   local name="$1" uid="$2"; shift 2
@@ -661,13 +679,15 @@ layer 30-ort        10001 data/mcp-3gpp/models/onnxruntime
 [ "$WITH_CORPUS" = 1 ] && layer 51-corpus-etsi 10001 data/mcp-3gpp/etsi.duckdb
 layer 60-bin        0     usr/local/bin usr/local/lib
 
-LAYER_ARGS=()
-for f in "$LAYERS"/*.tar.gz; do LAYER_ARGS+=(-f "$f"); done
-[ "${#LAYER_ARGS[@]}" -gt 0 ] || die "no layers were produced"
+LAYER_FILES=()
+for f in "$LAYERS"/*.tar.gz; do [ -e "$f" ] && LAYER_FILES+=("$f"); done
+[ "${#LAYER_FILES[@]}" -gt 0 ] || die "no layers were produced"
 
 # ---- 8. assemble + push ------------------------------------------------------
 
 if [ "$PUSH" = 0 ]; then
+  LAYER_ARGS=()
+  for f in "${LAYER_FILES[@]}"; do LAYER_ARGS+=(-f "$f"); done
   say "assembling locally (no push) → $STAGE/image.tar"
   "$CRANE" append --platform linux/amd64 -b "$BASE" "${LAYER_ARGS[@]}" -t "$TAG" -o "$STAGE/image.tar"
   echo "wrote $STAGE/image.tar"
@@ -697,12 +717,51 @@ push_retry() {
   done
 }
 
-say "appending onto $BASE and pushing $TAG"
-push_retry "$CRANE" append --platform linux/amd64 -b "$BASE" "${LAYER_ARGS[@]}" -t "$TAG" \
-  || die "crane append failed after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — nothing was published"
+# THE IMAGE IS ASSEMBLED FROM THE LAYERS' RECORDS; crane ONLY MOVES BYTES.
+#
+# This was `crane append -b "$BASE" -f <layer>… -t "$TAG"`, and crane cannot be
+# told what a layer is: every -f goes through tarball.LayerFromFile, which reads
+# the blob to sha256 it and reads it again, gunzipped, for the diff_id — before the
+# first request. On 2026-09-11 that was 7m42 (12:27:50 -> 12:35:32 in
+# .local/logs/20260911T101313Z-publish.log) to learn digests imgtar had just
+# produced, for seven layers of which the registry already held all but the binary.
+#
+# Now the same three things happen, in the open:
+#   - the base is pulled as an OCI layout (the ~28 MB image crane append pulled);
+#   - `imgtar oci` appends each layer from the identity recorded beside it and
+#     writes the image crane append would have built, byte for byte — the
+#     manifest it pushed that day, sha256:778f0d31…, is the fixture of
+#     TestAssemblyIsByteIdenticalToCraneAppend. A layer with no valid record is
+#     read to compute one, the old cost, and says so; none is guessed;
+#   - `crane push` sends the layout. It takes a layout's descriptors as written and
+#     opens a layer only to upload it, so a blob the registry holds is answered
+#     "existing blob" without a byte of it being read.
+# Nothing else changes: the same registry calls, the same "existing blob" dedupe,
+# the same `crane mutate` below, the same config read-back.
+pull_base() {
+  # Fresh every attempt: crane pull ADDS to a layout that exists, and a base
+  # layout holding two images is one imgtar oci refuses.
+  rm -rf "$STAGE/base-oci"
+  "$CRANE" pull --format=oci --platform linux/amd64 "$BASE" "$STAGE/base-oci"
+}
+say "assembling onto $BASE from the layers' identity records (no layer is read)"
+push_retry pull_base || die "cannot pull $BASE after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — nothing was published"
+rm -rf "$STAGE/oci"
+"$IMGTAR" oci --base "$STAGE/base-oci" --out "$STAGE/oci" "${LAYER_FILES[@]}" \
+  || die "could not assemble the image — nothing was published"
+# The manifest digest imgtar computed; the tag must name exactly this after the push.
+OCI_INDEX="$(<"$STAGE/oci/index.json")"
+ASSEMBLED="${OCI_INDEX##*'"digest":"'}"
+ASSEMBLED="${ASSEMBLED%%'"'*}"
+
+say "pushing $TAG"
+push_retry "$CRANE" push "$STAGE/oci" "$TAG" \
+  || die "crane push failed after ${IMAGE_PUSH_ATTEMPTS:-4} attempts — nothing was published"
 
 say "setting the image config"
 DIGEST="$("$CRANE" digest "$TAG")"
+[ "$DIGEST" = "$ASSEMBLED" ] \
+  || die "after the push $TAG names $DIGEST, not the image assembled here ($ASSEMBLED) — refusing to set a config on it"
 # The config mutation is a manifest write, not a blob upload, but it lands on the
 # same link — and a tag left carrying layers with no entrypoint is worse than one
 # that was never moved.

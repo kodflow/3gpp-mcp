@@ -54,10 +54,10 @@ func TestTheGzipLayerIsThePlainLayerGzippedAtBestSpeed(t *testing.T) {
 	}
 	dir := t.TempDir()
 	plain, gz := filepath.Join(dir, "l.tar"), filepath.Join(dir, "l.tar.gz")
-	if err := writeLayer(plain, entries, 10001, 10001, false); err != nil {
+	if _, err := writeLayer(plain, entries, 10001, 10001, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeLayer(gz, entries, 10001, 10001, true); err != nil {
+	if _, err := writeLayer(gz, entries, 10001, 10001, true); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := os.ReadFile(plain)
@@ -136,14 +136,14 @@ func TestTheCacheHitsOnlyOnItsOwnKey(t *testing.T) {
 	k := key(t, root, "usr", "data")
 	dir := t.TempDir()
 	layer := filepath.Join(dir, "10-x.tar.gz")
-	if err := writeLayer(layer, entries, 10001, 10001, true); err != nil {
+	if _, err := writeLayer(layer, entries, 10001, 10001, true); err != nil {
 		t.Fatal(err)
 	}
 	blob := filepath.Join(dir, "cache", "10-x.tar.gz")
 	if hit(blob, k) {
 		t.Fatal("an empty cache hit")
 	}
-	if err := store(blob, k, layer); err != nil {
+	if err := store(blob, k, layer, identity{}); err != nil {
 		t.Fatal(err)
 	}
 	if !hit(blob, k) {
