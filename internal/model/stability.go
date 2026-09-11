@@ -1,6 +1,9 @@
 package model
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // IsStableSpecVersion is the ONE stability rule a citation, a draft warning or a
 // resolver may use, because stability is a fact about the HALF a version belongs
@@ -28,12 +31,22 @@ import "strings"
 //
 // The 3GPP half keeps IsStableVersion unchanged: 570 of its 20 163 versions are
 // genuine drafts and must keep saying so.
+//
+// NOT "ANY NON-EMPTY STRING" (Qodo, #338). The rule vouches for what the crawl
+// can produce: a /deliver folder "VV.VV.VV_60" becomes the dotted "V.V.V", and
+// all 11 822 ETSI versions in the served corpus have exactly that shape. A value
+// of any other shape did not come from that path, so nothing vouches for it and
+// it is not called stable.
 func IsStableSpecVersion(specID, version string) bool {
 	if IsETSICorpusID(specID) {
-		return strings.TrimSpace(version) != ""
+		return reETSIPublishedVersion.MatchString(strings.TrimSpace(version))
 	}
 	return IsStableVersion(version)
 }
+
+// reETSIPublishedVersion is the shape etsicat.Version.String gives a milestone-60
+// folder: three dotted integers.
+var reETSIPublishedVersion = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 // IsETSICorpusID reports whether a spec_id names a deliverable of the ETSI half
 // ("ETSI TS 103 221-1", "ETSI EN 300 497-1"). Same predicate the MCP router uses:
