@@ -393,13 +393,16 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	var hits []model.SearchHit
 	var unread []unreadHalf
 	federated := filter.SpecID == "" && filter.Series == ""
+	// ONE cross-encoder pass per call: each half used to rerank its own window
+	// before the rank-based merge discarded those scores (federated_rerank.go).
+	armRerank := h.armRerank(rerank, federated, etsiScoped)
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
 		servingEng = h.etsiEng
-		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, armRerank)
 	} else {
-		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
+		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: armRerank})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
@@ -414,7 +417,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 				unread = append(unread, unreadOf("3gpp", "", threeErr))
 				hits = nil
 			}
-			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, armRerank)
 			unread = append(unread, partial...)
 			switch {
 			case eerr != nil && threeErr != nil:
@@ -430,6 +433,11 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 		} else if u, down := h.etsiOpenFailure(); down && (federated || etsiScoped) {
 			unread = append(unread, u)
 		}
+	}
+	// The merged head, cross-encoded once (federated_rerank.go). A call that ran
+	// one search reranked inside it, over its own window, exactly as before.
+	if err == nil && rerank && !armRerank {
+		hits = h.rerankFused(ctx, q, hits)
 	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("search failed", err), nil

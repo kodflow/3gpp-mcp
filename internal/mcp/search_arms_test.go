@@ -99,8 +99,8 @@ func TestARerankTheBudgetSkippedIsNamedInTheAnswer(t *testing.T) {
 		t.Fatal("the search answered nothing — the budget must degrade the answer, never empty it")
 	}
 	md, _ := out["mode_degraded"].(string)
-	if !strings.Contains(md, "rerank (3gpp") || !strings.Contains(md, "rerank (etsi") || !strings.Contains(md, "SEARCH_BUDGET") {
-		t.Fatalf("mode_degraded = %q — it must name the skipped rerank on each half and the budget that skipped it", md)
+	if !strings.Contains(md, "rerank (federated)") || !strings.Contains(md, "SEARCH_BUDGET") {
+		t.Fatalf("mode_degraded = %q — it must name the skipped rerank and the budget that skipped it", md)
 	}
 	var corpora []string
 	for _, r := range reportsOf(t, out) {
@@ -111,13 +111,15 @@ func TestARerankTheBudgetSkippedIsNamedInTheAnswer(t *testing.T) {
 			}
 		}
 	}
-	if got := strings.Join(corpora, ","); !strings.Contains(got, "3gpp") || !strings.Contains(got, "etsi") {
-		t.Errorf("arms came from %q, want a report per half", got)
+	if got := strings.Join(corpora, ","); !strings.Contains(got, "3gpp") || !strings.Contains(got, "etsi") ||
+		!strings.Contains(got, "federated") {
+		t.Errorf("arms came from %q, want a report per half and one for the fused rerank", got)
 	}
 }
 
 // The control: the same call with no budget pressure carries no mode_degraded,
-// and the arms say the rerank ran on each half — the note is not a constant.
+// and the arms say the rerank ran, once, over the merged head — the note is not
+// a constant, and the fused pass is where the cross-encoder now runs.
 func TestARerankThatRanIsReportedAndNothingIsDegraded(t *testing.T) {
 	t.Setenv("RERANKER", "lexical")
 	t.Setenv("EMBEDDER", "off")
@@ -130,15 +132,19 @@ func TestARerankThatRanIsReportedAndNothingIsDegraded(t *testing.T) {
 		t.Fatalf("mode_degraded = %v on a call where every requested arm ran", md)
 	}
 	ran := map[string]bool{}
+	n := 0
 	for _, r := range reportsOf(t, out) {
 		for _, a := range r.Arms {
-			if a.Arm == search.ArmRerank && a.Ran {
-				ran[r.Corpus] = true
+			if a.Arm == search.ArmRerank {
+				n++
+				if a.Ran {
+					ran[r.Corpus] = true
+				}
 			}
 		}
 	}
-	if !ran["3gpp"] || !ran["etsi"] {
-		t.Fatalf("rerank ran on %v, want both halves", ran)
+	if !ran["federated"] || n != 1 {
+		t.Fatalf("rerank arms = %v over %d pass(es), want exactly one, over the fused head", ran, n)
 	}
 }
 
@@ -172,26 +178,29 @@ func TestWarmupRunsEachHalfAndSaysSo(t *testing.T) {
 	}
 }
 
-// slowReranker takes d per call and ignores the context, as an in-flight ONNX
-// Run does.
-type slowReranker struct{ d time.Duration }
-
-func (slowReranker) Enabled() bool { return true }
-func (s slowReranker) Score(_ context.Context, _ string, p []string) ([]float64, error) {
-	time.Sleep(s.d)
-	return make([]float64, len(p)), nil
+// slowStore answers its lexical query after d, as a cold, loaded corpus does.
+type slowStore struct {
+	store.Reader
+	d time.Duration
 }
 
-// ONE BUDGET PER CALL, ACROSS BOTH HALVES. The 3GPP pass starts its rerank inside
-// the budget and overruns it; the ETSI pass that follows must find the budget
-// spent and say so — not start a fresh SEARCH_BUDGET of its own, which is how a
-// "20 s" federated call used to be able to spend three.
+func (s slowStore) SearchClauses(ctx context.Context, q store.SearchQuery) ([]model.SearchHit, error) {
+	time.Sleep(s.d)
+	return s.Reader.SearchClauses(ctx, q)
+}
+
+// ONE BUDGET PER CALL, ACROSS BOTH HALVES AND THE PASS THAT FOLLOWS THEM. The
+// 3GPP half here takes longer than the whole budget; what comes after it — the
+// ETSI pass and the cross-encoder over the merged head — must find the budget
+// spent and say so, rather than each starting a fresh SEARCH_BUDGET of its own,
+// which is how a "20 s" federated call used to be able to spend three.
 //
-// Falsified: without search.WithBudget in searchSpec, the ETSI pass gets its own
-// budget, its rerank runs, and this fails.
+// Falsified: without search.WithBudget in searchSpec, the fused rerank gets its
+// own budget, runs, and this fails.
 func TestAFederatedCallSpendsOneBudget(t *testing.T) {
 	t.Setenv("EMBEDDER", "off")
-	t.Setenv("SEARCH_BUDGET", "400ms")
+	t.Setenv("RERANKER", "lexical")
+	t.Setenv("SEARCH_BUDGET", "300ms")
 	ctx := context.Background()
 	open := func(spec, rel string) *store.Store {
 		s, err := store.Open(":memory:")
@@ -206,8 +215,8 @@ func TestAFederatedCallSpendsOneBudget(t *testing.T) {
 		})
 		return s
 	}
-	srv, _ := New(open("23.502", "Rel-19"), "test", "", nil, open("ETSI TS 103 221-1", "ETSI"),
-		WithReranker(slowReranker{d: 700 * time.Millisecond}))
+	srv, _ := New(slowStore{Reader: open("23.502", "Rel-19"), d: 500 * time.Millisecond},
+		"test", "", nil, open("ETSI TS 103 221-1", "ETSI"))
 	c, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatal(err)
@@ -225,21 +234,23 @@ func TestAFederatedCallSpendsOneBudget(t *testing.T) {
 	out := call(t, c, ctx, "search_spec", map[string]any{
 		"query": "registration", "mode": "lexical", "rerank": true, "spec_type": "any"})
 
-	ran := map[string]search.ArmRun{}
+	if n, _ := out["count"].(float64); n == 0 {
+		t.Fatal("the call answered nothing — a spent budget degrades the answer, never empties it")
+	}
+	arms := map[string]search.ArmRun{}
 	for _, r := range reportsOf(t, out) {
 		for _, a := range r.Arms {
-			if a.Arm == search.ArmRerank {
-				ran[r.Corpus] = a
-			}
+			arms[r.Corpus+"/"+a.Arm] = a
 		}
 	}
-	if !ran["3gpp"].Ran {
-		t.Fatalf("the 3GPP rerank started inside the budget and must have run: %+v", ran["3gpp"])
+	if a := arms["federated/rerank"]; a.Ran || !strings.Contains(a.Skipped, "SEARCH_BUDGET=300ms") {
+		t.Fatalf("the fused rerank = %+v, want skipped on the call's spent budget", a)
 	}
-	if e := ran["etsi"]; e.Ran || !strings.Contains(e.Skipped, "SEARCH_BUDGET=400ms") {
-		t.Fatalf("the ETSI rerank = %+v, want skipped on the call's spent budget", e)
+	if md, _ := out["mode_degraded"].(string); !strings.Contains(md, "rerank (federated)") {
+		t.Fatalf("mode_degraded = %q, want the fused rerank named", md)
 	}
-	if md, _ := out["mode_degraded"].(string); !strings.Contains(md, "rerank (etsi") {
-		t.Fatalf("mode_degraded = %q, want the ETSI rerank named", md)
+	// The lexical arm of the second half still runs: degrade, never block.
+	if a := arms["etsi/lexical"]; !a.Ran {
+		t.Fatalf("the ETSI lexical arm = %+v, want it to run whatever the budget", a)
 	}
 }

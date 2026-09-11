@@ -211,9 +211,6 @@ func (e *Engine) UseVectorShards(aliases []string) { e.vecShards = aliases }
 // SetName names the corpus this engine answers for, as its Reports say it.
 func (e *Engine) SetName(name string) { e.name = name }
 
-// SetReranker replaces the cross-encoder New picked from the environment.
-func (e *Engine) SetReranker(r rerank.Reranker) { e.rr = r }
-
 // NewSharing builds an Engine over st that SHARES o's models — the query embedder
 // (with its cache) and the cross-encoder — instead of loading its own.
 //
@@ -520,34 +517,65 @@ func (e *Engine) search(ctx context.Context, r Request, rep *Report) ([]model.Se
 	// then narrow to TopK. Best-effort — a reranker error keeps the RRF order, and
 	// the report says the order is the fused one.
 	if r.Rerank || e.rerankAll.Load() {
-		t0 := time.Now()
-		switch {
-		case !e.rr.Enabled():
-			rep.skip(ArmRerank, "no cross-encoder in this server: "+rerank.Reason(), t0)
-		case len(hits) <= 1:
-			rep.ran(ArmRerank, len(hits), t0) // nothing to reorder
-		case bctx.Err() != nil:
-			rep.skip(ArmRerank, budgetSpent(), t0)
-		default:
-			window := min(rerankWindowFor(), len(hits))
-			reordered, err := e.rerank(bctx, r.Text, hits[:window])
-			switch {
-			case err == nil:
-				hits = append(reordered, hits[window:]...)
-				rep.ran(ArmRerank, window, t0)
-			case bctx.Err() != nil:
-				// The budget ran out BETWEEN the cross-encoder's batches.
-				rep.skip(ArmRerank, budgetSpent()+" — it expired while the cross-encoder was running; the page keeps the fused order", t0)
-			default:
-				rep.skip(ArmRerank, failed("the cross-encoder failed, the page keeps the fused order", err), t0)
-			}
-		}
+		hits = e.rerankHead(bctx, r.Text, hits, rep, budgetSpent)
 	}
 
 	if len(hits) > topK {
 		hits = hits[:topK]
 	}
 	return hits, nil
+}
+
+// rerankHead re-scores the head of an already-fused list and returns the list
+// with that head reordered — the one place the cross-encoder is applied, whether
+// it runs inside one Search or once over the halves a federated call merged
+// (RerankFused). Best-effort: on any failure the list comes back as it was and
+// the report says why, so an answer never claims a rerank it did not get.
+func (e *Engine) rerankHead(bctx context.Context, text string, hits []model.SearchHit, rep *Report,
+	budgetSpent func() string) []model.SearchHit {
+	t0 := time.Now()
+	switch {
+	case !e.rr.Enabled():
+		rep.skip(ArmRerank, "no cross-encoder in this server: "+rerank.Reason(), t0)
+	case len(hits) <= 1:
+		rep.ran(ArmRerank, len(hits), t0) // nothing to reorder
+	case bctx.Err() != nil:
+		rep.skip(ArmRerank, budgetSpent(), t0)
+	default:
+		window := min(rerankWindowFor(), len(hits))
+		reordered, err := e.rerank(bctx, text, hits[:window])
+		switch {
+		case err == nil:
+			hits = append(reordered, hits[window:]...)
+			rep.ran(ArmRerank, window, t0)
+		case bctx.Err() != nil:
+			// The budget ran out BETWEEN the cross-encoder's batches.
+			rep.skip(ArmRerank, budgetSpent()+" — it expired while the cross-encoder was running; the page keeps the fused order", t0)
+		default:
+			rep.skip(ArmRerank, failed("the cross-encoder failed, the page keeps the fused order", err), t0)
+		}
+	}
+	return hits
+}
+
+// RerankFused re-scores the head of a list a CALLER fused — the merge of the
+// halves search_spec federates — under the request's budget, and records the arm
+// as its own Report under the given corpus name.
+//
+// One pass over the merged head, instead of one per half whose scores the
+// rank-based merge then discarded: see internal/mcp/federated_rerank.go for the
+// measurement and for what it changes.
+func (e *Engine) RerankFused(ctx context.Context, query string, hits []model.SearchHit, corpus string) []model.SearchHit {
+	began := time.Now()
+	rep := Report{Corpus: corpus}
+	bctx, cancel, budgetSpent := budgetCtx(ctx)
+	defer cancel()
+	out := e.rerankHead(bctx, query, hits, &rep, budgetSpent)
+	rep.Ms = msSince(began)
+	if t := traceFrom(ctx); t != nil {
+		t.add(rep)
+	}
+	return out
 }
 
 // rerank re-scores cand with the cross-encoder over (query, heading+text)
