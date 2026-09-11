@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/kodflow/3gpp-mcp/internal/anchor"
 	"github.com/kodflow/3gpp-mcp/internal/store"
@@ -52,15 +53,39 @@ func run(ctx context.Context, dbPath, out string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	tmp := out + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return 0, err
-	}
-	if err := os.Rename(tmp, out); err != nil {
-		_ = os.Remove(tmp)
+	if err := writeDurable(out, b); err != nil {
 		return 0, err
 	}
 	return len(ix), nil
+}
+
+// writeDurable publishes b at path the way goal.WriteAtomic does: a uniquely
+// named temporary in the same directory, flushed to disk BEFORE the rename. A
+// rename of unflushed data can survive a power cut as an empty file, and an empty
+// anchor is read by discover as "nothing is indexed".
+func writeDurable(path string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(b)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(tmp, 0o644)
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+	}
+	return werr
 }
 
 // derive reads spec_versions, the table the fold derives its anchor from.
