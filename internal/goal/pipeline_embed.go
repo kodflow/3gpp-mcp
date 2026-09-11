@@ -1360,6 +1360,7 @@ func stepSmoke() *Step {
 				"served_tol":           servedTol,
 				"served_search_budget": servedSearchBudget,
 				"served_memory_limit":  servedMemoryLimit,
+				"served_queries":       strings.Join(servedQueryIDs, ","),
 			}, nil
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
