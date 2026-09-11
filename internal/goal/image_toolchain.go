@@ -95,7 +95,9 @@ func parseImageToolchain(out string) (map[string]string, error) {
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")
-		if !ok || k == "" || strings.ContainsAny(k, " \t") || v == "" {
+		// A blank value names no version, however many spaces it holds (review of
+		// #330, CodeRabbit): "zig=   " would otherwise count as zig reported.
+		if !ok || k == "" || strings.ContainsAny(k, " \t") || strings.TrimSpace(v) == "" {
 			return nil, fmt.Errorf("%s --print-toolchain printed %q, which is not a name=version line", buildImageScript, line)
 		}
 		if _, dup := got[k]; dup {

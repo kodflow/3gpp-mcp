@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -97,6 +98,7 @@ func TestParseImageToolchainIsStrict(t *testing.T) {
 		"a required tool missing": strings.Replace(full, "zig=0.13.0\n", "", 1),
 		"a tool twice":            full + "go=go version go2\n",
 		"an empty value":          strings.Replace(full, "crane=0.20.2", "crane=", 1),
+		"a blank value":           strings.Replace(full, "zig=0.13.0", "zig=   \t", 1),
 		"not a name=value line":   full + "warning: something\n",
 	} {
 		if m, err := parseImageToolchain(out); err == nil {
@@ -169,6 +171,30 @@ func TestPrintToolchainExitsBeforeTheBuildWrites(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("build-image.sh --print-toolchain changed the tree it was run in:\n\tbefore %v\n\tafter  %v",
 			before, after)
+	}
+}
+
+// A STALE zig-* DIRECTORY WITHOUT ITS zig.exe STOPS THE BUILD AT THE PREFLIGHT,
+// before it deletes and restages .local/image — not at the first compile, after
+// (review of #330, CodeRabbit). Run as the real build, in a root where every other
+// check passes, so the only thing that can stop it early is that check.
+func TestAZigDirectoryWithoutZigStopsTheBuildBeforeItWrites(t *testing.T) {
+	root := fakeImageRoot(t)
+	if err := os.Remove(filepath.Join(root, ".local", "toolchain", "zig-fake", "zig.exe")); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, root)
+	cmd := exec.Command("bash", buildImageScript, "--no-push")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("the build went on with no zig executable:\n%s", out)
+	}
+	if !strings.Contains(string(out), "zig not found") {
+		t.Errorf("the build did not stop on the missing zig, but on:\n%s", out)
+	}
+	if after := snapshotTree(t, root); !reflect.DeepEqual(before, after) {
+		t.Fatalf("the build wrote before refusing a missing zig:\n\tbefore %v\n\tafter  %v", before, after)
 	}
 }
 
