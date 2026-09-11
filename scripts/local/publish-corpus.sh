@@ -183,16 +183,6 @@ publish_one() {
   "$CRANE" tag "$repo:$date_tag" latest || die "crane tag latest failed for $pkg"
   log "$pkg: published $repo:$date_tag (+ :latest)"
 
-  # PIN WHAT WAS JUST PUSHED, BY DIGEST — read back from the registry rather than
-  # computed here, so the pin names the manifest the registry actually serves. The
-  # dated tag is not a pin either: two publishes on one day move it.
-  local full
-  full="$("$CRANE" digest --full-ref "$repo:$date_tag")" || die "could not read back the digest of $repo:$date_tag"
-  pin_corpus_snapshot "$PIN_FILE" "$pkg" "$full" \
-    || die "$pkg was pushed but contracts/corpus-pin.txt could not be updated — pin $full by hand"
-  log "$pkg: pinned $full"
-  PINNED="$PINNED $pkg"
-
   # ANTI-LEAK. Verbatim standards text must not become a public package.
   #
   # NO LEADING SLASH, and MSYS_NO_PATHCONV. Git Bash rewrites an argument that
@@ -217,6 +207,19 @@ publish_one() {
    It carries verbatim standards text. CHECK IT:
    https://github.com/users/$OWNER/packages/container/$pkg/settings" >&2;;
   esac
+
+  # PIN WHAT WAS JUST PUSHED, BY DIGEST — read back from the registry rather than
+  # computed here, so the pin names the manifest the registry actually serves. The
+  # dated tag is not a pin either: two publishes on one day move it.
+  #
+  # LAST, after the anti-leak guard: a pin that could not be written must not be
+  # the reason the visibility of a freshly pushed package goes unchecked.
+  local full
+  full="$("$CRANE" digest --full-ref "$repo:$date_tag")" || die "could not read back the digest of $repo:$date_tag"
+  pin_corpus_snapshot "$PIN_FILE" "$pkg" "$full" \
+    || die "$pkg was pushed but contracts/corpus-pin.txt could not be updated — pin $full by hand"
+  log "$pkg: pinned $full"
+  PINNED="$PINNED $pkg"
 }
 
 # The gate. Baking a corpus that fails its own contract produces an image that
