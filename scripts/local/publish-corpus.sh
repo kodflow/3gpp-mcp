@@ -168,7 +168,12 @@ publish_one() {
   fi
   log "$pkg: layer is $(du -h "$work/layer.tar" | cut -f1) uncompressed (crane gzips it on the wire)"
 
-  local date_tag; date_tag="$(date -u +%F)"
+  # %Y-%m-%d, NOT %F: once scripts/local/toolchain-env.sh is sourced, `date` is
+  # w64devkit's busybox, whose strftime prints NOTHING for %F. The 2026-09-11
+  # republication pushed `<repo>:` with an empty tag that way (only :latest and
+  # the pinned digest were set; the dated tags were added by hand afterwards).
+  local date_tag; date_tag="$(date -u +%Y-%m-%d)"
+  [ -n "$date_tag" ] || die "could not compute the snapshot's date tag"
   if [ "$DRY" = 1 ]; then
     log "DRY RUN — would push $repo:$date_tag, retag :latest, and pin its digest in contracts/corpus-pin.txt"
     return 0
