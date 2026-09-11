@@ -199,7 +199,19 @@ cp "$SYSROOT/libstdc++.so.6" "$SYSROOT/libgomp.so.1" "$ROOTFS/usr/lib/x86_64-lin
 # matters: a hand-written passwd would drop root, daemon and nobody, and anything
 # in the image that resolves a uid would start answering wrong.
 say "deriving /etc/passwd and /etc/group from $BASE"
-go build -o "$ROOT/.local/bin/imgtar.exe" ./scripts/local/imgtar
+# -buildvcs=false -trimpath: THE SAME SOURCE MUST BE THE SAME BINARY ON EVERY COMMIT.
+#
+# imgtar's layer cache keys every layer on the hash of imgtar's own executable
+# (layerKey: a change to how layers are written must invalidate them). A plain
+# `go build` in a git checkout stamps vcs.revision, vcs.time and vcs.modified into
+# the binary — the one published on 2026-09-11 carries vcs.revision=2cfa4a70… —
+# so ANY commit, to any file, gave imgtar a new hash and every cached layer a new
+# key: the ~12 minutes of packing came back on the first publish after every
+# merge, for byte-identical layers. Without the stamp (and without the checkout's
+# path) the binary moves only when its source or the Go toolchain does, which is
+# what the key is meant to follow. TestImgtarIsBuiltWithoutTheCommitInIt runs
+# this exact command and holds it to that.
+go build -trimpath -buildvcs=false -o "$ROOT/.local/bin/imgtar.exe" ./scripts/local/imgtar
 IMGTAR="$ROOT/.local/bin/imgtar.exe"
 "$CRANE" export "$BASE" "$STAGE/base.tar" --platform linux/amd64
 "$IMGTAR" cat --in "$STAGE/base.tar" etc/passwd > "$STAGE/passwd"
