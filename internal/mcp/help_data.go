@@ -34,7 +34,8 @@ var helpConfig = []map[string]string{
 	{"env": "RERANKER", "effect": "off disables the cross-encoder rerank pass"},
 	{"env": "RERANK_WINDOW", "effect": "how many candidates the cross-encoder rescores (default 12)"},
 	{"env": "RERANK_ALL", "effect": "true reranks every arm's candidates, not just the hybrid head"},
-	{"env": "SEARCH_BUDGET", "effect": "wall-clock budget per search before partial results are returned (default 20s)"},
+	{"env": "SEARCH_BUDGET", "effect": "wall-clock budget per search_spec call, both halves included, before partial " +
+		"results are returned (default 20s); an arm it cuts is named in the answer's degraded and mode_degraded"},
 	{"env": "EMBED_QUERY_CACHE", "effect": "query-embedding cache entries (default 512)"},
 	{"env": "MCP3GPP_ALLOW_LEXICAL_FALLBACK", "effect": "true lets the server start lexically when vectors are unusable; " +
 		"default refuses to start, so a silently degraded server is never served"},
