@@ -170,3 +170,47 @@ func TestSparseArmOrdersExactTiesTheSameWayEveryTime(t *testing.T) {
 		}
 	}
 }
+
+// THE OLD-SHAPE CORPUS GETS THE SAME TOTAL ORDER (CodeRabbit, #348). Rounding the
+// summed score to nine decimals is what stops summation order from deciding a
+// near-tie — and it also makes exact ties MORE common, so the tie-break after the
+// score has to be total on this path too. Two releases of one clause carry the
+// same postings and the same score; without (release, version, chunk_id) the LIMIT
+// could take either, and a page could change between two identical calls.
+func TestSparseArmOrdersExactTiesOnALegacyCorpusToo(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.InsertClauses([]model.Clause{
+		{ChunkID: 1, SpecID: "23.501", Release: "Rel-18", Version: "18.0.0", ClausePath: "5.2", Heading: "Registration", Text: "the same text"},
+		{ChunkID: 2, SpecID: "23.501", Release: "Rel-19", Version: "19.0.0", ClausePath: "5.2", Heading: "Registration", Text: "the same text"},
+		{ChunkID: 3, SpecID: "23.501", Release: "Rel-19", Version: "19.0.0", ClausePath: "5.3", Heading: "Session", Text: "another"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO clause_sparse VALUES (1,100,0.9),(2,100,0.9),(3,200,0.5)`,
+	} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.LoadSparse(ctx); err != nil || !s.SparseAvailable() {
+		t.Fatalf("sparse arm not available: %v", err)
+	}
+	if s.ContentAddressed() {
+		t.Fatal("this fixture must be the OLD shape — the CA path is covered above")
+	}
+	for i := 0; i < 20; i++ {
+		got, err := s.SearchSparse(ctx, model.SparseVec{100: 1.0}, SpecFilter{}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Clause.Release != "Rel-18" {
+			t.Fatalf("run %d: the tied page took %+v, want the Rel-18 row every time", i, got)
+		}
+	}
+}

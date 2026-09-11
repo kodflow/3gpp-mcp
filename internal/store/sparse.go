@@ -122,7 +122,7 @@ func (s *Store) SearchSparse(ctx context.Context, query model.SparseVec, f SpecF
 	        ) sub
 	        JOIN clauses cl ON cl.chunk_id = sub.chunk_id
 	        WHERE 1=1` + filterSQL + `
-	        ORDER BY sub.score DESC, cl.spec_id, cl.clause_path
+	        ORDER BY sub.score DESC, cl.spec_id, cl.clause_path, cl.release, cl.version, cl.chunk_id
 	        LIMIT ?`
 	args = append(args, fargs...)
 	args = append(args, topK)
