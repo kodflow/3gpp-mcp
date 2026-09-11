@@ -222,4 +222,3 @@ func checkData(args []string) error {
 	fmt.Println("check-data: OK — data layer meets the completeness contract")
 	return nil
 }
-
