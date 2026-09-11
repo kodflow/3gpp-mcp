@@ -70,6 +70,9 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	for _, o := range opts {
 		o(h)
 	}
+	if h.warmLog != nil {
+		go h.warmUp()
+	}
 
 	// EVERY TOOL IS SHIELDED, AND THAT IS WHY THE WRAPPER IS HERE RATHER THAN
 	// INSIDE EACH HANDLER: registrations are a list, and a list is auditable.
@@ -223,6 +226,8 @@ type handlers struct {
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
 	etsiDown string // why the ETSI half asked for could not be opened; "" = not asked for, or attached
+	// warmLog, when set, warms every half at start and reports through it (WithWarmup).
+	warmLog func(format string, args ...any)
 }
 
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "

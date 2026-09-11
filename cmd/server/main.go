@@ -304,6 +304,14 @@ func serve(args []string) error {
 	if etsiSt != nil {
 		etsiReader = etsiSt
 	}
+	// Warm every half in the background (search.Engine.Warm): the first dense query
+	// of a session loads the HNSW index — 21-28 s on the 3GPP half, measured — and
+	// did so inside the client's search budget. MCP3GPP_NO_WARMUP=1 declines it.
+	if os.Getenv("MCP3GPP_NO_WARMUP") != "1" {
+		mcpOpts = append(mcpOpts, mcp.WithWarmup(func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[3gpp-mcp] "+format+"\n", args...)
+		}))
+	}
 	srv, eng := mcp.New(st, Version, *release, vecShards, etsiReader, mcpOpts...)
 	scope := *release
 	if scope == "" {
