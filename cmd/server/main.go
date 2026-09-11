@@ -279,9 +279,14 @@ func serve(args []string) error {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus not attached (%s): serving 3GPP only\n", etsiWhy)
 	}
 	var etsiSt *store.Store
+	var mcpOpts []mcp.Option
 	if etsiPath != "" {
 		if es, eerr := store.OpenReadOnly(etsiPath); eerr != nil {
 			fmt.Fprintf(os.Stderr, "[3gpp-mcp] ETSI corpus %s (%s) unavailable, serving 3GPP only: %v\n", etsiPath, etsiWhy, eerr)
+			// And every federated answer says so: this log line reaches the operator,
+			// never the client, who would otherwise read 3GPP-only answers as complete.
+			mcpOpts = append(mcpOpts, mcp.WithETSIUnavailable(
+				fmt.Sprintf("%s (%s) could not be opened at startup: %v", etsiPath, etsiWhy, eerr)))
 		} else {
 			_ = es.LoadFTS(ctx)
 			_ = es.LoadVSS(ctx)
@@ -299,7 +304,7 @@ func serve(args []string) error {
 	if etsiSt != nil {
 		etsiReader = etsiSt
 	}
-	srv, eng := mcp.New(st, Version, *release, vecShards, etsiReader)
+	srv, eng := mcp.New(st, Version, *release, vecShards, etsiReader, mcpOpts...)
 	scope := *release
 	if scope == "" {
 		scope = "latest"

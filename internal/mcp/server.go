@@ -37,7 +37,7 @@ import (
 // corpora stay SPLIT (3gpp.duckdb + etsi.duckdb), never merged. When present, the
 // handlers federate to it: get_spec / list_releases / get_changelog route a spec_id
 // beginning "ETSI " to the ETSI store, and list_specs unions both. nil = 3GPP only.
-func New(st store.Reader, version, baseline string, vecShards []string, etsi store.Reader) (*server.MCPServer, *search.Engine) {
+func New(st store.Reader, version, baseline string, vecShards []string, etsi store.Reader, opts ...Option) (*server.MCPServer, *search.Engine) {
 	eng := search.New(st)
 	eng.UseVectorShards(vecShards)
 	scope := "latest release"
@@ -63,6 +63,9 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		etsiEng = search.New(etsi) // its own single-DB FTS/HNSW; no 3GPP vec shards
 	}
 	h := &handlers{st: st, etsi: etsi, eng: eng, etsiEng: etsiEng, reg: registry.Default(), baseline: baseline, version: version}
+	for _, o := range opts {
+		o(h)
+	}
 
 	// EVERY TOOL IS SHIELDED, AND THAT IS WHY THE WRAPPER IS HERE RATHER THAN
 	// INSIDE EACH HANDLER: registrations are a list, and a list is auditable.
@@ -215,6 +218,7 @@ type handlers struct {
 	reg      *subject.Registry
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
+	etsiDown string // why the ETSI half asked for could not be opened; "" = not asked for, or attached
 }
 
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
@@ -338,7 +342,7 @@ func (h *handlers) serverInfo(ctx context.Context, _ mcp.CallToolRequest) (*mcp.
 			"embedding_model_ok": etsiModel != "" && etsiModel == clientModel,
 		}
 	} else {
-		info["etsi"] = map[string]any{"attached": false}
+		info["etsi"] = h.etsiDetached()
 	}
 	b, _ := json.MarshalIndent(info, "", "  ")
 	return mcp.NewToolResultText(string(b)), nil
@@ -371,20 +375,44 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	// toggles, so reading h.eng below described an engine that never ran.
 	servingEng := h.eng
 	var hits []model.SearchHit
+	var unread []unreadHalf
+	federated := filter.SpecID == "" && filter.Series == ""
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
 		servingEng = h.etsiEng
-		hits, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
 	} else {
 		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: rerank})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
-		if err == nil && h.etsiEng != nil && filter.SpecID == "" && filter.Series == "" {
-			if eh, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank); eerr == nil && len(eh) > 0 {
+		//
+		// EACH HALF IS ASKED EVEN WHEN THE OTHER FAILED, AND A FAILED HALF IS NAMED
+		// (half_failures.go). This used to skip ETSI when 3GPP failed and drop an
+		// ETSI error in silence, so a 3GPP-only page read as the whole corpus.
+		if h.etsiEng != nil && federated {
+			var threeErr error
+			if err != nil {
+				threeErr, err = err, nil
+				unread = append(unread, unreadOf("3gpp", "", threeErr))
+				hits = nil
+			}
+			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rerank)
+			unread = append(unread, partial...)
+			switch {
+			case eerr != nil && threeErr != nil:
+				return mcp.NewToolResultError(fmt.Sprintf("search failed on both halves — 3GPP: %s; ETSI: %s",
+					firstLine(threeErr.Error(), errorTextLimit), firstLine(eerr.Error(), errorTextLimit))), nil
+			case eerr != nil:
+				unread = append(unread, unreadOf("etsi", "", eerr))
+			case threeErr != nil:
+				hits = eh
+			case len(eh) > 0:
 				hits = search.RRF(60, hits, eh)
 			}
+		} else if u, down := h.etsiOpenFailure(); down && (federated || etsiScoped) {
+			unread = append(unread, u)
 		}
 	}
 	if err != nil {
@@ -437,6 +465,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	if next != "" {
 		resp["next_cursor"] = next
 	}
+	withUnread(resp, unread)
 	return jsonResult(resp)
 }
 
@@ -444,6 +473,9 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	specID, err := r.RequireString("spec_id")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if res := h.etsiRefusal(specID); res != nil {
+		return res, nil
 	}
 	clause := r.GetString("clause", "")
 	release := r.GetString("release", h.baseline) // default: the baseline norm
@@ -529,6 +561,9 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	specID, err := r.RequireString("spec_id")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if res := h.etsiRefusal(specID); res != nil {
+		return res, nil
 	}
 	// The store applies release bounds and nothing else; a version bound is applied
 	// here, and a bound neither can read is reported rather than dropped in silence.
@@ -765,6 +800,9 @@ func (h *handlers) listReleases(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if res := h.etsiRefusal(specID); res != nil {
+		return res, nil
+	}
 	vs, err := h.specStore(specID).ListReleases(ctx, specID)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("list_releases failed", err), nil
@@ -793,9 +831,18 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	// tie-break handed back the alphabetically first expansion. Each row now also
 	// carries declared_by, the number of deliverables that agree on it, which is
 	// what orders a corpus that publishes no precedence rule of its own.
+	//
+	// ONE HALF FAILING DOES NOT FAIL THE OTHER (half_failures.go). An ETSI read
+	// error used to fail the whole call, taking the 3GPP definition — the canonical
+	// one — with it; a failed half is now named and the other served.
+	var unread []unreadHalf
 	a, err := h.st.ResolveTerm(ctx, term)
 	if err != nil {
-		return mcp.NewToolResultErrorFromErr("resolve_term failed", err), nil
+		if h.etsi == nil {
+			return mcp.NewToolResultErrorFromErr("resolve_term failed", err), nil
+		}
+		unread = append(unread, unreadOf("3gpp", "", err))
+		a = nil
 	}
 	if h.etsi != nil {
 		seen := make(map[[3]string]bool, len(a))
@@ -804,7 +851,11 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 		}
 		e, eErr := h.etsi.ResolveTerm(ctx, term)
 		if eErr != nil {
-			return mcp.NewToolResultErrorFromErr("resolve_term failed on the ETSI half", eErr), nil
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("resolve_term failed on both halves — 3GPP: %s; ETSI: %s",
+					firstLine(err.Error(), errorTextLimit), firstLine(eErr.Error(), errorTextLimit))), nil
+			}
+			unread = append(unread, unreadOf("etsi", "", eErr))
 		}
 		for _, x := range e {
 			if k := ([3]string{x.Term, x.Expansion, x.Domain}); !seen[k] {
@@ -812,6 +863,11 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 				a = append(a, x)
 			}
 		}
+	} else if u, down := h.etsiOpenFailure(); down {
+		unread = append(unread, u)
+	}
+	if a == nil {
+		a = []model.Acronym{}
 	}
 	resp := map[string]any{"term": term, "count": len(a), "matches": a}
 	// Domain subjects may enrich the term (e.g. the LI subject attaches an ASN.1
@@ -823,6 +879,7 @@ func (h *handlers) resolveTerm(ctx context.Context, r mcp.CallToolRequest) (*mcp
 			}
 		}
 	}
+	withUnread(resp, unread)
 	return jsonResult(resp)
 }
 
@@ -845,12 +902,14 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	cites := []model.Citation{}
 	held := map[string]int{}
 	var unread []string
+	var failures []unreadHalf // the same failures, with their errors, for unread_halves
 	var lookupErr error
 	halves := h.evolutionHalves()
 	for _, half := range halves {
 		es, err := half.st.GetEvolutions(ctx, entity)
 		if err != nil {
 			unread = append(unread, half.name)
+			failures = append(failures, unreadOf(half.name, "", err))
 			lookupErr = err
 			continue
 		}
@@ -862,19 +921,30 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 			held[half.name] = n
 		} else {
 			unread = append(unread, half.name)
+			failures = append(failures, unreadOf(half.name, "edge count", err))
 		}
 	}
 	if lookupErr != nil && len(unread) == len(halves) {
 		return mcp.NewToolResultErrorFromErr("trace_evolution failed on every half", lookupErr), nil
 	}
-	return jsonResult(map[string]any{
+	// An ETSI half that could not even be opened is unread too; evolutionNote
+	// already knows how to say so, from the name alone.
+	if f, down := h.etsiOpenFailure(); down {
+		unread = append(unread, f.Half)
+		failures = append(failures, f)
+	}
+	out := map[string]any{
 		"entity":     entity,
 		"count":      len(evos),
 		"evolutions": evos,
 		"citations":  cites,
 		"edges_held": held,
 		"note":       evolutionNote(entity, len(evos), held, unread, h.etsi != nil),
-	})
+	}
+	if len(failures) > 0 {
+		out["unread_halves"] = failures
+	}
+	return jsonResult(out)
 }
 
 // docTypeDefault applies the TS-first doctrine (CLAUDE.md §7: "TS ≠ TR — toujours
@@ -920,6 +990,9 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if res := h.etsiRefusal(specID); res != nil {
+		return res, nil
+	}
 	// ROUTE THE SOURCE SPEC. This handler read h.st unconditionally while get_spec
 	// and trace_clause went through storeFor, so asking an ETSI deliverable for its
 	// references hit the 3GPP store, found no such spec, and answered count 0 —
@@ -947,6 +1020,11 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 	etsiSeen := map[string]bool{}
 	etsiRefs := make([]string, 0)
 	etsiCites := make([]model.Citation, 0)
+	// A reference whose half could not be read keeps its pointer (the folder) but
+	// loses its version — which is what an unindexed spec looks like too. Count
+	// those per half, so the answer can tell the two apart (half_failures.go).
+	lookupFailed := map[string]int{}
+	lookupErr := map[string]error{}
 	for _, c := range clauses {
 		hay := c.Heading + " " + c.Text
 		for _, m := range reSpecRef.FindAllStringSubmatch(hay, -1) {
@@ -954,7 +1032,11 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 			if id != specID && !seen[id] {
 				seen[id] = true
 				refs = append(refs, id)
-				rel, ver, _, _ := h.st.LatestVersion(ctx, id)
+				rel, ver, _, lerr := h.st.LatestVersion(ctx, id)
+				if lerr != nil {
+					lookupFailed["3gpp"]++
+					lookupErr["3gpp"] = lerr
+				}
 				url := model.ArchiveURL(id, ver)
 				if url == "" {
 					url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(id) + "_series/" + id + "/"
@@ -983,21 +1065,47 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 			// folder — cite the pointer, never fabricate a version.
 			cite := model.Citation{SpecID: "ETSI TS " + id, URL: model.EtsiDeliverURL(id, "")}
 			if h.etsi != nil {
+				resolved := false
+				var lerr error
 				for _, dt := range []string{"TS", "EN", "TR"} {
 					full := "ETSI " + dt + " " + id
-					if rel, v, ok, _ := h.etsi.LatestVersion(ctx, full); ok {
+					rel, v, ok, err := h.etsi.LatestVersion(ctx, full)
+					if err != nil {
+						lerr = err
+						continue
+					}
+					if ok {
 						cite = model.Citation{
 							SpecID: full, Release: rel, Version: v,
 							URL: model.SpecURL(full, v), Stable: model.IsStableSpecVersion(full, v),
 						}
+						resolved = true
 						break
 					}
+				}
+				if !resolved && lerr != nil {
+					lookupFailed["etsi"]++
+					lookupErr["etsi"] = lerr
 				}
 			}
 			etsiCites = append(etsiCites, cite)
 		}
 	}
-	return jsonResult(map[string]any{
+	var unread []unreadHalf
+	for _, half := range []string{"3gpp", "etsi"} {
+		if n := lookupFailed[half]; n > 0 {
+			u := unreadOf(half, "", lookupErr[half])
+			u.effect = fmt.Sprintf("%d of the references to it cite its document folder rather than the "+
+				"version this corpus holds — not because the corpus lacks them, but because it could not be asked", n)
+			unread = append(unread, u)
+		}
+	}
+	if u, down := h.etsiOpenFailure(); down && len(etsiRefs) > 0 {
+		u.effect = "the ETSI references below cite the deliverable's folder rather than a version this " +
+			"corpus could have resolved"
+		unread = append(unread, u)
+	}
+	out := map[string]any{
 		"spec_id": specID, "release": release, "version": version,
 		"count": len(refs), "references": refs,
 		// Source-spec citation (where the references were found) + one citation per
@@ -1011,7 +1119,9 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		// ETSI cross-references (separate keys; absent-as-empty, never null).
 		"etsi_references":    etsiRefs,
 		"etsi_ref_citations": etsiCites,
-	})
+	}
+	withUnread(out, unread)
+	return jsonResult(out)
 }
 
 func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1019,8 +1129,15 @@ func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 		Release: r.GetString("release", h.baseline), Series: r.GetString("series", ""),
 		WorkingGroup: r.GetString("working_group", ""), DocType: docTypeDefault(r.GetString("spec_type", "")),
 	})
+	// A failed half is named and the other still served (half_failures.go): the
+	// ETSI catalogue used to vanish on a read error, and a 3GPP error lost it too.
+	var unread []unreadHalf
 	if err != nil {
-		return mcp.NewToolResultErrorFromErr("list_specs failed", err), nil
+		if h.etsi == nil {
+			return mcp.NewToolResultErrorFromErr("list_specs failed", err), nil
+		}
+		unread = append(unread, unreadOf("3gpp", "", err))
+		specs = nil
 	}
 	// Flag specs that also have machine-readable OpenAPI rows (axis #2) so a
 	// client knows it can call search_api for them.
@@ -1037,20 +1154,37 @@ func (h *handlers) listSpecs(ctx context.Context, r mcp.CallToolRequest) (*mcp.C
 	// release space ("ETSI"), so the 3GPP release filter never applies to them —
 	// pass series/WG/doc_type through but clear the release so they always surface.
 	if h.etsi != nil {
-		for _, dt := range etsiDocTypes(r.GetString("spec_type", "")) {
+		types := etsiDocTypes(r.GetString("spec_type", ""))
+		var failed []unreadHalf
+		var lastErr error
+		for _, dt := range types {
 			es, eerr := h.etsi.ListSpecs(ctx, store.SpecFilter{
 				Series: r.GetString("series", ""), WorkingGroup: r.GetString("working_group", ""),
 				DocType: dt,
 			})
 			if eerr != nil {
+				failed = append(failed, unreadOf("etsi", docTypePart(dt), eerr))
+				lastErr = eerr
 				continue
 			}
 			for _, sp := range es {
 				rows = append(rows, specRow{Spec: sp, HasAPI: false})
 			}
 		}
+		if len(failed) == len(types) {
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("list_specs failed on both halves — 3GPP: %s; ETSI: %s",
+					firstLine(err.Error(), errorTextLimit), firstLine(lastErr.Error(), errorTextLimit))), nil
+			}
+			failed = []unreadHalf{unreadOf("etsi", "", lastErr)}
+		}
+		unread = append(unread, failed...)
+	} else if u, down := h.etsiOpenFailure(); down {
+		unread = append(unread, u)
 	}
-	return jsonResult(map[string]any{"count": len(rows), "specs": rows})
+	resp := map[string]any{"count": len(rows), "specs": rows}
+	withUnread(resp, unread)
+	return jsonResult(resp)
 }
 
 // searchAPI answers from the 5GC OpenAPI tables (axis #2). Every hit carries the
@@ -1136,6 +1270,9 @@ func (h *handlers) traceClause(ctx context.Context, r mcp.CallToolRequest) (*mcp
 	specID, err := r.RequireString("spec_id")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if res := h.etsiRefusal(specID); res != nil {
+		return res, nil
 	}
 	clause, err := r.RequireString("clause")
 	if err != nil {
@@ -1232,8 +1369,12 @@ func etsiDocTypes(specType string) []string {
 // One query per type, RRF-merged. RRF is rank-based, so merging two lists from the
 // same engine is the same operation as merging the ETSI list into the 3GPP one —
 // no score calibration is implied between them.
+//
+// A TYPE WHOSE QUERY FAILED IS RETURNED, NOT DROPPED: the TS query can fail while
+// the EN one succeeds, and the answer then holds no TS at all. The error is
+// returned only when EVERY type failed — the whole half is unread then.
 func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
-	topK int, mode string, rerank bool) ([]model.SearchHit, error) {
+	topK int, mode string, rerank bool) ([]model.SearchHit, []unreadHalf, error) {
 	f.Release = ""
 
 	// A spec_id PINS the document, so the type default must not second-guess it.
@@ -1248,6 +1389,7 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 
 	var lists [][]model.SearchHit
 	var firstErr error
+	var failed []unreadHalf
 	for _, dt := range types {
 		ef := f
 		ef.DocType = dt
@@ -1256,6 +1398,7 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 			if firstErr == nil {
 				firstErr = err
 			}
+			failed = append(failed, unreadOf("etsi", docTypePart(dt), err))
 			continue
 		}
 		if len(hits) > 0 {
@@ -1263,14 +1406,14 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 		}
 	}
 	switch {
-	case len(lists) == 0 && firstErr != nil:
-		return nil, firstErr
+	case len(failed) == len(types):
+		return nil, nil, firstErr
 	case len(lists) == 0:
-		return nil, nil
+		return nil, failed, nil
 	case len(lists) == 1:
-		return lists[0], nil
+		return lists[0], failed, nil
 	default:
-		return search.RRF(60, lists...), nil
+		return search.RRF(60, lists...), failed, nil
 	}
 }
 
