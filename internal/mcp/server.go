@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -71,6 +72,9 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		o(h)
 	}
 	if h.warmLog != nil {
+		if h.warmWG != nil {
+			h.warmWG.Add(1)
+		}
 		go h.warmUp()
 	}
 
@@ -226,8 +230,11 @@ type handlers struct {
 	baseline string // release every answer is scoped to ("Rel-17"); "" = latest
 	version  string
 	etsiDown string // why the ETSI half asked for could not be opened; "" = not asked for, or attached
-	// warmLog, when set, warms every half at start and reports through it (WithWarmup).
+	// warmLog, when set, warms every half at start and reports through it; warmCtx
+	// stops that warm-up and warmWG lets the caller wait for it (WithWarmup).
 	warmLog func(format string, args ...any)
+	warmCtx context.Context
+	warmWG  *sync.WaitGroup
 }
 
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
@@ -395,14 +402,15 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	federated := filter.SpecID == "" && filter.Series == ""
 	// ONE cross-encoder pass per call: each half used to rerank its own window
 	// before the rank-based merge discarded those scores (federated_rerank.go).
-	armRerank := h.armRerank(rerank, federated, etsiScoped)
+	rr := h.planRerank(rerank, federated, etsiScoped)
 	if h.etsiEng != nil && etsiScoped {
 		// An ETSI-scoped query goes ONLY to the ETSI index. Its clauses live in the
 		// "ETSI" release space, so the 3GPP baseline release filter must not apply.
 		servingEng = h.etsiEng
-		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, armRerank)
+		hits, unread, err = h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rr)
 	} else {
-		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode, Rerank: armRerank})
+		hits, err = h.eng.Search(ctx, search.Request{Text: q, Filter: filter, TopK: want, Mode: mode,
+			Rerank: rr.arm, DeferRerank: rr.defer_})
 		// Federate the SPLIT ETSI index: when not scoped to a specific 3GPP spec/series,
 		// search it too and RRF-merge so ETSI clauses are searchable, not just reachable
 		// by id. The release filter is cleared for ETSI (its own release space).
@@ -417,7 +425,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 				unread = append(unread, unreadOf("3gpp", "", threeErr))
 				hits = nil
 			}
-			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, armRerank)
+			eh, partial, eerr := h.searchETSI(ctx, q, filter, r.GetString("spec_type", ""), want, mode, rr)
 			unread = append(unread, partial...)
 			switch {
 			case eerr != nil && threeErr != nil:
@@ -436,7 +444,7 @@ func (h *handlers) searchSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.
 	}
 	// The merged head, cross-encoded once (federated_rerank.go). A call that ran
 	// one search reranked inside it, over its own window, exactly as before.
-	if err == nil && rerank && !armRerank {
+	if err == nil && rr.fused {
 		hits = h.rerankFused(ctx, q, hits)
 	}
 	if err != nil {
@@ -1423,7 +1431,7 @@ func etsiDocTypes(specType string) []string {
 // the EN one succeeds, and the answer then holds no TS at all. The error is
 // returned only when EVERY type failed — the whole half is unread then.
 func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter, specType string,
-	topK int, mode string, rerank bool) ([]model.SearchHit, []unreadHalf, error) {
+	topK int, mode string, rr rerankPlan) ([]model.SearchHit, []unreadHalf, error) {
 	f.Release = ""
 
 	// A spec_id PINS the document, so the type default must not second-guess it.
@@ -1442,7 +1450,8 @@ func (h *handlers) searchETSI(ctx context.Context, q string, f store.SpecFilter,
 	for _, dt := range types {
 		ef := f
 		ef.DocType = dt
-		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode, Rerank: rerank})
+		hits, err := h.etsiEng.Search(ctx, search.Request{Text: q, Filter: ef, TopK: topK, Mode: mode,
+			Rerank: rr.arm, DeferRerank: rr.defer_})
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

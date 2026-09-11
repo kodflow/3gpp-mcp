@@ -19,8 +19,8 @@ import (
 // hybrid+rerank took 67-86 s per call, of which 60-62 s were the three passes —
 // against the image's 20 s budget, under which the ETSI passes are skipped
 // anyway, now visibly (internal/search/report.go). One pass over the FUSED head
-// costs a third of that and is the only shape in which a cross-encoded page over
-// both halves fits any budget at all.
+// costs a third of that, and on the judged queries it ranks BETTER: nDCG@5 0.388
+// → 0.660, nDCG@10 0.525 → 0.660, MRR@10 0.667 → 0.750 (both halves, budget off).
 //
 // WHAT CHANGES, AND WHAT DOES NOT. Nothing changes for a server with one half, or
 // for an ETSI-scoped query (one pass either way): the rerank stays inside
@@ -29,20 +29,29 @@ import (
 // score, on the judged queries). On a federated call the window is now the head
 // of the merged list rather than each half's own head, so the cross-encoder
 // compares 3GPP and ETSI candidates against each other instead of ranking them
-// separately and interleaving them. That is a ranking change on the federated
-// path, deliberately: it is the arm doing what the answer says it does.
-// RERANK_WINDOW widens the window for an operator who wants the old breadth.
+// separately and interleaving them. RERANK_WINDOW widens the window.
 
-// armRerank reports whether each half's own Search should run the cross-encoder,
-// or whether this call reranks once after the halves are merged.
-func (h *handlers) armRerank(rerank, federated, etsiScoped bool) bool {
-	return rerank && !h.rerankFusedWanted(rerank, federated, etsiScoped)
+// rerankPlan says where the cross-encoder runs for one call.
+//
+// THE ALWAYS-RERANK TOGGLE IS PART OF THE DECISION, not just the request flag
+// (Qodo, #348): Engine.Search reranks when `r.Rerank || rerankAll`, so a
+// federated call under RERANK_ALL=1 — the profile deploy/labs-8c32g-env.conf
+// ships — would have run a pass per half AND the fused one, four passes where
+// there used to be three. The per-half searches are told to DEFER, which
+// suppresses both, and the decision is applied once, here.
+type rerankPlan struct {
+	arm    bool // each half's own Search reranks its window (one search feeds the page)
+	defer_ bool // the halves rerank nothing; this call reranks the merged head
+	fused  bool // …and it is wanted (asked for, or always-on)
 }
 
-// rerankFusedWanted is true when more than one search feeds the page: the 3GPP
-// half plus the ETSI half.
-func (h *handlers) rerankFusedWanted(rerank, federated, etsiScoped bool) bool {
-	return rerank && h.etsiEng != nil && federated && !etsiScoped
+func (h *handlers) planRerank(rerank, federated, etsiScoped bool) rerankPlan {
+	if h.etsiEng == nil || !federated || etsiScoped {
+		// One search feeds the page: it reranks its own window, as it always did —
+		// including for the always-rerank toggle, which Search reads itself.
+		return rerankPlan{arm: rerank}
+	}
+	return rerankPlan{defer_: true, fused: rerank || h.eng.RerankEvery() || h.etsiEng.RerankEvery()}
 }
 
 // rerankFused re-scores the head of the merged list with the cross-encoder, and

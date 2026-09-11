@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,7 +166,11 @@ func TestWarmupRunsEachHalfAndSaysSo(t *testing.T) {
 		return s
 	}
 	lines := make(chan string, 4)
-	New(open(), "test", "", nil, open(), WithWarmup(func(f string, a ...any) { lines <- fmt.Sprintf(f, a...) }))
+	var warmed sync.WaitGroup
+	ctx, stop := context.WithCancel(context.Background())
+	defer func() { stop(); warmed.Wait() }()
+	New(open(), "test", "", nil, open(),
+		WithWarmup(ctx, &warmed, func(f string, a ...any) { lines <- fmt.Sprintf(f, a...) }))
 	for _, half := range []string{"3gpp", "etsi"} {
 		select {
 		case l := <-lines:
@@ -252,5 +257,40 @@ func TestAFederatedCallSpendsOneBudget(t *testing.T) {
 	// The lexical arm of the second half still runs: degrade, never block.
 	if a := arms["etsi/lexical"]; !a.Ran {
 		t.Fatalf("the ETSI lexical arm = %+v, want it to run whatever the budget", a)
+	}
+}
+
+// ALWAYS-ON RERANK GOES THROUGH THE SAME ONE PASS. Engine.Search reranks when
+// `r.Rerank || rerankAll`, so suppressing only the request flag would leave
+// RERANK_ALL=1 — the profile deploy/labs-8c32g-env.conf ships — running a
+// cross-encoder pass per half AND the fused one: four passes for one call, worse
+// than the three this PR removes (Qodo, #348).
+//
+// Falsified two ways: with planRerank ignoring RerankEvery, no pass runs at all;
+// with the halves not told to defer, three do.
+func TestAlwaysOnRerankStillRunsExactlyOncePerFederatedCall(t *testing.T) {
+	t.Setenv("RERANKER", "lexical")
+	t.Setenv("EMBEDDER", "off")
+	t.Setenv("SEARCH_BUDGET", "0")
+	t.Setenv("RERANK_ALL", "1")
+	c, ctx := armsClient(t)
+	for _, asked := range []bool{false, true} {
+		out := call(t, c, ctx, "search_spec", map[string]any{
+			"query": "registration", "mode": "lexical", "rerank": asked, "spec_type": "any"})
+		ran, n := map[string]bool{}, 0
+		for _, r := range reportsOf(t, out) {
+			for _, a := range r.Arms {
+				if a.Arm == search.ArmRerank {
+					n++
+					if a.Ran {
+						ran[r.Corpus] = true
+					}
+				}
+			}
+		}
+		if !ran["federated"] || n != 1 {
+			t.Fatalf("rerank=%v with RERANK_ALL=1: arms %v over %d pass(es), want exactly one, over the fused head",
+				asked, ran, n)
+		}
 	}
 }
