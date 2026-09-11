@@ -853,11 +853,13 @@ type abbreviationsRegion struct {
 // unnumbered or numbered under it, up to the first numbered clause that is not.
 //
 // UNNUMBERED CLAUSES BELONG TO THE REGION, which is what TS 21.905's letter
-// clauses need, and what the Rust rule no longer grants them: rust/parse's
-// extract_acronyms stops at the first clause that is not a DESCENDANT, and ""
-// is not a descendant of "4" (is_descendant), so under today's rule it reads
-// "4 Abbreviations" — an empty body — and nothing after it. The rows stamped
-// "21" in the corpus predate that rule; this reading does not depend on it.
+// clauses need — and the same rule as rust/parse's extract_acronyms, the
+// writer. From 2026-09-07 to 2026-09-11 the Rust rule walked numbered
+// sub-clauses only: "" is not a descendant of "4", so it read "4 Abbreviations"
+// — an empty body — and nothing after it, 0 rows on every stored version. The
+// rows stamped "21" in the corpus predate that rule, which is why they were
+// still there; the writer grants the continuation again, and the two readers
+// agree on the region once more.
 //
 // A version holding two documents would yield both regions; none of the 16
 // stored versions does — each has the one 28-clause region described in
