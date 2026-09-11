@@ -283,6 +283,15 @@ fn main() -> Result<()> {
                  the ones already there: pass one"
             );
         }
+        // A replace puts a new producer's postings in, so it must say whose: without
+        // --sparse-model the stamp below is skipped and the previous producer's
+        // sparse_model would stay on the new layer, vouching for it.
+        if args.import_sparse_replace && args.sparse_model.is_empty() {
+            anyhow::bail!(
+                "--import-sparse-replace needs --sparse-model: the layer it writes must carry its \
+                 own stamp, not the one of the layer it replaces"
+            );
+        }
         let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
         let mut total = 0usize;
         let mut skipped = 0usize;
@@ -371,6 +380,16 @@ fn main() -> Result<()> {
                 "embed-io: sparse import will apply {to_apply} of {existing_clauses} existing clause(s)                  — term_id index {}",
                 if bulk { "dropped and rebuilt" } else { "kept" }
             );
+        }
+        // THE STAMP GOES FIRST, BEFORE ANYTHING IS CLEARED. The batches below commit
+        // one by one, so a replace that dies leaves part of the new layer — and when
+        // only the code changed, not the model, the stamp already on the corpus is the
+        // same string this run would write. validate --require-sparse and check-data
+        // ask for "some postings + the expected stamp", and would pass the partial
+        // layer. Emptied here, the stamp is written back only once every batch and
+        // the index are in.
+        if args.import_sparse_replace {
+            store.set_meta("sparse_model", "")?;
         }
         if bulk {
             store.drop_sparse_term_index()?;

@@ -215,6 +215,9 @@ fn replace_and_changed_only_are_refused_together() {
             led.to_str().unwrap(),
             "--import-sparse-replace",
             "--import-sparse-changed-only",
+            // A model, so this is refused for the contradiction and nothing else.
+            "--sparse-model",
+            "m",
         ])
         .output()
         .unwrap();
@@ -227,4 +230,105 @@ fn replace_and_changed_only_are_refused_together() {
         vec![1, 2],
         "a refused import still touched the layer"
     );
+}
+
+/// A REPLACE THAT DIES LEAVES NO STAMP TO VOUCH FOR WHAT IT LEFT. The batches
+/// commit one by one, so a failure after the first leaves part of the new layer;
+/// when only the code changed, the stamp on the corpus is the very string this run
+/// would write, and "some postings + the expected stamp" is all the sparse gates
+/// ask. The stamp must be gone until the replace completes.
+#[test]
+fn a_replace_that_dies_leaves_no_stamp_to_vouch_for_the_partial_layer() {
+    let t = Tmp::new("dies");
+    let db = t.db();
+    seed(&db, 5);
+    let led = t.join("l.jsonl");
+    ledger(&led, 1..=5, 0.5);
+    embed_io_ok(&[
+        "--db",
+        &db,
+        "--import-sparse",
+        led.to_str().unwrap(),
+        "--sparse-model",
+        "same-model",
+    ]);
+
+    // One full batch (2 000 lines) commits, then a line that is not UTF-8 kills
+    // the reader.
+    let mut bytes = Vec::new();
+    for i in 1..=2_001u64 {
+        bytes.extend_from_slice(format!("{{\"chunk_id\":{i},\"terms\":[[7,0.9]]}}\n").as_bytes());
+    }
+    bytes.extend_from_slice(b"\xff\xfe\n");
+    std::fs::write(&led, bytes).unwrap();
+    let out = Command::new(embed_io())
+        .args([
+            "--db",
+            &db,
+            "--import-sparse",
+            led.to_str().unwrap(),
+            "--import-sparse-replace",
+            "--sparse-model",
+            "same-model",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "fixture: the replace did not die: {out:?}"
+    );
+    assert_eq!(
+        posted(&db).len(),
+        2_000,
+        "fixture: the replace did not leave a partial layer behind"
+    );
+    let store = store_rs::Store::open_rw(&db).unwrap();
+    assert_eq!(
+        store.get_meta("sparse_model").unwrap(),
+        "",
+        "a replace that died left the stamp on a partial layer: validate --require-sparse \
+         would pass it"
+    );
+}
+
+/// AND A REPLACE MUST SAY WHOSE LAYER IT WRITES: without --sparse-model the stamp
+/// is skipped and the replaced producer's would stay on the new postings.
+#[test]
+fn a_replace_without_a_model_is_refused_before_it_touches_the_layer() {
+    let t = Tmp::new("nomodel");
+    let db = t.db();
+    seed(&db, 3);
+    let led = t.join("l.jsonl");
+    ledger(&led, 1..=3, 0.5);
+    embed_io_ok(&[
+        "--db",
+        &db,
+        "--import-sparse",
+        led.to_str().unwrap(),
+        "--sparse-model",
+        "old",
+    ]);
+    ledger(&led, 1..=1, 0.9);
+
+    let out = Command::new(embed_io())
+        .args([
+            "--db",
+            &db,
+            "--import-sparse",
+            led.to_str().unwrap(),
+            "--import-sparse-replace",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "embed-io replaced the layer without --sparse-model"
+    );
+    assert_eq!(
+        posted(&db),
+        vec![1, 2, 3],
+        "a refused replace still touched the layer"
+    );
+    let store = store_rs::Store::open_rw(&db).unwrap();
+    assert_eq!(store.get_meta("sparse_model").unwrap(), "old");
 }

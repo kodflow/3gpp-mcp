@@ -456,3 +456,40 @@ func TestSparseProducerStateIsPersistedAndAnUnreadableOneReencodes(t *testing.T)
 		t.Fatal("an unreadable producer record was read as a current one")
 	}
 }
+
+// AN UNREADABLE LEDGER SIDECAR IS NOT AN ABSENT ONE. Absent is a ledger from before
+// the sidecar existed, which the incremental path adopts; unreadable says nothing
+// about who appended to the ledger, and adopting it would relabel another
+// producer's postings as the current one's. It stops the step instead, and leaves
+// the ledger and the sidecar as they were.
+func TestAnUnreadableLedgerSidecarStopsTheStepInsteadOfBeingAdopted(t *testing.T) {
+	c, _ := newTestCtx(t)
+	cur := producerFixture("m1", producerFiles)
+	ledger := filepath.Join(c.Local, "vecs", "sparse.jsonl")
+	write(t, ledger, "{\"chunk_id\":1,\"h\":\"x\",\"terms\":[]}\n")
+	// A directory where the sidecar file should be: present, and not readable as one.
+	if err := os.MkdirAll(sparseLedgerProducerPath(ledger), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, adopt := range []bool{true, false} {
+		if err := ensureSparseLedgerProducer(c, ledger, cur, adopt); err == nil {
+			t.Errorf("adopt=%v: an unreadable sidecar was taken as an absent one", adopt)
+		}
+		if !fileNonEmpty(ledger) {
+			t.Fatalf("adopt=%v: the ledger was moved although nothing could say whose it is", adopt)
+		}
+		if st, err := os.Stat(sparseLedgerProducerPath(ledger)); err != nil || !st.IsDir() {
+			t.Fatalf("adopt=%v: the unreadable sidecar was overwritten", adopt)
+		}
+	}
+	// And the absent case still adopts, which is what the first run relies on.
+	if err := os.Remove(sparseLedgerProducerPath(ledger)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSparseLedgerProducer(c, ledger, cur, true); err != nil {
+		t.Fatalf("an absent sidecar on the incremental path was refused: %v", err)
+	}
+	if !fileNonEmpty(ledger) {
+		t.Fatal("an absent sidecar on the incremental path archived the ledger it adopts")
+	}
+}
