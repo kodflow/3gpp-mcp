@@ -4,7 +4,15 @@
 # ENTIRELY ON THIS MACHINE, with no Docker, no WSL and no CI runner.
 #
 #   scripts/local/build-image.sh [--tag ghcr.io/kodflow/3gpp-mcp:latest]
+#                                [--embed-floor Rel-99]
 #                                [--no-push] [--no-corpus] [--no-models]
+#   scripts/local/build-image.sh --print-toolchain
+#
+# --embed-floor is the release floor of the corpus contract (EMBED_FLOOR in the
+# environment, Rel-99 by default). Under `goal` the publish step always passes the
+# floor its own validate step applied, so the two gates hold the corpus to ONE
+# contract; see section 5. --print-toolchain prints the version of every tool that
+# writes bytes of the image and exits before touching anything; see image_toolchain.
 #
 # WHY THIS EXISTS. The image used to be baked by two GitHub workflows that moved
 # ~14 GB per run. Those are gone: the build happens here and the result is pushed
@@ -41,18 +49,27 @@ cd "$ROOT"
 
 TAG="${IMAGE_TAG:-ghcr.io/kodflow/3gpp-mcp:latest}"
 BASE="${IMAGE_BASE:-debian:bookworm-slim}"
+# The contract's embed floor, ONE value from here to the gate in section 5. The
+# flag wins over the environment, and an empty --embed-floor is kept as empty —
+# data-contract.sh then applies no floor, i.e. every release — which the
+# environment cannot express (`:-` reads an empty EMBED_FLOOR as unset). That is
+# why the publish step passes a flag and not a variable.
+EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}"
 PUSH=1
 WITH_CORPUS=1
 WITH_MODELS=1
+PRINT_TOOLCHAIN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="$2"; shift 2 ;;
     --base) BASE="$2"; shift 2 ;;
+    --embed-floor) EMBED_FLOOR="$2"; shift 2 ;;
+    --print-toolchain) PRINT_TOOLCHAIN=1; shift ;;
     --no-push) PUSH=0; shift ;;
     --no-corpus) WITH_CORPUS=0; shift ;;
     --no-models) WITH_MODELS=0; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -103,24 +120,114 @@ field() {
 
 # ---- toolchain ---------------------------------------------------------------
 
+# Everything is RESOLVED first and checked after, so that --print-toolchain reports
+# the very tools the build below runs — this resolution, not a copy of it — and
+# can still answer on a machine that lacks one of them.
 CRANE="$ROOT/.local/bin/crane.exe"
 [ -x "$CRANE" ] || CRANE="$(command -v crane || true)"
-[ -n "$CRANE" ] && [ -x "$CRANE" ] || die "crane not found (.local/bin/crane.exe)"
 
 ZIG_DIR="$(ls -d "$ROOT"/.local/toolchain/zig-* 2>/dev/null | head -1 || true)"
-[ -n "$ZIG_DIR" ] || die "zig not found under .local/toolchain (see scripts/local/fetch-linux-toolchain.sh)"
+ZIG=""
+[ -z "$ZIG_DIR" ] || ZIG="$(cd "$ZIG_DIR" && pwd -W 2>/dev/null || echo "$ZIG_DIR")/zig.exe"
 export ZIG
-ZIG="$(cd "$ZIG_DIR" && pwd -W 2>/dev/null || echo "$ZIG_DIR")/zig.exe"
 export ZIG_TARGET="${ZIG_TARGET:-x86_64-linux-gnu.2.36}"
 
 SYSROOT="$ROOT/.local/toolchain/sysroot-linux/lib"
 SYSROOT_W="$(cd "$ROOT/.local/toolchain/sysroot-linux/lib" 2>/dev/null && (pwd -W 2>/dev/null || pwd) || true)"
-[ -s "$SYSROOT/libstdc++.so.6" ] && [ -s "$SYSROOT/libgomp.so.1" ] \
-  || die "Debian libstdc++.so.6 / libgomp.so.1 missing under $SYSROOT (see scripts/local/fetch-linux-toolchain.sh)"
 
 # shellcheck source=scripts/local/toolchain-env.sh
 . "$ROOT/scripts/local/toolchain-env.sh" >/dev/null 2>&1 || true
 export PATH="$ROOT/.local/toolchain/cargo/bin:$PATH"
+
+# image_toolchain — the version of every tool that WRITES BYTES OF THIS IMAGE, one
+# `name=value` line each, "absent" for one this machine does not have.
+#
+# The publish step folds these lines into its fingerprint (internal/goal,
+# image_toolchain.go), because each can move a digest while no source file does:
+#
+#   go       compiles imgtar, whose compress/gzip writes every layer blob — a Go
+#            whose gzip emits other bytes gives the 42 GB of corpus layers new
+#            digests, and the registry dedupes nothing: one full re-upload — and
+#            compiles the server binary of layer 60.
+#   zig      compiles and links that binary (cgo, through scripts/local/zigcc).
+#   rustc    compile libembed_core.so, the cdylib layer 60 ships.
+#   cargo
+#   crane    writes the image config and the manifest, so it decides the digest
+#            consumers pull.
+#   sysroot  the Debian libstdc++.so.6 / libgomp.so.1 the binary links against and
+#            layer 10 ships. fetch-linux-toolchain.sh fetches them only when they
+#            are absent, so a new pin in that script changes nothing on disk: the
+#            files' content is what ships, and what is recorded.
+#
+# Read HERE, after the resolution above, so the answer is the go, cargo and zig this
+# script then runs: the same PATH, the same working directory (rustup and go pick
+# their toolchain from it), the same environment.
+#
+# Fails (non-zero) when a tool is PRESENT and will not say its version: recording
+# "absent" for a cargo that is merely broken today would give the next plan a
+# different fingerprint and replay the whole publish once it answers again.
+image_toolchain() {
+  local v rc=0
+  v="$(tool_version go version)" || rc=1
+  printf 'go=%s\n' "$v"
+  v="$(tool_version "$ZIG" version)" || rc=1
+  printf 'zig=%s\n' "$v"
+  v="$(tool_version rustc --version)" || rc=1
+  printf 'rustc=%s\n' "$v"
+  v="$(tool_version cargo --version)" || rc=1
+  printf 'cargo=%s\n' "$v"
+  v="$(tool_version "$CRANE" version)" || rc=1
+  printf 'crane=%s\n' "$v"
+  printf 'sysroot=%s\n' "$(sysroot_identity)"
+  return "$rc"
+}
+
+# tool_version <cmd…> — its first line of output; "absent" when there is no such
+# command; a failure when there is one and it gives no version.
+tool_version() {
+  local out
+  if [ -z "$1" ] || ! command -v "$1" >/dev/null 2>&1; then
+    printf 'absent'
+    return 0
+  fi
+  if out="$("$@" 2>/dev/null)" && out="${out//$'\r'/}" && [ -n "$out" ]; then
+    printf '%s' "${out%%$'\n'*}"
+    return 0
+  fi
+  printf 'build-image: %s is on this machine and `%s` gives no version\n' "$1" "$*" >&2
+  printf 'unreadable'
+  return 1
+}
+
+# sysroot_identity — the sha256 of the two libraries the image ships from the sysroot.
+sysroot_identity() {
+  local f sum out=""
+  for f in libstdc++.so.6 libgomp.so.1; do
+    [ -s "$SYSROOT/$f" ] || { printf 'absent'; return 0; }
+    sum="$(sha256sum < "$SYSROOT/$f")"
+    out="$out $f=${sum%% *}"
+  done
+  printf '%s' "${out# }"
+}
+
+# NOTHING ABOVE THIS LINE WRITES, AND NOTHING BELOW IT RUNS IN THIS MODE. The plan
+# runs it (publish's fingerprint), possibly while a publish holds .local/image —
+# which the first command after the checks deletes.
+# TestPrintToolchainExitsBeforeTheBuildWrites holds the order.
+if [ "$PRINT_TOOLCHAIN" = 1 ]; then
+  image_toolchain || exit 3
+  exit 0
+fi
+
+[ -n "$CRANE" ] && [ -x "$CRANE" ] || die "crane not found (.local/bin/crane.exe)"
+# The EXECUTABLE, not the directory: a stale zig-* left without its zig.exe passed a
+# directory check, was reported zig=absent by --print-toolchain, and failed later at
+# the first compile (review of #330, CodeRabbit).
+[ -n "$ZIG" ] && [ -x "$ZIG" ] \
+  || die "zig not found under .local/toolchain (see scripts/local/fetch-linux-toolchain.sh)"
+[ -s "$SYSROOT/libstdc++.so.6" ] && [ -s "$SYSROOT/libgomp.so.1" ] \
+  || die "Debian libstdc++.so.6 / libgomp.so.1 missing under $SYSROOT (see scripts/local/fetch-linux-toolchain.sh)"
+say "toolchain: $(image_toolchain | paste -sd' ' -)"
 
 STAGE="$ROOT/.local/image"
 ROOTFS="$STAGE/rootfs"
@@ -340,8 +447,18 @@ if [ "$WITH_CORPUS" = 1 ]; then
     # fingerprint; a label here must not be a second one.
     # DATA_ETSI_DB points --require-etsi at the local layout rather than the
     # image's absolute path.
+    #
+    # THE FLOOR IS THE ONE THE PIPELINE VALIDATED WITH. It used to be
+    # ${EMBED_FLOOR:-Rel-99} here while `goal` validated at ${GOAL_EMBED_FLOOR:-Rel-99}:
+    # two knobs for one contract. Exporting either alone held the image to a
+    # contract the pipeline had not checked — a higher floor checked less than
+    # validate had, a lower one failed a corpus embed was never asked to cover —
+    # and made validate's certificate refuse to match, re-running
+    # this 8-minute gate for nothing. The publish step now passes --embed-floor with
+    # the floor validate applied (and refuses an EMBED_FLOOR that disagrees with it),
+    # so under `goal` EMBED_FLOOR only matters when it is the same value.
     CONTRACT_FLAGS="$(DATA_ETSI_DB="$ROOT/data/etsi.duckdb" \
-                      DATA_EMBED_FLOOR="${EMBED_FLOOR:-Rel-99}" \
+                      DATA_EMBED_FLOOR="$EMBED_FLOOR" \
                       bash scripts/data-contract.sh)" \
       || die "scripts/data-contract.sh refused DATA_CONTRACT='${DATA_CONTRACT:-}'"
     say "corpus contract (DATA_CONTRACT='${DATA_CONTRACT:-}', empty = its default): $CONTRACT_FLAGS"

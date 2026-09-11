@@ -130,6 +130,16 @@ stale or unbootable while every local gate was green. It now depends on `smoke`
 **and** `index-etsi` — both halves frozen and proved — and `make plan` states
 whether the published image is behind the corpus before anything runs.
 
+Two things in its fingerprint are not files. **The embed floor**: the image is
+held to the floor `validate` applied (`--embed-floor` / `GOAL_EMBED_FLOOR`), which
+`publish` hands `build-image.sh` as `--embed-floor`; an `EMBED_FLOOR` exported with
+another value refuses the plan instead of publishing under a contract nobody
+checked (`EMBED_FLOOR` still sets the floor of a standalone `make image`). **The
+toolchain that writes the image** — go (it compiles imgtar, whose gzip writes every
+layer blob: a Go upgrade can re-upload the whole corpus), zig, rustc, cargo, crane
+and the Debian sysroot libraries — as `build-image.sh --print-toolchain` reports
+them, so a toolchain upgrade replays `publish` and the record says why.
+
 ---
 
 ## What makes it resumable
