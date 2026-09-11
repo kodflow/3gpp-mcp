@@ -37,6 +37,10 @@ func guardFixture(t *testing.T, stale int, silent bool) string {
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	// The TS 21.905 every real corpus holds, declaring none of these keys: a run
+	// that cannot read it releases nothing, and no guard verdict below could be
+	// reached on a removal.
+	withTS21905(t, s, ts21905Min)
 	for _, id := range []string{"23.501", "29.999"} {
 		if err := s.UpsertSpec(model.Spec{SpecID: id, Series: id[:2], DocType: "TS"}); err != nil {
 			t.Fatal(err)
@@ -101,7 +105,7 @@ func TestTheGuardRefusesASweepThatSilencesACataloguedSpec(t *testing.T) {
 	if cerr == nil || cerr.Error() != err.Error() {
 		t.Errorf("--check-only reached a different verdict than the write:\n write: %v\n check: %v", err, cerr)
 	}
-	if crep.Guard != "refused" || len(crep.Vanished) != 1 || crep.Vanished[0] != (VanishedSpec{"29.999", 2, 2}) {
+	if crep.Guard != "refused" || len(crep.Vanished) != 1 || crep.Vanished[0] != (VanishedSpec{Spec: "29.999", Owned: 2, Removed: 2}) {
 		t.Errorf("--check-only did not report the silenced spec: guard=%q vanished=%+v", crep.Guard, crep.Vanished)
 	}
 	if got := terms(t, path); got["ZZA"] != "29.999" {

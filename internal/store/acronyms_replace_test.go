@@ -58,7 +58,7 @@ func keyOf(a model.Acronym) acronymKey { return acronymKey{a.Term, a.Expansion, 
 func TestASeededRowNoSpecDeclaresAnyMoreIsRemoved(t *testing.T) {
 	s := openScratch(t)
 	before := []model.Acronym{amf, uaClean, uaWithCRMarkers, multicastMBS, multiPartSpec}
-	if _, err := s.ReplaceSeededAcronyms(before, nil); err != nil {
+	if _, err := s.ReplaceSeededAcronyms(before, cleared, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,7 +66,7 @@ func TestASeededRowNoSpecDeclaresAnyMoreIsRemoved(t *testing.T) {
 
 	// The check-only view of the same sweep must predict exactly the removal the
 	// write then performs — and write nothing while doing it.
-	plan, err := s.PlanSeededAcronyms(after)
+	plan, err := s.PlanSeededAcronyms(after, cleared)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestASeededRowNoSpecDeclaresAnyMoreIsRemoved(t *testing.T) {
 		t.Fatalf("PlanSeededAcronyms changed the table: %d rows, want %d", got, len(before))
 	}
 
-	diff, err := s.ReplaceSeededAcronyms(after, nil)
+	diff, err := s.ReplaceSeededAcronyms(after, cleared, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestASeededRowNoSpecDeclaresAnyMoreIsRemoved(t *testing.T) {
 	}
 
 	// And the replacement converges: the same sweep again is a no-op.
-	if again, err := s.ReplaceSeededAcronyms(after, nil); err != nil {
+	if again, err := s.ReplaceSeededAcronyms(after, cleared, nil); err != nil {
 		t.Fatal(err)
 	} else if again.Changed() {
 		t.Errorf("re-running the sweep that removed the rows reported a change: %+v", again)
@@ -147,11 +147,11 @@ func TestRowsTheSeedDoesNotOwnSurviveTheReplacement(t *testing.T) {
 		VALUES ('PLMN', 'Public Land Mobile Network', '', 'Rel-8', 'Rel-8', NULL, NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, nil); err != nil {
+	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, cleared, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf}, nil)
+	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf}, cleared, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestAnIdenticalSweepLeavesTheFileByteIdentical(t *testing.T) {
 		FirstRelease: "Rel-19", LastRelease: "Rel-19", SourceSeries: "21"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReplaceSeededAcronyms(sweep, nil); err != nil {
+	if _, err := s.ReplaceSeededAcronyms(sweep, cleared, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().Exec(`CHECKPOINT`); err != nil {
@@ -208,7 +208,7 @@ func TestAnIdenticalSweepLeavesTheFileByteIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	diff, err := s.ReplaceSeededAcronyms(sweep, nil)
+	diff, err := s.ReplaceSeededAcronyms(sweep, cleared, nil)
 	if err != nil {
 		_ = s.Close()
 		t.Fatal(err)
@@ -234,10 +234,10 @@ func TestAnIdenticalSweepLeavesTheFileByteIdentical(t *testing.T) {
 // into a glossary with no spec-declared row left in it.
 func TestAnEmptyBatchRemovesNothing(t *testing.T) {
 	s := openScratch(t)
-	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, nil); err != nil {
+	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, cleared, nil); err != nil {
 		t.Fatal(err)
 	}
-	diff, err := s.ReplaceSeededAcronyms(nil, nil)
+	diff, err := s.ReplaceSeededAcronyms(nil, cleared, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestAnEmptyBatchRemovesNothing(t *testing.T) {
 func TestABatchRowWithForeignProvenanceIsRefused(t *testing.T) {
 	s := openScratch(t)
 	_, err := s.ReplaceSeededAcronyms([]model.Acronym{amf,
-		{Term: "EIR", Expansion: "Equipment Identity Centre", SourceSeries: "21"}}, nil)
+		{Term: "EIR", Expansion: "Equipment Identity Centre", SourceSeries: "21"}}, cleared, nil)
 	if err == nil || !strings.Contains(err.Error(), "not a spec id") {
 		t.Fatalf("a batch row stamped %q was accepted (err=%v): it would outlive every later sweep",
 			"21", err)

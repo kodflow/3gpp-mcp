@@ -23,6 +23,7 @@ package glossaryseed
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -123,11 +124,26 @@ func removalBound(owned int) int {
 }
 
 // massRemoval says why a diff would be refused, or "" when it passes.
+//
+// RULE 2 COUNTS EVERY ROW THE SWEEP DROPPED — store.GlossaryDiff.Released — not
+// only the rows the write deletes. Since 2026-09-11 a dropped row TS 21.905 still
+// declares is handed back to it rather than deleted, and one the run could not
+// clear is withheld; before that, every one of them was a removal. Counting all
+// three keeps this verdict, on any given sweep, exactly what it was before the
+// hand-back existed: the bound was derived from what one spec can DROP, and a
+// sweep that lost half its specs is no less broken because TS 21.905 happens to
+// declare many of their keys.
 func massRemoval(d store.GlossaryDiff) string {
 	var why []string
-	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
-		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
-			n, d.Owned, bound))
+	if n, bound := d.Released(), removalBound(d.Owned); n > bound {
+		// The words the guard has always used, while they are the whole truth.
+		what := fmt.Sprintf("remove %d", n)
+		if n != len(d.Removed) {
+			what = fmt.Sprintf("release %d (%d removed, %d handed back to TS 21.905, %d withheld)",
+				n, len(d.Removed), len(d.Restored), len(d.Withheld))
+		}
+		why = append(why, fmt.Sprintf("it would %s of the %d seeded rows, above the bound of %d",
+			what, d.Owned, bound))
 	}
 	if len(d.Vanished) > 0 {
 		// The first twenty by name; the JSON report carries every one. A broken
@@ -174,16 +190,31 @@ type Report struct {
 	// has to be pushed again.
 	Changed bool `json:"changed"`
 	// Rewritten counts the rows the write inserted or rewrote, Removed the seeded
-	// rows it took out because no spec declares them any more — and, on
-	// --check-only, what the write WOULD do. The two together are exactly what
+	// rows it took out because no spec declares them any more, and Restored those
+	// it handed back to TS 21.905 because TS 21.905 still does — and, on
+	// --check-only, what the write WOULD do. The three together are exactly what
 	// Changed summarises, so a check-only run answers the push question before
 	// anything is written.
 	Rewritten int `json:"rewritten_total"`
 	Removed   int `json:"removed_total"`
+	Restored  int `json:"restored_total"`
 	// RemovedRows names every removed row. A deletion nobody can list is the
 	// silent failure this package keeps refusing: the count alone would say that
 	// the glossary shrank, never what a reader can no longer find.
 	RemovedRows []RemovedRow `json:"removed,omitempty"`
+	// RestoredRows names every row handed back, with the spec that held it until
+	// now as Source. The key stays in the glossary; what moves is its precedence
+	// — it now ranks as the general vocabulary, which is what it is.
+	RestoredRows []RemovedRow `json:"restored,omitempty"`
+	// Withheld counts the rows no spec declares any more that the run left in
+	// place because TS 21.905 could not be read (General.Unread), and WithheldRows
+	// names them. Nothing is written for them: they are what the table already
+	// holds, so they do not make a run Changed.
+	Withheld     int          `json:"withheld_total"`
+	WithheldRows []RemovedRow `json:"withheld,omitempty"`
+	// General is what the run read of TS 21.905 — the evidence every release was
+	// checked against. See readGeneral.
+	General GeneralReport `json:"ts21905"`
 	// The mass-removal guard's inputs and verdict — see removalBound. Guard is
 	// "pass", "refused" or "overridden" (refused, and let through by
 	// --allow-mass-removal), and --check-only reaches the same verdict as the
@@ -196,19 +227,36 @@ type Report struct {
 	Error        string         `json:"error,omitempty"`
 }
 
-// RemovedRow is one seeded row a run took out of the glossary.
+// RemovedRow is one seeded row a run took out of the glossary — or, listed as
+// restored or withheld, one it handed back to TS 21.905 or left where it was.
 type RemovedRow struct {
 	Term      string `json:"term"`
 	Expansion string `json:"expansion"`
 	Source    string `json:"source"`
 }
 
-// VanishedSpec is a spec still in the catalogue that the sweep no longer hears
-// from: how many rows it owns, and how many of them the write would delete.
-type VanishedSpec struct {
+// GeneralReport is what a run learned of TS 21.905.
+type GeneralReport struct {
 	Spec    string `json:"spec"`
-	Owned   int    `json:"owned"`
-	Removed int    `json:"removed"`
+	Version string `json:"version,omitempty"`
+	Release string `json:"release,omitempty"`
+	// Pairs is how many (term, expansion) pairs the Abbreviations region yields;
+	// Min is the floor under which that is read as a broken read.
+	Pairs int `json:"pairs"`
+	Min   int `json:"min_required"`
+	// Unread says why TS 21.905 could not be read in full. When it is set, no
+	// seeded row is released: each one the sweep dropped is withheld instead.
+	Unread string `json:"unread,omitempty"`
+}
+
+// VanishedSpec is a spec still in the catalogue that the sweep no longer hears
+// from: how many rows it owns, how many of them the write would delete, and how
+// many it would hand back to TS 21.905.
+type VanishedSpec struct {
+	Spec     string `json:"spec"`
+	Owned    int    `json:"owned"`
+	Removed  int    `json:"removed"`
+	Restored int    `json:"restored"`
 }
 
 // Options is what a run is asked to do.
@@ -327,6 +375,21 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 			rep.Floor, strings.Join(specIDs, ","), min, len(todo), rep.Parsed)
 	}
 
+	// TS 21.905, READ BEFORE ANYTHING IS PLANNED, on --check-only too — the plan
+	// decides from it which dropped rows are removed and which are handed back, so
+	// a check that skipped it would predict a different write.
+	//
+	// A READ THAT FAILS IS NOT AN ERROR HERE, and not a success either: it comes
+	// back unread, and the store then releases nothing (store.GeneralVocabulary).
+	// Failing the run would stop the whole enrich over rows that were never going
+	// to be deleted; succeeding with an empty set would delete every one of them.
+	// Only a query that errors — a corpus the store cannot read at all — fails.
+	general, gr, err := readGeneral(ctx, s)
+	rep.General = gr
+	if err != nil {
+		return rep, err
+	}
+
 	// TALLY FIRST: declared_by is HOW MANY specs declare this exact expansion,
 	// and it is what lets a corpus-wide sweep rank correctly. Counting specs,
 	// not rows: a spec present at a dozen releases declares its vocabulary
@@ -369,7 +432,8 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 				// The owning SPEC, not its two-digit series: it is what makes
 				// the precedence above auditable, and it is what marks the row as
 				// this package's to replace (store.seededSource). The series form
-				// belongs to TS 21.905's rows, which this package never removes.
+				// belongs to TS 21.905's rows, which this package never removes —
+				// and writes only to hand a row back to TS 21.905 (readGeneral).
 				SourceSeries: todo[i].sr.Spec,
 			})
 		}
@@ -382,7 +446,8 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 	approve := func(d store.GlossaryDiff) error {
 		rep.Owned, rep.RemovalBound = d.Owned, removalBound(d.Owned)
 		for _, v := range d.Vanished {
-			rep.Vanished = append(rep.Vanished, VanishedSpec{v.Spec, v.Owned, v.Removed})
+			rep.Vanished = append(rep.Vanished, VanishedSpec{Spec: v.Spec, Owned: v.Owned,
+				Removed: v.Removed, Restored: v.Restored})
 		}
 		why := massRemoval(d)
 		switch {
@@ -401,7 +466,7 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 
 	var diff store.GlossaryDiff
 	if checkOnly {
-		if diff, err = s.PlanSeededAcronyms(rows); err == nil {
+		if diff, err = s.PlanSeededAcronyms(rows, general); err == nil {
 			err = approve(diff)
 		}
 	} else {
@@ -415,7 +480,7 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 		// writes nothing — which is the point, since one changed byte in this
 		// 23 GB file is an 11 GB push — and a run that announced "written=679"
 		// either way would hide exactly the thing worth knowing.
-		if diff, err = s.ReplaceSeededAcronyms(rows, approve); err == nil {
+		if diff, err = s.ReplaceSeededAcronyms(rows, general, approve); err == nil {
 			rep.Applied = true
 			rep.Changed = diff.Changed()
 			for i := range todo {
@@ -430,6 +495,14 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 	rep.Removed = len(diff.Removed)
 	for _, a := range diff.Removed {
 		rep.RemovedRows = append(rep.RemovedRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
+	}
+	rep.Restored = len(diff.Restored)
+	for _, a := range diff.Restored {
+		rep.RestoredRows = append(rep.RestoredRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
+	}
+	rep.Withheld = len(diff.Withheld)
+	for _, a := range diff.Withheld {
+		rep.WithheldRows = append(rep.WithheldRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
@@ -572,6 +645,154 @@ func readSpec(ctx context.Context, s *store.Store, specID string) (SpecReport, [
 	sr.Clause = path
 	sr.Parsed = len(entries)
 	return sr, entries, nil
+}
+
+// ts21905 is the vocabulary spec, whose rows the Rust ingest writes into the
+// glossary stamped "21" (rust/parse/src/glossary.rs, GLOSSARY_SPEC_ID).
+//
+// THIS PACKAGE NEVER MINES IT — readSpec looks under clause 3 and TS 21.905's
+// abbreviations are clause 4, so the sweep lists it and skips it, "no clause
+// headed Abbreviations" — and that is right: its rows are its writer's, not
+// seeded ones. What this package asks of it is narrower and comes from the
+// replacement: before a seeded row is released, does TS 21.905 still declare its
+// key? See readGeneral.
+const ts21905 = "21.905"
+
+// ts21905Min is the floor under which a read of TS 21.905 is treated as broken,
+// and every release is withheld rather than decided on it.
+//
+// MEASURED 2026-09-11 on every version the corpus holds, with the rule
+// readGeneral applies: the vocabulary has NEVER SHRUNK across its 16 stored
+// versions — 963 pairs at v4.5.0 (Rel-4), 1 086 at v9.4.0, 1 242 from v10.3.0
+// (Rel-10) onwards, 1 285 at v19.2.0. 1 200 is 93 % of today's figure and below
+// every version from v10.3.0 (Rel-10) on, so an editorial change does not trip it;
+// losing any one of the four largest letter clauses (S 128, C 126, P 102, M 97)
+// does, and so does a read that finds the region and parses nothing.
+//
+// The floor errs HIGH on purpose, because its two failures do not cost the same.
+// Tripping it on a sound read withholds releases: stale rows stay one more run,
+// which is what the additive writer did for ever. Passing a broken read lets a
+// partial set "clear" keys TS 21.905 does declare, and those rows are deleted.
+const ts21905Min = 1200
+
+// readGeneral reads what TS 21.905 declares NOW — the evidence a release is
+// checked against — and says why when it cannot.
+//
+// WHAT IS READ: the newest version's region under the clause headed exactly
+// "Abbreviations" (the miner's own heading test), which in TS 21.905 is not one
+// clause but 28: "4 Abbreviations" with an empty body, then "0-9" and "A" to "Z"
+// as UNNUMBERED clauses — clause_path "" — up to "5 Equations". Measured on all
+// 16 stored versions: that shape, every time.
+//
+// DOCUMENT ORDER IS THE CHUNK ID, sorted here. GetClauses orders by
+// `len(clause_path), clause_path`, which puts the 27 letter clauses — and the
+// Contents and Foreword before clause 1 — in one tie that the table's physical
+// order decides; readSpec paid for that tie once already. The chunk id is the
+// clause's position in its document and survives compaction.
+//
+// WHAT IS PARSED: every clause of the region with internal/abbrev's rules —
+// Parse AND ParseLines — so a key here has exactly the shape of the keys the
+// seeded rows carry. Both, because the wrap rule reads TS 21.905 wrongly where a
+// cell's text sits on its own untabbed line: measured on v19.2.0, Parse alone
+// yields 1 264 pairs and misses 4 of the 896 seeded rows whose key TS 21.905's
+// writer stored (SN, OSP, REQ, X2-U — see abbrev.ParseLines); with ParseLines
+// the set is 1 285 pairs and misses none.
+//
+// THE UNION ERRS TOWARD SPARING A ROW, and that is its cost as well as its
+// point. A pair only Parse yields can be one of its misreadings — "OSP = Octet
+// Stream Protocol Service" — and a seeded row carrying exactly that key would be
+// handed back rather than removed. None does: of the 905 seeded rows whose key
+// is in the union, 896 carry a pair TS 21.905's writer stored and the other 9 a
+// pair it prints but its writer could not read — a term with a space ("JAR
+// file", "WLAN UE"), an ampersand ("O&M"), or a whole wrapped expansion where the
+// writer kept the first line ("ADM = Access condition to an EF which is under
+// the control of the authority which creates this file").
+//
+// A missing spec, a missing region or a set under ts21905Min comes back UNREAD —
+// never as an empty set, which the store would read as "TS 21.905 declares none
+// of these" and release every row on. Only a query error is returned as one.
+func readGeneral(ctx context.Context, s *store.Store) (store.GeneralVocabulary, GeneralReport, error) {
+	gr := GeneralReport{Spec: ts21905, Min: ts21905Min}
+	clauses, err := s.GetClauses(ctx, ts21905, "", "")
+	if err != nil {
+		return store.GeneralVocabulary{}, gr, fmt.Errorf("%s: %w", ts21905, err)
+	}
+	if len(clauses) == 0 {
+		gr.Unread = "not in this corpus"
+		return store.GeneralVocabulary{}, gr, nil
+	}
+	region := generalRegion(clauses)
+	gr.Version = region.version
+	if len(region.clauses) == 0 {
+		gr.Unread = "no clause headed \"Abbreviations\" in v" + region.version
+		return store.GeneralVocabulary{}, gr, nil
+	}
+	gr.Release = region.clauses[0].Release
+	pairs := map[store.GeneralPair]bool{}
+	for _, c := range region.clauses {
+		for _, e := range append(abbrev.Parse(c.Text), abbrev.ParseLines(c.Text)...) {
+			pairs[store.GeneralPair{Term: e.Term, Expansion: e.Expansion}] = true
+		}
+	}
+	gr.Pairs = len(pairs)
+	if gr.Pairs < ts21905Min {
+		gr.Unread = fmt.Sprintf("v%s yields %d pairs, below the floor of %d — a broken read, "+
+			"not a smaller vocabulary", region.version, gr.Pairs, ts21905Min)
+		return store.GeneralVocabulary{}, gr, nil
+	}
+	return store.GeneralVocabulary{Read: true, Pairs: pairs, Release: gr.Release}, gr, nil
+}
+
+// abbreviationsRegion is the part of one version of a spec its Abbreviations
+// heading governs.
+type abbreviationsRegion struct {
+	version string
+	clauses []model.Clause
+}
+
+// generalRegion returns the newest version's Abbreviations region, in document
+// order: each clause headed "Abbreviations", and every clause after it that is
+// unnumbered or numbered under it, up to the first numbered clause that is not.
+//
+// UNNUMBERED CLAUSES BELONG TO THE REGION, which is what TS 21.905's letter
+// clauses need, and what the Rust rule no longer grants them: rust/parse's
+// extract_acronyms stops at the first clause that is not a DESCENDANT, and ""
+// is not a descendant of "4" (is_descendant), so under today's rule it reads
+// "4 Abbreviations" — an empty body — and nothing after it. The rows stamped
+// "21" in the corpus predate that rule; this reading does not depend on it.
+//
+// A version holding two documents yields both regions. Over-reading can only
+// spare a row; under-reading is what deletes one.
+func generalRegion(clauses []model.Clause) abbreviationsRegion {
+	var r abbreviationsRegion
+	for _, c := range clauses {
+		if newerVersion(c.Version, r.version) {
+			r.version = c.Version
+		}
+	}
+	var doc []model.Clause
+	for _, c := range clauses {
+		if c.Version == r.version {
+			doc = append(doc, c)
+		}
+	}
+	sort.SliceStable(doc, func(i, j int) bool { return doc[i].ChunkID < doc[j].ChunkID })
+	for i := 0; i < len(doc); i++ {
+		if !strings.EqualFold(strings.TrimSpace(doc[i].Heading), "abbreviations") {
+			continue
+		}
+		root := doc[i].ClausePath
+		r.clauses = append(r.clauses, doc[i])
+		for i+1 < len(doc) {
+			p := doc[i+1].ClausePath
+			if p != "" && (root == "" || !strings.HasPrefix(p, root+".")) {
+				break
+			}
+			i++
+			r.clauses = append(r.clauses, doc[i])
+		}
+	}
+	return r
 }
 
 // earlier reports whether the clause at (pathA, chunkA) sorts before (pathB,
