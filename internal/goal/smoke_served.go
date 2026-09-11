@@ -85,13 +85,12 @@ const (
 	// them on every run.
 	servedBaseline = "docs/inputs/eval/served_baseline.json"
 	// servedTol is the absolute drop a tracked metric may take: the 0.02 of the
-	// lexical gate and bench. On six queries it reads as follows. A relevant clause
-	// that LEAVES the page costs recall@10 at least 1/12 = 0.083. One that slips at
-	// the top of one query's page costs MRR@10 0.083 from rank 1 to 2 and 0.028 from
-	// 2 to 3 — both fail; from 3 to 4 it costs 0.014 and passes, as does any
-	// shuffle deeper down. The served path answered identically on two runs (see
-	// stepSmoke), so the tolerance absorbs no noise that was measured; it is the
-	// slack below which a movement is not called a regression.
+	// lexical gate and bench. On the two scored queries (servedQueryIDs) it reads as
+	// follows. A judged clause that LEAVES the page costs recall@10 at least 0.25.
+	// The first judged hit slipping one rank in one query costs MRR@10 0.25 from
+	// rank 1, 0.083 from 2, 0.042 from 3 and 0.025 from 4 — all fail; from 5 to 6 it
+	// costs 0.017 and passes, as does any shuffle below. It absorbs float noise
+	// that does not reorder a judged hit, and nothing else.
 	servedTol = "0.02"
 	// servedSearchBudget disables the per-request budget in the gate's server. The
 	// budget is a LATENCY guard: when it expires, Search skips the embed, the sparse
@@ -121,6 +120,50 @@ var servedArms = []servedArm{
 	{Key: "lexical", Mode: "lexical"},
 	{Key: "hybrid", Mode: "hybrid"},
 	{Key: "rerank", Mode: "hybrid", Rerank: true},
+}
+
+// servedQueryIDs are the judged queries the served gate scores: the two of the
+// six on which some arm ranks a judged clause at all.
+//
+// THE SECOND BOUND, ON TIME, AND ALSO MEASURED. All six through all three arms,
+// server-full on the 3GPP half, 2026-09-11 (eight agents sharing the machine):
+//
+//	arm       secs   nDCG@10 per query (amf-registration, amf-location-update,
+//	                 amf-section, smf-pdu-session, lexical-clause-ref, udm-events)
+//	lexical      9   0.00 0.00 0.00 0.63 0.00 0.00
+//	hybrid     551   0.51 0.00 0.00 0.50 0.00 0.00
+//	rerank     919   0.63 0.00 0.00 0.63 0.00 0.00
+//
+// 25 min 15 end to end, 80-120 s per semantic call. Four queries score 0 on EVERY
+// arm, and so on every tracked metric: a regression gate is one-sided, a metric
+// at 0 cannot fall, and those four were two thirds of the cost of a gate that
+// could fail on none of them. The two kept carry every non-zero number above —
+// and are held more tightly for it: one rank lost in either moves a two-query
+// mean twice as far as a six-query one.
+//
+// The set is a list, not "whatever scored": the baseline was measured on exactly
+// these, the ids fold into smoke's Extra, and a judged query renamed away fails
+// the gate (servedSubset) instead of shrinking it. When a ranking change makes
+// one of the other four non-zero, add it here and re-measure; the candidate
+// baseline the gate writes is how.
+var servedQueryIDs = []string{"amf-registration", "smf-pdu-session"}
+
+// servedSubset picks servedQueryIDs out of the judged set, in that order.
+func servedSubset(set eval.Set) (eval.Set, error) {
+	byID := map[string]eval.Query{}
+	for _, q := range set {
+		byID[q.ID] = q
+	}
+	out := make(eval.Set, 0, len(servedQueryIDs))
+	for _, id := range servedQueryIDs {
+		q, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("the served gate scores the judged query %q and %s has no such id — it was "+
+				"renamed or removed; the baseline was measured on it", id, retrievalQuerySet)
+		}
+		out = append(out, q)
+	}
+	return out, nil
 }
 
 func servedArmKeys() string {
@@ -487,15 +530,19 @@ func runServedRetrievalGate(c *Ctx) error {
 	if err := buildServeSucceeded(c); err != nil {
 		return err
 	}
-	set, err := eval.Load(filepath.Join(c.Root, filepath.FromSlash(retrievalQuerySet)))
+	all, err := eval.Load(filepath.Join(c.Root, filepath.FromSlash(retrievalQuerySet)))
 	if err != nil {
 		return fmt.Errorf("load the judged query set: %w", err)
 	}
+	set, err := servedSubset(all)
+	if err != nil {
+		return err
+	}
 
 	args := servedServerArgs(c)
-	c.Log.Printf("served retrieval gate: %s %s (arms %s, tol %s, SEARCH_BUDGET=%s, DUCKDB_MEMORY_LIMIT=%s) vs %s",
-		c.bin("server-full"), strings.Join(args, " "), servedArmKeys(), servedTol, servedSearchBudget,
-		servedMemoryLimit, servedBaseline)
+	c.Log.Printf("served retrieval gate: %s %s (arms %s, queries %s, tol %s, SEARCH_BUDGET=%s, "+
+		"DUCKDB_MEMORY_LIMIT=%s) vs %s", c.bin("server-full"), strings.Join(args, " "), servedArmKeys(),
+		strings.Join(servedQueryIDs, ","), servedTol, servedSearchBudget, servedMemoryLimit, servedBaseline)
 	start := time.Now()
 	srv, err := startStdio(c, c.bin("server-full"), args, servedServerEnv(c))
 	if err != nil {

@@ -484,3 +484,44 @@ func TestTheServedGateServesThe3GPPHalfAlone(t *testing.T) {
 		t.Errorf("server-full is started with %v, want %v", args, want)
 	}
 }
+
+// THE SCORED QUERIES ARE A FIXED LIST, AND EACH MUST EXIST. A judged query renamed
+// away fails the gate instead of silently shrinking what it scores; the list is in
+// smoke's Extra, so editing it replays the gate.
+func TestTheServedGateScoresItsListedQueriesAndOnlyThose(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := eval.Load(filepath.Join(root, filepath.FromSlash(retrievalQuerySet)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := servedSubset(all)
+	if err != nil {
+		t.Fatalf("the committed judged set lacks a query the served gate scores: %v", err)
+	}
+	var ids []string
+	for _, q := range sub {
+		ids = append(ids, q.ID)
+	}
+	if !slices.Equal(ids, servedQueryIDs) {
+		t.Errorf("servedSubset picked %v, want %v", ids, servedQueryIDs)
+	}
+	renamed := slices.Clone(all)
+	for i := range renamed {
+		if renamed[i].ID == servedQueryIDs[0] {
+			renamed[i].ID = "renamed"
+		}
+	}
+	if _, err := servedSubset(renamed); err == nil || !strings.Contains(err.Error(), servedQueryIDs[0]) {
+		t.Errorf("a scored query renamed away did not fail the gate: %v", err)
+	}
+	extra, err := stepSmoke().Extra(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extra["served_queries"] != strings.Join(servedQueryIDs, ",") {
+		t.Errorf("smoke's Extra does not carry the scored queries: %q", extra["served_queries"])
+	}
+}
