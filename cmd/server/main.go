@@ -183,7 +183,8 @@ func serve(args []string) error {
 			fmt.Fprintf(os.Stderr, "[3gpp-mcp] could not cap the %s buffer pool at %s (%v)\n", what, lim, err)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "[3gpp-mcp] %s buffer pool capped at %s (%s)\n", what, lim, store.MemoryLimitEnv)
+		fmt.Fprintf(os.Stderr, "[3gpp-mcp] %s buffer pool capped at %s (set %s to change it)\n",
+			what, lim, store.MemoryLimitEnv)
 	}
 	limitMemory("3GPP", st)
 	if err := st.LoadFTS(ctx); err != nil {
