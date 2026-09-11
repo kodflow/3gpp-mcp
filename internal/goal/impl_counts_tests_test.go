@@ -23,9 +23,15 @@ import (
 var countsTestFiles = map[string]string{
 	"test": "runs the suites; test files are its INPUT, not noise — the reason ExcludeTests exists",
 
-	// Cheap to replay, so the one-time fingerprint churn buys little.
-	"validate":      "cmd/validate; replaying it is 2m32 (build E)",
-	"validate-etsi": "cmd/validate, shared with validate; replaying it is 17.6 s (build E)",
+	// Cheap to replay AND the replay stops there: discover-etsi asserts
+	// OutputsComplete, so a run that rewrites a byte-identical work list carries
+	// its provenance forward and nothing behind it moves.
+	//
+	// A step's own replay time is not its price unless that holds. validate and
+	// validate-etsi sat here at 2m32 and 17.6 s (build E) and were removed on
+	// 2026-09-11: neither has Outputs, so each replay handed smoke a new
+	// provenance and smoke handed publish one — a 25-minute image re-compose per
+	// test-only commit in cmd/validate. That is the reasoning #324 applied to smoke.
 	"discover-etsi": "internal/etsicat; replaying it is 39.6 s and it re-enumerates anyway",
 
 	// Expensive, and deliberately deferred: fixing it costs one replay of the

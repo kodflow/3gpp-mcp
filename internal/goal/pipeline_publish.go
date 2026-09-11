@@ -160,6 +160,28 @@ func stepPublish() *Step {
 			// the module graph — so a dependency bump (DuckDB above all) changes
 			// what ships without touching a line of the packages named below.
 			"go.mod", "go.sum",
+			// SO IS THE QUERY EMBEDDER, and nothing declared it.
+			//
+			// build-image.sh compiles rust/embed-core --features ort for the Linux
+			// target and ships it as /usr/local/lib/libembed_core.so, the cdylib the
+			// image's server calls through embed_ffi for every semantic query. This
+			// step named none of it. The steps that did cover the crate are all Tools
+			// — build-rust hashes the whole of rust/, build-serve and build-sparse
+			// its src — and a dirty Tool invalidates no consumer. So a fix to the
+			// embedder, or an ort bump in its Cargo.toml, planned publish as
+			// "fingerprint unchanged" and the registry kept the previous cdylib as
+			// current.
+			//
+			// The LOCKFILE is the crate's own, not rust/Cargo.lock: rust/Cargo.toml
+			// excludes embed-core from the workspace, so its own Cargo.lock is what
+			// decides the ort, tokenizers and ndarray that ship. build-image.sh now
+			// builds it --locked, so the file hashed here is the file cargo obeyed.
+			// The crate has no build.rs.
+			// TestPublishDeclaresEveryCrateTheImageBuildCompiles reads every
+			// --manifest-path the script passes and holds this list to it.
+			"rust/embed-core/src",
+			"rust/embed-core/Cargo.toml",
+			"rust/embed-core/Cargo.lock",
 		}, serverImplPackages()...),
 		// The shipped binary is `go build`, which does not compile _test.go. Editing
 		// a server test must not re-push an image, for the same reason it must not
@@ -373,10 +395,19 @@ func imageModelDirs() []string {
 // digests, which is ~8 minutes of streaming 40 GB off disk to discover that
 // nothing moved.
 //
-// WHY NOT the three packages smoke names. Because smoke only has to START the
-// server, while this ships it: a fix in internal/store or internal/rerank changes
-// what a consumer runs, and under-declaring it would publish an image whose
-// binary does not match the tree that claims to have produced it.
+// WHY NOT a narrower list. A fix in internal/store or internal/rerank changes
+// what a consumer runs, and under-declaring it would publish an image whose binary
+// does not match the tree that claims to have produced it.
+//
+// SMOKE DECLARES THIS SAME LIST, by calling this function, and that is the gate's
+// half of the same argument. It used to name five of these packages, on the
+// reasoning that smoke only has to START the server while this step ships it. But
+// smoke runs every probe through the server it starts, and build-go — which
+// rebuilds that server — is a Tool dep that invalidates no consumer. So an edit in
+// one of the other eight (internal/subject, behind resolve_term, among them)
+// skipped the gate that would have caught it, and this step, whose fingerprint did
+// move, published it recorded as gated. One function, two callers:
+// TestSmokeJudgesEveryPackagePublishShips fails the day they part.
 //
 // The list is written out rather than computed so that reading this step tells
 // you what defines it. TestPublishCoversEveryPackageTheServerLinks holds it to

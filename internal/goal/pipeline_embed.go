@@ -1032,6 +1032,19 @@ func stepValidate(t corpusTarget) *Step {
 		Doc:     "run the data-completeness contract against the finished corpus",
 		Deps:    t.validateDeps(),
 		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
+		// The step RUNS cmd/validate and cmd/anchorcheck; a _test.go cannot change
+		// what either binary checks. Both arms counted them until 2026-09-11,
+		// recorded in countsTestFiles as cheap to replay — 2m32 and 17.6 s (build E).
+		// That was the gate's own cost and not the price of replaying it, the
+		// understatement #324 corrected for smoke: this step has no Outputs, so
+		// every replay hands smoke a new provenance ("dependency output changed"),
+		// smoke hands one to publish, and publish re-composes the image — 24m40 of
+		// it before the first blob moved on 2026-09-10 (build-image.sh), for an image
+		// that differs from the last one by nothing but the commit stamped into its
+		// binary. cmd/validate holds six test files and cmd/anchorcheck one — seven
+		// of the eleven files this step hashed, four now — so a test-only commit in
+		// either paid all of that.
+		ExcludeTests: true,
 		// THE CONTRACT THE GATE APPLIED IS A DETERMINANT OF ITS VERDICT, and until
 		// 2026-09-11 it was not in the fingerprint.
 		//
@@ -1187,15 +1200,18 @@ func stepSmoke() *Step {
 		// is inert" trap, reached through the gate. A Tool dep adds nothing to the
 		// fingerprint, so declaring it replays nothing.
 		Deps: []string{"validate", "validate-etsi", "build-go"},
-		Impl: []string{
-			"cmd/server", "internal/mcp", "internal/search",
-			// THE RETRIEVAL GATE'S DETERMINANTS (see smoke_gate.go). The instrument,
-			// the verdict, the lexical ranking it measures (Store.SearchClauses) and
-			// the shape a hit is read from; then the judged queries and the bar. bench
-			// also links internal/embed and internal/rerank, which -systems lexical
-			// never reaches, so they are left out rather than replaying the gate for
-			// code it cannot run.
-			"cmd/bench", "internal/eval", "internal/store", "internal/model",
+		Impl: append([]string{
+			// THE RETRIEVAL GATE'S OWN DETERMINANTS (see smoke_gate.go): the
+			// instrument and the verdict, then the judged queries and the bar. The
+			// lexical ranking it measures (Store.SearchClauses) and the shape a hit
+			// is read from are server packages, internal/store and internal/model,
+			// so they arrive with serverImplPackages below — and so do
+			// internal/embed and internal/rerank, which bench also links and which
+			// this list used to leave out because -systems lexical never reaches
+			// them. The server that answers the probes links them either way.
+			// TestSmokeDeclaresEveryPackageItsBinariesLink holds both closures to
+			// `go list -deps`, so bench cannot grow an import this list misses.
+			"cmd/bench", "internal/eval",
 			retrievalQuerySet, retrievalBaseline,
 			// THE MODULE GRAPH, because build-go is a Tool dep and a dirty Tool dep
 			// deliberately invalidates no consumer. A DuckDB bump in go.mod rebuilds
@@ -1203,7 +1219,24 @@ func stepSmoke() *Step {
 			// — and without these two lines this step kept the verdict the old
 			// engine earned. Found by review of #324.
 			"go.mod", "go.sum",
-		},
+			// EVERY PACKAGE THE SHIPPED SERVER LINKS, out of the SAME function
+			// publish declares them with, so the gate and the thing it gates cannot
+			// drift apart again.
+			//
+			// This list named five of the thirteen publish names — cmd/server,
+			// internal/mcp and internal/search for the probes, internal/store and
+			// internal/model for the bench — on the reasoning that smoke only STARTS
+			// the server. It does more than start it: resolve_term runs the
+			// EnrichTerm of every subject internal/registry wires in, and
+			// internal/subject/li attaches the ASN.1 type there. The same Tool-dep
+			// rule as the module graph above then applies: an edit confined to
+			// internal/subject/li rebuilt server.exe through build-go, left this step
+			// "fingerprint unchanged, outputs present and valid" — SKIP, with no
+			// probe run — while publish, whose Impl DID move, republished the broken
+			// server recorded as gated. Eight packages, 47 source files, were in that
+			// gap: this step hashed 50 files and now hashes 97. Found by review on
+			// 2026-09-11; TestSmokeJudgesEveryPackagePublishShips counts them.
+		}, serverImplPackages()...),
 		// The step RUNS binaries; a _test.go cannot change what either of them does.
 		// It counted them until now, recorded in countsTestFiles as cheap to replay
 		// at 23.9 s — which understated it: smoke has no outputs, so every replay
