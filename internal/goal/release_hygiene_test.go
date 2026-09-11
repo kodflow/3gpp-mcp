@@ -30,17 +30,24 @@ func TestPublishCorpusHoldsEachArmToThePipelinesContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the dry run failed: %v\n%s", err, out)
 	}
-	calls := readValidateCalls(t, record)
-	if len(calls) != 2 {
-		t.Fatalf("validate ran %d time(s), want once per arm:\n%v\n%s", len(calls), calls, out)
+	argv := readValidateCalls(t, record)
+	if len(argv) != 2 {
+		t.Fatalf("validate ran %d time(s), want once per arm:\n%v\n%s", len(argv), argv, out)
 	}
+	// ARGUMENT BY ARGUMENT, not as one string: the fake records each argument's
+	// boundaries (review of #339). The contract is split into arguments exactly as
+	// the pipeline splits it — strings.Fields in validateArgs — so the snapshot gate
+	// and the validate step hand cmd/validate the same argv.
+	calls := make([]string, len(argv))
 	for i, arm := range []string{"etsi", "3gpp"} {
 		db := posixRoot + "/data/" + map[string]string{"etsi": "etsi.duckdb", "3gpp": "3gpp.duckdb"}[arm]
-		wantCall := "EMBED_MODEL=bge-m3-sparse --db " + db + " --report text " + want[arm]
-		if calls[i] != wantCall {
-			t.Errorf("the %s arm was checked as\n\t%s\nwant exactly what scripts/data-contract.sh gives that arm:\n\t%s",
-				arm, calls[i], wantCall)
+		wantArgv := strings.Join(append([]string{"EMBED_MODEL=bge-m3-sparse", "--db", db, "--report", "text"},
+			strings.Fields(want[arm])...), "|")
+		if argv[i] != wantArgv {
+			t.Errorf("the %s arm was checked with argv\n\t%s\nwant exactly what scripts/data-contract.sh gives that arm, "+
+				"split as validateArgs splits it:\n\t%s", arm, argv[i], wantArgv)
 		}
+		calls[i] = strings.ReplaceAll(argv[i], "|", " ")
 	}
 
 	// And that contract is the pipeline's, not whatever the script happens to say:
@@ -90,7 +97,7 @@ func TestPublishCorpusChecksEveryArmBeforePushingAny(t *testing.T) {
 		t.Fatalf("--only etsi failed: %v\n%s", err, out)
 	}
 	calls := readValidateCalls(t, record)
-	if len(calls) != 1 || !strings.Contains(calls[0], "/data/etsi.duckdb ") {
+	if len(calls) != 1 || !strings.Contains(calls[0], "|--db|") || !strings.Contains(calls[0], "/data/etsi.duckdb|") {
 		t.Fatalf("--only etsi checked %v, want the ETSI corpus once", calls)
 	}
 }
@@ -129,7 +136,8 @@ func TestTheImageBaseIsPinnedByDigest(t *testing.T) {
 // fakePublishCorpusRoot is a checkout holding copies of the real publish-corpus.sh
 // and data-contract.sh, two small corpora, an ETSI work list, a crane that is never
 // reached by a dry run, and a validate that appends each call — its EMBED_MODEL
-// and its arguments — to the returned file, failing when an argument contains
+// and its arguments, "|"-separated so their boundaries survive — to the returned
+// file, failing when an argument contains
 // $FAKE_VALIDATE_FAIL. curl and gh are fakes too, so nothing leaves this machine.
 func fakePublishCorpusRoot(t *testing.T) (root, record string) {
 	t.Helper()
@@ -150,7 +158,7 @@ func fakePublishCorpusRoot(t *testing.T) (root, record string) {
 	}
 	exe(filepath.Join(root, ".local", "bin", "crane.exe"), `exit 0`)
 	exe(filepath.Join(root, ".local", "bin", "validate.exe"),
-		`echo "EMBED_MODEL=${EMBED_MODEL:-} $*" >> "`+filepath.ToSlash(record)+`"`+"\n"+
+		`{ printf 'EMBED_MODEL=%s' "${EMBED_MODEL:-}"; printf '|%s' "$@"; echo; } >> "`+filepath.ToSlash(record)+`"`+"\n"+
 			`[ -n "${FAKE_VALIDATE_FAIL:-}" ] && case "$*" in *"$FAKE_VALIDATE_FAIL"*) exit 1;; esac`+"\n"+`exit 0`)
 	write(t, filepath.Join(root, "data", "3gpp.duckdb"), "3gpp corpus bytes")
 	write(t, filepath.Join(root, "data", "etsi.duckdb"), "etsi corpus bytes")
