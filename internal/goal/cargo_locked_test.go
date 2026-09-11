@@ -275,6 +275,15 @@ func cargoArgLists(stack []ast.Node) ([][]string, error) {
 			return out, nil
 		}
 	}
+	// NOT A COMMAND: imageToolchainRequired lists the tools build-image.sh
+	// --print-toolchain must report (image_toolchain.go). "cargo" there is a name
+	// the script prints the version of; the cargo it runs is judged in the script,
+	// by TestEveryCargoBuildInTheImageIsLocked.
+	for _, n := range stack {
+		if vs, ok := n.(*ast.ValueSpec); ok && len(vs.Names) == 1 && vs.Names[0].Name == "imageToolchainRequired" {
+			return nil, nil
+		}
+	}
 	return nil, fmt.Errorf("a \"cargo\" this reader cannot place: if it runs cargo, teach goCargoCalls " +
 		"its shape so the command is judged; if it does not, say so here")
 }

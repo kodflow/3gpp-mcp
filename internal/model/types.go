@@ -142,7 +142,7 @@ func (c Clause) Cite() Citation {
 		Version: c.Version,
 		Clause:  c.ClausePath,
 		URL:     SpecURL(c.SpecID, c.Version),
-		Stable:  IsStableVersion(c.Version),
+		Stable:  IsStableSpecVersion(c.SpecID, c.Version),
 	}
 }
 
@@ -204,7 +204,7 @@ func (o APIOperation) Cite() Citation {
 	return Citation{
 		SpecID: o.SpecID, Release: o.Release, Version: o.Version,
 		Clause: o.Locator(), URL: o.ForgeURL,
-		Stable: IsStableVersion(o.Version),
+		Stable: IsStableSpecVersion(o.SpecID, o.Version),
 	}
 }
 
@@ -231,6 +231,6 @@ func (s APISchema) Cite() Citation {
 	return Citation{
 		SpecID: s.SpecID, Release: s.Release, Version: s.Version,
 		Clause: "API schema " + s.SchemaName, URL: s.ForgeURL,
-		Stable: IsStableVersion(s.Version),
+		Stable: IsStableSpecVersion(s.SpecID, s.Version),
 	}
 }

@@ -102,10 +102,11 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	), shielded(h.getSpec))
 
 	s.AddTool(mcp.NewTool("get_changelog",
-		mcp.WithDescription("Change Request records for a spec between releases."),
+		mcp.WithDescription("Change Request records for a spec between releases or versions. The note says what "+
+			"a count means: 0 is \"no record in this corpus\", never \"unchanged\"."),
 		mcp.WithString("spec_id", mcp.Required()),
-		mcp.WithString("from_release", mcp.Description("e.g. Rel-18")),
-		mcp.WithString("to_release", mcp.Description("e.g. Rel-19")),
+		mcp.WithString("from_release", mcp.Description("e.g. Rel-18, or a version (18.4.0; an ETSI deliverable has only versions)")),
+		mcp.WithString("to_release", mcp.Description("e.g. Rel-19, or a version (18.6.0)")),
 		mcp.WithString("clause", mcp.Description("filter by affected clause")),
 	), shielded(h.getChangelog))
 
@@ -124,7 +125,8 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 		mcp.WithDescription("How a 4G/legacy network element maps to its 5GC network function(s), "+
 			"with the TS 23.501 clause that justifies each edge. NE->NF is many-to-many: "+
 			"MME alone splits across AMF, SMF and SMSF. Pass a 5GC name to see what it "+
-			"replaced, or an EPC name to see what replaced it."),
+			"replaced, or an EPC name to see what replaced it. Reads a CURATED table on both halves: "+
+			"a count of 0 means no curated edge, not that the entity has no history."),
 		mcp.WithString("entity", mcp.Required()),
 		mcp.WithString("from_release", mcp.Description("")),
 		mcp.WithString("to_release", mcp.Description("")),
@@ -210,11 +212,13 @@ type handlers struct {
 // specStore routes a per-spec lookup to the right index: a spec_id beginning "ETSI "
 // goes to the attached ETSI store (when present), everything else to the 3GPP store.
 // This is how the two SPLIT indexes are federated without a merge.
+//
+// ONE PREDICATE FOR BOTH ROUTERS (CodeRabbit, #332). This used to test the raw
+// string for "ETSI " while storeFor trimmed and ignored case, so the same id could
+// reach different halves depending on which tool received it — and get_changelog
+// routed with one rule and chose its note with the other. It now delegates.
 func (h *handlers) specStore(specID string) store.Reader {
-	if h.etsi != nil && strings.HasPrefix(specID, "ETSI ") {
-		return h.etsi
-	}
-	return h.st
+	return h.storeFor(specID)
 }
 
 // ---- response shapes ----------------------------------------------------
@@ -482,12 +486,16 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 		"spec_id": specID, "release": release, "version": version,
 		"count": len(out), "clauses": out, "citations": cites,
 		"obsolete_count": obsolete,
-		"stable":         model.IsStableVersion(version),
+		"stable":         model.IsStableSpecVersion(specID, version),
 	}
 	// Stable-first doctrine: the resolver already prefers a published version, so a
 	// draft here means NO stable version is indexed for this spec/release. Say so
 	// loudly rather than let the client treat work-in-progress text as normative.
-	if !model.IsStableVersion(version) {
+	//
+	// Half-aware (model.IsStableSpecVersion): the "major < 3" rule is 3GPP's, and
+	// applied to ETSI it warned that 4 354 of 5 142 published deliverables were
+	// drafts — ETSI TS 103 221-1 V1.23.1 among them.
+	if !model.IsStableSpecVersion(specID, version) {
 		resp["draft_warning"] = "returned version " + version +
 			" is a DRAFT (major < 3, work-in-progress); no stable/published version is indexed for this spec/release"
 	}
@@ -514,22 +522,52 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	changes, err := h.specStore(specID).GetChangelog(ctx, specID, r.GetString("from_release", ""), r.GetString("to_release", ""))
-	if err != nil {
-		return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
-	}
-	// THE NOTE SPEAKS FOR THE SPEC, SO IT READS THE SPEC'S RECORDS.
+	// The store applies release bounds and nothing else; a version bound is applied
+	// here, and a bound neither can read is reported rather than dropped in silence.
+	// See changelogBound for the measurement.
+	from := parseChangelogBound(r.GetString("from_release", ""))
+	to := parseChangelogBound(r.GetString("to_release", ""))
+	st := h.specStore(specID)
+	// THE NOTE SPEAKS FOR THE SPEC, SO IT READS THE SPEC'S RECORDS — ALL OF THEM.
 	//
 	// `changes` is about to be narrowed to one clause, and changelogNote describes
 	// the whole change history: fed the narrowed slice it would answer "this corpus
 	// holds no citable records for 23.501" whenever the clause simply has none, on
 	// a spec with plenty — the same false zero this release exists to remove, one
 	// level down. Keep the unfiltered set for it.
-	all := append([]model.Change(nil), changes...)
+	//
+	// And not narrowed by the RANGE either, for the same reason one level up: a
+	// request for Rel-5..Rel-5 on a spec whose records start at Rel-15 is empty,
+	// and a note fed that empty set told the caller the spec had no records at all.
+	all, err := st.GetChangelog(ctx, specID, "", "")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
+	}
+	changes := all
+	bounded := from.raw != "" || to.raw != ""
+	if bounded {
+		// Only a RELEASE bound is the store's to apply; for any other the query
+		// would repeat the one above verbatim (CodeRabbit, #332).
+		if from.release != "" || to.release != "" {
+			if changes, err = st.GetChangelog(ctx, specID, from.release, to.release); err != nil {
+				return mcp.NewToolResultErrorFromErr("get_changelog failed", err), nil
+			}
+		}
+		changes = applyVersionBounds(changes, from, to)
+	}
+	inRange := len(changes)
 	clause := r.GetString("clause", "")
+	// How many records in range name NO clause: the filter cannot test those, so
+	// they leave the answer whether or not they touched the clause.
+	clauseless := 0
 	if clause != "" {
-		filtered := changes[:0]
+		var filtered []model.Change
 		for _, c := range changes {
+			// A list holding only "" names no clause: it is what an empty list
+			// becomes when it is written through string_split('', sep).
+			if strings.TrimSpace(strings.Join(c.Clauses, "")) == "" {
+				clauseless++
+			}
 			for _, cl := range c.Clauses {
 				if strings.HasPrefix(cl, clause) {
 					filtered = append(filtered, c)
@@ -538,6 +576,11 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 			}
 		}
 		changes = filtered
+	}
+	// An empty slice, not nil: `"changes": null` is a different JSON type from the
+	// list a caller iterates, and the count beside it already says there are none.
+	if changes == nil {
+		changes = []model.Change{}
 	}
 	out := map[string]any{"spec_id": specID, "count": len(changes), "changes": changes}
 	// A ZERO THAT MEANS TWO DIFFERENT THINGS IS NOT AN ANSWER.
@@ -559,16 +602,57 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	// So say what is true, and name the tool that DOES answer the question from the
 	// text itself. trace_clause diffs a clause between two versions as a set
 	// operation on paragraph ids — no parsing, nothing reconstructed.
-	if len(changes) == 0 && h.etsi != nil && isETSISpecID(specID) {
-		out["note"] = "this corpus holds no change-request records for the ETSI half: ETSI publishes PDFs, " +
-			"and the change-history table does not survive text extraction well enough to cite. " +
-			"Use trace_clause with from_release/to_release (they accept two VERSIONS here) to diff a " +
-			"clause between two published versions from the text itself."
-	} else if !isETSISpecID(specID) {
-		out["note"] = changelogNote(ctx, h.specStore(specID), specID, all)
+	//
+	// The ETSI note is read from the ETSI corpus (etsiChangelogNote), so it stays
+	// true whether or not that half carries records, and it now also speaks when
+	// the ETSI half is not attached at all — a case both branches used to leave
+	// silent. ETSI records, when there are any, cite the published PDF whose
+	// annex they were read from.
+	note := ""
+	if isETSISpecID(specID) {
+		note = etsiChangelogNote(ctx, h.etsi, specID, all)
+		if h.etsi != nil && len(changes) > 0 {
+			cites, uncited := etsiChangeCitations(ctx, h.etsi, specID, changes)
+			out["citations"] = cites
+			if uncited > 0 {
+				note = fmt.Sprintf("%d of these records name a version whose document this corpus could not "+
+					"resolve, so they carry no citation. ", uncited) + note
+			}
+		}
+	} else {
+		note = changelogNote(ctx, st, specID, all)
 	}
-	if out["note"] == "" {
-		delete(out, "note")
+	narrowed := ""
+	switch {
+	case bounded && inRange == 0 && len(all) > 0:
+		narrowed = fmt.Sprintf("none of the %d records held for %s falls inside the requested range.", len(all), specID)
+	case clause != "" && clauseless > 0:
+		// A FILTER THAT CANNOT MATCH IS NOT A NEGATIVE ANSWER. The 3GPP records
+		// come from the CR database, which records a version transition and not
+		// the clause paths a change touched — so `clauses` is NULL on every one of
+		// them, and a clause filter answered 0 for every clause of every spec.
+		//
+		// And a PARTLY blind filter is not a complete answer either (Qodo, #332):
+		// when only some records name their clauses, the others were dropped
+		// untested, and a count built from the rest — zero or not — must say so.
+		// "in range" only when a bound was actually APPLIED: an unreadable one is
+		// named as not applied by boundsNote, and the two must not contradict.
+		scope := ""
+		if from.release != "" || from.version != "" || to.release != "" || to.version != "" {
+			scope = " in range"
+		}
+		if clauseless == inRange {
+			narrowed = fmt.Sprintf("none of the %d records%s names the clauses it touched, so the clause "+
+				"filter cannot match any of them: count 0 says nothing about clause %s. trace_clause answers "+
+				"that from the clause text.", inRange, scope, clause)
+		} else {
+			narrowed = fmt.Sprintf("%d of the %d records%s name no clause, so the clause filter could not "+
+				"test them: they are left out of this answer whether or not they touched clause %s. "+
+				"trace_clause answers that from the clause text.", clauseless, inRange, scope, clause)
+		}
+	}
+	if n := joinNotes(joinNotes(boundsNote(from, to), narrowed), note); n != "" {
+		out["note"] = n
 	}
 	return jsonResult(out)
 }
@@ -717,39 +801,49 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	evos, err := h.st.GetEvolutions(ctx, entity)
-	if err != nil {
-		return mcp.NewToolResultErrorFromErr("trace_evolution failed", err), nil
-	}
-	cites := make([]model.Citation, 0, len(evos))
-	for _, e := range evos {
-		// Fill release+version from the justification spec's latest indexed version
-		// so the citation carries {spec_id, release, version, clause, url} whenever
-		// the spec is in the corpus (issue #7). An evolution is inherently
-		// cross-release, so the citation points at the spec's current state — the
-		// clause is the curated justification anchor. If the spec isn't indexed,
-		// release/version stay empty (cite-or-silent: we still give spec+clause+url).
-		rel, ver, _, _ := h.st.LatestVersion(ctx, e.JustificationSpec)
-		// Prefer the exact versioned archive URL; fall back to the spec directory
-		// when the justification spec isn't indexed (no version to encode) so the
-		// citation always carries a resolvable URL.
-		url := model.ArchiveURL(e.JustificationSpec, ver)
-		if url == "" {
-			url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(e.JustificationSpec) + "_series/" + e.JustificationSpec + "/"
+	// FEDERATED, like every other lookup that can name an ETSI entity, and each
+	// half reports how many edges it had to look at — see evolutionHalves and
+	// evolutionNote for the silence this replaces.
+	//
+	// ONE HALF FAILING DOES NOT SILENCE THE OTHER (CodeRabbit, #332). search_spec
+	// federates the same optional half defensively, and aborting here would drop
+	// the 3GPP edges — today the only ones there are — over an ETSI read error. A
+	// half that cannot be read is named in the note and left out of edges_held, so
+	// its silence is never read as a count of zero. Only when no half can be read
+	// is there nothing to serve.
+	evos := []model.Evolution{}
+	cites := []model.Citation{}
+	held := map[string]int{}
+	var unread []string
+	var lookupErr error
+	halves := h.evolutionHalves()
+	for _, half := range halves {
+		es, err := half.st.GetEvolutions(ctx, entity)
+		if err != nil {
+			unread = append(unread, half.name)
+			lookupErr = err
+			continue
 		}
-		cites = append(cites, model.Citation{
-			SpecID: e.JustificationSpec, Release: rel, Version: ver,
-			Clause: e.JustificationClause,
-			URL:    url,
-			Stable: model.IsStableVersion(ver),
-		})
+		for _, e := range es {
+			evos = append(evos, e)
+			cites = append(cites, h.evolutionCitation(ctx, e))
+		}
+		if n, err := countEvolutions(ctx, half.st); err == nil {
+			held[half.name] = n
+		} else {
+			unread = append(unread, half.name)
+		}
+	}
+	if lookupErr != nil && len(unread) == len(halves) {
+		return mcp.NewToolResultErrorFromErr("trace_evolution failed on every half", lookupErr), nil
 	}
 	return jsonResult(map[string]any{
 		"entity":     entity,
 		"count":      len(evos),
 		"evolutions": evos,
 		"citations":  cites,
-		"note":       "Curated NE↔NF seed (V1 relational). Full corpus-mined graph (KuzuDB) is V2.",
+		"edges_held": held,
+		"note":       evolutionNote(entity, len(evos), held, unread, h.etsi != nil),
 	})
 }
 
@@ -835,7 +929,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 				if url == "" {
 					url = "https://www.3gpp.org/ftp/Specs/archive/" + model.SeriesOf(id) + "_series/" + id + "/"
 				}
-				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableVersion(ver)})
+				refCites = append(refCites, model.Citation{SpecID: id, Release: rel, Version: ver, URL: url, Stable: model.IsStableSpecVersion(id, ver)})
 			}
 		}
 		for _, m := range reEtsiRef.FindAllStringSubmatch(hay, -1) {
@@ -864,7 +958,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 					if rel, v, ok, _ := h.etsi.LatestVersion(ctx, full); ok {
 						cite = model.Citation{
 							SpecID: full, Release: rel, Version: v,
-							URL: model.SpecURL(full, v), Stable: model.IsStableVersion(v),
+							URL: model.SpecURL(full, v), Stable: model.IsStableSpecVersion(full, v),
 						}
 						break
 					}
@@ -882,7 +976,7 @@ func (h *handlers) findCrossRefs(ctx context.Context, r mcp.CallToolRequest) (*m
 		// store for a spec_id beginning "ETSI ", and ArchiveURL answers "" for
 		// anything that is not a 3GPP id — so this citation named a deliverable
 		// with no pointer to it.
-		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableVersion(version)},
+		"citation":      model.Citation{SpecID: specID, Release: release, Version: version, URL: model.SpecURL(specID, version), Stable: model.IsStableSpecVersion(specID, version)},
 		"ref_citations": refCites,
 		// ETSI cross-references (separate keys; absent-as-empty, never null).
 		"etsi_references":    etsiRefs,

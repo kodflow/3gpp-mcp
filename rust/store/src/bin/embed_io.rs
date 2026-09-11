@@ -79,6 +79,18 @@ struct Args {
     /// every posting; see the comment on the import for what that gives up.
     #[arg(long, default_value_t = false)]
     import_sparse_changed_only: bool,
+    /// With --export-sparse-worklist: export EVERY embeddable clause at/above the
+    /// floor, whether or not it already carries postings. The pipeline asks for it
+    /// when the postings in the corpus were written by another producer, which the
+    /// ordinary "has no posting" work list cannot see.
+    #[arg(long, default_value_t = false)]
+    export_sparse_all: bool,
+    /// With --import-sparse: delete EVERY existing posting first, then load the
+    /// ledger. The import of a re-encode — a row the ledger does not name would be
+    /// the previous producer's, served under the new stamp. Refused together with
+    /// --import-sparse-changed-only, whose whole point is to keep what is there.
+    #[arg(long, default_value_t = false)]
+    import_sparse_replace: bool,
 }
 
 #[derive(Deserialize)]
@@ -245,7 +257,7 @@ fn main() -> Result<()> {
         } else {
             store_rs::identity::release_ordinal(&args.embed_floor).unwrap_or(0)
         };
-        let wl = store.clauses_needing_sparse(args.limit, floor_ord)?;
+        let wl = store.clauses_for_sparse(args.limit, floor_ord, args.export_sparse_all)?;
         let f = std::fs::File::create(out).with_context(|| format!("create {out}"))?;
         let mut w = BufWriter::new(f);
         for it in &wl {
@@ -265,6 +277,21 @@ fn main() -> Result<()> {
     }
 
     if let Some(inp) = args.import_sparse.as_deref() {
+        if args.import_sparse_replace && args.import_sparse_changed_only {
+            anyhow::bail!(
+                "--import-sparse-replace clears every posting and --import-sparse-changed-only keeps \
+                 the ones already there: pass one"
+            );
+        }
+        // A replace puts a new producer's postings in, so it must say whose: without
+        // --sparse-model the stamp below is skipped and the previous producer's
+        // sparse_model would stay on the new layer, vouching for it.
+        if args.import_sparse_replace && args.sparse_model.is_empty() {
+            anyhow::bail!(
+                "--import-sparse-replace needs --sparse-model: the layer it writes must carry its \
+                 own stamp, not the one of the layer it replaces"
+            );
+        }
         let f = std::fs::File::open(inp).with_context(|| format!("open {inp}"))?;
         let mut total = 0usize;
         let mut skipped = 0usize;
@@ -354,8 +381,27 @@ fn main() -> Result<()> {
                 if bulk { "dropped and rebuilt" } else { "kept" }
             );
         }
+        // THE STAMP GOES FIRST, BEFORE ANYTHING IS CLEARED. The batches below commit
+        // one by one, so a replace that dies leaves part of the new layer — and when
+        // only the code changed, not the model, the stamp already on the corpus is the
+        // same string this run would write. validate --require-sparse and check-data
+        // ask for "some postings + the expected stamp", and would pass the partial
+        // layer. Emptied here, the stamp is written back only once every batch and
+        // the index are in.
+        if args.import_sparse_replace {
+            store.set_meta("sparse_model", "")?;
+        }
         if bulk {
             store.drop_sparse_term_index()?;
+        }
+        // AFTER the index is dropped, so the delete does not maintain it row by row.
+        // A replace is always a bulk load: `bulk` is true whenever changed-only is
+        // off, and the two flags were refused together above.
+        if args.import_sparse_replace {
+            let cleared = store.clear_sparse()?;
+            eprintln!(
+                "embed-io: --import-sparse-replace cleared the postings of {cleared} clause(s)"
+            );
         }
 
         for line in BufReader::new(f).lines() {

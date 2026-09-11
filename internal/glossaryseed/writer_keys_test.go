@@ -45,6 +45,11 @@ func TestWriterLineIsTheRustPattern(t *testing.T) {
 		`let exp = m[2].trim().replace('\t', " ");`,
 		`if exp.len() < 4 || term.eq_ignore_ascii_case(&exp) || is_all_digits(&exp) {`,
 		`!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())`,
+		// THE REGION, not only the line: generalRegion reproduces the writer's
+		// heading test and its walk, and the retirement deletes on what it finds.
+		`if !c.heading.to_lowercase().contains("abbreviation") {`,
+		`if root.is_empty() || root.starts_with("Annex") {`,
+		`if !d.clause_path.is_empty() && !is_descendant(&root, &d.clause_path) {`,
 	} {
 		if !strings.Contains(string(src), stmt) {
 			t.Errorf("%s no longer says %q — writerKeys reproduces that statement, and must follow it",

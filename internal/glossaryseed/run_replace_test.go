@@ -39,9 +39,11 @@ func replaceFixture(t *testing.T) string {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	// The TS 21.905 every real corpus holds, declaring none of these keys: a run
-	// that cannot read it releases nothing, and OLD could then never go.
-	withTS21905(t, s, ts21905Min)
+	// The TS 21.905 every real corpus holds — which declares 3GPP, whose "21" row
+	// is below (a "21" row the newest TS 21.905 no longer stores is retired), and
+	// none of the other keys: a run that cannot read it releases nothing, and OLD
+	// could then never go.
+	withTS21905(t, s, ts21905Min, "3GPP\tThird Generation Partnership Project")
 	for _, a := range []model.Acronym{
 		{Term: "OLD", Expansion: "Once Declared, Now Nowhere", FirstRelease: "18.0.0",
 			LastRelease: "18.0.0", SourceSeries: "23.501", DeclaredBy: 1},
