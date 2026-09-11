@@ -288,6 +288,39 @@ func TestPackLayerNeverServesAStaleIdentity(t *testing.T) {
 	check(t, out4, id4)
 }
 
+// asyncHash IS THE sha256 OF EVERY BYTE WRITTEN, whatever the write sizes: empty
+// writes, writes that straddle its 1 MiB buffers, one larger than a buffer, and a
+// tail that never fills one (which only sum hands over).
+func TestAsyncHashIsTheSHA256OfEveryByteWritten(t *testing.T) {
+	sizes := []int{0, 1, 512, 32 << 10, asyncBufSize - 1, 2, asyncBufSize, 0, 3*asyncBufSize + 7, 100}
+	a := newAsyncHash()
+	want := sha256.New()
+	var total int64
+	for i, n := range sizes {
+		p := make([]byte, n)
+		for j := range p {
+			p[j] = byte(i*131 + j*7)
+		}
+		if w, err := a.Write(p); err != nil || w != n {
+			t.Fatalf("Write(%d bytes) = %d, %v", n, w, err)
+		}
+		// The caller reuses its buffer at once, as tar and gzip do.
+		for j := range p {
+			p[j] = 0xAA
+		}
+		q := make([]byte, n)
+		for j := range q {
+			q[j] = byte(i*131 + j*7)
+		}
+		want.Write(q)
+		total += int64(n)
+	}
+	got, n := a.sum()
+	if exp := "sha256:" + hex.EncodeToString(want.Sum(nil)); got != exp || n != total {
+		t.Fatalf("asyncHash = %s over %d bytes; sha256 of what was written is %s over %d", got, n, exp, total)
+	}
+}
+
 // imgtar oci COMPUTES WHAT HAS NO VALID RECORD, and records it: correct first,
 // then cheap.
 func TestLayerIdentityComputesAMissingOrFalseRecord(t *testing.T) {

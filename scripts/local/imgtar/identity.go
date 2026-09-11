@@ -193,40 +193,74 @@ func (c *countWriter) Write(p []byte) (int, error) {
 //
 // Measured on this machine (2026-09-11, 8 vCPU EPYC 7543P under QEMU): sha256
 // 305 MB/s, gzip BestSpeed 72 MB/s, both single-threaded. Inline, the two hashes
-// would add roughly (42+26) GB / 305 MB/s ≈ 3.7 minutes to a miss that already
-// costs ~12 for the gzip; in their own goroutines they finish while the compressor
+// would add roughly (42+26) GB / 305 MB/s = 3.7 minutes to a miss that already
+// costs ~12 for the gzip; in their own goroutines they run while the compressor
 // is still producing.
+//
+// BYTES TRAVEL IN RECYCLED 1 MiB BUFFERS, not one fresh copy per Write. The first
+// version copied every write into a new slice and sent it: packing the real 6.4 GB
+// model layer then took 249 s against 182 s for the previous imgtar, most of it
+// allocation and a channel send per 32 KiB. Filling a buffer and handing it over
+// only when full sends one message per MiB and allocates nothing after start-up.
 type asyncHash struct {
-	h    hash.Hash
-	ch   chan []byte
-	done chan struct{}
-	n    int64
+	h          hash.Hash
+	full, free chan []byte
+	cur        []byte
+	done       chan struct{}
+	n          int64
 }
 
+const (
+	asyncBufSize = 1 << 20
+	asyncBufs    = 4
+)
+
 func newAsyncHash() *asyncHash {
-	a := &asyncHash{h: sha256.New(), ch: make(chan []byte, 64), done: make(chan struct{})}
+	a := &asyncHash{
+		h:    sha256.New(),
+		full: make(chan []byte, asyncBufs),
+		free: make(chan []byte, asyncBufs),
+		done: make(chan struct{}),
+	}
+	for i := 0; i < asyncBufs; i++ {
+		a.free <- make([]byte, 0, asyncBufSize)
+	}
+	a.cur = <-a.free
 	go func() {
-		for b := range a.ch {
+		for b := range a.full {
 			a.h.Write(b)
+			// Never blocks: only asyncBufs buffers exist, and free holds that many.
+			a.free <- b[:0]
 		}
 		close(a.done)
 	}()
 	return a
 }
 
-// Write copies p: the tar and gzip writers reuse their buffers.
+// Write copies p into the current buffer, handing it to the hasher when full: the
+// tar and gzip writers reuse their own buffers the moment Write returns.
 func (a *asyncHash) Write(p []byte) (int, error) {
-	b := make([]byte, len(p))
-	copy(b, p)
-	a.ch <- b
-	a.n += int64(len(p))
-	return len(p), nil
+	n := len(p)
+	a.n += int64(n)
+	for len(p) > 0 {
+		k := copy(a.cur[len(a.cur):cap(a.cur)], p)
+		a.cur = a.cur[:len(a.cur)+k]
+		p = p[k:]
+		if len(a.cur) == cap(a.cur) {
+			a.full <- a.cur
+			a.cur = <-a.free
+		}
+	}
+	return n, nil
 }
 
-// sum stops the goroutine and returns "sha256:<hex>" and the bytes hashed. It
-// must be called exactly once.
+// sum hands over what is buffered, stops the goroutine, and returns
+// "sha256:<hex>" and the bytes hashed. It must be called exactly once.
 func (a *asyncHash) sum() (string, int64) {
-	close(a.ch)
+	if len(a.cur) > 0 {
+		a.full <- a.cur
+	}
+	close(a.full)
 	<-a.done
 	return "sha256:" + hex.EncodeToString(a.h.Sum(nil)), a.n
 }
