@@ -129,15 +129,30 @@ func servedArgs(q eval.Query, a servedArm) map[string]any {
 // move what the cross-encoder sees, EMBEDDER/RERANKER=off would switch an arm off
 // (server_info would catch that one, the others it would not), and
 // EMBED_MODELS_CONFIG would swap the registry the query embedder resolves.
+var servedPinnedEnv = []string{"RERANK_ALL", "RERANK_WINDOW", "EMBEDDER", "RERANKER", "EMBED_MODELS_CONFIG"}
+
+// servedMemoryLimit is the DUCKDB_MEMORY_LIMIT the gate's server runs with — the
+// ONE place the gate departs from the image's configuration, and the reason it
+// can run on this machine at all. Measured 2026-09-11, server-full over both
+// halves, the judged set:
 //
-// DUCKDB_MEMORY_LIMIT too, and that one was measured rather than argued. It caps
-// each store's buffer pool, which also holds the frozen HNSW index; at 4GB the
-// ETSI half (1 138 341 vectors) no longer fits, its first semantic query loads
-// the index and every later ETSI search FAILS — which search_spec swallows (see
-// errETSIDropped). Twice on 2026-09-11, with the cap exported for the run. Unset,
-// the store applies its own 16GB default, which is what the image serves with.
-var servedPinnedEnv = []string{"RERANK_ALL", "RERANK_WINDOW", "EMBEDDER", "RERANKER", "EMBED_MODELS_CONFIG",
-	"DUCKDB_MEMORY_LIMIT"}
+//	unset (16GB per store, the image's)  39.8 GB committed, 22.1 GB resident, the
+//	                                     FIRST hybrid query still unanswered after
+//	                                     3 min 30 — killed, 14.6 GB of swap in use
+//	4GB                                  the ETSI half FAILS after its first
+//	                                     semantic query, every later page is
+//	                                     3GPP-only (twice) — errETSIDropped
+//
+// The limit caps each store's buffer pool, and the frozen HNSW index lives IN
+// that pool (duckdb_memory(), tag ART_INDEX, after one k-NN: 3.37 GB on the 3GPP
+// half, 3.68 GB on the ETSI half — with 5.5 and 6.1 GB of table pages cached
+// beside it). 4GB leaves the ETSI index 0.3 GB to work in; the value here leaves
+// each half at least 2.3 GB beyond its index. It changes what DuckDB CACHES, not
+// what a query returns: a query that runs out of room fails, it does not answer
+// differently — and the failures that search_spec would swallow are exactly the
+// ones this gate refuses (errETSIDropped, the mode check). An operator's own
+// DUCKDB_MEMORY_LIMIT is overridden for the same reason the knobs above are.
+const servedMemoryLimit = "6GB"
 
 // servedServerEnv is the environment server-full is started with. Two ONNX
 // Runtimes, and they are not interchangeable (scripts/local/prove-serving.sh has
@@ -156,6 +171,7 @@ func servedServerEnv(c *Ctx) []string {
 		"BGE_RERANKER_DIR="+c.dataPath("models", rerankModelName),
 		"ONNXRUNTIME_SHARED_LIBRARY_PATH="+c.dataPath("models", "onnxruntime", "lib", ortLibName()),
 		"SEARCH_BUDGET="+servedSearchBudget,
+		"DUCKDB_MEMORY_LIMIT="+servedMemoryLimit,
 		"MCP3GPP_NO_UPDATE=1",
 	)
 }
@@ -491,8 +507,9 @@ func runServedRetrievalGate(c *Ctx) error {
 		args = append(args, "--etsi-db", etsi)
 		etsiAttached = true
 	}
-	c.Log.Printf("served retrieval gate: %s %s (arms %s, tol %s, SEARCH_BUDGET=%s) vs %s",
-		c.bin("server-full"), strings.Join(args, " "), servedArmKeys(), servedTol, servedSearchBudget, servedBaseline)
+	c.Log.Printf("served retrieval gate: %s %s (arms %s, tol %s, SEARCH_BUDGET=%s, DUCKDB_MEMORY_LIMIT=%s) vs %s",
+		c.bin("server-full"), strings.Join(args, " "), servedArmKeys(), servedTol, servedSearchBudget,
+		servedMemoryLimit, servedBaseline)
 	start := time.Now()
 	srv, err := startStdio(c, c.bin("server-full"), args, servedServerEnv(c))
 	if err != nil {

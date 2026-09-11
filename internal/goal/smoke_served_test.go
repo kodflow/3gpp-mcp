@@ -361,12 +361,13 @@ func TestTheServedServerEnvironment(t *testing.T) {
 		"EMBED_MODEL_DIR":                 c.dataPath("models", sparseModelName),
 		"BGE_RERANKER_DIR":                c.dataPath("models", rerankModelName),
 		"SEARCH_BUDGET":                   "0",
+		"DUCKDB_MEMORY_LIMIT":             servedMemoryLimit,
 	} {
 		if env[k] != want {
 			t.Errorf("%s = %q, want %q", k, env[k], want)
 		}
 	}
-	for _, k := range []string{"RERANK_ALL", "RERANK_WINDOW", "RERANKER", "EMBEDDER", "EMBED_MODELS_CONFIG", "DUCKDB_MEMORY_LIMIT"} {
+	for _, k := range []string{"RERANK_ALL", "RERANK_WINDOW", "RERANKER", "EMBEDDER", "EMBED_MODELS_CONFIG"} {
 		if v, ok := env[k]; !ok || v != "" {
 			t.Errorf("%s is not pinned to the image's unset value (%q, present=%v): an exported %s would "+
 				"change the ranking this gate records", k, v, ok, k)
@@ -413,7 +414,7 @@ func TestTheServedGateReplaysWhenItsJudgementMoves(t *testing.T) {
 		t.Fatal(err)
 	}
 	for k, want := range map[string]string{"served_arms": "lexical,hybrid,rerank", "served_tol": servedTol,
-		"served_search_budget": servedSearchBudget} {
+		"served_search_budget": servedSearchBudget, "served_memory_limit": servedMemoryLimit} {
 		if extra[k] != want {
 			t.Errorf("smoke's Extra[%s] = %q, want %q: loosening it would not replay the gate", k, extra[k], want)
 		}
