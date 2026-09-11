@@ -23,12 +23,16 @@ package store
 // WHAT LIVES HERE: every statement in this package that writes a row of
 // `acronyms`, and SpecsWithAbbreviations — the sweep's scope. Since the
 // replacement below, the scope decides which rows are DELETED, so it belongs to
-// the write path even though it issues no write.
+// the write path even though it issues no write. GeneralVocabulary lives here for
+// the same reason: since 2026-09-11 it decides whether a row the sweep dropped is
+// deleted or handed back to TS 21.905.
 //
 // WHAT DOES NOT, AND STAYS UNDECLARED: GetClauses (store.go), through which the
-// miner reads every clause. It is the serve path's main read, so moving it here
-// would make every clause-lookup edit replay enrich. That residual is the one
-// #323 documented in readSpec, and this file does not change it.
+// miner reads every clause — and glossaryseed.readGeneral reads TS 21.905. It is
+// the serve path's main read, so moving it here would make every clause-lookup
+// edit replay enrich. That residual is the one #323 documented in readSpec, and
+// this file does not change it; readGeneral sorts the clauses it gets back itself
+// rather than trusting their order.
 //
 // internal/goal/enrich_glossary_test.go holds both halves of the trade: enrich
 // declares this file, and the methods in it have exactly the callers the
@@ -44,18 +48,24 @@ import (
 	"github.com/kodflow/3gpp-mcp/internal/model"
 )
 
-// seededSource is the provenance seed-glossary stamps, and the ONLY one it
-// stamps: the spec id of the spec whose Abbreviations clause declares the row —
-// "23.501", or a multi-part id such as "38.101-1".
+// seededSource is the provenance seed-glossary stamps on the rows it OWNS: the
+// spec id of the spec whose Abbreviations clause declares the row — "23.501", or
+// a multi-part id such as "38.101-1".
 //
 // OWNERSHIP IS READ FROM THE ROW, and it can be, because every writer of this
 // table stamps a shape no other writer uses. Read from each writer on 2026-09-11:
 //
 //	seed-glossary (this file)       the declaring spec's id        "23.501"
+//	  … handing a row back          TS 21.905's row, as its writer stamps it: "21"
 //	rust ingest, TS 21.905 only     the two-digit series           "21"
 //	rust ingest-glossary (ETSI)     the deliverable, etsi.duckdb   "ETSI TS 103 221-1"
 //	rust merge, overlay; cmd/split  copy rows verbatim, stamp nothing of their own
 //	UpsertAcronym below             whatever it is handed — tests only, no caller ships
+//
+// The second line is the one exception to "the seed stamps spec ids", and it is
+// not a second owned shape: a row handed back is TS 21.905's again, byte for byte
+// what the Rust ingest writes for it (see GeneralVocabulary), and the seed never
+// touches it after that unless a spec declares its key again.
 //
 // Measured the same day on the shipped corpus: 14 127 rows, of which 13 722 cite a
 // spec id (13 027 "NN.NNN" over 1 857 specs, 695 "NN.NNN-N" over 127) and 405
@@ -68,6 +78,10 @@ import (
 // plain, 298 multi-part). A spec id that did not would not be silently lost:
 // ReplaceSeededAcronyms refuses to write a row it could never later remove.
 var seededSource = regexp.MustCompile(`^[0-9]{2}\.[0-9]{3}(-[0-9]+)?$`)
+
+// generalSource is the provenance of TS 21.905's rows: its two-digit series, as
+// rust/parse/src/glossary.rs stamps it (GLOSSARY_SPEC_ID[..2]).
+const generalSource = "21"
 
 // seededBySpec reports whether a glossary row is seed-glossary's to replace.
 //
@@ -85,13 +99,98 @@ var seededSource = regexp.MustCompile(`^[0-9]{2}\.[0-9]{3}(-[0-9]+)?$`)
 // a TS 21.905 entry that no step puts back: merge skips a shard with no changed
 // bucket, and its fold is ON CONFLICT DO NOTHING in any case.
 //
-// The first sweep under this rule releases ONE row, "Multicast = MBS session"
-// from 23.783, and it is not among the 895 (measured 2026-09-11 with
-// seed-glossary --check-only against the shipped corpus). So the gap is latent
-// today, and it is written down here rather than discovered later. Closing it
-// needs the corpus to remember TS 21.905's claim on a key the seed has taken
-// over — a question for that writer and the schema, not for this method.
+// This paragraph used to end "so the gap is latent today", and it was: the first
+// sweep under the replacement released ONE row, "Multicast = MBS session" from
+// 23.783, which is not among the 895. It was reachable by ordinary operation all
+// the same — a spec takes a key over, a later issue of that spec drops the pair,
+// and TS 21.905's entry leaves resolve_term while TS 21.905 still prints it.
+//
+// THE CORPUS DOES NOT REMEMBER THE CLAIM, BUT TS 21.905'S TEXT DOES. So the
+// release no longer rests on this method alone: planSeededAcronyms asks
+// GeneralVocabulary whether TS 21.905's writer stores the key, and a row it does
+// store is HANDED BACK — re-stamped as TS 21.905's own — instead of deleted. A
+// run that could not read TS 21.905 releases nothing at all.
 func seededBySpec(source string) bool { return seededSource.MatchString(source) }
+
+// GeneralPair is one (term, expansion) TS 21.905's writer stores. The domain is
+// not part of it: every row of the general glossary carries domain "".
+type GeneralPair struct{ Term, Expansion string }
+
+// GeneralVocabulary is what TS 21.905's writer stores NOW, as glossaryseed reads
+// it back from the corpus — the evidence a release is checked against.
+//
+// WHY A RELEASE NEEDS IT. A seeded row the sweep no longer declares used to be
+// deleted on seededBySpec's word alone, and that word is only "a spec stamped
+// this row last". When the row was TS 21.905's before a spec took its key over,
+// the delete removed an entry TS 21.905 still declares — see seededBySpec. With
+// this, such a row goes back to TS 21.905 instead, and a row TS 21.905's writer
+// does not store is released exactly as before.
+//
+// WHAT THE WRITER STORES, NOT WHAT THE TEXT PRINTS. A hand-back re-creates a "21"
+// row, so it may only re-create one TS 21.905's writer holds: a key a spec took
+// over from it. Until 2026-09-11 Pairs was the text as the seed's own parser
+// reads it, and on the local corpus that set held 9 keys the writer never stored
+// (measured against rust/parse's line rule, which reproduces all 1 300 keys the
+// writer did store). ADM, BOIC-exHC, BIC-Roam, GLONASS and SCF wrap onto a second
+// line: the writer keeps the first and holds a "21" row cut there, the seed joins
+// the wrap. CFNRc's "21" row keeps the double space TS 21.905 prints, which the
+// seed collapses. "JAR file", "WLAN UE" and "O&M" have no "21" row at all: the
+// writer's pattern refuses a space or an ampersand in a term. Handed back, each
+// became a "21" row the writer never wrote — for the first six a SECOND one,
+// beside the writer's own — served by ResolveTerm as a TS 21.905 entry for good,
+// and the glossary then depended on which spec had once declared what.
+//
+// AND NOT A GUESS FROM THE TABLE. Asking the stored "21" rows whether one of them
+// already "is" the dropped entry — the same expansion give or take a space, or
+// one cut from the other — catches six of those 9, still hands back the three
+// with no "21" row, and gets EF wrong. TS 21.905 prints EF twice, as "Elementary
+// File" and as "Elementary File (on the UICC)", each on a line of its own, and its
+// writer stored both; the first is a spec's today. Released, it reads as a cut of
+// the second and is deleted — the defect this type exists to close. The mirror,
+// the longer one taken over while the shorter is TS 21.905's, fails the other
+// direction of the rule the same way. So a key is matched exactly against what
+// the writer stores, and against nothing else.
+//
+// MEASURED 2026-09-11, read-only, on the local corpus as it stood that evening
+// (13 793 seeded rows, 404 stamped "21"): 896 seeded rows carry a key TS 21.905's
+// writer stored — every one taken over from it. Planned as if every spec holding
+// one of those, or one of the 9 above, dropped it at once: the replacement before
+// this type deleted all 905; with it the 896 are handed back and the 9 removed,
+// and with TS 21.905 unread all 905 are withheld. The next real run on that
+// corpus releases nothing: removed 0, restored 0, withheld 0 (seed-glossary
+// --check-only).
+//
+// THE ZERO VALUE RELEASES NOTHING. Read is false unless a caller says the read
+// succeeded, and an unread vocabulary cannot clear any key — so a caller that
+// forgets to read TS 21.905, or whose read failed, withholds every release
+// (GlossaryDiff.Withheld) rather than deleting on no evidence. Fail-open would be
+// one forgotten argument away from the defect this type exists to close.
+type GeneralVocabulary struct {
+	// Read is true when Pairs is TS 21.905's whole vocabulary, read and parsed in
+	// full. glossaryseed decides that, floor included; the store only obeys it.
+	Read bool
+	// Pairs are the keys TS 21.905's writer stores for its newest version — byte for
+	// byte, a double space included — and no others. See glossaryseed.readGeneral.
+	Pairs map[GeneralPair]bool
+	// Release is that version's release — "Rel-19" — which the Rust ingest stamps
+	// on both ends of each TS 21.905 row, and a row handed back is stamped with.
+	Release string
+}
+
+// declares reports whether the key a stored row carries is one TS 21.905's writer
+// stores — the only keys a hand-back may re-create.
+func (g GeneralVocabulary) declares(k acronymKey) bool {
+	return k.domain == "" && g.Pairs[GeneralPair{Term: k.term, Expansion: k.expansion}]
+}
+
+// handedBack is the row TS 21.905's own writer stores for a pair: rust/ingest's
+// write_spec stamps the series, the release on both ends, domain "" and no count
+// — declared_by NULL, which is what the 405 rows it wrote carry. Anything else
+// would leave a restored row distinguishable from the entry it restores.
+func (g GeneralVocabulary) handedBack(a model.Acronym) model.Acronym {
+	return model.Acronym{Term: a.Term, Expansion: a.Expansion, Domain: a.Domain,
+		FirstRelease: g.Release, LastRelease: g.Release, SourceSeries: generalSource}
+}
 
 // UpsertAcronym inserts or updates a glossary entry.
 func (s *Store) UpsertAcronym(a model.Acronym) error {
@@ -123,6 +222,9 @@ func declaredBy(a model.Acronym) any {
 
 // GlossaryDiff is what replacing the seeded glossary does — or, from
 // PlanSeededAcronyms, would do.
+//
+// A seeded row the batch no longer declares lands in exactly ONE of Removed,
+// Restored and Withheld, and which one is decided by GeneralVocabulary alone.
 type GlossaryDiff struct {
 	// Written counts the rows the batch inserts or rewrites: keys the table does
 	// not hold, and keys whose stored values differ from the batch's.
@@ -130,11 +232,35 @@ type GlossaryDiff struct {
 	// Removed are the seeded rows the batch no longer declares, ordered by
 	// (term, expansion, domain) so two runs over one corpus list them alike.
 	Removed []model.Acronym
+	// Restored are the seeded rows the batch no longer declares whose key
+	// TS 21.905's writer stores, as they stand BEFORE the write — stamped with the
+	// spec that took the key over. The write hands each back to TS 21.905 instead
+	// of deleting it (GeneralVocabulary.handedBack). Same order as Removed.
+	//
+	// Not a deletion either: the key stays in resolve_term, and only its
+	// precedence moves. The guard does not count it.
+	Restored []model.Acronym
+	// Withheld are the seeded rows the batch no longer declares that the write
+	// leaves exactly as they are, because TS 21.905 could not be read and so no
+	// key could be cleared. Same order as Removed; empty whenever it was read.
+	//
+	// NOT A DELETION, so the mass-removal guard does not count it — see Vanished
+	// for the other half. A withheld row stays seeded, and every later run that
+	// cannot read TS 21.905 withholds it again: the list grows until TS 21.905 is
+	// readable. Counted as a release, as the hand-back was first written, it
+	// refused the SECOND such run and every one after: 30 rows withheld, then 30
+	// more against a bound of 53, came back "release 60 (0 removed, 0 handed back,
+	// 60 withheld)", exit 1, from a run that changed nothing — and
+	// --allow-mass-removal could not clear it, because there was nothing to remove.
+	// A withheld row is judged the first time TS 21.905 is read again: it is then
+	// removed or handed back, and the guard counts the removals.
+	Withheld []model.Acronym
 	// Owned is how many seeded rows the table held BEFORE the replacement — the
 	// base a removal is measured against.
 	Owned int
 	// Vanished are the specs that own seeded rows today, declare NOTHING in this
-	// batch, and are still listed in `specs`, ordered by spec id.
+	// batch, are still listed in `specs`, and would lose at least one row to the
+	// DELETE. Ordered by spec id.
 	//
 	// That is the signature of a broken read, not of an editorial change: the
 	// catalogue says the spec is there, and the sweep came back with not one row
@@ -142,34 +268,57 @@ type GlossaryDiff struct {
 	// pair is also declared by a spec read after it ends with zero rows of its own
 	// while being read perfectly — the corpus grew, the citation moved — and a
 	// guard keyed on that would refuse ordinary growth.
+	//
+	// AND A DELETION MUST BE COMING, because deletions are what the guard stops. A
+	// silent spec whose rows are all withheld, handed back to TS 21.905, or passed
+	// to another spec that declares the same pair takes nothing out of
+	// resolve_term: every key stays, cited by a document that declares it. Named,
+	// it refused a run that deletes nothing — and, withheld rows never leaving
+	// while TS 21.905 stays unread, every run after it, the same pile-up Withheld
+	// describes. The run that would delete its rows names it; until then those
+	// rows are reported as what they are.
 	Vanished []VanishedSpec
 }
 
-// VanishedSpec is a spec the batch no longer hears from at all.
+// VanishedSpec is a spec the batch no longer hears from at all, and whose rows
+// the write would delete.
 type VanishedSpec struct {
 	Spec string
 	// Owned is how many seeded rows cite it today; Removed how many of those the
-	// replacement deletes. The difference passes to another spec that declares
-	// the same pair, which is why a vanished spec is not measured by Removed.
-	Owned, Removed int
+	// replacement deletes — never 0, or the spec is not listed — and Restored how
+	// many it hands back to TS 21.905. The rest pass to another spec that
+	// declares the same pair, which is why a vanished spec is shown by what it
+	// owns. None is withheld: a deletion needs TS 21.905 read, and a run that read
+	// it withholds nothing.
+	Owned, Removed, Restored int
 }
 
-// Changed reports whether applying the diff moves the corpus at all.
-func (d GlossaryDiff) Changed() bool { return d.Written > 0 || len(d.Removed) > 0 }
+// Changed reports whether applying the diff moves the corpus at all. A withheld
+// row is not a change: it is exactly the row the table already holds.
+func (d GlossaryDiff) Changed() bool {
+	return d.Written > 0 || len(d.Removed) > 0 || len(d.Restored) > 0
+}
 
 // PlanSeededAcronyms computes what ReplaceSeededAcronyms would do, and writes
 // nothing. It is the SAME computation, not a second copy of it: a check-only run
 // that predicted the deletions with its own query would drift from the write the
 // first time either was touched.
-func (s *Store) PlanSeededAcronyms(as []model.Acronym) (GlossaryDiff, error) {
-	d, _, err := s.planSeededAcronyms(as)
+func (s *Store) PlanSeededAcronyms(as []model.Acronym, general GeneralVocabulary) (GlossaryDiff, error) {
+	d, _, err := s.planSeededAcronyms(as, general)
 	return d, err
 }
 
 // ReplaceSeededAcronyms makes the rows seed-glossary owns EQUAL to the batch, in
 // ONE transaction: what the batch declares is written, what it no longer declares
-// is removed, and every row the seed does not own — see seededSource — is left
+// is released, and every row the seed does not own — see seededSource — is left
 // exactly as it was.
+//
+// RELEASED MEANS ONE OF THREE THINGS, decided by general and nothing else: a row
+// whose key TS 21.905's writer does not store is removed; a row whose key it does
+// store is handed back to it, re-stamped exactly as that writer stamps it; and
+// when TS 21.905 could not be read, every such row is withheld — left as it is —
+// because no key could be cleared. See GeneralVocabulary and seededBySpec for the
+// entry this protects. Only the first is a deletion.
 //
 // WHY REPLACE. This used to upsert and nothing else, so it could only ever grow
 // the table: an expansion a spec corrected, or a clause the miner stopped
@@ -249,8 +398,9 @@ func (s *Store) PlanSeededAcronyms(as []model.Acronym) (GlossaryDiff, error) {
 //
 // Reading the table first is affordable precisely because it is small — some
 // fourteen thousand rows. The same trade would be wrong on clauses.
-func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, approve func(GlossaryDiff) error) (GlossaryDiff, error) {
-	diff, pending, err := s.planSeededAcronyms(as)
+func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, general GeneralVocabulary,
+	approve func(GlossaryDiff) error) (GlossaryDiff, error) {
+	diff, pending, err := s.planSeededAcronyms(as, general)
 	if err != nil {
 		return diff, err
 	}
@@ -282,7 +432,16 @@ func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, approve func(GlossaryD
 	// the same transaction. The batch is already unique on (term, expansion,
 	// domain) — planSeededAcronyms guarantees it — so the delete-then-insert has
 	// exactly the ON CONFLICT DO UPDATE semantics it replaces.
-	if err := stageAcronyms(tx, "staged_acronyms", pending); err != nil {
+	//
+	// A ROW HANDED BACK TO TS 21.905 RIDES THE SAME SWAP: its TS 21.905 form is
+	// staged beside the batch and inserted with it. That keeps the staged rows
+	// unique too — a restored key is by definition one the batch does not declare,
+	// and the table held it once.
+	written := append([]model.Acronym(nil), pending...)
+	for _, a := range diff.Restored {
+		written = append(written, general.handedBack(a))
+	}
+	if err := stageAcronyms(tx, "staged_acronyms", written); err != nil {
 		_ = tx.Rollback()
 		return GlossaryDiff{}, err
 	}
@@ -290,25 +449,41 @@ func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, approve func(GlossaryD
 		_ = tx.Rollback()
 		return GlossaryDiff{}, err
 	}
+	if err := stageAcronyms(tx, "restored_acronyms", diff.Restored); err != nil {
+		_ = tx.Rollback()
+		return GlossaryDiff{}, err
+	}
 	// THE RELEASE IS KEYED ON THE PROVENANCE IT WAS PLANNED FROM, not on the key
 	// alone. A row whose source_series is no longer the one planSeededAcronyms
 	// classified as seeded is not deleted here — so ownership is decided in ONE
 	// place, seededBySpec, and this statement cannot widen it.
-	res, err := tx.Exec(`DELETE FROM acronyms WHERE (term, expansion, domain, source_series) IN
-		(SELECT term, expansion, domain, source_series FROM released_acronyms)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return GlossaryDiff{}, fmt.Errorf("remove the seeded rows no spec declares any more: %w", err)
-	}
+	//
 	// THE PLAN AND THE WRITE MUST AGREE, or the report lies. A tuple comparison
-	// that meets a NULL matches nothing and raises nothing: without this count, a
+	// that meets a NULL matches nothing and raises nothing: without the count, a
 	// release that deleted fewer rows than it listed would print the full list
 	// and leave the rows in place — the silent version of the defect this method
 	// exists to end.
-	if n, err := res.RowsAffected(); err != nil || n != int64(len(diff.Removed)) {
-		_ = tx.Rollback()
-		return GlossaryDiff{}, fmt.Errorf("planned to remove %d seeded row(s) and the delete matched %d (%v) — "+
-			"nothing was written", len(diff.Removed), n, err)
+	//
+	// Both kinds of release go through it: the rows removed, and the seeded form
+	// of the rows handed back, whose TS 21.905 form the insert below then writes.
+	for _, r := range []struct {
+		table, what string
+		planned     int
+	}{
+		{"released_acronyms", "remove", len(diff.Removed)},
+		{"restored_acronyms", "hand back to TS 21.905", len(diff.Restored)},
+	} {
+		res, err := tx.Exec(`DELETE FROM acronyms WHERE (term, expansion, domain, source_series) IN
+			(SELECT term, expansion, domain, source_series FROM ` + r.table + `)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return GlossaryDiff{}, fmt.Errorf("%s the seeded rows no spec declares any more: %w", r.what, err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n != int64(r.planned) {
+			_ = tx.Rollback()
+			return GlossaryDiff{}, fmt.Errorf("planned to %s %d seeded row(s) and the delete matched %d (%v) — "+
+				"nothing was written", r.what, r.planned, n, err)
+		}
 	}
 	if _, err := tx.Exec(`DELETE FROM acronyms WHERE (term, expansion, domain) IN
 		(SELECT term, expansion, domain FROM staged_acronyms)`); err != nil {
@@ -330,7 +505,7 @@ func (s *Store) ReplaceSeededAcronyms(as []model.Acronym, approve func(GlossaryD
 
 // planSeededAcronyms diffs the batch against the table: the rows to write, and the
 // seeded rows to release.
-func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Acronym, error) {
+func (s *Store) planSeededAcronyms(as []model.Acronym, general GeneralVocabulary) (GlossaryDiff, []model.Acronym, error) {
 	if len(as) == 0 {
 		return GlossaryDiff{}, nil, nil
 	}
@@ -379,9 +554,17 @@ func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Ac
 		}
 		pending = append(pending, a)
 	}
-	var removed []model.Acronym
+	// WHERE A DROPPED ROW GOES is decided HERE, once, for the plan and the write
+	// alike — so --check-only reports exactly the hand-backs the write performs.
+	//
+	// The order of the tests is the whole point. An unread TS 21.905 comes FIRST:
+	// with no evidence, no key can be cleared, and "we could not tell" must never
+	// read as "TS 21.905 does not declare it" — which is what a failed read that
+	// returned an empty set would otherwise say, for every row at once.
+	var removed, restored, withheld []model.Acronym
 	owned := map[string]int{}
 	lost := map[string]int{}
+	back := map[string]int{}
 	for k, cur := range existing {
 		if !seededBySpec(cur.SourceSeries) {
 			continue
@@ -390,20 +573,30 @@ func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Ac
 		if _, declared := want[k]; declared {
 			continue
 		}
-		removed = append(removed, cur)
-		lost[cur.SourceSeries]++
+		switch {
+		case !general.Read:
+			withheld = append(withheld, cur)
+		case general.declares(k):
+			restored = append(restored, cur)
+			back[cur.SourceSeries]++
+		default:
+			removed = append(removed, cur)
+			lost[cur.SourceSeries]++
+		}
 	}
-	sort.Slice(removed, func(i, j int) bool {
-		a, b := removed[i], removed[j]
-		if a.Term != b.Term {
-			return a.Term < b.Term
-		}
-		if a.Expansion != b.Expansion {
-			return a.Expansion < b.Expansion
-		}
-		return a.Domain < b.Domain
-	})
-	diff := GlossaryDiff{Written: len(pending), Removed: removed}
+	for _, rows := range [][]model.Acronym{removed, restored, withheld} {
+		sort.Slice(rows, func(i, j int) bool {
+			a, b := rows[i], rows[j]
+			if a.Term != b.Term {
+				return a.Term < b.Term
+			}
+			if a.Expansion != b.Expansion {
+				return a.Expansion < b.Expansion
+			}
+			return a.Domain < b.Domain
+		})
+	}
+	diff := GlossaryDiff{Written: len(pending), Removed: removed, Restored: restored, Withheld: withheld}
 	for _, n := range owned {
 		diff.Owned += n
 	}
@@ -429,9 +622,11 @@ func (s *Store) planSeededAcronyms(as []model.Acronym) (GlossaryDiff, []model.Ac
 		sort.Strings(silent)
 		for _, spec := range silent {
 			// A spec the catalogue no longer lists has left the corpus, and its
-			// rows leaving with it is the replacement doing its job.
-			if listed[spec] {
-				diff.Vanished = append(diff.Vanished, VanishedSpec{Spec: spec, Owned: owned[spec], Removed: lost[spec]})
+			// rows leaving with it is the replacement doing its job. A spec losing
+			// no row to the delete is not what the guard stops (see Vanished).
+			if listed[spec] && lost[spec] > 0 {
+				diff.Vanished = append(diff.Vanished, VanishedSpec{Spec: spec, Owned: owned[spec],
+					Removed: lost[spec], Restored: back[spec]})
 			}
 		}
 	}

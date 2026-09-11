@@ -126,15 +126,17 @@ func stepPublish() *Step {
 		Name:    "publish",
 		Version: 1,
 		Doc:     "compose the OCI image from the finished corpus and push it to the registry",
-		// BOTH halves, and the proof that they serve.
+		// BOTH halves, and the proof that they serve — through ONE edge.
 		//
-		// smoke is the last gate on the 3GPP side and starts the real server over
-		// stdio; index-etsi is the last WRITE to the ETSI half. Depending on smoke
-		// alone would not be enough: smoke and index-etsi are siblings in the graph
-		// (smoke depends on validate, index-etsi on compact), so nothing would order
-		// a publish after the ETSI freeze, and the image could carry an ETSI corpus
-		// whose HNSW is still "building" — which serve refuses.
-		Deps: []string{"smoke", "index-etsi"},
+		// smoke starts the real server over both stores, and it stands on validate
+		// AND validate-etsi, each of which stands on its own arm's index. So smoke
+		// is ordered after BOTH freezes, and so is this step. It used to add
+		// index-etsi here, from the time smoke depended on the 3GPP gate alone and
+		// nothing else ordered a publish after the ETSI freeze (an image carrying an
+		// ETSI HNSW still "building" is one serve refuses). validate-etsi closed that
+		// gap one level down; naming one arm's index here and not the other's was
+		// the last place the product step still told the arms apart.
+		Deps: []string{"smoke"},
 		Impl: append([]string{
 			buildImageScript,
 			"scripts/local/imgtar",
@@ -160,7 +162,29 @@ func stepPublish() *Step {
 			// the module graph — so a dependency bump (DuckDB above all) changes
 			// what ships without touching a line of the packages named below.
 			"go.mod", "go.sum",
-		}, serverImplPackages()...),
+			// SO IS THE QUERY EMBEDDER, and nothing declared it.
+			//
+			// build-image.sh compiles rust/embed-core --features ort for the Linux
+			// target and ships it as /usr/local/lib/libembed_core.so, the cdylib the
+			// image's server calls through embed_ffi for every semantic query. This
+			// step named none of it. The steps that did cover the crate are all Tools
+			// — build-rust hashes the whole of rust/, build-serve and build-sparse
+			// the crate — and a dirty Tool invalidates no consumer. So a fix to the
+			// embedder, or an ort bump in its Cargo.toml, planned publish as
+			// "fingerprint unchanged" and the registry kept the previous cdylib as
+			// current.
+			//
+			// The LOCKFILE is the crate's own, not rust/Cargo.lock: rust/Cargo.toml
+			// excludes embed-core from the workspace, so its own Cargo.lock is what
+			// decides the ort, tokenizers and ndarray that ship. build-image.sh now
+			// builds it --locked, so the file hashed here is the file cargo obeyed.
+			// The crate has no build.rs.
+			// TestPublishDeclaresEveryCrateTheImageBuildCompiles reads every
+			// --manifest-path the script passes and holds this list to it.
+			"rust/embed-core/src",
+			"rust/embed-core/Cargo.toml",
+			"rust/embed-core/Cargo.lock",
+		}, append(serverImplPackages(), imageGuardPackages()...)...),
 		// The shipped binary is `go build`, which does not compile _test.go. Editing
 		// a server test must not re-push an image, for the same reason it must not
 		// relink eight binaries.
@@ -373,15 +397,34 @@ func imageModelDirs() []string {
 // digests, which is ~8 minutes of streaming 40 GB off disk to discover that
 // nothing moved.
 //
-// WHY NOT the three packages smoke names. Because smoke only has to START the
-// server, while this ships it: a fix in internal/store or internal/rerank changes
-// what a consumer runs, and under-declaring it would publish an image whose
-// binary does not match the tree that claims to have produced it.
+// WHY NOT a narrower list. A fix in internal/store or internal/rerank changes
+// what a consumer runs, and under-declaring it would publish an image whose binary
+// does not match the tree that claims to have produced it.
+//
+// SMOKE DECLARES THIS SAME LIST, by calling this function, and that is the gate's
+// half of the same argument. It used to name five of these packages, on the
+// reasoning that smoke only has to START the server while this step ships it. But
+// smoke runs every probe through the server it starts, and build-go — which
+// rebuilds that server — is a Tool dep that invalidates no consumer. So an edit in
+// one of the other eight (internal/subject, behind resolve_term, among them)
+// skipped the gate that would have caught it, and this step, whose fingerprint did
+// move, published it recorded as gated. One function, two callers:
+// TestSmokeJudgesEveryPackagePublishShips fails the day they part.
 //
 // The list is written out rather than computed so that reading this step tells
 // you what defines it. TestPublishCoversEveryPackageTheServerLinks holds it to
-// `go list -deps ./cmd/server`, so a new import fails the build instead of
-// silently escaping the fingerprint.
+// `go list -deps ./cmd/server` in both directions, so a new import fails the build
+// instead of silently escaping the fingerprint, and a stale entry fails it too.
+//
+// THE CLOSURE OF THE SERVER THE IMAGE SHIPS, NOT OF THE ONE `go build` MAKES HERE.
+// build-image.sh compiles cmd/server `-tags "onnx,embed_ffi"` for GOOS=linux, and
+// under `onnx` internal/rerank/rerank_onnx.go imports internal/onnxrt: the
+// process-wide ONNX Runtime initialisation the image's reranker runs through, and
+// LibPath, the library path it loads. The test asked for the untagged, host graph
+// until 2026-09-11, which does not contain that package, so it was missing here
+// and the test agreed. An edit there could keep the reranker from starting in the
+// image while publish reported the previous image as current. The test now reads
+// the tags and the target out of the script.
 //
 // internal/subject covers its own subpackages: Impl walks directories.
 //
@@ -398,6 +441,7 @@ func serverImplPackages() []string {
 		"internal/mcp",
 		"internal/metrics",
 		"internal/model",
+		"internal/onnxrt", // linked only under `onnx`, which is how the image builds it
 		"internal/registry",
 		"internal/releaseview",
 		"internal/rerank",
@@ -406,6 +450,31 @@ func serverImplPackages() []string {
 		"internal/store",
 		"internal/subject",
 	}
+}
+
+// imageGuardPackages are the commands build-image.sh runs on this machine to decide
+// whether the image may be published at all. Its identity guards (step 6) take the
+// dense and sparse identities the baked registry resolves to from cmd/embedid, and
+// the ones the corpus carries from cmd/dbcount, and refuse the push when they
+// differ or when the corpus states none.
+//
+// NOT DECLARED UNTIL 2026-09-11. No test read the script's Go commands: the
+// closure test asked `go list` about ./cmd/server alone, and these two run as
+// `go run` inside $( ) substitutions, a shape the script's only command reader
+// (the cargo one) could not see either. Reading every `go build` and `go run` the
+// script performs, under its own tags, found them the first time it ran. An edit
+// to either (the field dbcount prints, how embedid resolves the sparse head)
+// changed what this step lets through while its fingerprint stood still. The
+// packages they link (internal/embed, internal/model, internal/store) are server
+// packages and were already here.
+//
+// They ship nothing, which is why they are a list of their own:
+// TestSmokeJudgesEveryPackagePublishShips requires smoke to fingerprint what the
+// image carries, and smoke runs neither of these.
+// TestPublishCoversEveryPackageTheImageBuildCompiles holds the list to the `go
+// build` and `go run` commands the script performs.
+func imageGuardPackages() []string {
+	return []string{"cmd/dbcount", "cmd/embedid"}
 }
 
 // filesUnder lists every regular file below dir.

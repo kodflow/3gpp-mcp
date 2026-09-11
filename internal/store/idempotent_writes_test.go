@@ -174,7 +174,7 @@ func TestReplaceSeededAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 			FirstRelease: "20.2.0", LastRelease: "20.2.0", SourceSeries: "33.501"},
 	}
 
-	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, cleared, nil); err != nil {
 		t.Fatalf("first seed: %v", err)
 	} else if !diff.Changed() {
 		t.Fatal("the first seed wrote nothing; the premise of this test is wrong")
@@ -198,7 +198,7 @@ func TestReplaceSeededAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 	// duplicate pair is written back and forth, so counting rows would have
 	// passed on the very bug this exists for.
 	countBefore := rowCount(t, s, "acronyms")
-	if diff, err := s.ReplaceSeededAcronyms(batch, nil); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(batch, cleared, nil); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	} else if diff.Changed() {
 		t.Errorf("re-seeding an identical glossary reported a write: %+v", diff)
@@ -214,7 +214,7 @@ func TestReplaceSeededAcronymsSkipsRowsAlreadyCorrect(t *testing.T) {
 	grown := append(append([]model.Acronym{}, batch...), model.Acronym{Term: "SMF",
 		Expansion: "Session Management Function", FirstRelease: "20.2.0",
 		LastRelease: "20.2.0", SourceSeries: "23.501"})
-	if diff, err := s.ReplaceSeededAcronyms(grown, nil); err != nil {
+	if diff, err := s.ReplaceSeededAcronyms(grown, cleared, nil); err != nil {
 		t.Fatalf("new row: %v", err)
 	} else if !diff.Changed() || diff.Written != 1 || len(diff.Removed) != 0 {
 		t.Errorf("a new term was not reported as exactly one write: %+v", diff)

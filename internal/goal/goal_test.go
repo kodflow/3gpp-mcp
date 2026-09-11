@@ -398,9 +398,10 @@ func TestPipelineShapeIsValid(t *testing.T) {
 			}
 		}
 	}
-	// The documented invariant: embed must come after merge, never before.
-	if pos["embed"] < pos["merge"] {
-		t.Error("embed is ordered before merge — shard-local chunk_ids would collide in the shared ledger")
+	// The documented invariant: embed must come after the fold, never before. The
+	// fold is the second half of `ingest` now, so the edge is ingest -> embed.
+	if pos["embed"] < pos["ingest"] {
+		t.Error("embed is ordered before ingest's fold — shard-local chunk_ids would collide in the shared ledger")
 	}
 }
 
@@ -1097,7 +1098,7 @@ func TestAReleaseNumberIsReadFromThePathNotTheName(t *testing.T) {
 // index — half an hour of rework to answer a scheduling question.
 func TestParallelismIsNotPartOfWhatFetchProduces(t *testing.T) {
 	c, _ := newTestCtx(t)
-	step := stepFetch()
+	step := stepFetch(corpus3GPP())
 
 	c.Config["floor"] = "Rel-99"
 	c.Config["repair"] = "0"
@@ -1119,7 +1120,7 @@ func TestParallelismIsNotPartOfWhatFetchProduces(t *testing.T) {
 // The two knobs that DO change which specs are acquired must still replay it.
 func TestTheAcquiredSetIsPartOfWhatFetchProduces(t *testing.T) {
 	c, _ := newTestCtx(t)
-	step := stepFetch()
+	step := stepFetch(corpus3GPP())
 	c.Config["floor"] = "Rel-99"
 	c.Config["repair"] = "0"
 	base, err := step.Extra(c)

@@ -35,9 +35,19 @@ func stepBuildEmbedder() *Step {
 		Run: func(c *Ctx) error {
 			target := filepath.Join(c.Local, "cargo-target")
 			c.Log.Printf("cargo build rust/embedder (pulls ONNX Runtime; first build is long)")
+			// --locked, the rule build-rust and test have followed since #323 and
+			// build-image.sh since 6cafdc7: without it cargo may re-resolve and
+			// REWRITE rust/embedder/Cargo.lock as a side effect of the build, the drift
+			// that moved rust/discover/Cargo.lock mid-step on 2026-09-10. This step's
+			// Impl names the whole crate, lockfile included, so a rewrite would also
+			// move the fingerprint it had just recorded. Verified before it was added
+			// (2026-09-11): `cargo metadata --locked --format-version 1 --manifest-path
+			// rust/embedder/Cargo.toml` exits 0, so no build that was correct changes.
+			// TestEveryCargoCommandThePipelineRunsIsLocked reads every cargo command
+			// in this package.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release", "--manifest-path", "rust/embedder/Cargo.toml", "--bin", "embedder"},
+				Args: []string{"build", "--release", "--locked", "--manifest-path", "rust/embedder/Cargo.toml", "--bin", "embedder"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
 				Echo: true,
 			}); err != nil {
@@ -70,10 +80,9 @@ func stepEmbed(t corpusTarget) *Step {
 		Version: 2,
 		Doc:     "vectorise the corpus on the GPU, reusing every already-seen content hash",
 		Deps:    append([]string{"build-embedder"}, t.singleProducer()...),
-		// data/3gpp.duckdb has two producers, not one: `merge` folds local shards
-		// into it, `seed` downloads the published snapshot. Both are supported
-		// paths to a vectorisable corpus. ETSI has a single producer, so it goes
-		// through Deps instead (AnyDeps rejects a one-element set on purpose).
+		// Each corpus has two producers, not one: `ingest` writes what was
+		// converted locally, `seed` downloads the published snapshot. Both are
+		// supported paths to a vectorisable corpus, on both arms.
 		AnyDeps: t.multiProducer(),
 		// rust/store/src/vectors.rs closes a FALSE NEGATIVE, and it is the mirror
 		// image of the one this file's provenance work has been fixing all along.
@@ -502,7 +511,9 @@ func stepEnrich(t corpusTarget) *Step {
 		Name:    "enrich",
 		Version: 1,
 		Doc:     "overlay the DynaReport catalogue, the 5GC OpenAPI corpus and the LI registry",
-		Deps:    []string{"merge"},
+		// ingest is the data edge, as ingest-etsi is enrich-etsi's. The tools are the
+		// binaries this step launches: four Rust overlays and two Go seeders.
+		Deps: []string{"ingest", "build-rust", "build-go"},
 		// The two fetch scripts are part of this step's implementation now that it
 		// runs them: changing how an overlay is acquired must replay the overlay.
 		// internal/evolseed is implementation here because this step now APPLIES
@@ -1031,7 +1042,44 @@ func stepValidate(t corpusTarget) *Step {
 		Version: 2,
 		Doc:     "run the data-completeness contract against the finished corpus",
 		Deps:    t.validateDeps(),
-		Impl:    []string{"cmd/validate", "cmd/anchorcheck", "scripts/data-contract.sh", "contracts/accepted-absences.txt"},
+		Impl: []string{
+			"cmd/validate", "cmd/anchorcheck",
+			// THE PACKAGES BOTH BINARIES LINK, AND THE MODULE GRAPH, because the
+			// verdict is computed in them and build-go is a Tool dep.
+			//
+			// This list named the two commands and nothing they import. The verdict
+			// does not live in cmd/ alone: validate reads the embed floor through
+			// model.ReleaseOrdinal (cmd/validate/main.go:203), compares the corpus's
+			// sparse stamp against embed.SparseModelID() (:271), and decides the
+			// re-ingest check in store.SummariseReingested (:682); anchorcheck opens the
+			// corpus through internal/store. build-go relinks both binaries when any
+			// of these moves, and a dirty Tool dep invalidates no consumer. So an edit
+			// there left this step "fingerprint unchanged, outputs present and valid"
+			// — SKIP, the new check never run — while smoke and publish, which name
+			// the same packages, replayed and recorded the image as having passed a
+			// contract the edited validate never evaluated. A DuckDB bump in go.mod
+			// reached the gate the same way. Found by review on 2026-09-11;
+			// TestValidateDeclaresEveryPackageItsBinariesLink holds this list to
+			// `go list -deps` of both commands under build-go's own tags.
+			"internal/embed", "internal/model", "internal/store",
+			"go.mod", "go.sum",
+			"scripts/data-contract.sh", "contracts/accepted-absences.txt",
+		},
+		// The step RUNS cmd/validate and cmd/anchorcheck; a _test.go cannot change
+		// what either binary checks. Both arms counted them until 2026-09-11,
+		// recorded in countsTestFiles as cheap to replay — 2m32 and 17.6 s (build E).
+		// That was the gate's own cost and not the price of replaying it, the
+		// understatement #324 corrected for smoke: this step has no Outputs, so
+		// every replay hands smoke a new provenance ("dependency output changed"),
+		// smoke hands one to publish, and publish re-composes the image — 24m40 of
+		// it before the first blob moved on 2026-09-10 (build-image.sh), for an image
+		// that differs from the last one by nothing but the commit stamped into its
+		// binary. cmd/validate holds six test files and cmd/anchorcheck one — seven
+		// of the eleven files this step hashed then — so a test-only commit in
+		// either paid all of that. It matters more since the three packages above
+		// joined the list: 44 files hashed, and 79 test artefacts left out, 45 of
+		// them internal/store's.
+		ExcludeTests: true,
 		// THE CONTRACT THE GATE APPLIED IS A DETERMINANT OF ITS VERDICT, and until
 		// 2026-09-11 it was not in the fingerprint.
 		//
@@ -1105,7 +1153,7 @@ func stepValidate(t corpusTarget) *Step {
 			}
 			// THE ANCHOR IS A 3GPP ARTEFACT, and this is not the ETSI arm being
 			// treated as second class. The delta anchor is .local/corpus-index.json,
-			// which `merge` writes out of the 3GPP shards; the ETSI ingest produces
+			// which the 3GPP ingest's fold writes out of its shards; the ETSI ingest produces
 			// one database directly and there is no anchor to check against. Running
 			// anchorcheck here would point it at the 3GPP corpus from the ETSI gate,
 			// which is the same check twice under a name that says otherwise.
@@ -1187,15 +1235,18 @@ func stepSmoke() *Step {
 		// is inert" trap, reached through the gate. A Tool dep adds nothing to the
 		// fingerprint, so declaring it replays nothing.
 		Deps: []string{"validate", "validate-etsi", "build-go"},
-		Impl: []string{
-			"cmd/server", "internal/mcp", "internal/search",
-			// THE RETRIEVAL GATE'S DETERMINANTS (see smoke_gate.go). The instrument,
-			// the verdict, the lexical ranking it measures (Store.SearchClauses) and
-			// the shape a hit is read from; then the judged queries and the bar. bench
-			// also links internal/embed and internal/rerank, which -systems lexical
-			// never reaches, so they are left out rather than replaying the gate for
-			// code it cannot run.
-			"cmd/bench", "internal/eval", "internal/store", "internal/model",
+		Impl: append([]string{
+			// THE RETRIEVAL GATE'S OWN DETERMINANTS (see smoke_gate.go): the
+			// instrument and the verdict, then the judged queries and the bar. The
+			// lexical ranking it measures (Store.SearchClauses) and the shape a hit
+			// is read from are server packages, internal/store and internal/model,
+			// so they arrive with serverImplPackages below — and so do
+			// internal/embed and internal/rerank, which bench also links and which
+			// this list used to leave out because -systems lexical never reaches
+			// them. The server that answers the probes links them either way.
+			// TestSmokeDeclaresEveryPackageItsBinariesLink holds both closures to
+			// `go list -deps`, so bench cannot grow an import this list misses.
+			"cmd/bench", "internal/eval",
 			retrievalQuerySet, retrievalBaseline,
 			// THE MODULE GRAPH, because build-go is a Tool dep and a dirty Tool dep
 			// deliberately invalidates no consumer. A DuckDB bump in go.mod rebuilds
@@ -1203,7 +1254,33 @@ func stepSmoke() *Step {
 			// — and without these two lines this step kept the verdict the old
 			// engine earned. Found by review of #324.
 			"go.mod", "go.sum",
-		},
+			// EVERY PACKAGE THE SHIPPED SERVER LINKS, out of the SAME function
+			// publish declares them with, so the gate and the thing it gates cannot
+			// drift apart again.
+			//
+			// This list named five of the thirteen publish names — cmd/server,
+			// internal/mcp and internal/search for the probes, internal/store and
+			// internal/model for the bench — on the reasoning that smoke only STARTS
+			// the server. It does more than start it: resolve_term runs the
+			// EnrichTerm of every subject internal/registry wires in, and
+			// internal/subject/li attaches the ASN.1 type there. The same Tool-dep
+			// rule as the module graph above then applies: an edit confined to
+			// internal/subject/li rebuilt server.exe through build-go, left this step
+			// "fingerprint unchanged, outputs present and valid" — SKIP, with no
+			// probe run — while publish, whose Impl DID move, republished the broken
+			// server recorded as gated. Eight packages, 47 source files, were in that
+			// gap: this step hashed 50 files and then 97. Found by review on
+			// 2026-09-11; TestSmokeJudgesEveryPackagePublishShips counts them.
+			//
+			// A ninth came the same day: internal/onnxrt, which only the image's
+			// `-tags "onnx,embed_ffi"` build links, so the untagged graph both
+			// closure tests read did not contain it (99 files now). server.exe,
+			// built lexical by build-go, cannot exercise it, and smoke replays on it
+			// anyway: this is the gate in front of the image that links it, and a
+			// probe replay is under a minute (53.7 s on 2026-09-11) against the image
+			// it guards. TestSmokeDeclaresEveryPackageItsBinariesLink reads each graph
+			// under the tags its binary is built with.
+		}, serverImplPackages()...),
 		// The step RUNS binaries; a _test.go cannot change what either of them does.
 		// It counted them until now, recorded in countsTestFiles as cheap to replay
 		// at 23.9 s — which understated it: smoke has no outputs, so every replay
@@ -1700,7 +1777,7 @@ func corpus3GPP() corpusTarget {
 		Snapshot: func() bootstrap.CorpusSource {
 			return bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
 		},
-		Producers: []string{"merge", "seed"},
+		Producers: []string{"ingest", "seed"},
 	}
 }
 
@@ -1714,7 +1791,7 @@ func corpusETSI() corpusTarget {
 		Snapshot: func() bootstrap.CorpusSource {
 			return bootstrap.CorpusETSI(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
 		},
-		// seed-etsi joins ingest-etsi exactly as seed joins merge on the other arm:
+		// seed-etsi joins ingest-etsi exactly as seed joins ingest on the other arm:
 		// two producers, so they land in AnyDeps and either one moving is enough.
 		Producers: []string{"ingest-etsi", "seed-etsi"},
 	}
@@ -1726,9 +1803,9 @@ func (t corpusTarget) ledgerPath(c *Ctx) string { return filepath.Join(c.Local, 
 // singleProducer / multiProducer split the producer list between Deps and AnyDeps.
 //
 // AnyDeps deliberately rejects a one-element set — one alternative is a Dep in
-// disguise and would lose the ordinary dependency semantics. 3GPP has two
-// producers (merge OR seed) and belongs in AnyDeps; ETSI has one and belongs in
-// Deps. Encoding that here keeps the rule in one place instead of at each call.
+// disguise and would lose the ordinary dependency semantics. Both arms have two
+// producers today (ingest OR seed), so both land in AnyDeps; the split stays so an
+// arm with one producer would still be expressed correctly.
 func (t corpusTarget) singleProducer() []string {
 	if len(t.Producers) == 1 {
 		return t.Producers
@@ -1743,14 +1820,18 @@ func (t corpusTarget) multiProducer() []string {
 	return nil
 }
 
-// indexDeps: the vector index needs the vectors, and for 3GPP it also waits on
-// `enrich` -- the catalogue overlay rewrites rows, and rebuilding the index before
-// it would index a corpus that is about to change.
+// indexDeps: the vector index needs the vectors, the content-addressed conversion
+// (the vectors move to `bodies` there, and an index built before it would index
+// the table the step is about to drop) and its own corpus's compaction. build-go
+// because the index is built by cmd/freeze-hnsw.
 //
-// The ETSI arm names its own enrich TRANSITIVELY, through paragraphs-etsi: that
-// step depends on enrich-etsi (see paragraphsDeps), and enrich-etsi writes only
-// `acronyms`, a table no vector index reads. Listing it again here would be a
-// dependency that documents nothing the DAG does not already enforce.
+// THE SAME LIST ON BOTH ARMS. The 3GPP arm used to add `enrich` here — the
+// catalogue overlay rewrites rows, and the index must not be built before it —
+// while the ETSI arm named its enrich only transitively. Both constraints are
+// enforced by `paragraphs`, which depends on its arm's enrich (paragraphsDeps), so
+// the extra edge documented nothing the DAG did not already guarantee and made the
+// two index steps stand on different lists. Dropping a determinant replays nothing
+// (onlyDroppedDeterminants).
 //
 // BOTH ARMS NAME THEIR OWN COMPACTION. `COPY FROM DATABASE` does not carry custom
 // indexes and the bin therefore resets hnsw_state to "building", so an index
@@ -1759,15 +1840,7 @@ func (t corpusTarget) multiProducer() []string {
 // it used to be expressed by both arms naming the SAME `compact` step -- which
 // worked, and coupled the ETSI freeze to the 3GPP conversion for no reason.
 func (t corpusTarget) indexDeps() []string {
-	deps := []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact" + t.Suffix, "build-go"}
-	if t.Suffix == "" {
-		// The 3GPP index is built AFTER the corpus is content-addressed: the
-		// vectors move to `bodies` in that step, and an index built before it
-		// would index the table the step is about to drop.
-		// build-go because the index is now built by cmd/freeze-hnsw.
-		deps = append(deps, "enrich")
-	}
-	return deps
+	return []string{"embed" + t.Suffix, "paragraphs" + t.Suffix, "compact" + t.Suffix, "build-go"}
 }
 
 // compactDeps: after every writer that leaves dead blocks behind in THIS corpus.
@@ -1908,11 +1981,23 @@ func stepParagraphs(t corpusTarget) *Step {
 // compiles the workspace with neither, so it can never produce this binary.
 func stepBuildSparse() *Step {
 	return &Step{
-		Name:      "build-sparse",
-		Version:   1,
-		Doc:       "build the learned-lexical (sparse) corpus producer",
-		Deps:      []string{"toolchain"},
-		Impl:      []string{"rust/embed-core/src"},
+		Name:    "build-sparse",
+		Version: 1,
+		Doc:     "build the learned-lexical (sparse) corpus producer",
+		Deps:    []string{"toolchain"},
+		// THE MANIFEST AND THE LOCKFILE, NOT ONLY src. The build below is --locked,
+		// and --locked is only loud if the step runs: with src alone declared, an ort
+		// bump in Cargo.toml or a `cargo update` that rewrote Cargo.lock left this
+		// step "fingerprint unchanged" and embed-core-sparse linked against the
+		// previous versions, the "a fix that was not built is inert" trap. The
+		// lockfile is the crate's own: rust/Cargo.toml excludes embed-core from the
+		// workspace. This is a Tool, so the replay it costs is a relink (4.5 s on
+		// 2026-09-03) and moves no data step.
+		// TestEveryLockedCargoBuildDeclaresTheLockfileItObeys holds it.
+		//
+		// THE sparse STEPS DO NOT DECLARE THEM, deliberately and for now. See
+		// stepSparse.
+		Impl:      []string{"rust/embed-core/src", "rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock"},
 		Toolchain: true,
 		Tool:      true,
 		// A box without the sparse model still completes every other step: the
@@ -1927,9 +2012,16 @@ func stepBuildSparse() *Step {
 				feats = "ort,cuda"
 			}
 			c.Log.Printf("cargo build embed-core-sparse (--features %s)", feats)
+			// --locked: rust/embed-core/Cargo.lock is the lockfile publish has
+			// fingerprinted since 6cafdc7, and an unlocked build here was free to
+			// re-resolve and rewrite it, moving publish's fingerprint from inside a
+			// Tool (the 2026-09-10 rust/discover drift). `cargo metadata --locked
+			// --format-version 1 --manifest-path rust/embed-core/Cargo.toml` exits 0
+			// (2026-09-11), and the lockfile does not depend on --features, so ort and
+			// ort,cuda resolve from the same file.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release",
+				Args: []string{"build", "--release", "--locked",
 					"--manifest-path", "rust/embed-core/Cargo.toml",
 					"--features", feats, "--bin", "embed-core-sparse"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
@@ -1982,6 +2074,19 @@ func stepSparse(t corpusTarget) *Step {
 		// rust/store/src/vectors.rs carries set_sparse_many, sparse_chunk_ids and
 		// the term_id index handling — the import this step's whole cost lives in.
 		// It was in lib.rs, which this step never declared.
+		//
+		// rust/embed-core/Cargo.toml AND Cargo.lock ARE NOT HERE, AND THAT IS
+		// DEFERRED, NOT DECIDED (2026-09-11). They decide the ort and tokenizers
+		// embed-core-sparse runs with, and build-sparse now declares both. Adding
+		// them here is not the fix it looks like, measured: the last replay of each
+		// arm (2026-09-10, .local/state/steps/sparse*.json) exported a work list of
+		// 0, DECLINED in 158.7 s and 10.4 s and carried its provenance forward. So
+		// the two lines would cost those ~2m49 once, move nothing downstream, and
+		// re-embed nothing either: runSparse declines whenever every clause carries
+		// a posting, whichever binary wrote it. Postings that follow a lockfile
+		// change need the step's decision, not only its fingerprint, to know which
+		// build wrote them, and the first time that holds it re-embeds both corpora
+		// on the GPU. That wants its own decision.
 		Impl: []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs",
 			"rust/store/src/vectors.rs"},
 		// The corpus is not an input here either: compact rewrites it after this
@@ -2372,7 +2477,13 @@ func stepBuildServe() *Step {
 		Version: 1,
 		Doc:     "build the semantic server (onnx + embed_ffi) and stage its DLLs",
 		Deps:    []string{"toolchain", "build-go"},
-		Impl:    []string{"cmd/server", "internal", "rust/embed-core/src", "go.mod", "go.sum"},
+		// rust/embed-core's Cargo.toml and Cargo.lock for the reason build-sparse
+		// names them: the cdylib build below is --locked, and a flag that refuses a
+		// re-resolution only helps if a manifest or lockfile change runs the step at
+		// all. With src alone, an ort bump left server-full linking the previous
+		// embedder.
+		Impl: []string{"cmd/server", "internal", "rust/embed-core/src",
+			"rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock", "go.mod", "go.sum"},
 		// It LINKS a binary, which is the case ExcludeTests was written for and the
 		// one build-go and build-rust already set. It names `internal` whole, so
 		// every test under it counted — and `go build` compiles none of them. The
@@ -2389,9 +2500,11 @@ func stepBuildServe() *Step {
 		Run: func(c *Ctx) error {
 			target := filepath.Join(c.Local, "cargo-target-embedcore")
 			c.Log.Printf("cargo build embed-core cdylib (--features ort)")
+			// --locked, as build-sparse and build-image.sh build the same crate: the
+			// same lockfile, the same rewrite it prevents.
 			if err := c.Run(Cmd{
 				Name: "cargo",
-				Args: []string{"build", "--release",
+				Args: []string{"build", "--release", "--locked",
 					"--manifest-path", "rust/embed-core/Cargo.toml", "--features", "ort"},
 				Env:  append([]string{"CARGO_TARGET_DIR=" + target}, gpuEnv(c)...),
 				Echo: true,

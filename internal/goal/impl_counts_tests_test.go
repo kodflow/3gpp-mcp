@@ -23,15 +23,24 @@ import (
 var countsTestFiles = map[string]string{
 	"test": "runs the suites; test files are its INPUT, not noise — the reason ExcludeTests exists",
 
-	// Cheap to replay, so the one-time fingerprint churn buys little.
-	"validate":      "cmd/validate; replaying it is 2m32 (build E)",
-	"validate-etsi": "cmd/validate, shared with validate; replaying it is 17.6 s (build E)",
+	// Cheap to replay AND the replay stops there: discover-etsi asserts
+	// OutputsComplete, so a run that rewrites a byte-identical work list carries
+	// its provenance forward and nothing behind it moves.
+	//
+	// A step's own replay time is not its price unless that holds. validate and
+	// validate-etsi sat here at 2m32 and 17.6 s (build E) and were removed on
+	// 2026-09-11: neither has Outputs, so each replay handed smoke a new
+	// provenance and smoke handed publish one — a 25-minute image re-compose per
+	// test-only commit in cmd/validate. That is the reasoning #324 applied to smoke.
 	"discover-etsi": "internal/etsicat; replaying it is 39.6 s and it re-enumerates anyway",
 
 	// Expensive, and deliberately deferred: fixing it costs one replay of the
 	// thing it protects.
-	"merge":           "cmd/migrate-paragraphs; replaying merge is 34m15 and rewrites the corpus, which then costs a 42 GB image re-push",
-	"paragraphs":      "cmd/migrate-paragraphs, same binary as merge; deferred with it so the two move together",
+	// `merge` sat here too, until the fold became the second half of `ingest`:
+	// that change replays the step anyway, so it was the free moment to stop
+	// counting cmd/migrate-paragraphs' main_test.go — ingest and ingest-etsi both
+	// set ExcludeTests.
+	"paragraphs":      "cmd/migrate-paragraphs, the binary ingest's fold also runs; replaying paragraphs rewrites the corpus, which then costs a 42 GB image re-push",
 	"paragraphs-etsi": "cmd/migrate-paragraphs, the ETSI twin; replaying it is 8m07 and rewrites etsi.duckdb, which drags compact-etsi, index-etsi and a 19 GB layer re-push",
 }
 
