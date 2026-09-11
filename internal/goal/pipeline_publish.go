@@ -247,14 +247,20 @@ type imageKnob struct {
 //	               default lives in scripts/fetch-model.sh, which build-image.sh
 //	               reads it out of by design ("sourcing the number rather than
 //	               copying it"), and which is not in Impl either.
-//	EMBED_FLOOR    and DATA_CONTRACT: the contract the corpus must pass before the
-//	DATA_CONTRACT  script bakes it at all (:288-306). They change no byte of an
-//	               image that passes, and that is exactly why they belong here:
-//	               what this step records is not "these bytes were pushed" but
-//	               "this corpus met this contract and was pushed". DATA_CONTRACT=dense
-//	               checks neither the sparse layer nor the ETSI half, so an image
-//	               published under it must replay when the gate is restored, not
-//	               stand on the registry as current under a contract it never met.
+//	DATA_CONTRACT  the contract the corpus must pass before the script bakes it at
+//	               all. It changes no byte of an image that passes, and that is
+//	               exactly why it belongs here: what this step records is not
+//	               "these bytes were pushed" but "this corpus met this contract and
+//	               was pushed". DATA_CONTRACT=dense checks neither the sparse layer
+//	               nor the ETSI half, so an image published under it must replay
+//	               when the gate is restored, not stand on the registry as current
+//	               under a contract it never met.
+//
+// EMBED_FLOOR, the contract's other half, USED TO BE A KNOB HERE and is not any
+// more: runPublish passes the script --embed-floor, the floor validate applied, so
+// the environment's value never reaches the gate under goal. It is still folded in
+// — as embed_floor, at that applied value — and an EMBED_FLOOR that disagrees
+// refuses the plan. See embed_floor.go.
 //
 // DATA_CONTRACT is read by build-image.sh only to label its log. The value that
 // decides the gate is INHERITED by scripts/data-contract.sh, which applies its own
@@ -268,12 +274,12 @@ var imageKnobs = []imageKnob{
 	{Env: "IMAGE_BASE", Key: "image_base", DefaultIn: buildImageScript},
 	{Env: "ZIG_TARGET", Key: "zig_target", DefaultIn: buildImageScript},
 	{Env: "ORT_VERSION", Key: "ort_version", DefaultIn: "scripts/fetch-model.sh"},
-	{Env: "EMBED_FLOOR", Key: "embed_floor", DefaultIn: buildImageScript},
 	{Env: "DATA_CONTRACT", Key: "data_contract", DefaultIn: "scripts/data-contract.sh"},
 }
 
-// publishExtra is publish's Extra: the tag, and every imageKnob at the value the
-// script will use.
+// publishExtra is publish's Extra: the tag, every imageKnob at the value the script
+// will use, the embed floor runPublish passes it (embed_floor.go), and the version
+// of every tool that writes the image (image_toolchain.go).
 func publishExtra(c *Ctx) (map[string]string, error) {
 	m := map[string]string{"image_tag": imageTag()}
 	for _, k := range imageKnobs {
@@ -282,6 +288,14 @@ func publishExtra(c *Ctx) (map[string]string, error) {
 			return nil, err
 		}
 		m[k.Key] = v
+	}
+	floor, err := imageEmbedFloor(c)
+	if err != nil {
+		return nil, err
+	}
+	m["embed_floor"] = floor
+	if err := addImageToolchain(c, m); err != nil {
+		return nil, err
 	}
 	return m, nil
 }
@@ -579,17 +593,19 @@ func runPublish(c *Ctx) error {
 
 	c.Log.Printf("publishing %s — the corpus layer is ~40 GB, and only the blobs the "+
 		"registry does not already hold are transferred", tag)
-	// SKIP THE SCRIPT'S RE-RUN OF THE CONTRACT only when `validate` certified these
-	// exact bytes under the flags and floor the script would use. See
-	// contract_certificate.go; every doubt leaves the re-run in place.
-	floor, err := imageKnob{Env: "EMBED_FLOOR", Key: "embed_floor", DefaultIn: buildImageScript}.effective(c.Root)
+	// THE SCRIPT IS HELD TO THE FLOOR VALIDATE APPLIED, passed as a flag so that its
+	// own ${EMBED_FLOOR:-…} never decides under the pipeline (embed_floor.go).
+	floor, err := imageEmbedFloor(c)
 	if err != nil {
 		return err
 	}
+	// SKIP THE SCRIPT'S RE-RUN OF THE CONTRACT only when `validate` certified these
+	// exact bytes under the flags and floor the script will use. See
+	// contract_certificate.go; every doubt leaves the re-run in place.
 	env := contractEnv(c, floor)
 	if err := c.Run(Cmd{
 		Name: "bash",
-		Args: []string{buildImageScript, "--tag", tag},
+		Args: []string{buildImageScript, "--tag", tag, "--embed-floor", floor},
 		Env:  env,
 		Echo: true,
 	}); err != nil {

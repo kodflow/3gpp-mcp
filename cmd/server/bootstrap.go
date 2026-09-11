@@ -31,22 +31,42 @@ import (
 // `--db-url` survives as an explicit override for a mirror you host yourself.
 // Nothing points at a github.com release asset any more, which is what
 // TestBootstrapDefaultsAreNotAPublicReleaseAsset pins.
+//
+// THE SERVER FOLLOWS `latest` ON PURPOSE, and the pipeline does not. The pipeline's
+// seed steps pull the digest pinned in contracts/corpus-pin.txt, because a build
+// must be reproducible from its commit. This binary is not built from the commit
+// that publishes the corpus: it is released on its own cadence, and `serve`'s
+// update check (ensureDB) exists precisely so an installed binary picks up the
+// next published corpus without a re-release. Compatibility is not left to the
+// tag: the server refuses (or degrades to lexical on) a corpus whose embedding
+// identity differs from its own. What the server does share with the pipeline is
+// the reference grammar and the check behind it: a deployment that wants a frozen
+// corpus pins one by digest (MCP3GPP_CORPUS_REF_3GPP / _ETSI), and the manifest is
+// then verified against that digest before a byte is transferred.
 const (
 	// envGHCROwner / envCorpusTag let a deployment repoint the corpus without a
 	// rebuild (a fork, a staging tag) while keeping the default zero-config.
-	envGHCROwner = "MCP3GPP_GHCR_OWNER"
-	envCorpusTag = "MCP3GPP_CORPUS_TAG"
+	envGHCROwner = bootstrap.EnvGHCROwner
+	envCorpusTag = bootstrap.EnvCorpusTag
 )
 
 // corpusSource is the 3GPP corpus package this binary provisions from.
-func corpusSource() bootstrap.CorpusSource {
-	return bootstrap.Corpus3GPP(os.Getenv(envGHCROwner), os.Getenv(envCorpusTag))
+func corpusSource() (bootstrap.CorpusSource, error) {
+	ref, _, err := bootstrap.RefOverride(bootstrap.Image3GPP)
+	if err != nil {
+		return bootstrap.CorpusSource{}, err
+	}
+	return bootstrap.Corpus3GPP(os.Getenv(envGHCROwner), ref), nil
 }
 
 // etsiSource is the ETSI Lawful-Interception corpus, served alongside and never
 // merged (CLAUDE.md §13).
-func etsiSource() bootstrap.CorpusSource {
-	return bootstrap.CorpusETSI(os.Getenv(envGHCROwner), os.Getenv(envCorpusTag))
+func etsiSource() (bootstrap.CorpusSource, error) {
+	ref, _, err := bootstrap.RefOverride(bootstrap.ImageETSI)
+	if err != nil {
+		return bootstrap.CorpusSource{}, err
+	}
+	return bootstrap.CorpusETSI(os.Getenv(envGHCROwner), ref), nil
 }
 
 // bootstrapLog prefixes progress the same way the rest of the binary does.
@@ -84,7 +104,13 @@ func ensureDB(ctx context.Context, allowUpdate bool) (string, error) {
 		return dbPath, nil
 	}
 
-	src := corpusSource()
+	// A reference the operator mistyped is refused even with a cache in hand: it
+	// is a configuration error, not the network hiccup degrade-don't-block is for,
+	// and serving on would hide that the pin they set is not the one in force.
+	src, err := corpusSource()
+	if err != nil {
+		return "", err
+	}
 	pat, origin, cerr := bootstrap.GHCRCredential("")
 	if cerr != nil {
 		if have { // degrade: a cached corpus serves fine without a credential
@@ -113,7 +139,7 @@ func ensureDB(ctx context.Context, allowUpdate bool) (string, error) {
 		fmt.Fprintf(os.Stderr, "[3gpp-mcp] no cached corpus — pulling %s (credential from %s). This is large; it resumes if interrupted.\n", src, origin)
 	}
 
-	if err := bootstrap.FetchCorpus(ctx, src, pat, dbPath, bootstrapLog); err != nil {
+	if _, err := bootstrap.FetchCorpus(ctx, src, pat, dbPath, bootstrapLog); err != nil {
 		if have { // degrade: prefer a stale-but-working corpus over failing serve
 			fmt.Fprintf(os.Stderr, "[3gpp-mcp] corpus update failed (%v) — using the cached corpus\n", err)
 			return dbPath, nil
@@ -189,12 +215,24 @@ func runBootstrap(args []string) error {
 				// corrupt-but-current cache with no way back short of rm.
 				_ = os.Remove(bootstrap.DigestPath(dbPath))
 			}
+			// Both references are resolved BEFORE anything is transferred, so a
+			// mistyped ETSI pin fails here and not after a 7.9 GB 3GPP pull.
+			src, err := corpusSource()
+			if err != nil {
+				return err
+			}
+			var etsiSrc bootstrap.CorpusSource
+			if *withETSI {
+				if etsiSrc, err = etsiSource(); err != nil {
+					return err
+				}
+			}
 			pat, origin, cerr := bootstrap.GHCRCredential(*ghcrToken)
 			if cerr != nil {
 				return fmt.Errorf("%s", credentialAdvice)
 			}
-			bootstrapLog("corpus %s → %s (credential from %s)", corpusSource(), dbPath, origin)
-			if err := bootstrap.FetchCorpus(ctx, corpusSource(), pat, dbPath, bootstrapLog); err != nil {
+			bootstrapLog("corpus %s → %s (credential from %s)", src, dbPath, origin)
+			if _, err := bootstrap.FetchCorpus(ctx, src, pat, dbPath, bootstrapLog); err != nil {
 				return err
 			}
 			if *withETSI {
@@ -202,8 +240,8 @@ func runBootstrap(args []string) error {
 				if *force {
 					_ = os.Remove(bootstrap.DigestPath(etsiPath))
 				}
-				bootstrapLog("corpus %s → %s", etsiSource(), etsiPath)
-				if err := bootstrap.FetchCorpus(ctx, etsiSource(), pat, etsiPath, bootstrapLog); err != nil {
+				bootstrapLog("corpus %s → %s", etsiSrc, etsiPath)
+				if _, err := bootstrap.FetchCorpus(ctx, etsiSrc, pat, etsiPath, bootstrapLog); err != nil {
 					return err
 				}
 			}

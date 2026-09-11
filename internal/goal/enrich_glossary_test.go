@@ -83,7 +83,7 @@ func TestEnrichDeclaresTheGlossaryWriter(t *testing.T) {
 }
 
 // TestGlossaryWriterHasExactlyTheCallersEnrichAssumes is the other half of the
-// trade above, the Go twin of TestChangelogWriterHasExactlyOneCaller.
+// trade above, the Go twin of TestEveryChangelogWriterIsDeclaredByTheStepThatRunsIt.
 //
 // enrich's narrow declaration is correct only while the glossary is written by
 // this file alone, only seed-glossary calls it, and only enrich runs seed-glossary.
@@ -151,7 +151,7 @@ func TestGlossaryWriterHasExactlyTheCallersEnrichAssumes(t *testing.T) {
 		if defs := prod("func (s *Store) " + m.name + "("); len(defs) != 1 || defs[0] != glossaryWriter {
 			t.Errorf("%s must be defined exactly once, in %s; found %v", m.name, glossaryWriter, defs)
 		}
-		// MATCH THE CALL, NOT THE NAME — the lesson TestChangelogWriterHasExactlyOneCaller
+		// MATCH THE CALL, NOT THE NAME — the lesson TestEveryChangelogWriterIsDeclaredByTheStepThatRunsIt
 		// paid for when it failed on its own documentation. A call is `.Name(`.
 		got := prod("." + m.name + "(")
 		if strings.Join(got, ",") != strings.Join(m.callers, ",") {

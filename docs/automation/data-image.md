@@ -92,6 +92,17 @@ up the wire regardless, roughly 25 minutes of a 54-minute push carrying data the
 registry already had. Nothing failed; the only symptom was the clock.
 `scripts/local/build-image_test.sh` pins the split.
 
+**No layer is read to learn what it is.** `imgtar` writes each layer gzipped and
+hashes it on the way out: the digest of the blob and the diff_id of the tar land
+in `<layer>.id` beside it, and `.local/image-cache` keeps them with the blob.
+The script does not call `crane append` (whose `-f` reads every layer twice to
+compute both, 7m42 of the 2026-09-11 publish for layers the registry already
+held): `imgtar oci` appends the layers to the base from their records, writing
+the manifest crane would have written byte for byte (pinned against the one it
+pushed that day), and `crane push` sends that OCI layout, opening a layer only to
+upload it. A record is trusted only while it matches its file's size and content
+sample; otherwise the layer is repacked (cache) or read (assembly), never guessed.
+
 ## What is in it, and why each piece has to be
 
 - **The corpus, in place.** `serve` reads it read-only; there is no `VOLUME`, so

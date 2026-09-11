@@ -720,7 +720,8 @@ func stepEnrich(t corpusTarget) *Step {
 			// resolve_term answering "Authentication Management Field" when
 			// asked what an AMF is. It REPLACES the rows it owns — those citing a
 			// spec id — so a row no spec declares any more leaves, while the
-			// TS 21.905 and ETSI entries stay exactly where they are. Idempotent:
+			// TS 21.905 and ETSI entries stay where they are, save a TS 21.905
+			// row the newest TS 21.905 no longer stores (retired). Idempotent:
 			// an unchanged corpus is left untouched, byte for byte.
 			c.Log.Printf("glossary seed (each spec's own Abbreviations clause)")
 			return c.Run(Cmd{Name: c.bin("seed-glossary"), Args: []string{"--db", db}, Echo: true})
@@ -748,21 +749,42 @@ func stepEnrichETSI(t corpusTarget) *Step {
 	return &Step{
 		Name:    "enrich" + t.Suffix,
 		Version: 1,
-		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary",
+		Doc:     "mine each ETSI deliverable's own Abbreviations clause into the glossary, and its change-history annex into the changelog",
 		Deps:    []string{"ingest-etsi", "build-rust"},
 		// NAMED FILES, NOT THE CRATE — the declaration ingest-etsi carries, for the
 		// reason measured on 2026-09-06: naming rust/ingest/src/bin made a fix to
 		// ingest_li.rs invalidate the whole ETSI half (~1 h of rework, 18.8 GiB
 		// re-pushed) over a binary that half never runs. This step runs exactly
-		// one, so it names exactly its source and the crates it links.
+		// two, so it names exactly their sources and the crates they link.
 		Impl: []string{
 			"rust/ingest/src/bin/ingest_glossary.rs", "rust/ingest/Cargo.toml",
+			// THE ETSI CHANGELOG WRITER, and the store file its write goes through.
+			// rust/store/src/changes.rs holds replace_changes, which ingest-crs on
+			// the 3GPP arm also calls: each arm declares it for its own binary, so
+			// an edit to the guard replays both writers and neither corpus keeps a
+			// changelog the current code would not write.
+			// TestEveryChangelogWriterIsDeclaredByTheStepThatRunsIt holds the pairing.
+			"rust/ingest/src/bin/ingest_etsi_changes.rs", "rust/store/src/changes.rs",
+			// Both binaries read the converted HTML through it.
+			"rust/parse/src/html_bytes.rs",
 			// The extraction rule and the ETSI provenance header it keys on — AND the
 			// crate's manifest, for the reason rust/ingest/Cargo.toml is here: a
 			// dependency or feature change produces a different binary from identical
 			// sources, and build-rust is a Tool that never replays a data step.
 			"rust/parse/src/glossary.rs", "rust/parse/src/etsi.rs", "rust/parse/Cargo.toml",
+			// The crate root, where parse_html_clauses — the walker every deliverable
+			// goes through before a line is mined — lives, and the decoder that reads
+			// each file first. Both were missing: a fix to either changed the ETSI
+			// glossary with this step reported current. The list is no longer kept by
+			// hand: TestEnrichETSIDeclaresEverythingItsBinaryIsBuiltFrom derives what
+			// ingest-glossary is built from and fails on any file missing here.
+			"rust/parse/src/lib.rs", "rust/parse/src/html_bytes.rs",
 			"rust/store/src/lib.rs", "rust/store/Cargo.toml",
+			// Named by the store's crate root (`pub use changes::ChangeRow`, and the
+			// identity crate it re-exports), so compiled into this binary from code
+			// it can reach. Cheap to over-declare since ingest-glossary writes nothing
+			// when the glossary is unchanged: a replay here costs ~2 min, 0 bytes.
+			"rust/store/src/changes.rs", "rust/identity",
 			// The workspace manifest and LOCKFILE: `cargo update` alone can change
 			// the binary, and build-rust is a Tool that never replays a data step.
 			"rust/Cargo.toml", "rust/Cargo.lock",
@@ -812,7 +834,23 @@ func stepEnrichETSI(t corpusTarget) *Step {
 		},
 		Run: func(c *Ctx) error {
 			c.Log.Printf("mining the Abbreviations clause of each ETSI deliverable (newest version of each)")
-			return c.Run(Cmd{Name: c.rbin("ingest-glossary"), Args: []string{
+			if err := c.Run(Cmd{Name: c.rbin("ingest-glossary"), Args: []string{
+				"--convert", c.dataPath("sources", "convert-etsi"),
+				"--db", t.dbPath(c),
+			}, Echo: true}); err != nil {
+				return err
+			}
+			// THE ETSI CHANGELOG. etsi.duckdb carried no change record at all, and
+			// get_changelog could only say so. ETSI publishes no change-request
+			// database; what it does publish is the change-history annex some
+			// deliverables print about themselves, and in the TC LI layout that
+			// annex names each CR on a line of its own. The writer reads EVERY
+			// version — the version a CR landed in is where it first appears — and
+			// declines every layout it cannot read without guessing. Idempotent on
+			// its output: an unchanged archive leaves the corpus untouched, byte for
+			// byte (replace_changes compares the rows the table holds).
+			c.Log.Printf("ETSI changelog from the change-history annexes (every version of each deliverable)")
+			return c.Run(Cmd{Name: c.rbin("ingest-etsi-changes"), Args: []string{
 				"--convert", c.dataPath("sources", "convert-etsi"),
 				"--db", t.dbPath(c),
 			}, Echo: true})
@@ -1770,6 +1808,10 @@ type corpusTarget struct {
 	// from etsi.org over many hours of download and GPU, for a package that was
 	// sitting on the registry the whole time. Same shape as ingest-glossary: the
 	// capability existed, the wiring did not.
+	//
+	// It names the PACKAGE only. Which snapshot of it is pulled — the digest in
+	// contracts/corpus-pin.txt, or an operator override — is seedSource's answer,
+	// the same function for both arms (seed_pin.go).
 	Snapshot func() bootstrap.CorpusSource
 	// Producer names the step that writes DB (for AnyDeps / Deps).
 	Producers []string
@@ -1783,7 +1825,7 @@ func corpus3GPP() corpusTarget {
 		Floor:       func(c *Ctx) string { return c.Cfg("embed_floor") },
 		ContractKey: "contract_flags",
 		Snapshot: func() bootstrap.CorpusSource {
-			return bootstrap.Corpus3GPP(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+			return bootstrap.Corpus3GPP(os.Getenv(bootstrap.EnvGHCROwner), "")
 		},
 		Producers: []string{"ingest", "seed"},
 	}
@@ -1797,7 +1839,7 @@ func corpusETSI() corpusTarget {
 		Floor:       func(c *Ctx) string { return "" },
 		ContractKey: "contract_flags_etsi",
 		Snapshot: func() bootstrap.CorpusSource {
-			return bootstrap.CorpusETSI(os.Getenv("MCP3GPP_GHCR_OWNER"), os.Getenv("MCP3GPP_CORPUS_TAG"))
+			return bootstrap.CorpusETSI(os.Getenv(bootstrap.EnvGHCROwner), "")
 		},
 		// seed-etsi joins ingest-etsi exactly as seed joins ingest on the other arm:
 		// two producers, so they land in AnyDeps and either one moving is enough.
@@ -1914,7 +1956,20 @@ func stepParagraphs(t corpusTarget) *Step {
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
 		Deps:    t.paragraphsDeps(),
 		Impl:    []string{"cmd/migrate-paragraphs"},
-		Heavy:   true,
+		// The step RUNS cmd/migrate-paragraphs; a _test.go cannot change what that
+		// binary does to a corpus. Both arms counted main_test.go until 2026-09-11,
+		// recorded in countsTestFiles as too expensive to fix because "replaying
+		// paragraphs rewrites the corpus". Measured on copies of both corpora, that
+		// was false for every corpus this pipeline now leaves behind: the replay
+		// takes the alreadyConverted path, finds the attestation current, and exits
+		// in 0.2 s with the file identical to the byte (sha256 and mtime) — and so
+		// do the sparse export, the compaction's block count and the HNSW freeze
+		// its fresh provenance replays behind it. The one replay this costs is
+		// therefore gates and a re-composed image, not a corpus.
+		// TestAReplayOfAConvertedCorpusWritesNothing (cmd/migrate-paragraphs)
+		// holds the no-op the price depends on.
+		ExcludeTests: true,
+		Heavy:        true,
 		// The corpus is NOT an input, although this step reads and rewrites it.
 		//
 		// It is the step's own product, and compact, index and the paragraph
@@ -2003,9 +2058,10 @@ func stepBuildSparse() *Step {
 		// 2026-09-03) and moves no data step.
 		// TestEveryLockedCargoBuildDeclaresTheLockfileItObeys holds it.
 		//
-		// THE sparse STEPS DO NOT DECLARE THEM, deliberately and for now. See
-		// stepSparse.
-		Impl:      []string{"rust/embed-core/src", "rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock"},
+		// A rebuilt binary is not rebuilt postings: this being a Tool, the sparse
+		// steps declare the same closure themselves (sparseProducerImpl) and record
+		// which producer wrote each corpus's postings. See sparse_producer.go.
+		Impl:      append([]string(nil), sparseProducerImpl...),
 		Toolchain: true,
 		Tool:      true,
 		// A box without the sparse model still completes every other step: the
@@ -2083,20 +2139,19 @@ func stepSparse(t corpusTarget) *Step {
 		// the term_id index handling — the import this step's whole cost lives in.
 		// It was in lib.rs, which this step never declared.
 		//
-		// rust/embed-core/Cargo.toml AND Cargo.lock ARE NOT HERE, AND THAT IS
-		// DEFERRED, NOT DECIDED (2026-09-11). They decide the ort and tokenizers
-		// embed-core-sparse runs with, and build-sparse now declares both. Adding
-		// them here is not the fix it looks like, measured: the last replay of each
-		// arm (2026-09-10, .local/state/steps/sparse*.json) exported a work list of
-		// 0, DECLINED in 158.7 s and 10.4 s and carried its provenance forward. So
-		// the two lines would cost those ~2m49 once, move nothing downstream, and
-		// re-embed nothing either: runSparse declines whenever every clause carries
-		// a posting, whichever binary wrote it. Postings that follow a lockfile
-		// change need the step's decision, not only its fingerprint, to know which
-		// build wrote them, and the first time that holds it re-embeds both corpora
-		// on the GPU. That wants its own decision.
-		Impl: []string{"rust/embed-core/src", "rust/store/src/bin/embed_io.rs",
-			"rust/store/src/vectors.rs"},
+		// THE PRODUCER'S WHOLE CLOSURE, manifest and lockfile included
+		// (sparseProducerImpl). They decide the ort and tokenizers embed-core-sparse
+		// runs with; with src alone declared, a `cargo update` rebuilt the binary
+		// (build-sparse is a Tool) and never replayed this step.
+		//
+		// Declaring them was never enough on its own, and that is why it waited: the
+		// replay exported a work list of 0 and DECLINED, because the work list only
+		// asked whether a clause had ANY posting. runSparse now also knows which
+		// producer wrote the postings (sparse_producer.go) and re-encodes when it is
+		// not the current one. The fingerprint makes the step look; the recorded
+		// producer decides what it finds.
+		Impl: append(append([]string(nil), sparseProducerImpl...),
+			"rust/store/src/bin/embed_io.rs", "rust/store/src/vectors.rs"),
 		// The corpus is not an input here either: compact rewrites it after this
 		// step, so fingerprinting it guarantees a replay on the next build. The
 		// sparse identity in Extra and the data dependency are what actually decide
@@ -2190,21 +2245,60 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	}
 	c.Log.Printf("sparse identity: %s", id)
 
+	// WHO WROTE THE POSTINGS ALREADY THERE. "Does every clause carry a posting" is
+	// only the whole question when they were all written by what this run would
+	// write them with; see sparse_producer.go for why the corpus cannot say, and
+	// where the answer is kept instead.
+	cur, err := sparseProducerIdentity(c, id)
+	if err != nil {
+		return err
+	}
+	st, err := loadSparseProducerState(c, t, cur, c.previous)
+	if err != nil {
+		return err
+	}
+	c.Checkpoint("sparse_producer", cur.digest())
+	why := sparseReencodeReason(st, cur)
+	reencode := why != ""
+	if reencode {
+		c.Log.Printf("RE-ENCODING EVERY CLAUSE of %s: %s", t.DB, why)
+		c.Checkpoint("sparse_reencode", why)
+		// PENDING BEFORE ANYTHING IS TOUCHED, as the fold does: a re-encode that
+		// dies leaves a layer with postings from two producers, or none, and the
+		// retry must finish it whatever the work list says by then.
+		pending := sparseProducerState{Pending: true}
+		if st != nil {
+			pending.Producer = st.Producer
+		}
+		if err := saveSparseProducerState(c, t, pending); err != nil {
+			return err
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Join(c.Local, "vecs"), 0o755); err != nil {
 		return err
 	}
 	work, out := t.sparseFiles(c)
 
-	c.Log.Printf("exporting the sparse work list of %s (floor=%q)", t.DB, t.Floor(c))
-	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
-		"--db", db, "--export-sparse-worklist", work, "--embed-floor", t.Floor(c),
-	}}); err != nil {
+	// A re-encode exports EVERY embeddable clause at the floor, posted or not: the
+	// ordinary work list subtracts the clauses that already have postings, which is
+	// all of them.
+	exportArgs := []string{"--db", db, "--export-sparse-worklist", work, "--embed-floor", t.Floor(c)}
+	if reencode {
+		exportArgs = append(exportArgs, "--export-sparse-all")
+	}
+	c.Log.Printf("exporting the sparse work list of %s (floor=%q, every clause=%v)", t.DB, t.Floor(c), reencode)
+	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: exportArgs}); err != nil {
 		return err
 	}
 	todo := countLines(work)
 	c.Checkpoint("sparse_worklist", strconv.Itoa(todo))
-	if todo == 0 {
-		return fmt.Errorf("%w: every clause already carries a sparse posting", ErrDeclined)
+	if todo == 0 && !reencode {
+		return fmt.Errorf("%w: every clause already carries a sparse posting, written by the current producer (%s)",
+			ErrDeclined, cur.digest())
+	}
+	if err := ensureSparseLedgerProducer(c, out, cur, !reencode); err != nil {
+		return err
 	}
 	// SAME HAZARD AS THE DENSE LEDGER, and worse until now: a posting line carried a
 	// chunk_id and nothing else. chunk_ids are positional, so a rebuilt corpus reuses
@@ -2227,13 +2321,37 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	}
 	c.Log.Printf("%d clause(s) to embed (postings file already holds %d)", todo, countLines(out))
 
-	if err := c.Run(Cmd{Name: c.rbin("embed-core-sparse"), Args: []string{
-		"--in", work, "--out", out, "--batch", envOr("SPARSE_BATCH", "256"),
-	}, Env: append([]string{"EMBED_MODEL_DIR=" + modelDir}, gpuEnv(c)...), Echo: true}); err != nil {
-		c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
-		return err
+	if todo > 0 {
+		if err := c.Run(Cmd{Name: c.rbin("embed-core-sparse"), Args: []string{
+			"--in", work, "--out", out, "--batch", envOr("SPARSE_BATCH", "256"),
+		}, Env: append([]string{"EMBED_MODEL_DIR=" + modelDir}, gpuEnv(c)...), Echo: true}); err != nil {
+			c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
+			return err
+		}
+	} else if _, err := os.Stat(out); os.IsNotExist(err) {
+		// A re-encode of a corpus with nothing embeddable at the floor: the layer
+		// is replaced by nothing, and the import still needs a ledger to read.
+		if err := WriteAtomic(out, nil); err != nil {
+			return err
+		}
 	}
 	c.Checkpoint("sparse_postings", strconv.Itoa(countLines(out)))
+
+	if reencode {
+		// --import-sparse-replace: the layer belongs to another producer, so every
+		// posting goes, including any under a chunk_id this ledger does not name —
+		// a posting left behind would be the old producer's, served under the new
+		// stamp. It is a bulk load (term_id index dropped and rebuilt), and it
+		// rewrites the corpus, which is the price of a producer change.
+		c.Log.Printf("replacing clause_sparse with the re-encoded postings (stamping %s)", id)
+		if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
+			"--db", db, "--import-sparse", out, "--sparse-model", id,
+			"--import-sparse-replace",
+		}, Echo: true}); err != nil {
+			return err
+		}
+		return saveSparseProducerState(c, t, sparseProducerState{Producer: &cur})
+	}
 
 	// --import-sparse-changed-only, for the same reason the dense arm imports the
 	// changed rows only. Build 23 (2026-09-06, ETSI half): 368 clauses needed
@@ -2246,10 +2364,13 @@ func runSparse(c *Ctx, t corpusTarget) error {
 	// it exists to answer: postings damaged under a chunk_id that is still present,
 	// which no work list can see.
 	c.Log.Printf("importing the postings into clause_sparse (stamping %s)", id)
-	return c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
+	if err := c.Run(Cmd{Name: c.rbin("embed-io"), Args: []string{
 		"--db", db, "--import-sparse", out, "--sparse-model", id,
 		"--import-sparse-changed-only",
-	}, Echo: true})
+	}, Echo: true}); err != nil {
+		return err
+	}
+	return saveSparseProducerState(c, t, sparseProducerState{Producer: &cur})
 }
 
 // ----------------------------------------------------------- compaction

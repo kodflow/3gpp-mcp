@@ -61,19 +61,19 @@ const DefaultGHCROwner = "kodflow"
 type CorpusSource struct {
 	Owner  string // GHCR account, e.g. "kodflow"
 	Image  string // package name, e.g. "3gpp-corpus"
-	Ref    string // tag or digest, e.g. "latest"
+	Ref    string // tag or digest, e.g. "latest" or "sha256:…" (see corpus_ref.go)
 	Member string // file to extract, e.g. "3gpp.duckdb"
 }
 
 // Corpus3GPP is the main indexed corpus (12.36 GB, content-addressed per ADR 0004).
 func Corpus3GPP(owner, ref string) CorpusSource {
-	return CorpusSource{Owner: orDefault(owner, DefaultGHCROwner), Image: "3gpp-corpus", Ref: orDefault(ref, "latest"), Member: "3gpp.duckdb"}
+	return CorpusSource{Owner: orDefault(owner, DefaultGHCROwner), Image: Image3GPP, Ref: NormalizeRef(orDefault(ref, "latest")), Member: "3gpp.duckdb"}
 }
 
 // CorpusETSI is the ETSI Lawful-Interception corpus, served ALONGSIDE the 3GPP
 // one and never merged into it (CLAUDE.md §13).
 func CorpusETSI(owner, ref string) CorpusSource {
-	return CorpusSource{Owner: orDefault(owner, DefaultGHCROwner), Image: "etsi-corpus", Ref: orDefault(ref, "latest"), Member: "etsi.duckdb"}
+	return CorpusSource{Owner: orDefault(owner, DefaultGHCROwner), Image: ImageETSI, Ref: NormalizeRef(orDefault(ref, "latest")), Member: "etsi.duckdb"}
 }
 
 func orDefault(v, def string) string {
@@ -86,8 +86,15 @@ func orDefault(v, def string) string {
 // Repo is the registry path, "<owner>/<image>".
 func (s CorpusSource) Repo() string { return s.Owner + "/" + s.Image }
 
-// String renders the fully-qualified reference for logs and errors.
-func (s CorpusSource) String() string { return "ghcr.io/" + s.Repo() + ":" + s.Ref }
+// String renders the fully-qualified reference for logs and errors — `@` before a
+// digest, `:` before a tag, as every registry tool spells them. The old `:sha256:…`
+// rendering was not a reference anything else could read back.
+func (s CorpusSource) String() string {
+	if IsDigest(s.Ref) {
+		return FullRef(s, s.Ref)
+	}
+	return "ghcr.io/" + s.Repo() + ":" + s.Ref
+}
 
 // ErrNoGHCRCredential is returned when no token could be resolved. It is a named
 // error because the caller's advice differs from every other failure here: the
@@ -153,7 +160,7 @@ func CorpusIdentity(ctx context.Context, s CorpusSource, pat string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("authenticate to %s: %w", s, err)
 	}
-	layers, err := ghcrLayers(ctx, s.Repo(), s.Ref, tok)
+	_, layers, err := ghcrManifest(ctx, s.Repo(), s.Ref, tok)
 	if err != nil {
 		return "", fmt.Errorf("read manifest of %s: %w", s, err)
 	}
@@ -171,22 +178,33 @@ func CorpusIdentity(ctx context.Context, s CorpusSource, pat string) (string, er
 // pat may be empty only for a package that is genuinely public; the private
 // packages this project publishes will fail the token handshake, and the error
 // says so instead of surfacing a bare 401.
-func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func(string, ...any)) error {
+//
+// It returns the MANIFEST DIGEST the reference resolved to — the answer to "what
+// exactly did this pull?", which a tag cannot give after the fact. The manifest is
+// read ONCE and every layer is then fetched by the digest it names, so the pull is
+// atomic with respect to the tag: a `latest` moved mid-transfer cannot mix two
+// snapshots. When s.Ref is itself a digest, the manifest is checked against it.
+func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func(string, ...any)) (string, error) {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
+		return "", err
 	}
 
 	tok, err := ghcrPullToken(ctx, s.Repo(), s.Owner, pat)
 	if err != nil {
-		return fmt.Errorf("authenticate to %s: %w", s, err)
+		return "", fmt.Errorf("authenticate to %s: %w", s, err)
 	}
 
-	layers, err := ghcrLayers(ctx, s.Repo(), s.Ref, tok)
+	manifest, layers, err := ghcrManifest(ctx, s.Repo(), s.Ref, tok)
 	if err != nil {
-		return fmt.Errorf("read manifest of %s: %w", s, err)
+		return "", fmt.Errorf("read manifest of %s: %w", s, err)
+	}
+	if IsDigest(s.Ref) {
+		log("%s — pinned, manifest verified against its digest", s)
+	} else {
+		log("%s resolves to %s", s, FullRef(s, manifest))
 	}
 
 	identity := make([]string, 0, len(layers))
@@ -204,7 +222,7 @@ func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func
 	if joined := strings.Join(identity, ","); joined != "" &&
 		fileExists(dest) && CachedCorpusIdentity(dest) == joined {
 		log("%s is already current (%s) — nothing to transfer", s, shortDigest(identity[0]))
-		return nil
+		return manifest, nil
 	}
 
 	// The corpus images carry exactly one layer. Iterating rather than assuming
@@ -230,14 +248,14 @@ func FetchCorpus(ctx context.Context, s CorpusSource, pat, dest string, log func
 			if werr := os.WriteFile(DigestPath(dest), []byte(strings.Join(identity, ",")), 0o644); werr != nil {
 				log("warning: could not record the corpus identity (%v) — the next start will re-check the manifest", werr)
 			}
-			return nil
+			return manifest, nil
 		}
 		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("%s has no layers", s)
 	}
-	return fmt.Errorf("extract %s from %s: %w", s.Member, s, lastErr)
+	return "", fmt.Errorf("extract %s from %s: %w", s.Member, s, lastErr)
 }
 
 // ghcrPullToken exchanges a PAT for a registry bearer token scoped to one repo.
