@@ -102,12 +102,16 @@ func New(st store.Reader, version, baseline string, vecShards []string, etsi sto
 	), shielded(h.getSpec))
 
 	s.AddTool(mcp.NewTool("get_changelog",
-		mcp.WithDescription("Change Request records for a spec between releases or versions. The note says what "+
-			"a count means: 0 is \"no record in this corpus\", never \"unchanged\"."),
+		mcp.WithDescription("Change Request records for a spec between releases or versions, PAGED: `total` is how "+
+			"many match, `count` how many this page returns (default 100, at most 500 per call), and `next_cursor` "+
+			"fetches the rest. Records are ordered by to_version, then CR number. The note says what a count means: "+
+			"0 is \"no record in this corpus\", never \"unchanged\"."),
 		mcp.WithString("spec_id", mcp.Required()),
 		mcp.WithString("from_release", mcp.Description("e.g. Rel-18, or a version (18.4.0; an ETSI deliverable has only versions)")),
 		mcp.WithString("to_release", mcp.Description("e.g. Rel-19, or a version (18.6.0)")),
 		mcp.WithString("clause", mcp.Description("filter by affected clause")),
+		mcp.WithNumber("limit", mcp.Description("records per page (default 100, max 500)")),
+		mcp.WithString("cursor", mcp.Description("opaque cursor from a previous call's next_cursor, for the next page of the SAME query")),
 	), shielded(h.getChangelog))
 
 	s.AddTool(mcp.NewTool("list_releases",
@@ -577,12 +581,31 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 		}
 		changes = filtered
 	}
+	// PAGED, AFTER EVERY FILTER AND IN ONE TOTAL ORDER. The bounds and the clause
+	// decide which records exist for this question; only then is the list sorted
+	// (sortChanges: a page of an unordered list is not a page) and cut. The cursor
+	// is bound to the question, so it cannot be replayed against another range.
+	// See changelog_pagination.go for the measurement behind the default page.
+	sortChanges(changes)
+	total := len(changes)
+	limit, clamped := changelogLimit(r.GetInt("limit", 0))
+	page, start, next, err := paginate(changes, r.GetString("cursor", ""), changelogQueryHash(specID, from, to, clause), limit)
+	if err != nil {
+		return mcp.NewToolResultError("invalid cursor for this query: pass the next_cursor of a get_changelog call " +
+			"with the same spec_id, from_release, to_release and clause"), nil
+	}
 	// An empty slice, not nil: `"changes": null` is a different JSON type from the
 	// list a caller iterates, and the count beside it already says there are none.
-	if changes == nil {
-		changes = []model.Change{}
+	if page == nil {
+		page = []model.Change{}
 	}
-	out := map[string]any{"spec_id": specID, "count": len(changes), "changes": changes}
+	out := map[string]any{
+		"spec_id": specID, "count": len(page), "changes": page,
+		"total": total, "returned": len(page), "offset": start, "limit": limit,
+	}
+	if next != "" {
+		out["next_cursor"] = next
+	}
 	// A ZERO THAT MEANS TWO DIFFERENT THINGS IS NOT AN ANSWER.
 	//
 	// The changes table holds 3GPP change requests. The ETSI half carries none, so
@@ -611,8 +634,8 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 	note := ""
 	if isETSISpecID(specID) {
 		note = etsiChangelogNote(ctx, h.etsi, specID, all)
-		if h.etsi != nil && len(changes) > 0 {
-			cites, uncited := etsiChangeCitations(ctx, h.etsi, specID, changes)
+		if h.etsi != nil && len(page) > 0 {
+			cites, uncited := etsiChangeCitations(ctx, h.etsi, specID, page)
 			out["citations"] = cites
 			if uncited > 0 {
 				note = fmt.Sprintf("%d of these records name a version whose document this corpus could not "+
@@ -651,7 +674,10 @@ func (h *handlers) getChangelog(ctx context.Context, r mcp.CallToolRequest) (*mc
 				"trace_clause answers that from the clause text.", clauseless, inRange, scope, clause)
 		}
 	}
-	if n := joinNotes(joinNotes(boundsNote(from, to), narrowed), note); n != "" {
+	// The page note leads: a caller who does not know the list is truncated reads
+	// everything after it as the whole history.
+	if n := joinNotes(joinNotes(joinNotes(pageNote(total, start, len(page), limit, clamped, next),
+		boundsNote(from, to)), narrowed), note); n != "" {
 		out["note"] = n
 	}
 	return jsonResult(out)
