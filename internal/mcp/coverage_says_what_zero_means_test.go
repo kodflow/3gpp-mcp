@@ -403,3 +403,49 @@ func TestParseChangelogBound(t *testing.T) {
 		}
 	}
 }
+
+// Review round (CodeRabbit, #332): three more places where an answer could say
+// less than it knew.
+//
+// Falsified: with the uncited note removed, the record with no held version is
+// served beside an empty citations block in silence; with `scope` derived from
+// the raw arguments again, the banana note says "in range" after saying the bound
+// was NOT applied; with trace_evolution aborting on the first failed half, the
+// 3GPP edges are lost to an ETSI read error.
+func TestReviewRoundTheAnswerSaysWhatItCouldNotDo(t *testing.T) {
+	c, ctx := coverageClient(t, func(e *store.Store) {
+		etsiWithX1(e)
+		if err := e.InsertChanges([]model.Change{
+			{CRNumber: "CR090", SpecID: "ETSI TS 103 221-1", FromVersion: "1.23.1", ToVersion: "1.99.1", Category: "F", Summary: "a version the corpus does not hold"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = e.SetMeta("changes_source", "change-history annexes")
+	})
+	out := call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "ETSI TS 103 221-1"})
+	if n := noteOf(out); !strings.Contains(n, "1 of these records name a version") || !strings.Contains(n, "no citation") {
+		t.Errorf("a record that cannot be cited must be named as such; note = %q", n)
+	}
+
+	out = call(t, c, ctx, "get_changelog", map[string]any{"spec_id": "23.501", "from_release": "banana", "clause": "5.4"})
+	if n := noteOf(out); !strings.Contains(n, "NOT") || strings.Contains(n, " in range") {
+		t.Errorf("an unapplied bound must not be called a range in the same note; note = %q", n)
+	}
+
+	// The ETSI half is attached and then made unreadable.
+	c, ctx = coverageClient(t, func(e *store.Store) {
+		etsiWithX1(e)
+		_ = e.Close()
+	})
+	out = call(t, c, ctx, "trace_evolution", map[string]any{"entity": "MME"})
+	if n, _ := out["count"].(float64); n != 1 {
+		t.Fatalf("an ETSI read error cost the 3GPP edge: count = %v", out["count"])
+	}
+	if n := noteOf(out); !strings.Contains(n, "the ETSI half could not be read") {
+		t.Errorf("the unread half must be named; note = %q", n)
+	}
+	held, _ := out["edges_held"].(map[string]any)
+	if _, ok := held["etsi"]; ok || held["3gpp"] != float64(2) {
+		t.Errorf("edges_held = %v, want only the 3GPP half's count", held)
+	}
+}

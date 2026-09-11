@@ -37,19 +37,27 @@ func (h *handlers) evolutionHalves() []evolutionHalf {
 	return halves
 }
 
-// countEvolutions reads how many edges a half holds, or -1 when it cannot be read.
+// countEvolutions reads how many edges a half holds.
+//
+// AN ERROR, NOT A SENTINEL (CodeRabbit, #332): a failed count used to come back
+// as -1 inside edges_held, a number a client could sum. The caller now leaves the
+// half out of edges_held and names it in the note instead.
+//
+// Through Reader.QueryRowContext rather than a new typed Reader method: that
+// accessor exists for read-intent SQL, and a method on internal/store would make
+// `validate` replay (~8 min) for a count the server can already ask for.
 //
 // READ FROM THE CORPUS BEING SERVED, not written into the note. changelogNote's
 // history is the reason: an earlier draft of that note carried "covers 311 of the
 // 3 568 specs", true of the snapshot it was measured on and silently false of
 // every later one. A count read at call time cannot go stale against the corpus
 // it describes.
-func countEvolutions(ctx context.Context, st store.Reader) int {
+func countEvolutions(ctx context.Context, st store.Reader) (int, error) {
 	var n int
 	if err := st.QueryRowContext(ctx, "SELECT count(*) FROM evolutions").Scan(&n); err != nil {
-		return -1
+		return 0, err
 	}
-	return n
+	return n, nil
 }
 
 // evolutionCitation cites the clause that justifies one edge, from the half that
@@ -107,15 +115,23 @@ var reDocumentID = regexp.MustCompile(`^(?i)(?:ETSI\s+)?(?:(?:TS|TR|EN|ES)\s*)?(
 // specifications: an entity outside it answers 0 whether or not it has a
 // predecessor, and a caller who reads that 0 as "X replaced nothing" has been told
 // something the corpus never said.
-func evolutionNote(entity string, count int, held map[string]int, etsiAttached bool) string {
+func evolutionNote(entity string, count int, held map[string]int, unread []string, etsiAttached bool) string {
 	var b strings.Builder
+	if len(unread) > 0 {
+		labels := make([]string, 0, len(unread))
+		for _, u := range unread {
+			labels = append(labels, halfLabel(u))
+		}
+		b.WriteString("the " + strings.Join(labels, " and the ") + " half could not be read, so this answer " +
+			"does not cover it. ")
+	}
 	if count > 0 {
 		b.WriteString("Curated NE↔NF seed (V1 relational), each edge anchored to the clause that justifies it. " +
 			"Full corpus-mined graph (KuzuDB) is V2.")
 	} else {
 		b.WriteString("no evolution edge names " + entity + " in this corpus. trace_evolution reads a CURATED " +
 			"table of network-element → network-function edges, not the specification text")
-		b.WriteString(heldClause(held, etsiAttached))
+		b.WriteString(heldClause(held, unread, etsiAttached))
 		b.WriteString(". A count of 0 means \"no curated edge\", not \"this entity has no predecessor or " +
 			"successor\"; search_spec finds where the corpus itself describes it.")
 	}
@@ -129,17 +145,17 @@ func evolutionNote(entity string, count int, held map[string]int, etsiAttached b
 
 // heldClause renders the per-half edge counts for the note: " (the 3GPP half
 // holds 45 edges, the ETSI half holds 0)".
-func heldClause(held map[string]int, etsiAttached bool) string {
+func heldClause(held map[string]int, unread []string, etsiAttached bool) string {
 	part := func(name, label string) string {
-		n, ok := held[name]
-		switch {
-		case !ok:
-			return ""
-		case n < 0:
-			return "the " + label + " half's edges could not be counted"
-		default:
+		if n, ok := held[name]; ok {
 			return fmt.Sprintf("the %s half holds %d", label, n)
 		}
+		for _, u := range unread {
+			if u == name {
+				return "the " + label + " half's edges could not be counted"
+			}
+		}
+		return ""
 	}
 	parts := []string{}
 	if p := part("3gpp", "3GPP"); p != "" {
@@ -156,4 +172,12 @@ func heldClause(held map[string]int, etsiAttached bool) string {
 		return ""
 	}
 	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// halfLabel is how the note names a half: "3GPP" / "ETSI".
+func halfLabel(name string) string {
+	if name == "etsi" {
+		return "ETSI"
+	}
+	return "3GPP"
 }

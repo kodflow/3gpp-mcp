@@ -173,23 +173,34 @@ func etsiChangelogNote(ctx context.Context, etsi store.Reader, specID string, al
 // them, and only for versions the corpus holds: a version it does not hold has no
 // text behind it here, and cite-or-silent (CLAUDE.md §1) does not stretch to a
 // URL built for a document nobody fetched.
-func etsiChangeCitations(ctx context.Context, st store.Reader, specID string, changes []model.Change) []model.Citation {
+//
+// The second result counts the records left WITHOUT a citation — a version the
+// corpus does not hold, or a version list that could not be read — so the handler
+// can say so rather than serve records beside an empty citations block in
+// silence (CodeRabbit, #332). ingest-etsi-changes only writes a record whose two
+// versions the corpus holds, so on a corpus it built this is 0.
+func etsiChangeCitations(ctx context.Context, st store.Reader, specID string, changes []model.Change) ([]model.Citation, int) {
 	cites := []model.Citation{}
 	if len(changes) == 0 {
-		return cites
+		return cites, 0
 	}
 	vs, err := st.ListReleases(ctx, specID)
 	if err != nil {
-		return cites
+		return cites, len(changes)
 	}
 	held := make(map[string]model.SpecVersion, len(vs))
 	for _, v := range vs {
 		held[v.Version] = v
 	}
 	seen := map[string]bool{}
+	uncited := 0
 	for _, c := range changes {
 		v, ok := held[c.ToVersion]
-		if !ok || seen[c.ToVersion] {
+		if !ok {
+			uncited++
+			continue
+		}
+		if seen[c.ToVersion] {
 			continue
 		}
 		seen[c.ToVersion] = true
@@ -206,5 +217,5 @@ func etsiChangeCitations(ctx context.Context, st store.Reader, specID string, ch
 			Stable: true,
 		})
 	}
-	return cites
+	return cites, uncited
 }
