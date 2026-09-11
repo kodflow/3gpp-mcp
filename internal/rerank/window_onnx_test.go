@@ -63,6 +63,9 @@ func TestTheWindowIsTheWholePassages(t *testing.T) {
 		"empty body":       "Foreword\n",
 		"space run later":  "Heading\n" + repeatTo(english, 3000) + strings.Repeat(" ", 40) + repeatTo(english, 3000),
 		"numbers and dots": "Heading\n" + repeatTo("1.2.3 4.5.6 7 8 9 10.0.0 v19.4.0 ", 6000),
+		// ~13 bytes a token: the first cut yields fewer ids than the window, so the
+		// prefix has to grow before it can stand for the whole.
+		"few ids per byte": "Heading\n" + repeatTo("registration procedure establishment ", 12000),
 	}
 	for name, p := range passages {
 		whole, err := encodePair(tok, q, p)
@@ -121,5 +124,24 @@ func TestWindowIDsInParallelMatchSerial(t *testing.T) {
 		if !slices.Equal(serial[i], par[i]) {
 			t.Errorf("passage %d: parallel ids differ from serial", i)
 		}
+	}
+}
+
+// The "few ids per byte" passage really does need the prefix to grow: at the
+// first cut it yields fewer ids than the window. Without this, the case above
+// could pass without ever exercising the doubling.
+func TestTheFirstCutCanFallShortOfTheWindow(t *testing.T) {
+	tok := rerankerTokenizer(t)
+	p := "Heading\n" + repeatTo("registration procedure establishment ", 12000)
+	prefix, cut := windowPrefix(p, rrPrefixBytes)
+	if !cut {
+		t.Fatal("the passage was not cut")
+	}
+	enc, err := encodePair(tok, "AMF registration procedure over N1", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enc.Ids) > rrMaxTokens+1 {
+		t.Fatalf("the first cut already yields %d ids — the fixture no longer exercises the growth", len(enc.Ids))
 	}
 }
