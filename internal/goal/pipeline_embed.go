@@ -1914,7 +1914,20 @@ func stepParagraphs(t corpusTarget) *Step {
 		Doc:     "store each paragraph once and point at it (ADR 0004), then drop the clauses table",
 		Deps:    t.paragraphsDeps(),
 		Impl:    []string{"cmd/migrate-paragraphs"},
-		Heavy:   true,
+		// The step RUNS cmd/migrate-paragraphs; a _test.go cannot change what that
+		// binary does to a corpus. Both arms counted main_test.go until 2026-09-11,
+		// recorded in countsTestFiles as too expensive to fix because "replaying
+		// paragraphs rewrites the corpus". Measured on copies of both corpora, that
+		// was false for every corpus this pipeline now leaves behind: the replay
+		// takes the alreadyConverted path, finds the attestation current, and exits
+		// in 0.2 s with the file identical to the byte (sha256 and mtime) — and so
+		// do the sparse export, the compaction's block count and the HNSW freeze
+		// its fresh provenance replays behind it. The one replay this costs is
+		// therefore gates and a re-composed image, not a corpus.
+		// TestAReplayOfAConvertedCorpusWritesNothing (cmd/migrate-paragraphs)
+		// holds the no-op the price depends on.
+		ExcludeTests: true,
+		Heavy:        true,
 		// The corpus is NOT an input, although this step reads and rewrites it.
 		//
 		// It is the step's own product, and compact, index and the paragraph
