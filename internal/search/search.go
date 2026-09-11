@@ -211,6 +211,9 @@ func (e *Engine) UseVectorShards(aliases []string) { e.vecShards = aliases }
 // SetName names the corpus this engine answers for, as its Reports say it.
 func (e *Engine) SetName(name string) { e.name = name }
 
+// SetReranker replaces the cross-encoder New picked from the environment.
+func (e *Engine) SetReranker(r rerank.Reranker) { e.rr = r }
+
 // NewSharing builds an Engine over st that SHARES o's models — the query embedder
 // (with its cache) and the cross-encoder — instead of loading its own.
 //

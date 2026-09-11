@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kodflow/3gpp-mcp/internal/rerank"
 	"github.com/kodflow/3gpp-mcp/internal/search"
 )
 
@@ -15,6 +16,17 @@ import (
 // budget.
 func WithWarmup(logf func(format string, args ...any)) Option {
 	return func(h *handlers) { h.warmLog = logf }
+}
+
+// WithReranker gives both halves this cross-encoder instead of the one the
+// environment selects — one instance, shared, as NewSharing shares the default.
+func WithReranker(r rerank.Reranker) Option {
+	return func(h *handlers) {
+		h.eng.SetReranker(r)
+		if h.etsiEng != nil {
+			h.etsiEng.SetReranker(r)
+		}
+	}
 }
 
 // warmUp warms the halves one after the other — the 3GPP engine first, since
