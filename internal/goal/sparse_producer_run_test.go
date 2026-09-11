@@ -14,7 +14,7 @@ import (
 
 // runSparse, driven end to end over stand-ins for the three binaries it launches:
 // cmd/embedid, embed-io and embed-core-sparse. The stand-ins are THIS test binary,
-// linked under their names; init() below turns it into the tool its name says
+// copied under their names; init() below turns it into the tool its name says
 // before the testing package parses a single flag. (An init, not a TestMain: a
 // package has one TestMain, and this one is shared.)
 //
@@ -30,6 +30,7 @@ const (
 	fakeSparseTodoEnv  = "GOAL_FAKE_SPARSE_TODO"  // clauses with no posting
 	fakeSparseAllEnv   = "GOAL_FAKE_SPARSE_ALL"   // every embeddable clause
 	fakeSparseFailEnv  = "GOAL_FAKE_SPARSE_FAIL"  // embed-core-sparse dies after one line
+	fakeImportFailEnv  = "GOAL_FAKE_IMPORT_FAIL"  // embed-io --import-sparse dies
 )
 
 func init() {
@@ -83,6 +84,10 @@ func fakeSparseTool(name string, args []string) int {
 			return 0
 		}
 		if l := flag("--import-sparse"); l != "" {
+			if os.Getenv(fakeImportFailEnv) == "1" {
+				fmt.Fprintln(logf, "import died")
+				return 1
+			}
 			fmt.Fprintf(logf, "imported=%d\n", countLines(l))
 			return 0
 		}
@@ -180,6 +185,7 @@ func newSparseRig(t *testing.T) *sparseRig {
 	t.Setenv(fakeSparseTodoEnv, "0")
 	t.Setenv(fakeSparseAllEnv, "3")
 	t.Setenv(fakeSparseFailEnv, "")
+	t.Setenv(fakeImportFailEnv, "")
 	return r
 }
 
@@ -355,10 +361,9 @@ func TestAChangedProducerReencodesEveryClauseAndAnUnchangedOneDeclines(t *testin
 	}
 }
 
-// A RE-ENCODE THAT DIES IS FINISHED BY THE NEXT RUN, even though by then the
-// producer on disk IS the one the record... no longer names: the record is
-// PENDING, not "current". And the retry resumes from the new ledger instead of
-// archiving the work the GPU already did.
+// A RE-ENCODE THAT DIES IS FINISHED BY THE NEXT RUN, and the retry resumes from
+// the ledger the new producer started instead of archiving the work the GPU
+// already did.
 func TestAReencodeThatDiedIsFinishedAndResumed(t *testing.T) {
 	r := newSparseRig(t)
 	old := r.current(t)
@@ -394,5 +399,47 @@ func TestAReencodeThatDiedIsFinishedAndResumed(t *testing.T) {
 	}
 	if st := r.state(t); st.Pending {
 		t.Error("the finished re-encode is still pending")
+	}
+}
+
+// THE PENDING MARK IS WHAT KEEPS A HALF-REPLACED LAYER FROM BEING DECLINED.
+//
+// --import-sparse-replace clears the layer before it loads the ledger, so an
+// import that dies leaves a corpus with part of the new postings, or none. If the
+// producer is then reverted — the commit that bumped the lockfile is backed out —
+// the record without a pending mark would name the old producer, which is the
+// current one again, and the step would decline over that corpus for good.
+func TestAReplaceThatDiedIsFinishedEvenAfterTheProducerIsReverted(t *testing.T) {
+	r := newSparseRig(t)
+	lock := filepath.Join(r.c.Root, filepath.FromSlash(sparseProducerCrate+"/Cargo.lock"))
+	orig, err := os.ReadFile(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := r.current(t)
+	if err := r.run(t, recordOf(old)); !Declined(err) {
+		t.Fatalf("setup: %v", err)
+	}
+
+	write(t, lock, string(orig)+"# bumped\n")
+	t.Setenv(fakeImportFailEnv, "1")
+	if err := r.run(t, recordOf(old)); err == nil || Declined(err) {
+		t.Fatalf("the dying import reported %v", err)
+	}
+
+	write(t, lock, string(orig)) // the bump is reverted
+	t.Setenv(fakeImportFailEnv, "")
+	if r.current(t).digest() != old.digest() {
+		t.Fatal("fixture: the revert did not restore the old producer")
+	}
+	err = r.run(t, recordOf(old))
+	if Declined(err) {
+		t.Fatal("the step declined over a layer whose replace died half way: the corpus keeps a partial sparse arm for good")
+	}
+	if err != nil {
+		t.Fatalf("the retry failed: %v\n%s", err, r.calls(t))
+	}
+	if calls := r.calls(t); !strings.Contains(calls, "--import-sparse-replace") || !strings.Contains(calls, "imported=3") {
+		t.Errorf("the retry did not replace the layer:\n%s", calls)
 	}
 }
