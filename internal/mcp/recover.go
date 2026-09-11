@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"runtime/debug"
-	"strings"
 	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -69,14 +68,7 @@ const panicValueLimit = 200
 // panicSummary renders a recovered value for the client: its first line, bounded.
 // The stack never goes here; it goes to panicLog.
 func panicSummary(p any) string {
-	s := fmt.Sprint(p)
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		s = s[:i]
-	}
-	if len(s) > panicValueLimit {
-		s = s[:panicValueLimit] + "…"
-	}
-	return s
+	return firstLine(fmt.Sprint(p), panicValueLimit)
 }
 
 // recoverTools turns a panic in any tool handler into a tool error the client
@@ -104,9 +96,12 @@ func recoverResources(next server.ResourceHandlerFunc) server.ResourceHandlerFun
 	return func(ctx context.Context, r mcp.ReadResourceRequest) (res []mcp.ResourceContents, err error) {
 		defer func() {
 			if p := recover(); p != nil {
-				fmt.Fprintf(panicLog, "[3gpp-mcp] panic reading resource %s: %v\n%s\n", r.Params.URI, p, debug.Stack())
+				// The URI is the CLIENT's text, and neither transport bounds a request
+				// line: quoted once, bounded, on one line (CodeRabbit, #344).
+				uri := firstLine(r.Params.URI, errorTextLimit)
+				fmt.Fprintf(panicLog, "[3gpp-mcp] panic reading resource %s: %v\n%s\n", uri, p, debug.Stack())
 				res, err = nil, fmt.Errorf("reading %s failed: internal error — the handler panicked (%s); "+
-					"the server recovered and the stack is in its stderr log", r.Params.URI, panicSummary(p))
+					"the server recovered and the stack is in its stderr log", uri, panicSummary(p))
 			}
 		}()
 		return next(ctx, r)

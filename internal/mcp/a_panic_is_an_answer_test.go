@@ -225,13 +225,26 @@ func TestEveryToolThatPanicsStillAnswersOverStdio(t *testing.T) {
 	if err := json.Unmarshal(rep.Result, &listed); err != nil {
 		t.Fatal(err)
 	}
-	// Not vacuous: the surface CLAUDE.md §5 documents, the subject tool among it.
+	// Not vacuous: every tool of the surface CLAUDE.md §5 documents is listed, by
+	// NAME — a count alone passes when one tool is swapped for another (CodeRabbit,
+	// #344). Whatever else is registered is exercised too: the loop below walks the
+	// list, not this set.
 	names := map[string]bool{}
 	for _, tl := range listed.Tools {
 		names[tl.Name] = true
 	}
-	if len(names) < 13 || !names["li_events"] || !names["search_spec"] {
-		t.Fatalf("tools/list returned %d tools (%v); the test must exercise all 13, li_events included", len(names), names)
+	for _, want := range []string{
+		"search_spec", "get_spec", "get_changelog", "list_releases", "resolve_term", "trace_evolution",
+		"find_cross_references", "list_specs", // the eight core tools
+		"search_api", "trace_clause", "help", "server_info", // the core siblings
+		"li_events", // the subject tool, registered outside `shielded`
+	} {
+		if !names[want] {
+			t.Errorf("tools/list does not list %s; the test must exercise it", want)
+		}
+	}
+	if t.Failed() {
+		t.Fatalf("tools/list returned %v", names)
 	}
 
 	t.Logf("exercising %d tools over stdio", len(names))

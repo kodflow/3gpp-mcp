@@ -903,14 +903,24 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 	held := map[string]int{}
 	var unread []string
 	var failures []unreadHalf // the same failures, with their errors, for unread_halves
-	var lookupErr error
+	// An ETSI half that could not even be opened is unread before anything is
+	// asked (Qodo, #344): recorded first, so the every-half-failed error below
+	// names it too.
+	if f, down := h.etsiOpenFailure(); down {
+		unread = append(unread, f.Half)
+		failures = append(failures, f)
+	}
+	// LOOKUP failures alone decide "nothing to serve" (CodeRabbit, #344): a half
+	// whose edges were read but whose COUNT failed still has edges to serve, and
+	// counting it here discarded them.
+	lookupFailed := 0
 	halves := h.evolutionHalves()
 	for _, half := range halves {
 		es, err := half.st.GetEvolutions(ctx, entity)
 		if err != nil {
 			unread = append(unread, half.name)
 			failures = append(failures, unreadOf(half.name, "", err))
-			lookupErr = err
+			lookupFailed++
 			continue
 		}
 		for _, e := range es {
@@ -924,14 +934,12 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 			failures = append(failures, unreadOf(half.name, "edge count", err))
 		}
 	}
-	if lookupErr != nil && len(unread) == len(halves) {
-		return mcp.NewToolResultErrorFromErr("trace_evolution failed on every half", lookupErr), nil
-	}
-	// An ETSI half that could not even be opened is unread too; evolutionNote
-	// already knows how to say so, from the name alone.
-	if f, down := h.etsiOpenFailure(); down {
-		unread = append(unread, f.Half)
-		failures = append(failures, f)
+	if lookupFailed == len(halves) {
+		parts := make([]string, 0, len(failures))
+		for _, f := range failures {
+			parts = append(parts, halfLabel(f.Half)+": "+f.Error)
+		}
+		return mcp.NewToolResultError("trace_evolution failed on every half — " + strings.Join(parts, "; ")), nil
 	}
 	out := map[string]any{
 		"entity":     entity,
@@ -939,7 +947,9 @@ func (h *handlers) traceEvolution(ctx context.Context, r mcp.CallToolRequest) (*
 		"evolutions": evos,
 		"citations":  cites,
 		"edges_held": held,
-		"note":       evolutionNote(entity, len(evos), held, unread, h.etsi != nil),
+		// "Attached" for the note means ASKED FOR: an ETSI half that could not be
+		// opened is named as unread, not described as never configured (Qodo, #344).
+		"note": evolutionNote(entity, len(evos), held, unread, h.etsi != nil || h.etsiDown != ""),
 	}
 	if len(failures) > 0 {
 		out["unread_halves"] = failures
