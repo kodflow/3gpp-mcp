@@ -267,9 +267,17 @@ func sparseLedgerProducerPath(ledger string) string { return ledger + ".producer
 func ensureSparseLedgerProducer(c *Ctx, ledger string, cur sparseProducer, adopt bool) error {
 	want := cur.digest()
 	side := sparseLedgerProducerPath(ledger)
+	// ABSENT AND UNREADABLE ARE NOT THE SAME ANSWER. Absent is a ledger from
+	// before this mechanism, which the incremental path adopts; unreadable says
+	// nothing about who appended to the ledger, and adopting it would relabel
+	// another producer's postings as the current one's. So it stops the step.
 	had := ""
-	if b, err := os.ReadFile(side); err == nil {
+	switch b, err := os.ReadFile(side); {
+	case err == nil:
 		had = strings.TrimSpace(string(b))
+	case !os.IsNotExist(err):
+		return fmt.Errorf("the postings ledger's producer record %s cannot be read, so nothing says "+
+			"which producer appended to %s: %w", side, filepath.Base(ledger), err)
 	}
 	stale := had != want && (had != "" || !adopt)
 	if stale && fileNonEmpty(ledger) {
