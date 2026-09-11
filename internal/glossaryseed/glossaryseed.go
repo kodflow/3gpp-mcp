@@ -143,14 +143,24 @@ func removalBound(owned int) int {
 
 // massRemoval says why a diff would be refused, or "" when it passes.
 //
-// It reads the rows the write DELETES (Removed) and the specs it would delete
-// from (Vanished) — see the paragraph above removalBoundPct for why hand-backs
-// and withheld rows are not among them.
+// It reads the rows the write DELETES — seeded rows (Removed) and TS 21.905 rows
+// its newest version no longer stores (Retired) — and the specs it would delete
+// from (Vanished). See the paragraph above removalBoundPct for why hand-backs and
+// withheld rows are not among them.
+//
+// A RETIREMENT IS A DELETION and is counted as one, against the same bound. It
+// rests on one read of one document, and a read that passed the floor while
+// losing a letter clause would retire that letter's rows: the bound is what
+// stops it from doing so in bulk. Measured over the 16 stored versions, one
+// issue of TS 21.905 retires at most 8 keys.
 func massRemoval(d store.GlossaryDiff) string {
 	var why []string
-	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
-		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
-			n, d.Owned, bound))
+	if n, bound := len(d.Removed)+len(d.Retired), removalBound(d.Owned); n > bound {
+		what := fmt.Sprintf("it would remove %d of the %d seeded rows", len(d.Removed), d.Owned)
+		if len(d.Retired) > 0 {
+			what += fmt.Sprintf(" and retire %d of TS 21.905's", len(d.Retired))
+		}
+		why = append(why, fmt.Sprintf("%s, above the bound of %d", what, bound))
 	}
 	if len(d.Vanished) > 0 {
 		// The first twenty by name; the JSON report carries every one. A broken
@@ -225,6 +235,12 @@ type Report struct {
 	// until it can.
 	Withheld     int          `json:"withheld_total"`
 	WithheldRows []RemovedRow `json:"withheld,omitempty"`
+	// Retired counts TS 21.905's own rows the write took out because the newest
+	// TS 21.905 no longer stores their key and no spec declares it
+	// (store.GlossaryDiff.Retired), and RetiredRows names them. Deletions, and
+	// counted by the guard.
+	Retired     int          `json:"retired_total"`
+	RetiredRows []RemovedRow `json:"retired,omitempty"`
 	// General is what the run read of TS 21.905 — the evidence every release was
 	// checked against. See readGeneral.
 	General GeneralReport `json:"ts21905"`
@@ -450,8 +466,10 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 				// The owning SPEC, not its two-digit series: it is what makes
 				// the precedence above auditable, and it is what marks the row as
 				// this package's to replace (store.seededSource). The series form
-				// belongs to TS 21.905's rows, which this package never removes —
-				// and writes only to hand a row back to TS 21.905 (readGeneral).
+				// belongs to TS 21.905's rows, which this package removes only
+				// when the newest TS 21.905 no longer stores their key
+				// (store.GlossaryDiff.Retired) — and writes only to hand a row
+				// back to TS 21.905 (readGeneral).
 				SourceSeries: todo[i].sr.Spec,
 			})
 		}
@@ -521,6 +539,10 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 	rep.Withheld = len(diff.Withheld)
 	for _, a := range diff.Withheld {
 		rep.WithheldRows = append(rep.WithheldRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
+	}
+	rep.Retired = len(diff.Retired)
+	for _, a := range diff.Retired {
+		rep.RetiredRows = append(rep.RetiredRows, RemovedRow{a.Term, a.Expansion, a.SourceSeries})
 	}
 	for i := range todo {
 		rep.Specs = append(rep.Specs, todo[i].sr)
