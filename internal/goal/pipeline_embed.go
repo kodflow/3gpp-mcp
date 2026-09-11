@@ -1395,7 +1395,13 @@ func stepSmoke() *Step {
 			}
 			// After the lexical gate and after runSmoke's server has been killed:
 			// the two servers never hold the corpus at the same time, so the peak
-			// is the served server's alone (measured on the step, below).
+			// is the served server's alone. WHAT IT COSTS, measured 2026-09-11 on
+			// this machine with eight agents sharing it: 6 min 45 end to end (27.6 s
+			// to start server-full, 2 s lexical, 176 s hybrid, 199 s rerank for the
+			// two scored queries) and 14.1 GB committed at the peak — against the
+			// 11.7 GB the lexical server above already takes. The bounds that make
+			// it that (the 3GPP half, the two queries that can fail, a 6GB DuckDB
+			// limit) and what they were measured against are in smoke_served.go.
 			if err := runServedRetrievalGate(c); err != nil {
 				return err
 			}
