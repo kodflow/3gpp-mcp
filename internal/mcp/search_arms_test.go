@@ -3,8 +3,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -137,5 +139,35 @@ func TestARerankThatRanIsReportedAndNothingIsDegraded(t *testing.T) {
 	}
 	if !ran["3gpp"] || !ran["etsi"] {
 		t.Fatalf("rerank ran on %v, want both halves", ran)
+	}
+}
+
+// WithWarmup runs one search through each half as soon as the server is built,
+// and says what each took — so a session's first query does not pay the cold
+// HNSW load inside its budget (search.Engine.Warm).
+func TestWarmupRunsEachHalfAndSaysSo(t *testing.T) {
+	t.Setenv("EMBEDDER", "off")
+	t.Setenv("RERANKER", "off")
+	open := func() *store.Store {
+		s, err := store.Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		_ = s.InsertClauses([]model.Clause{{ChunkID: 1, SpecID: "23.502", Release: "Rel-19", Version: "19.4.0",
+			ClausePath: "4.2.2", Heading: "Registration", Text: "the registration procedure"}})
+		return s
+	}
+	lines := make(chan string, 4)
+	New(open(), "test", "", nil, open(), WithWarmup(func(f string, a ...any) { lines <- fmt.Sprintf(f, a...) }))
+	for _, half := range []string{"3gpp", "etsi"} {
+		select {
+		case l := <-lines:
+			if !strings.Contains(l, "warm-up of the "+half+" half") || !strings.Contains(l, "lexical") {
+				t.Fatalf("warm-up line %q, want the %s half with its arms", l, half)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("no warm-up line for the %s half", half)
+		}
 	}
 }
