@@ -38,9 +38,12 @@ func TestServerInfoTellsAnUnreadableIdentityFromAnEmptyOne(t *testing.T) {
 	}
 
 	// Unreadable: null, the error, and not "ok".
-	closed := memStore(t)
-	_ = closed.Close()
-	c, ctx = clientOver(t, st, &countlessHalf{Reader: e, closed: closed})
+	// A real store, closed: GetMeta on it answers "" (the old report), and
+	// every raw read fails.
+	deadEtsi, _ := halves(t)
+	_ = deadEtsi.SetMeta("embedding_model", "38067f8c6efe")
+	_ = deadEtsi.Close()
+	c, ctx = clientOver(t, st, deadEtsi)
 	out, _, _ = callAny(t, c, ctx, "server_info", map[string]any{})
 	etsi, _ = out["etsi"].(map[string]any)
 	if v, present := etsi["embedding_model"]; !present || v != nil {
@@ -61,7 +64,9 @@ func TestServerInfoTellsAnUnreadableIdentityFromAnEmptyOne(t *testing.T) {
 	}
 
 	// The 3GPP half's identity keys follow the same rule.
-	c, ctx = clientOver(t, &countlessHalf{Reader: st, closed: closed}, e)
+	dead3GPP, _ := halves(t)
+	_ = dead3GPP.Close()
+	c, ctx = clientOver(t, dead3GPP, e)
 	out, _, _ = callAny(t, c, ctx, "server_info", map[string]any{})
 	errs, _ = out["read_errors"].(map[string]any)
 	for _, key := range []string{"embedding_model", "sparse_model", "embed_floor"} {
