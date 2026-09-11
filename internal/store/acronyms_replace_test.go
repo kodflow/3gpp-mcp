@@ -147,11 +147,14 @@ func TestRowsTheSeedDoesNotOwnSurviveTheReplacement(t *testing.T) {
 		VALUES ('PLMN', 'Public Land Mobile Network', '', 'Rel-8', 'Rel-8', NULL, NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, cleared, nil); err != nil {
+	// TS 21.905's row is current — the newest TS 21.905 stores it — so the seed has
+	// no claim on it; a STALE one is retired (acronyms_retire_test.go).
+	general := storing(cleared, foreign[0])
+	if _, err := s.ReplaceSeededAcronyms([]model.Acronym{amf, multicastMBS}, general, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf}, cleared, nil)
+	diff, err := s.ReplaceSeededAcronyms([]model.Acronym{amf}, general, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

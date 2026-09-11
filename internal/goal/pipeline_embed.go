@@ -720,7 +720,8 @@ func stepEnrich(t corpusTarget) *Step {
 			// resolve_term answering "Authentication Management Field" when
 			// asked what an AMF is. It REPLACES the rows it owns — those citing a
 			// spec id — so a row no spec declares any more leaves, while the
-			// TS 21.905 and ETSI entries stay exactly where they are. Idempotent:
+			// TS 21.905 and ETSI entries stay where they are, save a TS 21.905
+			// row the newest TS 21.905 no longer stores (retired). Idempotent:
 			// an unchanged corpus is left untouched, byte for byte.
 			c.Log.Printf("glossary seed (each spec's own Abbreviations clause)")
 			return c.Run(Cmd{Name: c.bin("seed-glossary"), Args: []string{"--db", db}, Echo: true})
