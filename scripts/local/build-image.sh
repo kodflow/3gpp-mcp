@@ -220,7 +220,11 @@ if [ "$PRINT_TOOLCHAIN" = 1 ]; then
 fi
 
 [ -n "$CRANE" ] && [ -x "$CRANE" ] || die "crane not found (.local/bin/crane.exe)"
-[ -n "$ZIG_DIR" ] || die "zig not found under .local/toolchain (see scripts/local/fetch-linux-toolchain.sh)"
+# The EXECUTABLE, not the directory: a stale zig-* left without its zig.exe passed a
+# directory check, was reported zig=absent by --print-toolchain, and failed later at
+# the first compile (review of #330, CodeRabbit).
+[ -n "$ZIG" ] && [ -x "$ZIG" ] \
+  || die "zig not found under .local/toolchain (see scripts/local/fetch-linux-toolchain.sh)"
 [ -s "$SYSROOT/libstdc++.so.6" ] && [ -s "$SYSROOT/libgomp.so.1" ] \
   || die "Debian libstdc++.so.6 / libgomp.so.1 missing under $SYSROOT (see scripts/local/fetch-linux-toolchain.sh)"
 say "toolchain: $(image_toolchain | paste -sd' ' -)"
