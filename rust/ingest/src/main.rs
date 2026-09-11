@@ -100,6 +100,22 @@ fn etsi_done_set(
         corpus.replace('\'', "''")
     ))
     .with_context(|| format!("attach {corpus} read-only"))?;
+    // A corpus WITHOUT the ledger or the meta table (an older or foreign file) has
+    // nothing marked done and no index state: that is an empty answer, which plans
+    // everything as pending — not an error that would stop the step before the
+    // ingest could run. Genuine attach and query errors still propagate.
+    let has = |table: &str| -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'corp' AND table_name = ?",
+            [table],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    if !has("ingest_log")? || !has("schema_meta")? {
+        conn.execute_batch("DETACH corp")?;
+        return Ok((std::collections::HashSet::new(), String::new()));
+    }
     let done = {
         let mut st = conn.prepare(
             "SELECT DISTINCT spec_id, version FROM corp.ingest_log
@@ -608,6 +624,26 @@ mod plan_tests {
         let plan = etsi_plan(&files, &done);
         assert_eq!(plan.pending_docs, 1);
         assert!(plan.pending_clauses > 0, "a new deliverable with text must plan clauses");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file that is not a corpus of this schema — no ledger, no meta — plans as
+    // "everything pending", it does not fail the step before the ingest can run.
+    #[test]
+    fn a_corpus_without_the_ledger_plans_everything_pending() {
+        let dir = tmp("bare");
+        let db = dir.join("etsi.duckdb");
+        {
+            let mem = Store::in_memory().unwrap();
+            mem.raw()
+                .execute_batch(&format!(
+                    "ATTACH '{}' AS f; CREATE TABLE f.other (x INTEGER); DETACH f;",
+                    db.to_str().unwrap().replace('\'', "''")
+                ))
+                .unwrap();
+        }
+        let (done, hnsw) = etsi_done_set(db.to_str().unwrap()).unwrap();
+        assert!(done.is_empty() && hnsw.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

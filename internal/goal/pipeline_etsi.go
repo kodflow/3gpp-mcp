@@ -285,14 +285,18 @@ func stepIngestETSI() *Step {
 			//
 			// `ingest --etsi --plan` answers with the ingest's own resume predicate,
 			// read-only. See etsiIngestDeclines for when its answer is trusted.
+			//
+			// A plan that FAILS is not a reason to stop: it only means the question
+			// could not be answered, and the answer to "may I skip?" is then no. The
+			// ingest runs exactly as it did before the plan existed.
 			plan, err := planETSIIngest(c)
 			if err != nil {
-				return err
-			}
-			if why := etsiIngestDeclines(plan); why != "" {
+				c.Log.Printf("WARNING: the ETSI ingest plan failed, running the ingest anyway: %v", err)
+			} else if why := etsiIngestDeclines(plan); why != "" {
 				return fmt.Errorf("%w: %s", ErrDeclined, why)
+			} else {
+				c.Log.Printf("ingest plan: %s", plan.raw)
 			}
-			c.Log.Printf("ingest plan: %s", plan.raw)
 
 			// pdftotext IS NOT CHECKED HERE ANY MORE. It is the fetch's tool, and this
 			// step neither converts nor reads a PDF. Keeping the guard would have been
