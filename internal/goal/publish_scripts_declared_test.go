@@ -149,6 +149,11 @@ func TestPublishDeclaresEveryCrateTheImageBuildCompiles(t *testing.T) {
 // open. Since publish fingerprints rust/embed-core/Cargo.lock, a rewrite there
 // would ship versions no commit names AND move publish's fingerprint behind its
 // back, replaying the whole publish on the next plan.
+//
+// Each invocation is judged on its own flags, comments excluded. The reader this
+// test first stood on (6cafdc7) let a `# --locked` comment pass the check, and
+// judged a second cargo on the line by the first one's flags;
+// TestTheCargoReaderJudgesEachInvocation holds those shapes.
 func TestEveryCargoBuildInTheImageIsLocked(t *testing.T) {
 	invs := buildImageCargoInvocations(t)
 	if len(invs) == 0 {
@@ -156,8 +161,7 @@ func TestEveryCargoBuildInTheImageIsLocked(t *testing.T) {
 			"while checking nothing", buildImageScript)
 	}
 	for _, inv := range invs {
-		// --frozen is --locked plus --offline, so it satisfies the rule too.
-		if !slices.Contains(inv.Args, "--locked") && !slices.Contains(inv.Args, "--frozen") {
+		if !cargoIsLocked(inv.Args) {
 			t.Errorf("%s:%d runs `cargo %s` without --locked: cargo may rewrite the lockfile publish "+
 				"fingerprints, and the image would carry versions no commit names",
 				buildImageScript, inv.Line, strings.Join(inv.Args, " "))
@@ -165,60 +169,19 @@ func TestEveryCargoBuildInTheImageIsLocked(t *testing.T) {
 	}
 }
 
-// cargoInvocation is one cargo command build-image.sh runs that resolves the
-// dependency graph.
-type cargoInvocation struct {
-	Line int      // 1-based line the command starts on
-	Args []string // the words after `cargo`, subcommand first
-}
-
-// cargoResolves are the cargo subcommands that resolve dependencies — and so read,
-// and without --locked may rewrite, a Cargo.lock. `cargo --version` and the like
-// are not commands this test has anything to say about.
-var cargoResolves = map[string]bool{
-	"build": true, "test": true, "run": true, "check": true, "bench": true,
-	"doc": true, "rustc": true, "clippy": true, "install": true, "fetch": true,
-	"metadata": true, "tree": true,
-}
-
 // buildImageCargoInvocations reads every dependency-resolving cargo command out of
-// build-image.sh, the way bash reads it.
+// build-image.sh, one per command bash runs (see readShellCommands, which replaced
+// a line scan that missed four shapes, and cargoLeavesTheLockAlone, which replaced
+// a list of the subcommands that resolve).
 //
-// LINE BY LINE WOULD NOT DO. The cdylib build is one command over six lines — four
-// environment assignments, then `cargo build` on one line and --manifest-path on
-// the next — so a per-line reader could not say which crate a flag belongs to, or
-// that a --locked two lines down is part of the same command. Continuations are
-// joined first. A comment is never continued: bash ends it at the newline whatever
-// its last character is. The file is read LF-normalised, because the checkout the
-// pipeline tests in has kept CRLF files before (#325).
-//
-// It finds `cargo` as a bare word or opening a $( ) or backtick substitution. A
-// cargo reached through a variable ("$CARGO build") is invisible to it; the script
-// has none, and the count checks in the callers fail if every invocation vanishes.
+// The cdylib build is one command over six lines, four environment assignments
+// then `cargo build` on one line and --manifest-path on the next, which is why a
+// per-line reader never could say which crate a flag belongs to. The file is read
+// LF-normalised, because the checkout the pipeline tests in has kept CRLF files
+// before (#325).
 func buildImageCargoInvocations(t *testing.T) []cargoInvocation {
 	t.Helper()
-	lines := strings.Split(readLF(t, filepath.Join(repoRootForTest(), filepath.FromSlash(buildImageScript))), "\n")
-	var out []cargoInvocation
-	for i := 0; i < len(lines); i++ {
-		start := i
-		if strings.HasPrefix(strings.TrimSpace(lines[i]), "#") {
-			continue
-		}
-		cmd := strings.TrimRight(lines[i], " \t")
-		for strings.HasSuffix(cmd, `\`) && i+1 < len(lines) {
-			i++
-			cmd = strings.TrimSuffix(cmd, `\`) + " " + strings.TrimRight(lines[i], " \t")
-		}
-		words := strings.Fields(cmd)
-		for j := 0; j+1 < len(words); j++ {
-			if strings.TrimLeft(words[j], "$(`") != "cargo" || !cargoResolves[words[j+1]] {
-				continue
-			}
-			out = append(out, cargoInvocation{Line: start + 1, Args: words[j+1:]})
-			break
-		}
-	}
-	return out
+	return cargoInvocationsIn(readLF(t, filepath.Join(repoRootForTest(), filepath.FromSlash(buildImageScript))))
 }
 
 // flagValue is the value of a long flag in an argument list, in either spelling

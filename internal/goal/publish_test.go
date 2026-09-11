@@ -2,7 +2,6 @@ package goal
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -206,42 +205,38 @@ func TestPublishFingerprintsFilesNotDirectories(t *testing.T) {
 }
 
 // TestPublishCoversEveryPackageTheServerLinks holds serverImplPackages to the
-// real package graph. A new import in cmd/server would otherwise ship in the
-// image while being invisible to the step that publishes it.
+// package graph of the server the image ships, built the way build-image.sh builds
+// it — tags and target read out of the script — in both directions.
+//
+// THE DEFECT THIS PINS, found by review on 2026-09-11. This test ran
+// `go list -deps ./cmd/server` with no tags, for the host. The image's server is
+// built `-tags "onnx,embed_ffi"` for GOOS=linux, and under `onnx`
+// internal/rerank/rerank_onnx.go imports internal/onnxrt, which the untagged graph
+// does not contain. serverImplPackages left it out and this test agreed, so an
+// edit to the ONNX Runtime binding the image's reranker runs through planned
+// publish as "fingerprint unchanged".
+//
+// BOTH DIRECTIONS, and the second is what pins the tags. Every package the image's
+// server links must be declared, and every declared package must be one it links:
+// read without the tags, the graph loses internal/onnxrt and this test names it as
+// declared but not linked. A reader that silently dropped -tags fails here instead
+// of passing on a smaller graph.
 func TestPublishCoversEveryPackageTheServerLinks(t *testing.T) {
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("no go on PATH — this test compares against `go list -deps ./cmd/server`")
-	}
-	// From the repository root, not this package's directory: `./cmd/server` is
-	// relative, and running it from here made the test SKIP itself — a guard that
-	// silently stops guarding is worse than no guard.
-	cmd := exec.Command("go", "list", "-deps", "./cmd/server")
-	cmd.Dir = repoRootForTest()
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("go list -deps ./cmd/server failed in %s: %v", cmd.Dir, err)
-	}
-	const mod = "github.com/kodflow/3gpp-mcp/"
-	declared := serverImplPackages()
-	for _, line := range strings.Split(string(out), "\n") {
-		pkg := strings.TrimSpace(line)
-		if !strings.HasPrefix(pkg, mod) {
-			continue
-		}
-		rel := strings.TrimPrefix(pkg, mod)
-		covered := false
-		for _, d := range declared {
-			// A declared directory covers its subpackages: Impl walks directories.
-			if rel == d || strings.HasPrefix(rel, d+"/") {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			t.Errorf("cmd/server links %s, which publish does not name in Impl — a change there "+
-				"would ship in the image without republishing it", rel)
-		}
-	}
+	requireGo(t)
+	server := imageServerBuild(t)
+	checkDeclaresWhatItsBinariesLink(t, "serverImplPackages", serverImplPackages(), []goBuildSpec{server},
+		"a change there would ship in the image without republishing it")
+}
+
+// TestPublishCoversEveryPackageTheImageBuildCompiles holds publish's whole Impl to
+// every Go build build-image.sh runs, each under its own tags and target: the
+// server it ships and the host tools that build the image (zigcc, elfneeded,
+// imgtar). A tool that grew an import of this module would change what the image
+// is built with and sit outside every fingerprint.
+func TestPublishCoversEveryPackageTheImageBuildCompiles(t *testing.T) {
+	requireGo(t)
+	checkDeclaresWhatItsBinariesLink(t, "publish", stepPublish().Impl, buildImageGoBuilds(t),
+		"a change there changes what build-image.sh builds while publish reports the previous image as current")
 }
 
 // TestValidatePublishedRejectsWhatIsNotADigest, with the positive control that a

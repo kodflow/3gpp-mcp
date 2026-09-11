@@ -167,7 +167,7 @@ func stepPublish() *Step {
 			// image's server calls through embed_ffi for every semantic query. This
 			// step named none of it. The steps that did cover the crate are all Tools
 			// — build-rust hashes the whole of rust/, build-serve and build-sparse
-			// its src — and a dirty Tool invalidates no consumer. So a fix to the
+			// the crate — and a dirty Tool invalidates no consumer. So a fix to the
 			// embedder, or an ort bump in its Cargo.toml, planned publish as
 			// "fingerprint unchanged" and the registry kept the previous cdylib as
 			// current.
@@ -182,7 +182,7 @@ func stepPublish() *Step {
 			"rust/embed-core/src",
 			"rust/embed-core/Cargo.toml",
 			"rust/embed-core/Cargo.lock",
-		}, serverImplPackages()...),
+		}, append(serverImplPackages(), imageGuardPackages()...)...),
 		// The shipped binary is `go build`, which does not compile _test.go. Editing
 		// a server test must not re-push an image, for the same reason it must not
 		// relink eight binaries.
@@ -411,8 +411,18 @@ func imageModelDirs() []string {
 //
 // The list is written out rather than computed so that reading this step tells
 // you what defines it. TestPublishCoversEveryPackageTheServerLinks holds it to
-// `go list -deps ./cmd/server`, so a new import fails the build instead of
-// silently escaping the fingerprint.
+// `go list -deps ./cmd/server` in both directions, so a new import fails the build
+// instead of silently escaping the fingerprint, and a stale entry fails it too.
+//
+// THE CLOSURE OF THE SERVER THE IMAGE SHIPS, NOT OF THE ONE `go build` MAKES HERE.
+// build-image.sh compiles cmd/server `-tags "onnx,embed_ffi"` for GOOS=linux, and
+// under `onnx` internal/rerank/rerank_onnx.go imports internal/onnxrt: the
+// process-wide ONNX Runtime initialisation the image's reranker runs through, and
+// LibPath, the library path it loads. The test asked for the untagged, host graph
+// until 2026-09-11, which does not contain that package, so it was missing here
+// and the test agreed. An edit there could keep the reranker from starting in the
+// image while publish reported the previous image as current. The test now reads
+// the tags and the target out of the script.
 //
 // internal/subject covers its own subpackages: Impl walks directories.
 //
@@ -429,6 +439,7 @@ func serverImplPackages() []string {
 		"internal/mcp",
 		"internal/metrics",
 		"internal/model",
+		"internal/onnxrt", // linked only under `onnx`, which is how the image builds it
 		"internal/registry",
 		"internal/releaseview",
 		"internal/rerank",
@@ -437,6 +448,31 @@ func serverImplPackages() []string {
 		"internal/store",
 		"internal/subject",
 	}
+}
+
+// imageGuardPackages are the commands build-image.sh runs on this machine to decide
+// whether the image may be published at all. Its identity guards (step 6) take the
+// dense and sparse identities the baked registry resolves to from cmd/embedid, and
+// the ones the corpus carries from cmd/dbcount, and refuse the push when they
+// differ or when the corpus states none.
+//
+// NOT DECLARED UNTIL 2026-09-11. No test read the script's Go commands: the
+// closure test asked `go list` about ./cmd/server alone, and these two run as
+// `go run` inside $( ) substitutions, a shape the script's only command reader
+// (the cargo one) could not see either. Reading every `go build` and `go run` the
+// script performs, under its own tags, found them the first time it ran. An edit
+// to either (the field dbcount prints, how embedid resolves the sparse head)
+// changed what this step lets through while its fingerprint stood still. The
+// packages they link (internal/embed, internal/model, internal/store) are server
+// packages and were already here.
+//
+// They ship nothing, which is why they are a list of their own:
+// TestSmokeJudgesEveryPackagePublishShips requires smoke to fingerprint what the
+// image carries, and smoke runs neither of these.
+// TestPublishCoversEveryPackageTheImageBuildCompiles holds the list to the `go
+// build` and `go run` commands the script performs.
+func imageGuardPackages() []string {
+	return []string{"cmd/dbcount", "cmd/embedid"}
 }
 
 // filesUnder lists every regular file below dir.
