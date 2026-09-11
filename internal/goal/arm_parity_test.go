@@ -335,6 +335,29 @@ func TestTheArmsAreTheSameListInTheSameOrder(t *testing.T) {
 			t.Errorf("position %d: 3GPP runs %q, ETSI runs %q", i, three[i].Name, etsi[i].Name)
 		}
 	}
+	// THE ORDER THAT MATTERS, pinned in the arm itself rather than trusted to the
+	// pairing: the conversion runs after the overlay that rewrites rows and before
+	// the freeze that indexes them. Moving all three together keeps the two columns
+	// equal, so equality alone cannot catch it.
+	for _, arm := range [][]*Step{three, etsi} {
+		pos := map[string][]int{}
+		for i, s := range arm {
+			base, _ := strings.CutSuffix(s.Name, "-etsi")
+			pos[base] = append(pos[base], i)
+		}
+		for _, n := range []string{"ingest", "embed", "enrich", "paragraphs", "sparse", "compact", "index", "validate"} {
+			if len(pos[n]) != 1 {
+				t.Fatalf("%s appears %d times in an arm", n, len(pos[n]))
+			}
+		}
+		for _, pair := range [][2]string{{"ingest", "embed"}, {"enrich", "paragraphs"}, {"embed", "paragraphs"},
+			{"paragraphs", "sparse"}, {"sparse", "compact"}, {"compact", "index"}, {"index", "validate"}} {
+			if pos[pair[0]][0] >= pos[pair[1]][0] {
+				t.Errorf("%s runs after %s in the %s arm", pair[0], pair[1], arm[0].Name)
+			}
+		}
+	}
+
 	// And no data step lives outside the arms: everything Pipeline() holds is an
 	// arm step or a recorded exception.
 	inArm := map[string]bool{}

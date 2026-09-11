@@ -254,6 +254,32 @@ func TestGeneralRegionIsTheLetterClausesOfTheNewestVersion(t *testing.T) {
 	}
 }
 
+// AN ABBREVIATIONS HEADING WITH NO NUMBER OWNS ONLY ITSELF. Walking on from it
+// would read every unnumbered clause to the end of the document — here an
+// unrelated one carrying a perfectly acronym-shaped line — and hand its key back
+// to TS 21.905 although the writer never stored it. extract_acronyms stops there
+// too; the two readers must not disagree about what the region is.
+func TestAnUnnumberedAbbreviationsHeadingOwnsOnlyItself(t *testing.T) {
+	c := func(chunk uint64, path, heading string) model.Clause {
+		return model.Clause{ChunkID: chunk, SpecID: ts21905, Version: "19.2.0", Release: "Rel-19",
+			ClausePath: path, Heading: heading}
+	}
+	for _, root := range []string{"", "Annex B"} {
+		got := generalRegion([]model.Clause{
+			c(1, root, "Abbreviations"),
+			c(2, "", "Unrelated"),
+			c(3, "", "Also unrelated"),
+		})
+		var headings []string
+		for _, cl := range got.clauses {
+			headings = append(headings, cl.Heading)
+		}
+		if strings.Join(headings, ",") != "Abbreviations" {
+			t.Errorf("an Abbreviations heading at %q took %v — it must own only itself", root, headings)
+		}
+	}
+}
+
 // A HAND-BACK IS NOT A DELETION, AND THE GUARD DOES NOT COUNT IT. 54 taken-over
 // rows dropped at once, against a bound of 53, all handed back: every key stays
 // in resolve_term, cited as TS 21.905's, and the run passes.

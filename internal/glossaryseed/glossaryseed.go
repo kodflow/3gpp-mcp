@@ -883,9 +883,19 @@ func generalRegion(clauses []model.Clause) abbreviationsRegion {
 		}
 		root := doc[i].ClausePath
 		r.clauses = append(r.clauses, doc[i])
+		// AN UNNUMBERED OR ANNEX HEADING OWNS ONLY ITSELF, exactly as in
+		// extract_acronyms. With no number to anchor the walk, "every unnumbered
+		// clause after it" is the rest of the document, and any acronym-shaped
+		// line in there would become a key this sweep hands back to "21" — a row
+		// the writer never stored, that no later sweep owns and none can remove.
+		// No stored version has such a heading (each has one "4 Abbreviations");
+		// the guard is for the version that would.
+		if root == "" || strings.HasPrefix(root, "Annex") {
+			continue
+		}
 		for i+1 < len(doc) {
 			p := doc[i+1].ClausePath
-			if p != "" && (root == "" || !strings.HasPrefix(p, root+".")) {
+			if p != "" && !strings.HasPrefix(p, root+".") {
 				break
 			}
 			i++
