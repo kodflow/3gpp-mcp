@@ -260,6 +260,11 @@ type Record struct {
 	// Checkpoint is free-form per-step resume detail (how many items done, which
 	// shard was in flight). It survives a failure so the next run resumes.
 	Checkpoint map[string]string `json:"checkpoint,omitempty"`
+	// Produced names what a run ACTUALLY produced when that is not a function of
+	// the fingerprint — `seed` pulling whatever snapshot a reference resolved to.
+	// It is folded into Provenance, so dependants see a different artefact as a
+	// different artefact. Set through Ctx.Produced; empty for almost every step.
+	Produced map[string]string `json:"produced,omitempty"`
 	// LogFile points at the full stdout/stderr of the attempt.
 	LogFile string `json:"log_file,omitempty"`
 	// DurationSec is kept for the performance report.
@@ -329,6 +334,22 @@ func (c *Ctx) Checkpoint(k, v string) {
 		c.record.Checkpoint = map[string]string{}
 	}
 	c.record.Checkpoint[k] = v
+}
+
+// Produced records the identity of what this run actually produced, for the rare
+// step whose output is NOT determined by its fingerprint: the fingerprint must be
+// computable before the run (offline, for `goal plan`), and some answers only
+// exist after it — which manifest a tag resolved to, above all. The value is
+// folded into the provenance dependants see, and only on a run that completed;
+// a decline carries the previous provenance whatever was recorded here.
+func (c *Ctx) Produced(k, v string) {
+	if c.record == nil {
+		return
+	}
+	if c.record.Produced == nil {
+		c.record.Produced = map[string]string{}
+	}
+	c.record.Produced[k] = v
 }
 
 // Cfg reads a resolved configuration value.
