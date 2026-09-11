@@ -179,7 +179,7 @@ fn main() {
             eprintln!(
                 "repair-plan: upstream_missing={} upstream_stale={} corpus_holes={} overlap={} -> repair_specs={} \
                  ({} un-encodable, {} holes absent from the status report, recovered from the anchor, \
-                 {} re-filed under the release their version names)",
+                 {} re-filed under the release their version names, {} deduped)",
                 c.upstream_missing,
                 c.upstream_stale,
                 c.corpus_holes,
@@ -187,7 +187,8 @@ fn main() {
                 c.emitted,
                 c.unencodable,
                 c.holes_not_in_report,
-                c.refiled
+                c.refiled,
+                c.deduped
             );
         }
         Mode::Delta => {

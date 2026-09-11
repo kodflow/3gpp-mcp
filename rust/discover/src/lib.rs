@@ -860,6 +860,7 @@ pub fn emit_repair_worklist(
     let allow = series_set(series_filter);
     let mut counts = RepairCounts::default();
     let mut lines = String::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for (key, ver) in site {
         let (spec, rel) = split_key(key);
@@ -895,11 +896,17 @@ pub fn emit_repair_worklist(
             continue;
         }
         // Count each population in FULL, plus the overlap, so the identity
-        //     emitted = (missing + stale) + holes - overlap
+        //     emitted = (missing + stale) + holes - overlap - deduped
         // holds and is checkable by eye. Reporting only the disjoint parts would
         // hide the term that matters: an overlap collapsing towards zero means the
         // hole detector and the drift computation have stopped agreeing about what
         // the corpus contains, and that is a defect, not an improvement.
+        //
+        // `deduped` joined the identity with re-filing: two keys of one spec can now
+        // resolve to the same release at the same version and render the SAME line
+        // (33.816 is listed at 10.0.0 under both Rel-10 and Rel-11), and corpus.sh
+        // fetches the manifest in PARALLEL — two workers on one `$zip.part` is a
+        // download race, not merely a wasted request.
         if drifted {
             if have_there.is_empty() {
                 counts.upstream_missing += 1;
@@ -927,8 +934,12 @@ pub fn emit_repair_worklist(
         }
         match archive_line(spec, file_under, &pfx, want) {
             Some(line) => {
-                lines.push_str(&line);
-                counts.emitted += 1;
+                if seen.insert(line.clone()) {
+                    lines.push_str(&line);
+                    counts.emitted += 1;
+                } else {
+                    counts.deduped += 1;
+                }
             }
             None => counts.unencodable += 1,
         }
@@ -989,8 +1000,12 @@ pub fn emit_repair_worklist(
         counts.corpus_holes += 1;
         match archive_line(spec, file_under, &pfx, want) {
             Some(line) => {
-                lines.push_str(&line);
-                counts.emitted += 1;
+                if seen.insert(line.clone()) {
+                    lines.push_str(&line);
+                    counts.emitted += 1;
+                } else {
+                    counts.deduped += 1;
+                }
             }
             None => counts.unencodable += 1,
         }
@@ -1045,6 +1060,9 @@ pub struct RepairCounts {
     /// Lines emitted under the release the version's own major names instead of the
     /// key's release — see filing_release.
     pub refiled: usize,
+    /// Lines a re-filing made identical to one already emitted, and so dropped. Part
+    /// of the union identity; see the comment where the populations are counted.
+    pub deduped: usize,
 }
 
 /// load_holes reads `anchorcheck --emit-repair` output: one "spec|Rel" per line.
@@ -1110,9 +1128,10 @@ mod repair_tests {
         assert_eq!(c.overlap, 1, "24.501 is both stale and a hole");
         assert_eq!(
             c.emitted,
-            c.upstream_missing + c.upstream_stale + c.corpus_holes - c.overlap,
+            c.upstream_missing + c.upstream_stale + c.corpus_holes - c.overlap - c.deduped,
             "the union identity must hold, or the plan is silently over- or under-counting"
         );
+        assert_eq!(c.deduped, 0, "nothing converges in this fixture");
         assert_eq!(c.emitted, 4);
         assert!(
             !lines.contains("38331"),
@@ -1313,6 +1332,29 @@ mod repair_tests {
             "19.5.0 must be fetched as Rel-19; got: {lines}"
         );
         assert!(!lines.contains("Rel-20 "), "got: {lines}");
+    }
+
+    /// The repair plan can converge two keys onto one line too, and corpus.sh fetches
+    /// the manifest in PARALLEL: two workers on the same `$zip.part` is a download
+    /// race. The union identity carries the dropped line as its own term rather than
+    /// quietly not adding up.
+    #[test]
+    fn the_repair_plan_does_not_emit_a_line_twice() {
+        let site = m(&[("33.816|Rel-10", "10.0.0"), ("33.816|Rel-11", "10.0.0")]);
+        let idx = m(&[]);
+        let (lines, c) = emit_repair_worklist(&site, &idx, &BTreeSet::new(), 4, "");
+        assert_eq!(c.deduped, 1, "lines: {lines}");
+        assert_eq!(c.emitted, 1, "lines: {lines}");
+        assert_eq!(
+            c.emitted,
+            c.upstream_missing + c.upstream_stale + c.corpus_holes - c.overlap - c.deduped,
+            "the identity must still hold once a line converges"
+        );
+        assert_eq!(
+            lines,
+            "Rel-10 https://www.3gpp.org/ftp/Specs/archive/33_series/33.816/33816-a00.zip 33816-a00.zip
+"
+        );
     }
 
     /// Two keys of one spec that re-file onto the same release at the same version
