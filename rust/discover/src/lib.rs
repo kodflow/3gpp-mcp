@@ -101,7 +101,7 @@ pub fn emit_worklist(
         }
         let mut file_under = rel;
         let owned;
-        if let Some(own) = filing_release(site, spec, rel, ver) {
+        if let Some(own) = filing_release(site, spec, rel, ver, floor_major) {
             owned = own;
             file_under = &owned;
             refiled += 1;
@@ -147,18 +147,32 @@ pub fn emit_worklist(
 /// have a release the version's major contradicts. 51 are Rel-4 rows holding a
 /// 3.x.y Rel-99 document, and today's report still says so — the corpus has no
 /// Rel-99 section at all, so Rel-4 is their only home and they are left alone by
-/// the `site.contains_key` condition below. 16 are Rel-20 rows that today's report
+/// conditions 2 and 3 below. 16 are Rel-20 rows that today's report
 /// does not carry at all, and 12 of those hold 4 112 clauses of Rel-18/Rel-19 text
 /// that exists NOWHERE ELSE in the corpus: `get_spec(26.510, release=Rel-20)`
 /// serves 364 clauses of a document whose own cover says Release 18. Those 12 were
 /// acquired by the holes loop of emit_repair_worklist, which took the corpus's own
 /// key as proof of the release.
 ///
-/// Returns the release the document belongs to, when that is not the key's release
-/// AND the report files this spec there. A draft (major < 3) is legitimately older
-/// than the release it is drafted for and is never re-filed — guarding drafts would
-/// have moved the three rows today's report carries in that shape (23.873 Rel-5
-/// 2.0.0, 33.900 Rel-5 0.4.1, 36.833-1 Rel-13 0.4.0).
+/// Returns the release the document belongs to, when ALL of these hold — and every
+/// one of the three refusals below exists to make sure re-filing can only ever move
+/// a document, never lose one:
+///
+///  1. the version is a published one. A DRAFT (major < 3) is legitimately older
+///     than the release it is drafted for: today's report carries 23.873 Rel-5
+///     2.0.0, 33.900 Rel-5 0.4.1 and 36.833-1 Rel-13 0.4.0, and "Rel-0" is not a
+///     release. 3GPP has no Rel-0/1/2 section, so conditions 2 and 3 would refuse
+///     these anyway; the check is stated rather than relied upon, because what
+///     protects them must not be an accident of the report's shape.
+///  2. the report files this spec under that release too. Without it, the 51 Rel-4
+///     rows holding a 3.x.y document would be sent to Rel-99 — a section that does
+///     not exist — and 3 181 clauses with no other home would simply stop being
+///     acquired.
+///  3. that release is at or above the floor. The floor is applied to the KEY's
+///     release by `in_scope`; re-filing chooses a DIFFERENT one, and a target below
+///     the floor is dropped by the fetch. The day a `deadRel-99` section appears in
+///     the report, condition 2 stops protecting those same 51 rows and this is what
+///     still does.
 ///
 /// This is the invariant `scripts/corpus.sh`'s download fallback has enforced since
 /// 812e7e1 — "NEVER a higher release's version that would then be mis-filed under
@@ -169,13 +183,17 @@ fn filing_release(
     spec: &str,
     rel: &str,
     ver: &str,
+    floor_major: i64,
 ) -> Option<String> {
     let vmaj = major(ver);
     if vmaj < 3 || vmaj == major(rel) {
         return None;
     }
     let own = release_from_major(vmaj);
-    if own == rel || !site.contains_key(&format!("{spec}|{own}")) {
+    if own == rel || major(&own) < floor_major {
+        return None;
+    }
+    if !site.contains_key(&format!("{spec}|{own}")) {
         return None;
     }
     Some(own)
@@ -882,7 +900,7 @@ pub fn emit_repair_worklist(
         let want = if drifted { ver.as_str() } else { have };
         let mut file_under = rel;
         let owned;
-        if let Some(own) = filing_release(site, spec, rel, want) {
+        if let Some(own) = filing_release(site, spec, rel, want, floor_major) {
             owned = own;
             file_under = &owned;
             counts.refiled += 1;
@@ -943,7 +961,7 @@ pub fn emit_repair_worklist(
         // from MissingContent to NonContent: the bookkeeping row it always was.
         let mut file_under = rel;
         let owned;
-        if let Some(own) = filing_release(site, spec, rel, want) {
+        if let Some(own) = filing_release(site, spec, rel, want, floor_major) {
             owned = own;
             file_under = &owned;
             counts.refiled += 1;
@@ -1202,15 +1220,42 @@ mod repair_tests {
     }
 
     /// A DRAFT is legitimately older than the release it is drafted for: 36.833-1 is
-    /// listed at 0.4.0 under Rel-13, and "Rel-0" is not a release. Drafts keep their
-    /// section. Today's live report carries three rows in this shape and the guard
-    /// must move none of them.
+    /// listed at 0.4.0 under Rel-13, and "Rel-0" is not a release. Today's live report
+    /// carries three rows in that shape and the guard must move none of them.
+    ///
+    /// The fixture puts a "Rel-2" section in the report and drops the floor to 0, so
+    /// that the draft check is the ONLY thing refusing the move. The realistic
+    /// fixture (no such section, floor Rel-4) passes whether the draft check exists
+    /// or not — it is refused by the other two conditions — and would therefore have
+    /// proved nothing about the line it claims to cover.
     #[test]
     fn a_draft_keeps_the_release_it_is_drafted_for() {
-        let site = m(&[("36.833-1|Rel-12", "12.0.0"), ("36.833-1|Rel-13", "0.4.0")]);
-        let (lines, _, _, refiled) = emit_worklist(&site, 4, "");
+        let site = m(&[("36.833-1|Rel-2", "2.9.0"), ("36.833-1|Rel-13", "2.0.0")]);
+        let (lines, _, _, refiled) = emit_worklist(&site, 0, "");
         assert_eq!(refiled, 0, "a draft is not mis-filed; got: {lines}");
-        assert!(lines.contains("Rel-13 "), "got: {lines}");
+        assert!(
+            lines.contains(
+                "Rel-13 https://www.3gpp.org/ftp/Specs/archive/36_series/36.833-1/36833-1-200.zip"
+            ),
+            "the draft keeps the release it is drafted for; got: {lines}"
+        );
+    }
+
+    /// RE-FILING MUST NEVER MOVE A DOCUMENT OUT OF THE CORPUS. The floor is applied
+    /// to the KEY's release; re-filing picks a different one. If a `deadRel-99`
+    /// section ever appears in the report, the 51 Rel-4 rows holding a 3.x.y document
+    /// — 3 181 clauses with no other copy — would all resolve to Rel-99, below the
+    /// Rel-4 floor, and `in_scope` would drop every one of them from the fetch.
+    #[test]
+    fn refiling_never_sends_a_document_below_the_floor() {
+        let site = m(&[("21.810|Rel-99", "3.0.0"), ("21.810|Rel-4", "3.0.0")]);
+        let (lines, n, _, refiled) = emit_worklist(&site, major("Rel-4"), "");
+        assert_eq!(refiled, 0, "Rel-99 is below the floor; got: {lines}");
+        assert_eq!(n, 1, "only the Rel-4 key is in scope; got: {lines}");
+        assert!(
+            lines.starts_with("Rel-4 "),
+            "the document must still be fetched, as Rel-4; got: {lines}"
+        );
     }
 
     /// Two keys of one spec that re-file onto the same release at the same version
