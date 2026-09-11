@@ -49,7 +49,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TAG="${IMAGE_TAG:-ghcr.io/kodflow/3gpp-mcp:latest}"
-BASE="${IMAGE_BASE:-debian:bookworm-slim}"
+# THE BASE IS PINNED BY DIGEST. `debian:bookworm-slim` is a tag Debian moves on
+# every point release and security rebuild, so the same commit, corpus and
+# fingerprint could compose a different image — new base layer, new passwd/group
+# derived from it, other libraries for the loader check to resolve against — while
+# publish's fingerprint, which folds this value in as image_base, said nothing moved.
+# The digest is the linux/amd64 manifest the image published on 2026-09-11
+# (sha256:b0e4ccbf…) was built on: its base layer sha256:a8ac7f6c67ab… is that
+# manifest's only layer, so pinning it changes no byte of the image.
+#
+# TO BUMP IT (a deliberate, reviewed change — it replays publish and re-pushes the
+# ~28 MB base layer):
+#   .local/bin/crane.exe digest debian:bookworm-slim --platform linux/amd64
+# then put that digest after the @ below. IMAGE_BASE still overrides it for one run.
+BASE="${IMAGE_BASE:-debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867}"
 # The contract's embed floor, ONE value from here to the gate in section 5. The
 # flag wins over the environment, and an empty --embed-floor is kept as empty —
 # data-contract.sh then applies no floor, i.e. every release — which the
@@ -305,6 +318,10 @@ cp "$SYSROOT/libstdc++.so.6" "$SYSROOT/libgomp.so.1" "$ROOTFS/usr/lib/x86_64-lin
 # re-shipped with one line appended. Reading them rather than writing fresh files
 # matters: a hand-written passwd would drop root, daemon and nobody, and anything
 # in the image that resolves a uid would start answering wrong.
+case "$BASE" in
+  *@sha256:*) ;;
+  *) say "WARNING: base $BASE is a mutable tag, not a digest — the image is not reproducible from this commit" ;;
+esac
 say "deriving /etc/passwd and /etc/group from $BASE"
 # -buildvcs=false -trimpath: THE SAME SOURCE MUST BE THE SAME BINARY ON EVERY COMMIT.
 #
