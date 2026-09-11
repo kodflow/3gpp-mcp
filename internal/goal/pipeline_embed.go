@@ -1268,8 +1268,10 @@ func stepSmoke() *Step {
 		// probe that must find something, and a probe the server does not expose —
 		// all judged in internal/goal, which smoke's fingerprint does not cover, so
 		// only the version can say the step's meaning moved.
-		Version: 3,
-		Doc:     "start the real server over stdio, prove every probe answers, and hold retrieval to the committed baseline",
+		// 4: the served retrieval gate (smoke_served.go) — server-full, hybrid and
+		// the cross-encoder held to docs/inputs/eval/served_baseline.json.
+		Version: 4,
+		Doc:     "start the real server over stdio, prove every probe answers, and hold retrieval — lexical and as served (hybrid + rerank) — to the committed baselines",
 		// BOTH GATES, because there are two now. Naming only "validate" would let
 		// the smoke -- and `publish` behind it -- run while the ETSI contract had
 		// not been applied, which is the state this whole split ends.
@@ -1280,7 +1282,12 @@ func stepSmoke() *Step {
 		// judged the corpus with yesterday's bench — the "a fix that was not built
 		// is inert" trap, reached through the gate. A Tool dep adds nothing to the
 		// fingerprint, so declaring it replays nothing.
-		Deps: []string{"validate", "validate-etsi", "build-go"},
+		//
+		// build-serve for the same reason, and for the served gate: it launches
+		// server-full. build-serve is Optional, so its failure does not stop the
+		// runner — the gate refuses a server-full whose build did not just succeed
+		// (buildServeSucceeded) rather than score what an earlier tree left there.
+		Deps: []string{"validate", "validate-etsi", "build-go", "build-serve"},
 		Impl: append([]string{
 			// THE RETRIEVAL GATE'S OWN DETERMINANTS (see smoke_gate.go): the
 			// instrument and the verdict, then the judged queries and the bar. The
@@ -1326,6 +1333,15 @@ func stepSmoke() *Step {
 			// probe replay is under a minute (53.7 s on 2026-09-11) against the image
 			// it guards. TestSmokeDeclaresEveryPackageItsBinariesLink reads each graph
 			// under the tags its binary is built with.
+			//
+			// THE SERVED GATE'S OWN DETERMINANTS (smoke_served.go): its bar, and the
+			// query embedder server-full calls through embed_ffi — the embed-core
+			// cdylib build-serve compiles. build-serve is a Tool dep, so without these
+			// three lines an ort bump or an embedder fix rebuilt the DLL the gate
+			// scores and left this step SKIPping on the old verdict. The same three
+			// paths publish declares for the image's copy of the crate.
+			servedBaseline,
+			"rust/embed-core/src", "rust/embed-core/Cargo.toml", "rust/embed-core/Cargo.lock",
 		}, serverImplPackages()...),
 		// The step RUNS binaries; a _test.go cannot change what either of them does.
 		// It counted them until now, recorded in countsTestFiles as cheap to replay
@@ -1339,6 +1355,17 @@ func stepSmoke() *Step {
 			return map[string]string{
 				"retrieval_systems": retrievalSystems,
 				"retrieval_tol":     retrievalTol,
+				// The served gate's knobs live here too, for the same reason.
+				"served_arms":          servedArmKeys(),
+				"served_tol":           servedTol,
+				"served_search_budget": servedSearchBudget,
+				"served_memory_limit":  servedMemoryLimit,
+				"served_queries":       strings.Join(servedQueryIDs, ","),
+				// The tags server.exe, bench.exe and server-full are compiled with
+				// (review of #340): build-go and build-serve read GOTAGS, and as Tool
+				// deps they pass no provenance on, so a tag-only change rebuilt the
+				// binaries this step judges and left its verdict standing.
+				"gotags": os.Getenv("GOTAGS"),
 			}, nil
 		},
 		Inputs: func(c *Ctx) ([]string, error) {
@@ -1349,13 +1376,38 @@ func stepSmoke() *Step {
 			if etsi := c.dataPath("etsi.duckdb"); fileNonEmpty(etsi) {
 				in = append(in, etsi)
 			}
-			return in, nil
+			// The models and runtimes the served gate's server loads, FILE BY FILE
+			// (a directory fingerprints as the constant "dir"): the sparse+dense
+			// encoder, the cross-encoder and the Go binding's ONNX Runtime — the
+			// same three directories publish packs into the image — and the Rust
+			// side's runtime under .local/toolchain. A new reranker export is a new
+			// ranking; the gate must replay on it before publish ships it.
+			for _, d := range imageModelDirs() {
+				files, err := filesUnder(c.dataPath("models", d))
+				if err != nil {
+					return nil, err
+				}
+				in = append(in, files...)
+			}
+			return append(in, servedRuntimeInputs(c)...), nil
 		},
 		Run: func(c *Ctx) error {
 			if err := runSmoke(c); err != nil {
 				return err
 			}
 			if err := runRetrievalGate(c); err != nil {
+				return err
+			}
+			// After the lexical gate and after runSmoke's server has been killed:
+			// the two servers never hold the corpus at the same time, so the peak
+			// is the served server's alone. WHAT IT COSTS, measured 2026-09-11 on
+			// this machine with eight agents sharing it: 6 min 45 end to end (27.6 s
+			// to start server-full, 2 s lexical, 176 s hybrid, 199 s rerank for the
+			// two scored queries) and 14.1 GB committed at the peak — against the
+			// 11.7 GB the lexical server above already takes. The bounds that make
+			// it that (the 3GPP half, the two queries that can fail, a 6GB DuckDB
+			// limit) and what they were measured against are in smoke_served.go.
+			if err := runServedRetrievalGate(c); err != nil {
 				return err
 			}
 			// THIS is the moment compact's own instruction points at: "once served
@@ -1526,7 +1578,9 @@ func runSmoke(c *Ctx) error {
 	// needs embed_ffi, EMBED_MODEL_DIR and ORT), and a gate that fails on a
 	// correct corpus for want of an env var is worse than no gate — it teaches the
 	// operator to skip it. `.local/resume/prove.sh` drives server-full.exe with
-	// that environment set and asserts `semantic` there.
+	// that environment set and asserts `semantic` there — and so does this step's
+	// served retrieval gate (smoke_served.go), which builds that environment
+	// itself and fails when server-full does not report semantic and reranker.
 	if err := send(map[string]any{
 		"jsonrpc": "2.0", "id": id, "method": "tools/call",
 		"params": map[string]any{"name": "server_info", "arguments": map[string]any{}},
@@ -2640,11 +2694,7 @@ func stepBuildServe() *Step {
 			}); err != nil {
 				return err
 			}
-			tags := os.Getenv("GOTAGS")
-			if tags != "" {
-				tags += ","
-			}
-			tags += "onnx,embed_ffi"
+			tags := serveBuildTags(os.Getenv("GOTAGS"))
 			c.Log.Printf("go build cmd/server -tags %s", tags)
 			// APPEND to CGO_LDFLAGS, do not replace it.
 			//
@@ -2684,6 +2734,16 @@ func stepBuildServe() *Step {
 			return nil
 		},
 	}
+}
+
+// serveBuildTags is the tag set build-serve compiles server-full with: build-go's
+// GOTAGS plus the semantic pair. One function, so the test that holds smoke's
+// Impl to server-full's package graph reads the tags the build uses.
+func serveBuildTags(gotags string) string {
+	if gotags != "" {
+		return gotags + ",onnx,embed_ffi"
+	}
+	return "onnx,embed_ffi"
 }
 
 // serveDLLs lists what server-full dlopens at runtime: the embed-core cdylib and

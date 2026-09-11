@@ -136,7 +136,7 @@ has run once, the register exists and the check is a real gate.
 | `compact` / `compact-etsi` | rewrite the corpus without its dead space — **declines** when there is nothing to reclaim | ~30 min, or 0 |
 | `index` / `index-etsi` | build and freeze the HNSW cosine index | RAM-bound |
 | `validate` / `validate-etsi` | the data-completeness contract (+ `anchorcheck` on the 3GPP arm) | seconds |
-| `smoke` | start the real server over both stores, call real tools, assert vector search stays on | seconds |
+| `smoke` | start the real server over both stores, call real tools, assert vector search stays on; hold retrieval to `docs/inputs/eval/baseline.json` (lexical, bench) and to `served_baseline.json` (lexical / hybrid / hybrid+rerank, through `server-full`'s `search_spec` on the 3GPP half — `internal/goal/smoke_served.go`) | ~1 min + the served gate (measured on the step) |
 | `publish` | compose the OCI image and push it — declines without a registry credential | ~25 min |
 
 `publish` is a STEP, not a separate entry point. The image was the only output of

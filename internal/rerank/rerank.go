@@ -93,6 +93,43 @@ var reason string
 // reranking is the arm that had no such answer.
 func Reason() string { return reason }
 
+// forTokenizer is the fallback form of a query or a passage the tokenizer could
+// not encode: every run of whitespace — newlines and tabs included — folded into
+// one space, and none at the end (a leading run is kept as one space).
+//
+// THE TOKENIZER PANICS ON WHITESPACE IT HAS TO REWRITE. github.com/sugarme/tokenizer
+// v0.3.0, loaded with bge-reranker-v2-m3's tokenizer.json, answers
+//
+//	"Foreword\n"    slice bounds out of range [21:17]
+//	"5.1 Scope\n"   slice bounds out of range [24:19]
+//	"Foreword\r\n"  index out of range [10] with length 10
+//	"Test procedure\nStep Direction<36 spaces>Description"
+//	                slice bounds out of range [153:152]
+//
+// while "Foreword", "a\nb" and "Step Direction    Description" encode (measured
+// 2026-09-11). The normaliser maps control characters to spaces, strips the right
+// end and replaces runs of spaces (tokenizer.json: Precompiled, Strip, Replace
+// " {2,}"), and the library's offset bookkeeping for those length-changing
+// rewrites indexes past the end. The engine builds every passage as heading +
+// "\n" + text, so a clause with an empty body — a heading, an ETSI table row such
+// as "0 1 0 1 1 5" — or a tabulated line took the whole call down. The first run
+// of the served retrieval gate found it: search_spec(rerank=true) on a judged
+// query panicked inside the stdio worker, which mcp-go recovers WITHOUT
+// answering, so the client waited forever.
+//
+// ONLY A FALLBACK, because folding is not neutral for THIS library: it encodes
+// "a  b" with a stray ▁ token that "a b" does not have (checked by
+// TestTheRerankerTokenizesPassagesWithAnEmptyBody). So encodePair tries the input
+// as is, and folds only what would otherwise have crashed — which changes no
+// score the reranker could compute before.
+func forTokenizer(s string) string {
+	folded := strings.Join(strings.Fields(s), " ")
+	if folded != "" && strings.IndexFunc(s, func(r rune) bool { return !unicode.IsSpace(r) }) > 0 {
+		folded = " " + folded
+	}
+	return folded
+}
+
 func tokenSet(s string) map[string]bool {
 	m := map[string]bool{}
 	for _, t := range tokenize(s) {
