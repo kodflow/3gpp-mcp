@@ -77,9 +77,13 @@ func fileIdentity(t *testing.T, path string) string {
 // costs 0.2 s or a 22 GB image layer depends on one thing: whether the process
 // leaves the file as it found it. Measured on 2026-09-11 against copies of both
 // shipped corpora, it does (sha256 and mtime identical after the Run and after
-// the step's Validate). This keeps it true: a later "harmless" re-stamp of the
-// attestation, or a CHECKPOINT on the already-converted path, would pass every
-// other test here and move 42 GB per build.
+// the step's Validate). This keeps it true: any write on the already-converted
+// path — a new marker, a table touched "while we are here" — would pass every
+// other test here and move 42 GB per build. Falsified 2026-09-11 with a
+// one-row INSERT there: the fixture changed size, sha256 and mtime and this test
+// failed. (Re-stamping the SAME attestation value did not move the file — an
+// upsert that changes nothing leaves DuckDB nothing to checkpoint — so that one
+// is not what this guards against.)
 func TestAReplayOfAConvertedCorpusWritesNothing(t *testing.T) {
 	h := fixture(t)
 	var path string
@@ -108,9 +112,9 @@ func TestAReplayOfAConvertedCorpusWritesNothing(t *testing.T) {
 		if !strings.Contains(out, "clause_occ=8") {
 			t.Errorf("%v reported %q, want the 8 occurrences of the fixture", args, out)
 		}
-		// The already-converted path re-verifies and re-stamps only when the
-		// attestation is missing or stale; a fresh one must be honoured, or the
-		// replay is a full verification (7m12 on 3GPP) and a write.
+		// The already-converted path re-verifies only when the attestation is
+		// missing or stale; a current one must be honoured, or every replay is a
+		// full verification (7m12 on 3GPP, and a 16 GB memory cap).
 		if strings.Contains(errOut, "verifying once") {
 			t.Errorf("%v re-verified a corpus whose attestation is current:\n%s", args, errOut)
 		}
