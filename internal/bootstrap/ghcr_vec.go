@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/kodflow/3gpp-mcp/internal/retry"
 )
 
 // registryBase is the OCI registry every pull in this package targets, and
@@ -118,8 +122,26 @@ type ghcrLayer struct {
 // `crane append` sets no title, which is why the corpus path matches on the tar
 // member's name instead).
 func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, error) {
+	_, layers, err := ghcrManifest(ctx, repo, ref, token)
+	return layers, err
+}
+
+// maxManifestBytes bounds what is read as a manifest. The OCI distribution spec
+// has registries accept manifests up to 4 MiB; a corpus manifest is ~400 bytes.
+const maxManifestBytes = 4 << 20
+
+// ghcrManifest reads an OCI manifest and returns its DIGEST — the sha256 of the
+// exact bytes the registry served, which is what a manifest digest is — with its
+// layers.
+//
+// When ref is a digest, the bytes are checked against it and a mismatch is a
+// permanent error. That check is what turns a digest pin into a guarantee: without
+// it the client would trust the registry's word that the manifest it returned is
+// the one that was asked for, and a pin would be only as good as a tag.
+func ghcrManifest(ctx context.Context, repo, ref, token string) (string, []ghcrLayer, error) {
 	u := registryBase + "/v2/" + repo + "/manifests/" + ref
 	var out []ghcrLayer
+	var digest string
 	err := netRetry(ctx, func() error {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
@@ -134,6 +156,18 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("ghcr manifest: %s", resp.Status)
 		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
+		if err != nil {
+			return err
+		}
+		if len(body) > maxManifestBytes {
+			return retry.Permanent(fmt.Errorf("ghcr manifest %s is larger than %d bytes", repo, maxManifestBytes))
+		}
+		sum := sha256.Sum256(body)
+		got := "sha256:" + hex.EncodeToString(sum[:])
+		if IsDigest(ref) && got != ref {
+			return retry.Permanent(fmt.Errorf("asked %s for manifest %s and was served one whose digest is %s — refusing it", repo, ref, got))
+		}
 		var m struct {
 			Layers []struct {
 				Digest      string            `json:"digest"`
@@ -141,7 +175,7 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 				Annotations map[string]string `json:"annotations"`
 			} `json:"layers"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		if err := json.Unmarshal(body, &m); err != nil {
 			return err
 		}
 		layers := make([]ghcrLayer, 0, len(m.Layers))
@@ -151,10 +185,10 @@ func ghcrLayers(ctx context.Context, repo, ref, token string) ([]ghcrLayer, erro
 		if len(layers) == 0 {
 			return fmt.Errorf("ghcr manifest %s has no layers", repo)
 		}
-		out = layers
+		out, digest = layers, got
 		return nil
 	})
-	return out, err
+	return digest, out, err
 }
 
 // ghcrPullBlob downloads a blob by digest to dest, zstd-decompressing if asked.

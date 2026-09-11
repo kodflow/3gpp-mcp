@@ -26,11 +26,17 @@ import (
 func TestBootstrapDefaultsAreNotAPublicReleaseAsset(t *testing.T) {
 	t.Setenv(envGHCROwner, "")
 	t.Setenv(envCorpusTag, "")
+	t.Setenv(bootstrap.EnvCorpusRef3GPP, "")
+	t.Setenv(bootstrap.EnvCorpusRefETSI, "")
 
-	for name, src := range map[string]bootstrap.CorpusSource{
-		"corpusSource": corpusSource(),
-		"etsiSource":   etsiSource(),
+	for name, resolve := range map[string]func() (bootstrap.CorpusSource, error){
+		"corpusSource": corpusSource,
+		"etsiSource":   etsiSource,
 	} {
+		src, err := resolve()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
 		got := src.String()
 		if strings.Contains(got, "github.com") || strings.Contains(got, "/releases/") {
 			t.Errorf("%s resolves to a GitHub release asset (%s).\n"+
@@ -48,13 +54,54 @@ func TestBootstrapDefaultsAreNotAPublicReleaseAsset(t *testing.T) {
 func TestCorpusSourceIsRepointableWithoutARebuild(t *testing.T) {
 	t.Setenv(envGHCROwner, "someone-else")
 	t.Setenv(envCorpusTag, "2026-08-26")
+	t.Setenv(bootstrap.EnvCorpusRef3GPP, "")
+	t.Setenv(bootstrap.EnvCorpusRefETSI, "")
 
-	if got, want := corpusSource().String(), "ghcr.io/someone-else/3gpp-corpus:2026-08-26"; got != want {
+	if got, want := mustSource(t, corpusSource), "ghcr.io/someone-else/3gpp-corpus:2026-08-26"; got != want {
 		t.Errorf("corpusSource() = %q, want %q", got, want)
 	}
-	if got, want := etsiSource().String(), "ghcr.io/someone-else/etsi-corpus:2026-08-26"; got != want {
+	if got, want := mustSource(t, etsiSource), "ghcr.io/someone-else/etsi-corpus:2026-08-26"; got != want {
 		t.Errorf("etsiSource() = %q, want %q", got, want)
 	}
+}
+
+// THE SERVER ACCEPTS A DIGEST PIN, ONE PER PACKAGE. A digest names one manifest of
+// one package, so it cannot travel in the shared tag variable — which refuses it
+// rather than pinning the ETSI corpus with the 3GPP corpus's identity.
+func TestEachCorpusCanBePinnedByDigest(t *testing.T) {
+	d3 := "sha256:" + strings.Repeat("3a", 32)
+	dE := "sha256:" + strings.Repeat("e7", 32)
+	t.Setenv(envGHCROwner, "")
+	t.Setenv(envCorpusTag, "")
+	t.Setenv(bootstrap.EnvCorpusRef3GPP, "@"+d3)
+	t.Setenv(bootstrap.EnvCorpusRefETSI, dE)
+
+	if got, want := mustSource(t, corpusSource), "ghcr.io/kodflow/3gpp-corpus@"+d3; got != want {
+		t.Errorf("corpusSource() = %q, want %q", got, want)
+	}
+	if got, want := mustSource(t, etsiSource), "ghcr.io/kodflow/etsi-corpus@"+dE; got != want {
+		t.Errorf("etsiSource() = %q, want %q", got, want)
+	}
+
+	t.Setenv(bootstrap.EnvCorpusRef3GPP, "")
+	t.Setenv(bootstrap.EnvCorpusRefETSI, "")
+	t.Setenv(envCorpusTag, d3)
+	for name, resolve := range map[string]func() (bootstrap.CorpusSource, error){
+		"corpusSource": corpusSource, "etsiSource": etsiSource,
+	} {
+		if _, err := resolve(); err == nil {
+			t.Errorf("%s accepted a digest in the variable shared by both packages", name)
+		}
+	}
+}
+
+func mustSource(t *testing.T, resolve func() (bootstrap.CorpusSource, error)) string {
+	t.Helper()
+	src, err := resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return src.String()
 }
 
 // TestEnsureDBWithoutACredentialKeepsACachedCorpus covers the degrade path that

@@ -400,8 +400,13 @@ func stepSeed(t corpusTarget) *Step {
 		Version: 2, // bumped: the source changed, so a cached success must not carry over
 		Doc:     "seed the corpus from the published snapshot on the private GHCR package (skipped when a local corpus already exists, or when no credential is available)",
 		Deps:    []string{"build-go"},
-		Impl:    []string{"internal/goal/pipeline.go"},
+		Impl:    []string{"internal/goal/pipeline.go", "internal/goal/seed_pin.go"},
 		Heavy:   true,
+		// WHICH SNAPSHOT, as configured: the digest this arm's line of
+		// contracts/corpus-pin.txt names (or an operator override). Resolved
+		// offline, and per arm. See seed_pin.go for why a change here costs a
+		// decline and not a rebuild.
+		Extra:   t.seedExtra,
 		Outputs: func(c *Ctx) []string { return []string{t.dbPath(c)} },
 		Validate: func(c *Ctx) error {
 			// Proof that the file is a usable DuckDB, not just bytes on disk.
@@ -452,11 +457,23 @@ func stepSeed(t corpusTarget) *Step {
 						db)
 					return fmt.Errorf("%w: no GHCR credential for the corpus package", ErrDeclined)
 				}
-				src := t.Snapshot()
-				c.Log.Printf("seeding from %s (credential from %s) — large, and it resumes if interrupted", src, origin)
-				if err := bootstrap.FetchCorpus(c.Context, src, pat, db, c.Log.Printf); err != nil {
+				src, refOrigin, err := t.seedSource(c)
+				if err != nil {
+					return err
+				}
+				c.Log.Printf("seeding from %s (reference from %s, credential from %s) — large, and it resumes if interrupted",
+					src, refOrigin, origin)
+				digest, err := fetchCorpus(c.Context, src, pat, db, c.Log.Printf)
+				if err != nil {
 					return fmt.Errorf("seed from %s: %w", src, err)
 				}
+				// WHAT WAS PULLED, not what was asked for: under a tag override the
+				// two differ, and only this one says which corpus now sits on disk.
+				// Folded into the provenance, so a different snapshot replays what
+				// stands on it.
+				pulled := bootstrap.FullRef(src, digest)
+				c.Produced("snapshot", pulled)
+				c.Log.Printf("seeded %s", pulled)
 				seededNow = true
 			}
 			return t.seedAnchorIfAny(c, db, seededNow)
