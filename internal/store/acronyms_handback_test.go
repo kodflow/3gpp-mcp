@@ -83,8 +83,8 @@ func TestATakenOverRowTS21905StillDeclaresIsHandedBack(t *testing.T) {
 		t.Errorf("diff.Removed = %+v, want Multicast alone — a row TS 21.905 does not declare "+
 			"must still be released", diff.Removed)
 	}
-	if !diff.Changed() || diff.Released() != 2 {
-		t.Errorf("changed=%v released=%d, want true/2", diff.Changed(), diff.Released())
+	if !diff.Changed() || len(diff.Withheld) != 0 {
+		t.Errorf("changed=%v withheld=%d, want true/0 — TS 21.905 was read", diff.Changed(), len(diff.Withheld))
 	}
 	if len(plan.Restored) != len(diff.Restored) || len(plan.Removed) != len(diff.Removed) {
 		t.Errorf("--check-only planned %d hand-back(s) and %d removal(s), the write did %d and %d",
@@ -112,7 +112,7 @@ func TestATakenOverRowTS21905StillDeclaresIsHandedBack(t *testing.T) {
 	// nothing to do with it: not seeded, not dropped, not written.
 	if again, err := s.ReplaceSeededAcronyms(after, ts21905, nil); err != nil {
 		t.Fatal(err)
-	} else if again.Changed() || again.Released() != 0 {
+	} else if again.Changed() || len(again.Removed)+len(again.Restored)+len(again.Withheld) != 0 {
 		t.Errorf("re-running the sweep after the hand-back reported a change: %+v", again)
 	}
 }

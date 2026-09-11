@@ -254,11 +254,15 @@ func TestGeneralRegionIsTheLetterClausesOfTheNewestVersion(t *testing.T) {
 	}
 }
 
-// RULE 2 OF THE GUARD COUNTS A HAND-BACK AS A RELEASE, so its verdict on a sweep
-// is what it was before the hand-back existed. 54 taken-over rows dropped at once
-// against a bound of 53 is a refusal whether TS 21.905 happens to declare their
-// keys or not — the sweep lost them either way — and nothing is written.
-func TestTheGuardCountsHandedBackRowsAsReleased(t *testing.T) {
+// A HAND-BACK IS NOT A DELETION, AND THE GUARD DOES NOT COUNT IT. 54 taken-over
+// rows dropped at once, against a bound of 53, all handed back: every key stays
+// in resolve_term, cited as TS 21.905's, and the run passes.
+//
+// The hand-back as first written refused exactly this — "release 54 (0 removed,
+// 54 handed back to TS 21.905, 0 withheld)" — on the ground that each had been a
+// removal before the hand-back existed. The guard stops deletions; a run that
+// deletes nothing is never refused by it.
+func TestTheGuardDoesNotCountHandedBackRows(t *testing.T) {
 	dir, err := os.MkdirTemp("", "glossaryguard")
 	if err != nil {
 		t.Fatal(err)
@@ -289,15 +293,143 @@ func TestTheGuardCountsHandedBackRowsAsReleased(t *testing.T) {
 	}
 
 	rep, err := run(t, path, false, false)
-	want := "release 54 (0 removed, 54 handed back to TS 21.905, 0 withheld) of the 54 seeded rows, " +
-		"above the bound of 53"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("54 hand-backs against a bound of 53 were not refused with their numbers: %v", err)
+	if err != nil {
+		t.Fatalf("54 hand-backs against a bound of 53 were refused, and the run deletes nothing: %v", err)
 	}
-	if rep.Guard != "refused" || rep.Restored != 54 {
-		t.Errorf("guard=%q restored=%d, want refused/54", rep.Guard, rep.Restored)
+	if rep.Guard != "pass" || rep.Restored != 54 || rep.Removed != 0 || rep.RemovalBound != 53 {
+		t.Errorf("guard=%q restored=%d removed=%d bound=%d, want pass/54/0/53",
+			rep.Guard, rep.Restored, rep.Removed, rep.RemovalBound)
 	}
-	if got := terms(t, path)["T054"]; got != "23.501" {
-		t.Errorf("a REFUSED run handed rows back anyway: T054 is stamped %q", got)
+	got := terms(t, path)
+	for _, k := range []string{"T001", "T054"} {
+		if got[k] != "21" {
+			t.Errorf("%s is stamped %q after the run; it must be TS 21.905's again (\"21\")", k, got[k])
+		}
+	}
+}
+
+// rowsFor lists a term's glossary rows as "expansion | source", sorted.
+func rowsFor(t *testing.T, path, term string) []string {
+	t.Helper()
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	rows, err := s.DB().Query(`SELECT expansion || ' | ' || coalesce(source_series, '') FROM acronyms
+		WHERE term = ? ORDER BY 1`, term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// A HAND-BACK RESTORES WHAT TS 21.905'S WRITER STORES, AND INVENTS NOTHING.
+//
+// The entries are TS 21.905 v19.2.0's, verbatim, and the "21" rows are the ones
+// its writer stored for them — both as the local corpus holds them on
+// 2026-09-11. Every seeded row below is dropped by the sweep at once:
+//
+//   - ADM wraps onto a second line. The writer keeps the first and holds a "21"
+//     row cut there; the seed joins the wrap, so 51.011 holds the whole
+//     expansion under a key the writer never stored.
+//   - CFNRc: TS 21.905 prints a double space, and so does its "21" row; the seed
+//     collapses it.
+//   - "JAR file": the writer's pattern refuses a space in a term, so there is no
+//     "21" row at all.
+//
+// The hand-back as first written handed each of those three back — the seed's
+// parser read the same text and found the key — and left ADM and CFNRc with TWO
+// rows ResolveTerm serves as TS 21.905's, and JAR file with one its writer never
+// wrote. They are removed, like any row a spec dropped.
+//
+//   - CA: TS 21.905 prints two expansions and the writer stored both;
+//     "Carrier Aggregation" was taken over (38.903 holds it, 92 specs declare it)
+//     and "Capacity Allocation" is still TS 21.905's. The KEY is decided, not the
+//     term: it goes back, beside the "21" row that was never taken.
+//   - EF, likewise, and the case that rules out matching against the "21" rows
+//     instead of the writer's keys: "Elementary File" reads as a cut of
+//     "Elementary File (on the UICC)", and it is a line of its own that the
+//     writer stored. mirror swaps which of the two was taken over.
+func TestAHandBackRestoresOnlyWhatTS21905sWriterStores(t *testing.T) {
+	const (
+		admCut  = "Access condition to an EF which is under the control of the"
+		admFull = admCut + " authority which creates this file"
+		cfnrc21 = "Call Forwarding on mobile subscriber  Not Reachable"
+	)
+	for _, mirror := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mirror=%v", mirror), func(t *testing.T) {
+			efTaken, ef21 := "Elementary File", "Elementary File (on the UICC)"
+			if mirror {
+				efTaken, ef21 = ef21, efTaken
+			}
+			path := handBackFixture(t, func(s *store.Store) {
+				withTS21905(t, s, ts21905Min, "SN\tSerial Number",
+					"ADM\t"+admCut+"\nauthority which creates this file",
+					"CFNRc\t"+cfnrc21,
+					"JAR file\tJava Archive File",
+					"CA\tCarrier Aggregation", "CA\tCapacity Allocation",
+					"EF\tElementary File (on the UICC)", "EF\tElementary File")
+				general := func(term, exp string) model.Acronym {
+					return model.Acronym{Term: term, Expansion: exp, FirstRelease: "Rel-19",
+						LastRelease: "Rel-19", SourceSeries: "21"}
+				}
+				taken := func(term, exp, spec string) model.Acronym {
+					return model.Acronym{Term: term, Expansion: exp, FirstRelease: "18.0.0",
+						LastRelease: "18.0.0", SourceSeries: spec, DeclaredBy: 1}
+				}
+				for _, a := range []model.Acronym{
+					general("ADM", admCut), taken("ADM", admFull, "51.011"),
+					general("CFNRc", cfnrc21), taken("CFNRc", "Call Forwarding on mobile subscriber Not Reachable", "23.018"),
+					taken("JAR file", "Java Archive File", "23.057"),
+					general("CA", "Capacity Allocation"), taken("CA", "Carrier Aggregation", "38.903"),
+					general("EF", ef21), taken("EF", efTaken, "31.102"),
+				} {
+					if err := s.UpsertAcronym(a); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+			opt := Options{Specs: []string{"23.501"}, Min: 1}
+			check := opt
+			check.CheckOnly = true
+			crep, err := Run(context.Background(), path, check)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rep, err := Run(context.Background(), path, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// SN and OLD are handBackFixture's own: one handed back, one removed.
+			if rep.Restored != 3 || rep.Removed != 4 {
+				t.Errorf("restored=%d removed=%d, want 3 (SN, CA, EF) and 4 (ADM, CFNRc, JAR file, OLD)\n"+
+					"restored: %+v\nremoved: %+v", rep.Restored, rep.Removed, rep.RestoredRows, rep.RemovedRows)
+			}
+			if crep.Restored != rep.Restored || crep.Removed != rep.Removed {
+				t.Errorf("--check-only predicted restored=%d removed=%d, the write did %d and %d",
+					crep.Restored, crep.Removed, rep.Restored, rep.Removed)
+			}
+			for term, want := range map[string][]string{
+				"ADM":      {admCut + " | 21"},
+				"CFNRc":    {cfnrc21 + " | 21"},
+				"JAR file": nil,
+				"CA":       {"Capacity Allocation | 21", "Carrier Aggregation | 21"},
+				"EF":       {"Elementary File (on the UICC) | 21", "Elementary File | 21"},
+			} {
+				if got := rowsFor(t, path, term); strings.Join(got, "\n") != strings.Join(want, "\n") {
+					t.Errorf("%s holds %q, want exactly what TS 21.905's writer stores: %q", term, got, want)
+				}
+			}
+		})
 	}
 }

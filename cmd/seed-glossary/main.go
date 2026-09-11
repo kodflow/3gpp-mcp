@@ -15,16 +15,17 @@
 // are. It is idempotent: re-running over an unchanged corpus writes nothing. What
 // changes is which meaning a reader is shown first.
 //
-// A SEEDED ROW TS 21.905 STILL DECLARES IS NEVER REMOVED. When a spec took the
-// key of a TS 21.905 entry and later stops declaring it, the row is handed back —
-// re-stamped as TS 21.905's own — so the entry stays where TS 21.905 put it.
-// Every run reads TS 21.905 to know; a run that cannot read it releases nothing
-// and says so ("withheld").
+// A SEEDED ROW WHOSE KEY TS 21.905'S WRITER STORES IS NEVER REMOVED. When a spec
+// took the key of a TS 21.905 entry and later stops declaring it, the row is
+// handed back — re-stamped as TS 21.905's own — so the entry stays where
+// TS 21.905 put it. Every run reads TS 21.905 to know; a run that cannot read it
+// releases nothing and says so, loudly ("withheld").
 //
-// A run that would remove more rows than the mass-removal guard allows, or leave
-// a spec the catalogue still lists with none of its rows, is REFUSED: nothing is
-// written and it exits 1. --allow-mass-removal lets a deliberate cleanup through;
-// the pipeline never passes it.
+// A run that would remove more rows than the mass-removal guard allows, or delete
+// rows of a spec the catalogue still lists and the sweep no longer hears from, is
+// REFUSED: nothing is written and it exits 1. The guard counts deletions only — a
+// row handed back or withheld is not one. --allow-mass-removal lets a deliberate
+// cleanup through; the pipeline never passes it.
 package main
 
 import (
@@ -98,8 +99,8 @@ func emit(rep glossaryseed.Report, format string) {
 		fmt.Printf("seed-glossary: TS %s UNREAD — %s; no seeded row is released this run\n",
 			g.Spec, g.Unread)
 	case g.Version != "":
-		fmt.Printf("seed-glossary: TS %s v%s (%s): %d pairs — a seeded row it declares is "+
-			"handed back to it, never removed\n", g.Spec, g.Version, g.Release, g.Pairs)
+		fmt.Printf("seed-glossary: TS %s v%s (%s): %d keys its writer stores — a seeded row "+
+			"carrying one is handed back to it, never removed\n", g.Spec, g.Version, g.Release, g.Pairs)
 	}
 	switch {
 	case !rep.Applied:
@@ -133,22 +134,31 @@ func emit(rep glossaryseed.Report, format string) {
 	name(rep.WithheldRows, "withheld", ", TS 21.905 unread")
 	// The guard's verdict is printed on every run that reached it, pass included:
 	// "pass" with its numbers is what tells a reader of the enrich log how far this
-	// run was from being refused, which a silent pass never would. It counts every
-	// row the sweep dropped, however the write disposes of it — see massRemoval.
-	released := rep.Removed + rep.Restored + rep.Withheld
+	// run was from being refused, which a silent pass never would. It counts
+	// deletions and nothing else — see massRemoval — so its line says removed.
 	switch rep.Guard {
 	case "pass":
-		fmt.Printf("seed-glossary: mass-removal guard: pass — %d of %d seeded row(s) released "+
-			"(%d removed, %d handed back, %d withheld; bound %d), no catalogued spec silenced\n",
-			released, rep.Owned, rep.Removed, rep.Restored, rep.Withheld, rep.RemovalBound)
+		fmt.Printf("seed-glossary: mass-removal guard: pass — %d of %d seeded row(s) removed "+
+			"(bound %d), no catalogued spec silenced\n", rep.Removed, rep.Owned, rep.RemovalBound)
 	case "overridden":
 		fmt.Printf("seed-glossary: mass-removal guard: OVERRIDDEN by --allow-mass-removal — "+
 			"%d of %d seeded row(s) (bound %d), %d catalogued spec(s) silenced\n",
-			released, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
 	case "refused":
 		fmt.Printf("seed-glossary: mass-removal guard: REFUSED — nothing written "+
 			"(%d of %d seeded row(s), bound %d, %d catalogued spec(s) silenced)\n",
-			released, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+			rep.Removed, rep.Owned, rep.RemovalBound, len(rep.Vanished))
+	}
+	// WITHHELD ROWS ARE SAID APART, AND LOUDLY. The guard no longer counts them —
+	// they are not deletions — so this line is what keeps them from passing
+	// unnoticed: a count here means TS 21.905 could not be read, that the glossary
+	// keeps rows its specs dropped, and that the next unread run keeps these and
+	// adds its own. stderr, so it reaches an operator who reads only the errors.
+	if rep.Withheld > 0 {
+		fmt.Fprintf(os.Stderr, "seed-glossary: WARNING — %d seeded row(s) no spec declares any more are "+
+			"WITHHELD, left in place, because TS %s could not be read (%s). They stay until a run "+
+			"can read it, which then removes them or hands them back.\n",
+			rep.Withheld, rep.General.Spec, rep.General.Unread)
 	}
 	if rep.Error != "" {
 		fmt.Fprintf(os.Stderr, "seed-glossary: %s\n", rep.Error)

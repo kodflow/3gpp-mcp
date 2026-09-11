@@ -23,6 +23,7 @@ package glossaryseed
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,14 +90,14 @@ const DefaultMin = 150
 // untouched. So a run is refused — nothing written, non-zero exit — on either of
 // two signatures, unless --allow-mass-removal says the removal is deliberate:
 //
-//  1. A SPEC GOES SILENT. It owns rows today, the catalogue still lists it, and
-//     the sweep came back with not one row from it (store.GlossaryDiff.Vanished).
-//     That is what a broken read looks like and what an editorial change almost
-//     never does; a spec that really dropped its vocabulary is rare enough to be
-//     worth one deliberate flag.
-//  2. TOO MANY ROWS AT ONCE — more than removalBound. This catches the loss that
-//     rule 1 cannot: a regression spread across many specs, each of which still
-//     yields something.
+//  1. A SPEC GOES SILENT. It owns rows today, the catalogue still lists it, the
+//     sweep came back with not one row from it, and the write would delete some
+//     of them (store.GlossaryDiff.Vanished). That is what a broken read looks
+//     like and what an editorial change almost never does; a spec that really
+//     dropped its vocabulary is rare enough to be worth one deliberate flag.
+//  2. TOO MANY ROWS REMOVED AT ONCE — more than removalBound. This catches the
+//     loss that rule 1 cannot: a regression spread across many specs, each of
+//     which still yields something.
 //
 // THE BOUND IS DERIVED, from measurements taken 2026-09-11 on the shipped corpus:
 //
@@ -112,6 +113,23 @@ const DefaultMin = 150
 // specs at once do not. removalBoundRows = 53, the p99 above, is the floor under
 // that fraction: it only binds below 5 300 seeded rows (a partial rebuild, a test
 // corpus), where 1 % would refuse a single ordinary spec's re-issue.
+//
+// BOTH RULES COUNT DELETIONS AND NOTHING ELSE. A dropped row TS 21.905's writer
+// stores is handed back to it, and one the run could not judge because TS 21.905
+// was unread is withheld (store.GlossaryDiff): neither takes a key out of
+// resolve_term, and neither is counted. So a run that deletes nothing is never
+// refused, and a refusal can always be cleared by --allow-mass-removal.
+//
+// The hand-back as first written counted all three, reasoning that each had been
+// a removal before the hand-back existed — and a withheld row does not leave.
+// Reproduced on a fixture with no TS 21.905 and a bound of 53: 30 rows dropped,
+// withheld, pass; 30 more, REFUSED at "release 60 (0 removed, 0 handed back, 60
+// withheld)", exit 1, from a run that rewrote nothing; --allow-mass-removal let
+// it through and removed nothing; the run after that was refused again. Every
+// enrich would have stopped there until TS 21.905 became readable. Rule 1 did the
+// same with a spec gone silent while TS 21.905 was unread. The rows are not lost
+// to the guard: the first run that reads TS 21.905 judges them, and the ones it
+// would delete are counted then.
 const (
 	removalBoundPct  = 1
 	removalBoundRows = 53
@@ -125,25 +143,14 @@ func removalBound(owned int) int {
 
 // massRemoval says why a diff would be refused, or "" when it passes.
 //
-// RULE 2 COUNTS EVERY ROW THE SWEEP DROPPED — store.GlossaryDiff.Released — not
-// only the rows the write deletes. Since 2026-09-11 a dropped row TS 21.905 still
-// declares is handed back to it rather than deleted, and one the run could not
-// clear is withheld; before that, every one of them was a removal. Counting all
-// three keeps this verdict, on any given sweep, exactly what it was before the
-// hand-back existed: the bound was derived from what one spec can DROP, and a
-// sweep that lost half its specs is no less broken because TS 21.905 happens to
-// declare many of their keys.
+// It reads the rows the write DELETES (Removed) and the specs it would delete
+// from (Vanished) — see the paragraph above removalBoundPct for why hand-backs
+// and withheld rows are not among them.
 func massRemoval(d store.GlossaryDiff) string {
 	var why []string
-	if n, bound := d.Released(), removalBound(d.Owned); n > bound {
-		// The words the guard has always used, while they are the whole truth.
-		what := fmt.Sprintf("remove %d", n)
-		if n != len(d.Removed) {
-			what = fmt.Sprintf("release %d (%d removed, %d handed back to TS 21.905, %d withheld)",
-				n, len(d.Removed), len(d.Restored), len(d.Withheld))
-		}
-		why = append(why, fmt.Sprintf("it would %s of the %d seeded rows, above the bound of %d",
-			what, d.Owned, bound))
+	if n, bound := len(d.Removed), removalBound(d.Owned); n > bound {
+		why = append(why, fmt.Sprintf("it would remove %d of the %d seeded rows, above the bound of %d",
+			n, d.Owned, bound))
 	}
 	if len(d.Vanished) > 0 {
 		// The first twenty by name; the JSON report carries every one. A broken
@@ -191,7 +198,7 @@ type Report struct {
 	Changed bool `json:"changed"`
 	// Rewritten counts the rows the write inserted or rewrote, Removed the seeded
 	// rows it took out because no spec declares them any more, and Restored those
-	// it handed back to TS 21.905 because TS 21.905 still does — and, on
+	// it handed back to TS 21.905 because TS 21.905's writer stores them — and, on
 	// --check-only, what the write WOULD do. The three together are exactly what
 	// Changed summarises, so a check-only run answers the push question before
 	// anything is written.
@@ -210,6 +217,12 @@ type Report struct {
 	// place because TS 21.905 could not be read (General.Unread), and WithheldRows
 	// names them. Nothing is written for them: they are what the table already
 	// holds, so they do not make a run Changed.
+	//
+	// THEY ARE NOT DELETIONS, and the mass-removal guard does not count them — see
+	// the paragraph above removalBoundPct. They are reported apart instead, and
+	// loudly: a non-zero count means TS 21.905 could not be read, and that the
+	// glossary keeps rows its specs no longer declare — more of them each run —
+	// until it can.
 	Withheld     int          `json:"withheld_total"`
 	WithheldRows []RemovedRow `json:"withheld,omitempty"`
 	// General is what the run read of TS 21.905 — the evidence every release was
@@ -240,8 +253,9 @@ type GeneralReport struct {
 	Spec    string `json:"spec"`
 	Version string `json:"version,omitempty"`
 	Release string `json:"release,omitempty"`
-	// Pairs is how many (term, expansion) pairs the Abbreviations region yields;
-	// Min is the floor under which that is read as a broken read.
+	// Pairs is how many keys TS 21.905's writer stores for the Abbreviations
+	// region (see readGeneral); Min is the floor under which that is read as a
+	// broken read.
 	Pairs int `json:"pairs"`
 	Min   int `json:"min_required"`
 	// Unread says why TS 21.905 could not be read in full. When it is set, no
@@ -250,8 +264,9 @@ type GeneralReport struct {
 }
 
 // VanishedSpec is a spec still in the catalogue that the sweep no longer hears
-// from: how many rows it owns, how many of them the write would delete, and how
-// many it would hand back to TS 21.905.
+// from, and whose rows the write would delete: how many rows it owns, how many of
+// them the write would delete — at least one — and how many it would hand back
+// to TS 21.905.
 type VanishedSpec struct {
 	Spec     string `json:"spec"`
 	Owned    int    `json:"owned"`
@@ -384,6 +399,9 @@ func Run(ctx context.Context, path string, opt Options) (Report, error) {
 	// Failing the run would stop the whole enrich over rows that were never going
 	// to be deleted; succeeding with an empty set would delete every one of them.
 	// Only a query that errors — a corpus the store cannot read at all — fails.
+	// And the rows withheld are not counted by the mass-removal guard, so an
+	// unread TS 21.905 cannot stop the enrich by that road either, however many
+	// runs it lasts (store.GlossaryDiff.Withheld).
 	general, gr, err := readGeneral(ctx, s)
 	rep.General = gr
 	if err != nil {
@@ -663,20 +681,26 @@ const ts21905 = "21.905"
 //
 // MEASURED 2026-09-11 on every version the corpus holds, with the rule
 // readGeneral applies: the vocabulary has NEVER SHRUNK across its 16 stored
-// versions — 963 pairs at v4.5.0 (Rel-4), 1 086 at v9.4.0, 1 242 from v10.3.0
-// (Rel-10) onwards, 1 285 at v19.2.0. 1 200 is 93 % of today's figure and below
-// every version from v10.3.0 (Rel-10) on, so an editorial change does not trip it;
-// losing any one of the four largest letter clauses (S 128, C 126, P 102, M 97)
-// does, and so does a read that finds the region and parses nothing.
+// versions — 975 keys at v4.5.0 (Rel-4), 1 099 at v8.8.0 and v9.4.0, 1 255 from
+// v10.3.0 (Rel-10) onwards, 1 300 at v19.2.0. 1 210 is 93 % of today's figure
+// and below every version from v10.3.0 (Rel-10) on, so an editorial change does
+// not trip it; losing any one of the four largest letter clauses (S 125, C 125,
+// P 101, M 95 keys of their own) does, and so does a read that finds the region
+// and parses nothing.
+//
+// It was 1 200 while the keys were the seed parser's reading, whose count was
+// 1 285 at v19.2.0. The writer's reading counts 1 300, and at 1 200 a read that
+// lost the whole of M (1 205 left) would have passed.
 //
 // The floor errs HIGH on purpose, because its two failures do not cost the same.
 // Tripping it on a sound read withholds releases: stale rows stay one more run,
 // which is what the additive writer did for ever. Passing a broken read lets a
-// partial set "clear" keys TS 21.905 does declare, and those rows are deleted.
-const ts21905Min = 1200
+// partial set "clear" keys TS 21.905's writer does store, and those rows are
+// deleted.
+const ts21905Min = 1210
 
-// readGeneral reads what TS 21.905 declares NOW — the evidence a release is
-// checked against — and says why when it cannot.
+// readGeneral reads which keys TS 21.905's writer stores NOW — the evidence a
+// release is checked against — and says why when it cannot.
 //
 // WHAT IS READ: the newest version's region under the clause headed exactly
 // "Abbreviations" (the miner's own heading test), which in TS 21.905 is not one
@@ -690,23 +714,21 @@ const ts21905Min = 1200
 // order decides; readSpec paid for that tie once already. The chunk id is the
 // clause's position in its document and survives compaction.
 //
-// WHAT IS PARSED: every clause of the region with internal/abbrev's rules —
-// Parse AND ParseLines — so a key here has exactly the shape of the keys the
-// seeded rows carry. Both, because the wrap rule reads TS 21.905 wrongly where a
-// cell's text sits on its own untabbed line: measured on v19.2.0, Parse alone
-// yields 1 264 pairs and misses 4 of the 896 seeded rows whose key TS 21.905's
-// writer stored (SN, OSP, REQ, X2-U — see abbrev.ParseLines); with ParseLines
-// the set is 1 285 pairs and misses none.
+// WHAT IS PARSED: every clause of the region with THE WRITER'S OWN LINE RULE —
+// writerKeys, rust/parse's extract_acronyms line for line — because a hand-back
+// re-creates a "21" row and may only re-create one that writer stores. Measured
+// on v19.2.0: 1 300 keys, which are exactly the 404 rows stamped "21" and the 896
+// seeded rows that took a "21" row's key over — none missing, none extra.
 //
-// THE UNION ERRS TOWARD SPARING A ROW, and that is its cost as well as its
-// point. A pair only Parse yields can be one of its misreadings — "OSP = Octet
-// Stream Protocol Service" — and a seeded row carrying exactly that key would be
-// handed back rather than removed. None does: of the 905 seeded rows whose key
-// is in the union, 896 carry a pair TS 21.905's writer stored and the other 9 a
-// pair it prints but its writer could not read — a term with a space ("JAR
-// file", "WLAN UE"), an ampersand ("O&M"), or a whole wrapped expansion where the
-// writer kept the first line ("ADM = Access condition to an EF which is under
-// the control of the authority which creates this file").
+// NOT internal/abbrev, which is the seed's reading and not the writer's.
+// The hand-back as first written parsed the region with abbrev.Parse and a
+// line-at-a-time twin of it, and that set held 9 keys the writer never stored:
+// five wrapped expansions the seed joins and the writer cuts at the line (ADM,
+// BOIC-exHC, BIC-Roam, GLONASS, SCF), a double space the seed collapses and the
+// writer keeps (CFNRc), and three terms the writer's pattern refuses (JAR file,
+// WLAN UE, O&M). A seeded row carrying one of those would have been handed back
+// as a "21" row the writer never wrote — for the first six, beside the one it
+// did. See store.GeneralVocabulary. The twin had no other caller and is gone.
 //
 // A missing spec, a missing region or a set under ts21905Min comes back UNREAD —
 // never as an empty set, which the store would read as "TS 21.905 declares none
@@ -730,8 +752,8 @@ func readGeneral(ctx context.Context, s *store.Store) (store.GeneralVocabulary, 
 	gr.Release = region.clauses[0].Release
 	pairs := map[store.GeneralPair]bool{}
 	for _, c := range region.clauses {
-		for _, e := range append(abbrev.Parse(c.Text), abbrev.ParseLines(c.Text)...) {
-			pairs[store.GeneralPair{Term: e.Term, Expansion: e.Expansion}] = true
+		for _, k := range writerKeys(c.Text) {
+			pairs[k] = true
 		}
 	}
 	gr.Pairs = len(pairs)
@@ -741,6 +763,82 @@ func readGeneral(ctx context.Context, s *store.Store) (store.GeneralVocabulary, 
 		return store.GeneralVocabulary{}, gr, nil
 	}
 	return store.GeneralVocabulary{Read: true, Pairs: pairs, Release: gr.Release}, gr, nil
+}
+
+// writerLine is TS 21.905's writer's line pattern — re_abbrev in
+// rust/parse/src/glossary.rs — in Go's syntax:
+//
+//	^([A-Za-z0-9][A-Za-z0-9._/-]{0,19})(?:\t+|\s{2,})(\S.{2,})$
+//
+// ONE TRANSLATION, spelled out: Rust's \s is Unicode White_Space, Go's is four
+// ASCII characters and the space — \v and the non-breaking spaces left out — so
+// the class is written in full, and \S as its negation. The rest means the same
+// in both engines: leftmost-first alternation, a dot stopping only at \n,
+// repetition counted in characters. TestWriterLineIsTheRustPattern holds this to
+// the Rust source, so an edit there fails here instead of drifting.
+var writerLine = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]{0,19})(?:\t+|[` + whiteSpace +
+	`]{2,})([^` + whiteSpace + `].{2,})$`)
+
+// whiteSpace is the Unicode White_Space property as a character-class body:
+// what Rust's \s matches and char::is_whitespace accepts.
+const whiteSpace = `\t\n\v\f\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}`
+
+// writerKeys returns the keys TS 21.905's writer stores for one clause's text:
+// the loop body of extract_acronyms, statement for statement — split on \n,
+// trim spaces and tabs off the end, match, trim both captures, turn tabs in the
+// expansion into spaces, and drop an expansion under four BYTES, equal to the
+// term in ASCII case, or all digits. Nothing is collapsed: TS 21.905 prints
+// "Call Forwarding on mobile subscriber  Not Reachable" and so does its row.
+func writerKeys(text string) []store.GeneralPair {
+	var out []store.GeneralPair
+	for _, line := range strings.Split(text, "\n") {
+		m := writerLine.FindStringSubmatch(strings.TrimRight(line, " \t"))
+		if m == nil {
+			continue
+		}
+		term := strings.TrimSpace(m[1])
+		exp := strings.ReplaceAll(strings.TrimSpace(m[2]), "\t", " ")
+		if len(exp) < 4 || asciiEqualFold(term, exp) || allDigits(exp) {
+			continue
+		}
+		out = append(out, store.GeneralPair{Term: term, Expansion: exp})
+	}
+	return out
+}
+
+// asciiEqualFold is Rust's str::eq_ignore_ascii_case. Not strings.EqualFold,
+// which folds Unicode too: the Kelvin sign folds to "k" there, and not in the
+// writer.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+// allDigits is the writer's is_all_digits: non-empty, ASCII digits only.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // abbreviationsRegion is the part of one version of a spec its Abbreviations
@@ -761,8 +859,10 @@ type abbreviationsRegion struct {
 // "4 Abbreviations" — an empty body — and nothing after it. The rows stamped
 // "21" in the corpus predate that rule; this reading does not depend on it.
 //
-// A version holding two documents yields both regions. Over-reading can only
-// spare a row; under-reading is what deletes one.
+// A version holding two documents would yield both regions; none of the 16
+// stored versions does — each has the one 28-clause region described in
+// readGeneral. Over-reading would now risk a hand-back of a key the writer never
+// stored, under-reading the deletion of one it did.
 func generalRegion(clauses []model.Clause) abbreviationsRegion {
 	var r abbreviationsRegion
 	for _, c := range clauses {
