@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +85,7 @@ func apply(t *testing.T, dbPath string, write bool) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := run(dbPath, write, f); err != nil {
+	if _, err := run(dbPath, write, false, f); err != nil {
 		t.Fatalf("run(apply=%v): %v", write, err)
 	}
 	_ = f.Close()
@@ -312,6 +314,104 @@ func TestADryRunWritesNothing(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Errorf("the dry run changed the file: %d bytes -> %d bytes", len(before), len(after))
+	}
+}
+
+// ALL TWELVE OR NONE. The tool is run by hand, once, on a 23 GB corpus that is
+// then published. A transaction per filing would leave a failure on the seventh
+// with six moves committed, a corpus in a state nobody chose, and an operator who
+// has to work out which six from the log. (Qodo review on #351.)
+func TestAFailedMoveCommitsNothing(t *testing.T) {
+	db := fixture(t)
+	ctx := context.Background()
+	// Read the baseline before opening read-write: DuckDB refuses a second
+	// connection to one file with a different configuration.
+	before := joined(rows(t, db, `SELECT release, version, count(*)::VARCHAR FROM clause_occ GROUP BY 1,2 ORDER BY 1,2`))
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two filings move. Make the SECOND one fail the count check by adding an
+	// occurrence to it after the plan was read — the shape of any mid-run failure.
+	plan, err := candidates(ctx, st.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moving []filing
+	for _, f := range plan {
+		if ok, _ := f.verdict(); ok {
+			moving = append(moving, f)
+		}
+	}
+	if len(moving) != 2 {
+		t.Fatalf("the fixture must plan exactly two moves, got %d", len(moving))
+	}
+	moving[1].Occ++ // the count check will not match, mid-transaction
+
+	if err := moveAll(ctx, st.DB(), moving); err == nil {
+		t.Fatal("moveAll must fail when a move does not affect the rows it planned to")
+	}
+	_ = st.Close()
+
+	after := joined(rows(t, db, `SELECT release, version, count(*)::VARCHAR FROM clause_occ GROUP BY 1,2 ORDER BY 1,2`))
+	eq(t, after, before, "the FIRST move must have been rolled back too")
+}
+
+// --report json is the documented machine-readable form (cmd/CLAUDE.md), and it
+// must be a self-contained response on every path — including the one where the
+// repair fails, where a caller parsing stdout would otherwise see nothing at all.
+func TestTheJSONReportCarriesEveryDecision(t *testing.T) {
+	db := fixture(t)
+	var buf bytes.Buffer
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := run(db, false, true, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	text, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) != 0 {
+		t.Errorf("json mode must not also print the text report; got %q", string(text))
+	}
+	if err := writeJSONTo(&buf, res); err != nil {
+		t.Fatal(err)
+	}
+	var got result
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("the report must parse as json: %v\n%s", err, buf.String())
+	}
+	if got.Candidates != len(got.Filings) {
+		t.Errorf("every candidate must carry a decision: %d candidates, %d filings", got.Candidates, len(got.Filings))
+	}
+	if got.Moved != 0 {
+		t.Errorf("a dry run has moved nothing, got moved=%d", got.Moved)
+	}
+	moves, keeps := 0, 0
+	for _, fl := range got.Filings {
+		switch fl.Action {
+		case "move":
+			moves++
+			if fl.Destination == "" {
+				t.Errorf("a move must say what it does with the destination filing: %+v", fl)
+			}
+		case "keep":
+			keeps++
+			if fl.Reason == "" {
+				t.Errorf("a refusal without a reason is indistinguishable from a miss: %+v", fl)
+			}
+		default:
+			t.Errorf("unknown action %q", fl.Action)
+		}
+	}
+	if moves != 2 || keeps != got.LeftAlone {
+		t.Errorf("got moves=%d keeps=%d left_alone=%d", moves, keeps, got.LeftAlone)
 	}
 }
 
