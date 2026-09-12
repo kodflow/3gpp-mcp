@@ -53,10 +53,21 @@ func stepDiscoverETSI() *Step {
 		// A determinant has to name what the step will DO. etsiScopeArgs is that,
 		// and it is the same function the Run below hands to the binary, so the two
 		// cannot drift.
+		// AND THE SAME CLOCK ITS TWIN RUNS ON. Until 2026-09-12 this step's only
+		// determinant was the scope, and a scope nobody types does not move: once
+		// the ETSI worklist existed, `discover-etsi` could never run again. A new
+		// version of TS 103 221-1 published on etsi.org would have been invisible
+		// to this pipeline for ever, and no gate anywhere would have gone red —
+		// the corpus would simply have been out of date, in the half nobody was
+		// watching, while the 3GPP half re-enumerated every six hours.
+		//
+		// Bucketing the time since the last visit is what `discover` already did.
+		// Doing it through the same helper is what stops the two halves from
+		// drifting apart again. See freshness.go.
 		Extra: func(c *Ctx) (map[string]string, error) {
-			return map[string]string{
+			return withFreshness(c, "discover-etsi", map[string]string{
 				"etsi_scope": strings.Join(etsiScopeArgs(c.Cfg("etsi_scope")), " "),
-			}, nil
+			})
 		},
 		Outputs: func(c *Ctx) []string { return []string{c.statePath("etsi-worklist.tsv")} },
 		// The Run below writes this file and nothing else. An ETSI catalogue that
@@ -82,7 +93,8 @@ func stepDiscoverETSI() *Step {
 			n := countLines(c.statePath("etsi-worklist.tsv"))
 			c.Log.Printf("ETSI work list: %d deliverable(s)", n)
 			c.Checkpoint("etsi_deliverables", strconv.Itoa(n))
-			return nil
+			// Stamped last, like its twin: a failed enumeration is not a visit.
+			return recordVisit(c, "discover-etsi")
 		},
 	}
 }

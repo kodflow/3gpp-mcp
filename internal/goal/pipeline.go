@@ -7,9 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/kodflow/3gpp-mcp/internal/bootstrap"
 )
@@ -560,15 +558,9 @@ func readCorpusStateCounts(path string) (map[string]int, error) {
 
 // ----------------------------------------------------------------- discover
 
-// discoverTTL is how long a fetched 3GPP status report is considered current.
-//
-// It exists to make two requirements coexist. An immediate second /goal must be
-// a no-op (so discover cannot re-run just because the network exists), yet the
-// pipeline must still notice that 3GPP published something (so discover cannot
-// be pinned to its inputs forever). Bucketing the report's age turns time itself
-// into a determinant: within the window the fingerprint is stable and the step
-// skips; past it the bucket moves and the step re-runs.
-const discoverTTL = 6 * time.Hour
+// The enumeration TTL and its stamp live in freshness.go, shared with
+// discover-etsi: an arm that enumerates on a different clock than the other is
+// the asymmetry that file was written to end.
 
 func stepDiscover3GPP() *Step {
 	return &Step{
@@ -590,26 +582,28 @@ func stepDiscover3GPP() *Step {
 			return in, nil
 		},
 		Extra: func(c *Ctx) (map[string]string, error) {
-			m := map[string]string{
+			// The bucket is the age of the last VISIT, not of the cached report.
+			// The report's age only ever worked because 3gpp.org re-nonces every
+			// response — see freshness.go, and the projection in runDiscover that
+			// took that accident away.
+			return withFreshness(c, "discover", map[string]string{
 				"floor": c.Cfg("floor"),
 				"scope": c.Cfg("scope"),
-			}
-			// Age bucket of the cached report (see discoverTTL).
-			bucket := "none"
-			if st, err := os.Stat(c.statePath("status-report.htm")); err == nil {
-				bucket = strconv.FormatInt(int64(time.Since(st.ModTime())/discoverTTL), 10)
-			}
-			m["report_bucket"] = bucket
-			return m, nil
+			})
 		},
 		Outputs: func(c *Ctx) []string {
-			return []string{c.statePath("series.json"), c.statePath("worklist.txt")}
+			return []string{c.statePath("series.json"), c.statePath("worklist.txt"), c.statePath(catalogProjection)}
 		},
-		// runDiscover writes exactly these two files, plus status-report.htm — which
-		// is its OWN HTTP cache, read by nothing downstream and already folded into
-		// this step's fingerprint as an age bucket. So for a dependant, these two
-		// files are the whole of what discover did: an unchanged delta must not
-		// replay fetch, ingest and merge.
+		// runDiscover writes exactly these three files, plus status-report.htm —
+		// which is its OWN HTTP cache, read by nothing downstream and already folded
+		// into this step's fingerprint as an age bucket. That sentence used to be
+		// false: `enrich` read the cache directly, and since 3gpp.org re-nonces every
+		// response, the cache could not be equal to itself twice, so the whole 3GPP
+		// arm replayed on this step's 6 h clock. catalog-specs.tsv is the projection
+		// that made the claim true — see runDiscover.
+		//
+		// So for a dependant, these three files are the whole of what discover did:
+		// an unchanged delta must not replay fetch, ingest and merge.
 		OutputsComplete: true,
 		Validate: func(c *Ctx) error {
 			b, err := os.ReadFile(c.statePath("series.json"))

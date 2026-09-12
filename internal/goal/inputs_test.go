@@ -70,12 +70,19 @@ func TestNoStepFingerprintsADirectory(t *testing.T) {
 
 // TestDiscoverDoesNotTouchAReportThatDidNotChange.
 //
-// The status report is discover's own HTTP cache AND an input of `enrich`, which
-// writes the corpus. Publishing it with os.Rename moved its mtime on every run,
-// so every discover — and discover runs on a 6 h TTL, a clock rather than a
-// change — made enrich dirty and replayed paragraphs, sparse, compact, index,
-// validate and smoke behind it: ~21 minutes of corpus work, three builds in a
-// row, for a corpus nothing had been added to.
+// The status report is discover's own HTTP cache. It was ALSO an input of
+// `enrich`, which writes the corpus: publishing it with os.Rename moved its mtime
+// on every run, so every discover — and discover runs on a 6 h TTL, a clock
+// rather than a change — made enrich dirty and replayed paragraphs, sparse,
+// compact, index, validate and smoke behind it: ~21 minutes of corpus work, three
+// builds in a row, for a corpus nothing had been added to.
+//
+// WriteAtomic fixed the rename. It could not fix the BYTES, and 3gpp.org changes
+// those on every single response (CSP nonce, CSRF token, GDPR session id,
+// Cloudflare e-mail obfuscation — measured 2026-09-12), so the cascade came back
+// on the same 6 h clock and cost ~18 min per build until `enrich` was moved onto
+// the catalogue projection instead. This test keeps WriteAtomic's half of that
+// honest; catalog_projection_tests (rust/discover) keeps the other half.
 //
 // The negative control matters as much: a report that DID change must still be
 // published, or discover would stop seeing what 3GPP publishes.
