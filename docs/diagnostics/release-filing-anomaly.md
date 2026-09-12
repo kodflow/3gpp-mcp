@@ -221,7 +221,8 @@ Six of the twelve already have a waiting bookkeeping row at the target release
 **Price, which is why it is not done in this PR.** Any write to `spec_versions` or to
 the clause occurrences touches `data/3gpp.duckdb` — 23 175 114 752 bytes, one image
 layer per corpus half. The only step light enough to host such a targeted idempotent
-writer is `enrich` (it already reads `status-report.htm` as an `Input` and already
+writer is `enrich` (it already reads the catalogue projection `discover` derives from
+`status-report.htm` as an `Input` — it read the report itself until 2026-09-12 — and already
 opens the corpus read-write; a new writer would go in a file of its own beside
 `rust/store/src/changes.rs`, for the reason that file exists). Replaying it costs, on
 this machine's measured figures: `enrich` ~1 min, then `paragraphs` 20m32, `sparse`,

@@ -588,7 +588,19 @@ func stepEnrich(t corpusTarget) *Step {
 			// status-report.htm, and until runDiscover stopped renaming it over
 			// itself, that one moved on every single run. So this step was
 			// simultaneously blind to what it watched and dirty for what it did not.
-			in := []string{c.statePath("status-report.htm")}
+			//
+			// AND THE REPORT IS GONE FROM THIS LIST, replaced by the projection
+			// discover derives from it. WriteAtomic fixed the RENAME; it could not
+			// fix the bytes, and the bytes move on every response: a per-request CSP
+			// nonce, a CSRF token, a GDPR session id, Cloudflare e-mail obfuscation.
+			// Measured 2026-09-12, eight hours apart on an unchanged catalogue — 2
+			// bytes of difference, in the page chrome, none of it catalogue. This
+			// step then replayed on discover's 6 h TTL and took paragraphs, sparse,
+			// compact, index, validate, smoke and publish with it: ~18 min, to
+			// re-push an image with the identical digest. catalog-specs.tsv holds
+			// the four fields the overlay writes and nothing else, so an unchanged
+			// catalogue is now a file that did not move. See runDiscover.
+			in := []string{c.statePath(catalogProjection)}
 			for _, d := range []string{"5g-apis", "asn", "crdb"} {
 				files, err := filesUnder(c.dataPath("sources", d))
 				if err != nil {
@@ -614,14 +626,18 @@ func stepEnrich(t corpusTarget) *Step {
 		},
 		Run: func(c *Ctx) error {
 			db := c.dataPath("3gpp.duckdb")
-			report := c.statePath("status-report.htm")
+			catalog := c.statePath(catalogProjection)
 
 			// MANDATORY, not optional: without it doc_type stays "TS" for every
 			// spec, working_group and title stay empty, and cmd/validate's
 			// --max-empty-meta gate fails.
+			//
+			// THE FILE IT IS HANDED IS THE FILE IT DECLARES. Reading the report while
+			// declaring the projection would be the same defect one level down: the
+			// overlay would write from something this step does not watch.
 			args := []string{"--db", db}
-			if fileNonEmpty(report) {
-				args = append(args, "--status-report", report)
+			if fileNonEmpty(catalog) {
+				args = append(args, "--catalog", catalog)
 			}
 			c.Log.Printf("catalogue overlay (doc_type, working_group, freeze_date)")
 			if err := c.Run(Cmd{Name: c.rbin("ingest-catalog"), Args: args, Echo: true}); err != nil {

@@ -1,6 +1,7 @@
 package goal
 
 import (
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -453,5 +454,100 @@ func TestSharedStepsTreatBothArmsAlike(t *testing.T) {
 				t.Errorf("%s depends on %s and not on %s", s.Name, d, other)
 			}
 		}
+	}
+}
+
+// BOTH ARMS ENUMERATE ON THE SAME CLOCK.
+//
+// The step list has paired since #326, and every gate stayed green while the two
+// halves behaved completely differently underneath those names:
+//
+//	discover       re-enumerated every 6 h (report_bucket), which was correct, and
+//	               dragged enrich -> paragraphs -> sparse -> compact -> index ->
+//	               validate -> smoke -> publish behind it every time, which was not:
+//	               ~18 min of corpus work and a re-pushed image, to publish the same
+//	               digest twice on 2026-09-12.
+//	discover-etsi  had NO time determinant at all. Its fingerprint could not move
+//	               once the worklist existed, so a deliverable published on
+//	               etsi.org after the last enumeration was unreachable — for ever,
+//	               silently, with every gate green.
+//
+// Pairing by NAME cannot see either of those. This test reads the determinant.
+//
+// The 3GPP side of the cascade is fixed elsewhere (the catalogue projection in
+// runDiscover, so a re-downloaded report that says the same thing no longer makes
+// enrich dirty); this pins the half that belongs to the step list: if one arm
+// enumerates on a clock, so does the other, and it is the SAME clock.
+func TestBothArmsEnumerateOnTheSameClock(t *testing.T) {
+	c, _ := newTestCtx(t)
+	byName := map[string]*Step{}
+	for _, s := range Pipeline() {
+		byName[s.Name] = s
+	}
+
+	bucketOf := func(name string) (string, bool) {
+		s := byName[name]
+		if s == nil {
+			t.Fatalf("%s is not in the pipeline", name)
+		}
+		if s.Extra == nil {
+			return "", false
+		}
+		m, err := s.Extra(c)
+		if err != nil {
+			t.Fatalf("%s.Extra: %v", name, err)
+		}
+		v, ok := m[freshnessKey]
+		return v, ok
+	}
+
+	for _, pair := range [][2]string{{"discover", "discover-etsi"}} {
+		a, aOK := bucketOf(pair[0])
+		b, bOK := bucketOf(pair[1])
+		if aOK != bOK {
+			t.Errorf("%s declares %q=%v and %s declares %q=%v: one arm re-enumerates on a "+
+				"clock and the other cannot notice upstream at all",
+				pair[0], freshnessKey, aOK, pair[1], freshnessKey, bOK)
+		}
+		if aOK && bOK && a != b {
+			// Both stamps are absent in a fresh context, so both read "never". A
+			// difference here means the two arms measure different things.
+			t.Errorf("%s buckets to %q and %s to %q from the same empty state: the two arms "+
+				"are not reading the same clock", pair[0], a, pair[1], b)
+		}
+	}
+}
+
+// THE STAMP IS NOT AN OUTPUT. It moves on every visit by construction, so a step
+// that declared it would make its dependants replay on the clock — which is the
+// cascade this whole change exists to stop, reintroduced one edge lower.
+func TestTheVisitStampIsNotDeclaredAsAnOutput(t *testing.T) {
+	c, _ := newTestCtx(t)
+	for _, s := range Pipeline() {
+		if s.Outputs == nil {
+			continue
+		}
+		for _, out := range s.Outputs(c) {
+			if strings.Contains(filepath.ToSlash(out), "/visits/") {
+				t.Errorf("%s declares the visit stamp %s as an output: every dependant would "+
+					"replay every time this step looked upstream", s.Name, out)
+			}
+		}
+	}
+}
+
+// A VISIT IS RECORDED ONLY BY A RUN THAT FINISHED. recordVisit is called on the
+// way out of both enumerations; this pins the property the bucket rests on — a
+// stamp that is written, then read back as a bucket, moves the bucket off "never".
+func TestAStampedVisitLeavesNever(t *testing.T) {
+	c, _ := newTestCtx(t)
+	if got := visitBucket(c, "discover"); got != "never" {
+		t.Fatalf("an unstamped step bucketed to %q, want \"never\"", got)
+	}
+	if err := recordVisit(c, "discover"); err != nil {
+		t.Fatal(err)
+	}
+	if got := visitBucket(c, "discover"); got != "0" {
+		t.Errorf("a step stamped just now bucketed to %q, want \"0\"", got)
 	}
 }
