@@ -335,7 +335,11 @@ phase_enrich() {
   # pipeline passe par `discover --emit-catalog` ; ce script fait pareil, sinon les
   # deux chemins ecriraient le catalogue depuis deux sources differentes.
   log "overlay catalogue DynaReport (doc_type TS/TR, working_group, freeze_date)"
-  if [ -s "$sf" ]; then
+  # DRY : rien ne doit etre ecrit, et ces deux lignes ne passent pas par run() (une
+  # redirection et un mv ne sont pas une commande) -- donc le garde est explicite.
+  if [ "$DRY" = 1 ]; then
+    dim "DRY: $RUST_BIN/discover --status-file $sf --emit-catalog > $cat_tsv"
+  elif [ -s "$sf" ]; then
     if "$RUST_BIN/discover" --status-file "$sf" --emit-catalog > "$cat_tsv.tmp" 2>"$LOG_DIR/emit-catalog.err" && [ -s "$cat_tsv.tmp" ]; then
       mv -f "$cat_tsv.tmp" "$cat_tsv"
     else
@@ -343,13 +347,16 @@ phase_enrich() {
       warn "discover --emit-catalog a echoue -- voir $LOG_DIR/emit-catalog.err"
     fi
   fi
-  if [ -s "$cat_tsv" ]; then
-    run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" --catalog "$cat_tsv" \
-      || warn "ingest-catalog a echoue -- doc_type restera 'TS' partout"
-  else
-    run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" \
-      || warn "ingest-catalog a echoue -- doc_type restera 'TS' partout"
+  # PAS DE REPLI SANS SOURCE. ingest-catalog sans --catalog n'ecrit AUCUNE metadata et
+  # rend succes : doc_type resterait "TS" pour toutes les specs, title et
+  # working_group vides, et la phase se terminerait en annoncant que tout va bien.
+  # Le pipeline refuse des deux bouts (discover.Validate et enrich) ; ce script fait
+  # pareil. (CodeRabbit, PR #352.)
+  if [ "$DRY" != 1 ] && [ ! -s "$cat_tsv" ]; then
+    die "pas de projection catalogue ($cat_tsv) -- sans elle doc_type reste 'TS' partout ; verifie $sf et $LOG_DIR/emit-catalog.err"
   fi
+  run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" --catalog "$cat_tsv" \
+    || warn "ingest-catalog a echoue -- doc_type restera 'TS' partout"
 
   if [ -d "$DATA/sources/5g-apis" ]; then
     log "overlay OpenAPI 5GC"

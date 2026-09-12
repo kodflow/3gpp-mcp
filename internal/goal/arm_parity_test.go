@@ -565,12 +565,32 @@ func TestTheFreshnessDeterminantDoesNotMoveAcrossARun(t *testing.T) {
 
 // THE WINDOW MUST ACTUALLY EXPIRE. A determinant that never moves is the
 // discover-etsi defect restated: the step would stop looking upstream for ever.
+//
+// THE INSTANT IS FIXED, NOT time.Now(). Written with the wall clock, this test
+// failed for one minute in every six hours: a `now` in the last minute of a window
+// puts `now.Add(time.Minute)` in the next one, and the assertion fired on a
+// visitWindow that was entirely correct. A test that is right 99.7 % of the time is
+// a test nobody will trust the day it goes red. (CodeRabbit, PR #352.)
+//
+// So: the exact middle of a known window, which leaves half a TTL of slack on
+// either side of the minute this test adds.
 func TestTheFreshnessWindowMovesWithTheClock(t *testing.T) {
-	now := time.Now()
-	if a, b := visitWindow(now), visitWindow(now.Add(time.Minute)); a != b {
+	ttl := int64(discoverTTL.Seconds())
+	mid := time.Unix(1000*ttl+ttl/2, 0).UTC()
+
+	if a, b := visitWindow(mid), visitWindow(mid.Add(time.Minute)); a != b {
 		t.Errorf("the window moved after a minute (%q -> %q): every build would re-enumerate", a, b)
 	}
-	if a, b := visitWindow(now), visitWindow(now.Add(2*discoverTTL)); a == b {
+	if a, b := visitWindow(mid), visitWindow(mid.Add(2*discoverTTL)); a == b {
 		t.Errorf("the window did not move after two TTLs (%q): upstream would never be looked at again", a)
+	}
+	// And the boundaries are where they are claimed to be: the last instant of the
+	// window is still in it, the first instant of the next is not.
+	start := time.Unix(1000*ttl, 0).UTC()
+	if a, b := visitWindow(start), visitWindow(start.Add(discoverTTL-time.Second)); a != b {
+		t.Errorf("the window is shorter than its TTL (%q -> %q)", a, b)
+	}
+	if a, b := visitWindow(start), visitWindow(start.Add(discoverTTL)); a == b {
+		t.Errorf("the window did not end after exactly one TTL (%q)", a)
 	}
 }
