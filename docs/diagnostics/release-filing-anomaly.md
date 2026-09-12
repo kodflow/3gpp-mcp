@@ -223,3 +223,105 @@ corpus layer is re-pushed in full (22 GB on the wire, `publish` 22m39 measured o
 
 That is a trade for the orchestrator to make, not for this PR to make silently. The
 change here costs nothing and stops the population from growing.
+
+## 5. The repair, as taken (2026-09-12)
+
+The trade was taken. `cmd/repair-release-filing` does it, **dry-run by default**.
+
+**It moves and never deletes,** and the reason it can is that the release axis lives
+in exactly two base tables. `clauses` is a VIEW over `clause_occ` joined to `bodies`;
+`clause_sparse` is keyed by `chunk_id` alone; `bodies`, `paragraphs` and `body_seq`
+are content-addressed and carry no release; the BM25 index is `fts_main_paragraphs`,
+over `paragraphs(para_id, part)`. So the whole repair is:
+
+```
+UPDATE clause_occ SET release = <the release the version major names>
+INSERT the destination spec_versions row where it does not exist        (6 of 12)
+UPDATE its docx_url where it exists but names no archive                (6 of 12)
+```
+
+No `chunk_id` moves, no body moves, no vector moves, no posting is rewritten.
+
+The §4 plan said to "drop the 4 now-duplicate empty Rel-20 rows". **It does not**,
+and that is the correction §4 needed: the carrying row is what the catalogue said,
+and once its text is gone it becomes exactly the bookkeeping row `cmd/anchorcheck`
+already expects — its `NonContent` verdict. Deleting it would throw away a catalogue
+fact to fix a text fact.
+
+**Refusals, each doing work on the real corpus:** 8 filings with no occurrence; the
+51 Rel-4 filings of a 3.x.y document (no Rel-99 section exists — Rel-4 is their only
+home, and the same rule refuses `32.153-031 @ 27.14.31`, whose "Rel-27" does not
+exist); 33.816, filed at 10.0.0 under Rel-10 and Rel-11 with 215 occurrences under
+each, which is two copies and not a move; drafts.
+
+### The twelve filings moved
+
+| spec | from | version | to | occurrences | destination |
+|---|---|---|---|---:|---|
+| 24.283 | Rel-20 | 19.1.0 | Rel-19 | 259 | created |
+| 24.549 | Rel-20 | 19.1.0 | Rel-19 | 136 | created |
+| 24.559 | Rel-20 | 19.4.0 | Rel-19 | 207 | existed, no archive URL |
+| 26.113 | Rel-20 | 19.0.0 | Rel-19 | 156 | existed, no archive URL |
+| 26.264 | Rel-20 | 19.1.0 | Rel-19 | 130 | created |
+| **26.510** | Rel-20 | 18.4.0 | **Rel-18** | **364** | existed, no archive URL |
+| 26.512 | Rel-20 | 18.6.0 | Rel-18 | 466 | existed, no archive URL |
+| 26.517 | Rel-20 | 19.1.0 | Rel-19 | 155 | created |
+| 29.486 | Rel-20 | 18.3.0 | Rel-18 | 751 | existed, no archive URL |
+| 29.558 | Rel-20 | 19.5.0 | Rel-19 | 1 097 | created |
+| 29.580 | Rel-20 | 19.4.0 | Rel-19 | 199 | created |
+| 29.583 | Rel-20 | 19.1.0 | Rel-19 | 192 | existed, no archive URL |
+| | | | | **4 112** | |
+
+### Measured on a copy of the published corpus
+
+| | before | after |
+|---|---|---|
+| run time | — | **2.0 s** |
+| `clause_occ` rows | 2 751 918 | **2 751 918** (nothing lost, nothing invented) |
+| `spec_versions` rows | 20 163 | 20 169 (+6 destinations; **0 deleted**) |
+| `clause_sparse` rows | 194 051 110 | 194 051 110 |
+| distinct releases in `clause_occ` | 19 | 19 (`validate --expected-releases` safe) |
+| `clause_occ` under Rel-20 | 103 373 | 99 261 |
+| paragraph attestation | `paragraphs=3789493 bodies=897556 body_seq=8404379 clause_occ=2751918` | **identical**, `migrate-paragraphs --attested` exits 0 |
+| destinations with no archive URL | 6 of 12 | **0 of 12** |
+
+**Idempotence.** A second `--apply` reports `0 to move … corpus untouched` and leaves
+the file identical by sha256; so does a dry run afterwards. The tool opens read-only
+until it knows there is work. (Measured honestly: opening this corpus read-write and
+closing it without a statement is byte-neutral on this DuckDB build, so the read-only
+open is a guarantee rather than a repair of something observed.)
+
+### The real server, on the repaired copy
+
+| call | before | after |
+|---|---|---|
+| `get_spec(26.510, Rel-18, 18.4.0)` | 364 clauses **cited Rel-20**, note "filed under Rel-20, not Rel-18" | 364 clauses **cited Rel-18** |
+| `get_spec(26.510, Rel-18)` | 18.5.0, 364 clauses | unchanged |
+| `get_spec(26.510, Rel-20)` | 364 clauses **cited Rel-20** | scoped to Rel-18: "the clauses this corpus holds for 26.510 18.4.0 are filed under Rel-18, not Rel-20" |
+| lineage note on that answer | "12 element(s) existed in EARLIER releases but are **gone by Rel-20 (obsolete)**" | "Later releases **ADD** 12 element(s) ([Rel-19:+12])" |
+| `get_spec(29.558, Rel-20)` | 1 097 clauses cited Rel-20 | scoped to Rel-19 |
+| `get_spec(21.810, Rel-4)` | 57 clauses | unchanged |
+| `get_spec(33.816, Rel-11)` | 215, folded, `filed_under [Rel-10, Rel-11]` | unchanged |
+
+The false obsolescence in that fourth row is the one thing the move alone would not
+have fixed, and it was **already wrong before the repair**: the lineage axis is
+`spec_versions`, so a catalogue filing with no document behind it read as a removal.
+Measured on the published corpus, unrepaired: `trace_clause(29.675, 4)` answered
+`obsolete=true` for a clause nobody removed, and `trace_clause(26.532, 4.1)` the
+same. Obsolescence is now measured against the newest release the spec has TEXT
+under (`internal/store.newestReleaseWithText`), on the release axis only. The axis is
+untouched — `axis_values` still reports what the catalogue files.
+
+### Price
+
+The repair itself: **2.0 s**, and `data/3gpp.duckdb` changes, so the 3GPP corpus
+layer is re-pushed once — 22 GB on the wire (`publish` 22m39, 2026-09-11). Nothing
+re-derives: the attestation holds, so `paragraphs` keeps its 0.2 s no-op path,
+`bodies`/`paragraphs`/`clause_sparse` are untouched so `sparse`, `compact` and
+`index` have nothing to redo. Run it on the final corpus, immediately before
+`publish`.
+
+The code costs `build-go`, `test`, `build-serve`, `smoke` and `publish`: a new
+`cmd/` package and two files of `internal/store`, which is in the Impl of `validate`
+and `validate-etsi` (read-only re-validation, 2m32 + 17.6 s). **No data step replays
+from the code change**, and no corpus byte moves because of it.
