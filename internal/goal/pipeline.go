@@ -568,7 +568,30 @@ func stepDiscover3GPP() *Step {
 		Version: 3,
 		Doc:     "diff the live 3GPP status report against the local corpus index",
 		Deps:    []string{"build-rust", "seed"},
-		Impl:    []string{"rust/discover", "scripts/lib/discover.sh"},
+		// THE GO THAT WRITES THE FILES IS PART OF THE IMPLEMENTATION, like `seed`
+		// already says of itself. This step is not a launcher: runDiscover curls the
+		// report, publishes it, derives the catalogue projection and writes
+		// series.json and worklist.txt, all in Go (pipeline_steps.go), reading the
+		// absence ledger (absent.go) and the anchor (anchor_derive.go).
+		//
+		// Declaring only the Rust binary and the shell helper cost exactly what an
+		// under-declaration always costs, measured on the publish run of 2026-09-12
+		// 23:34: PR #352 gave this step a NEW OUTPUT (catalog-specs.tsv) and made it
+		// a mandatory input of `enrich`, and this step's fingerprint did not move —
+		// it SKIPPED. On that machine the file happened to exist, because the
+		// from-zero build had just invalidated the whole ledger and produced it. On
+		// any machine that had not, `discover` would have skipped, the projection
+		// would have been absent, and `enrich` would have stopped the build on the
+		// error message #352 added for exactly that case: a clear message for a
+		// situation that should not have been reachable.
+		//
+		// ExcludeTests, for the reason `enrich` states: a _test.go cannot change
+		// what this step writes, and counting them replays the step on test-only
+		// commits.
+		Impl: []string{"rust/discover", "scripts/lib/discover.sh", "internal/goal/pipeline.go",
+			"internal/goal/pipeline_steps.go", "internal/goal/freshness.go",
+			"internal/goal/absent.go", "internal/goal/anchor_derive.go"},
+		ExcludeTests: true,
 		Inputs: func(c *Ctx) ([]string, error) {
 			in := []string{filepath.Join(c.Local, "corpus-index.json")}
 			// The accepted-absent ledger decides as much of the work list as the
