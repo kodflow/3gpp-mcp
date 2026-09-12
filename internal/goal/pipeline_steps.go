@@ -140,6 +140,11 @@ func runDiscover(c *Ctx) error {
 	if strings.TrimSpace(proj) == "" {
 		return fmt.Errorf("the catalogue projection came back empty — the status report parsed, so this is a projection bug, not an upstream change")
 	}
+	// Trailing newline, like worklist.txt beside it: c.Output trims what the binary
+	// printed, and a text file this pipeline writes ends in a newline. Measured on
+	// the first real run (2026-09-13 01:02): 365 859 bytes against the 365 860 the
+	// binary emits, the last of 3 695 lines unterminated.
+	proj = strings.TrimRight(proj, "\n") + "\n"
 	if err := WriteAtomic(c.statePath(catalogProjection), []byte(proj)); err != nil {
 		return err
 	}
