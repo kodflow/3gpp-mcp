@@ -51,15 +51,23 @@
 // `migrate-paragraphs --attested` still passes and the `paragraphs` step keeps
 // its 0.2 s no-op path. Proven on a copy, before and after.
 //
-//	repair-release-filing --db data/3gpp.duckdb           # dry run, reports
-//	repair-release-filing --db data/3gpp.duckdb --apply   # writes
+// ALL TWELVE OR NONE. One transaction covers every move. It is run by hand, once,
+// on a corpus that is then published, so a failure on the seventh filing must not
+// leave six committed and an operator working out which six from the log. Recovery
+// is "fix the cause and run it again": the tool is idempotent.
+//
+//	repair-release-filing --db data/3gpp.duckdb                  # dry run, reports
+//	repair-release-filing --db data/3gpp.duckdb --apply          # writes
+//	repair-release-filing --db data/3gpp.duckdb --report json    # for a machine
 package main
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -71,15 +79,74 @@ import (
 func main() {
 	db := flag.String("db", "", "corpus DuckDB to repair (required)")
 	apply := flag.Bool("apply", false, "actually move the filings; without it this only reports")
+	report := flag.String("report", "text", `"text" for an operator, "json" for a machine (cmd/CLAUDE.md)`)
 	flag.Parse()
 	if *db == "" {
 		fmt.Fprintln(os.Stderr, "repair-release-filing: --db is required")
 		os.Exit(2)
 	}
-	if err := run(*db, *apply, os.Stdout); err != nil {
+	if *report != "text" && *report != "json" {
+		fmt.Fprintf(os.Stderr, "repair-release-filing: --report %q is neither text nor json\n", *report)
+		os.Exit(2)
+	}
+	res, err := run(*db, *apply, *report == "json", os.Stdout)
+	if err != nil {
+		// A FAILURE IS A RESULT TOO. `--report json` promises a self-contained JSON
+		// response on every path, so the error goes into it rather than beside it on
+		// stderr, where a caller parsing stdout would see a truncated object and no
+		// reason.
+		if *report == "json" {
+			if res == nil {
+				res = &result{DB: *db, Applied: *apply}
+			}
+			res.Error = err.Error()
+			_ = writeJSON(os.Stdout, res)
+		}
 		fmt.Fprintln(os.Stderr, "repair-release-filing:", err)
 		os.Exit(1)
 	}
+	if *report == "json" {
+		if err := writeJSON(os.Stdout, res); err != nil {
+			fmt.Fprintln(os.Stderr, "repair-release-filing:", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// result is the machine-readable answer: every filing considered, what was decided
+// about it and why, and whether the decision was carried out. `--report json`
+// prints exactly this, on the success, dry-run, no-op and failure paths alike.
+type result struct {
+	DB          string      `json:"db"`
+	Applied     bool        `json:"applied"`
+	Candidates  int         `json:"candidates"`
+	Moved       int         `json:"moved"`
+	Occurrences int         `json:"occurrences"`
+	LeftAlone   int         `json:"left_alone"`
+	Filings     []filingOut `json:"filings"`
+	Error       string      `json:"error,omitempty"`
+}
+
+// filingOut is one filing's decision. `action` is "move" or "keep"; a "keep"
+// always carries its reason, because a repair that skips silently cannot be told
+// apart from one that misses silently.
+type filingOut struct {
+	SpecID      string `json:"spec_id"`
+	Release     string `json:"release"`
+	Version     string `json:"version"`
+	Target      string `json:"target"`
+	Occurrences int    `json:"occurrences"`
+	Action      string `json:"action"`
+	Reason      string `json:"reason,omitempty"`
+	Destination string `json:"destination,omitempty"`
+}
+
+func writeJSON(out *os.File, res *result) error { return writeJSONTo(out, res) }
+
+func writeJSONTo(out io.Writer, res *result) error {
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(res)
 }
 
 // filing is one (spec, release, version) row of spec_versions whose release the
@@ -120,16 +187,22 @@ func (f filing) verdict() (move bool, why string) {
 // a guarantee, not a repair of something observed — and TestASecondPassIsANoOp
 // cannot falsify it, which is why the test asserts the file bytes rather than how
 // the file was opened.
-func run(dbPath string, apply bool, out *os.File) error {
+func run(dbPath string, apply, asJSON bool, out *os.File) (*result, error) {
+	res := &result{DB: dbPath, Applied: apply}
+	say := func(format string, args ...any) {
+		if !asJSON {
+			fmt.Fprintf(out, format, args...)
+		}
+	}
 	ro, err := store.OpenReadOnly(dbPath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", dbPath, err)
+		return res, fmt.Errorf("open %s: %w", dbPath, err)
 	}
 	ctx := context.Background()
 	filings, err := candidates(ctx, ro.DB())
 	_ = ro.Close()
 	if err != nil {
-		return err
+		return res, err
 	}
 
 	var moving []filing
@@ -155,59 +228,90 @@ func run(dbPath string, apply bool, out *os.File) error {
 				claimed[dest] = f.Release
 			}
 		}
+		row := filingOut{
+			SpecID: f.SpecID, Release: f.Release, Version: f.Version,
+			Target: f.Target, Occurrences: f.Occ,
+		}
 		if ok {
 			moving = append(moving, f)
 			occ += f.Occ
-			where := "its filing is already there"
+			where, dest := "its filing is already there", "existing"
 			switch {
 			case !f.ExactRowAtTarget:
-				where = "its filing will be created"
+				where, dest = "its filing will be created", "created"
 			case f.TargetURLEmpty && f.SourceURL != "":
-				where = "its filing is there but names no archive — the URL moves with the text"
+				where, dest = "its filing is there but names no archive — the URL moves with the text", "existing, archive URL carried"
 			}
-			fmt.Fprintf(out, "  MOVE %-11s %-7s %-9s -> %-7s %5d occurrence(s), %s\n",
+			row.Action, row.Destination = "move", dest
+			say("  MOVE %-11s %-7s %-9s -> %-7s %5d occurrence(s), %s\n",
 				f.SpecID, f.Release, f.Version, f.Target, f.Occ, where)
 		} else {
-			fmt.Fprintf(out, "  KEEP %-11s %-7s %-9s    %s\n", f.SpecID, f.Release, f.Version, why)
+			row.Action, row.Reason = "keep", why
+			say("  KEEP %-11s %-7s %-9s    %s\n", f.SpecID, f.Release, f.Version, why)
 		}
+		res.Filings = append(res.Filings, row)
 	}
-	fmt.Fprintf(out, "repair-release-filing: %d filing(s) whose release the version's major contradicts; %d to move, %d occurrence(s); %d left alone\n",
+	res.Candidates, res.Occurrences, res.LeftAlone = len(filings), occ, len(filings)-len(moving)
+	say("repair-release-filing: %d filing(s) whose release the version's major contradicts; %d to move, %d occurrence(s); %d left alone\n",
 		len(filings), len(moving), occ, len(filings)-len(moving))
 
 	if len(moving) == 0 {
-		fmt.Fprintln(out, "repair-release-filing: nothing to move — corpus untouched")
-		return nil
+		say("repair-release-filing: nothing to move — corpus untouched\n")
+		return res, nil
 	}
 	if !apply {
-		fmt.Fprintln(out, "repair-release-filing: DRY RUN — pass --apply to write")
-		return nil
+		say("repair-release-filing: DRY RUN — pass --apply to write\n")
+		return res, nil
 	}
 
 	st, err := store.Open(dbPath)
 	if err != nil {
-		return fmt.Errorf("open %s read-write: %w", dbPath, err)
+		return res, fmt.Errorf("open %s read-write: %w", dbPath, err)
 	}
 	defer func() { _ = st.Close() }()
-	for _, f := range moving {
-		if err := moveOne(ctx, st.DB(), f); err != nil {
-			return fmt.Errorf("move %s %s v%s -> %s: %w", f.SpecID, f.Release, f.Version, f.Target, err)
-		}
+	if err := moveAll(ctx, st.DB(), moving); err != nil {
+		return res, err
 	}
-	fmt.Fprintf(out, "repair-release-filing: moved %d filing(s), %d occurrence(s)\n", len(moving), occ)
-	return nil
+	// Counted only once the commit succeeded: `moved` is what the corpus now holds,
+	// not what was planned. On the failure path moveAll rolls everything back, so
+	// `moved` stays 0 beside the error — which is the true report.
+	res.Moved = len(moving)
+	say("repair-release-filing: moved %d filing(s), %d occurrence(s)\n", len(moving), occ)
+	return res, nil
 }
 
-// moveOne re-files one document in a single transaction: the destination row
-// first, so no occurrence is ever left pointing at a release spec_versions does
-// not carry, then the occurrences. It verifies the count it moved and refuses to
-// commit otherwise.
-func moveOne(ctx context.Context, db *sql.DB, f filing) error {
+// moveAll moves every filing in ONE transaction: all twelve or none.
+//
+// A transaction per filing was the first shape, and it is wrong for this tool.
+// It is run by hand, once, on a 23 GB corpus that is then published — and a
+// failure on the seventh filing would leave six moves committed, a corpus in a
+// state nobody chose, and an operator who has to work out which six from the log.
+// The set is twelve statements over 4 112 rows; there is no reason to give that up
+// for a partial result. The command's own report is then true or the corpus is
+// untouched, with nothing in between.
+//
+// Re-running after a rollback is safe and does the whole job: the tool is
+// idempotent, so the recovery is "fix the cause and run it again".
+func moveAll(ctx context.Context, db *sql.DB, moving []filing) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	for _, f := range moving {
+		if err := moveOne(ctx, tx, f); err != nil {
+			return fmt.Errorf("move %s %s v%s -> %s (nothing was committed): %w",
+				f.SpecID, f.Release, f.Version, f.Target, err)
+		}
+	}
+	return tx.Commit()
+}
 
+// moveOne re-files one document: the destination row first, so no occurrence is
+// ever left pointing at a release spec_versions does not carry, then the
+// occurrences. It verifies the count it moved and returns an error otherwise,
+// which rolls the whole set back — see moveAll.
+func moveOne(ctx context.Context, tx *sql.Tx, f filing) error {
 	switch {
 	case !f.ExactRowAtTarget:
 		// Copy the carrying row's metadata rather than inventing it: docx_url is
@@ -249,7 +353,7 @@ func moveOne(ctx context.Context, db *sql.DB, f filing) error {
 	if n != int64(f.Occ) {
 		return fmt.Errorf("moved %d occurrence(s), expected %d — refusing to commit", n, f.Occ)
 	}
-	return tx.Commit()
+	return nil
 }
 
 // candidates reads every filing whose release the version's major contradicts,
