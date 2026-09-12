@@ -586,7 +586,7 @@ func stepDiscover3GPP() *Step {
 			// The report's age only ever worked because 3gpp.org re-nonces every
 			// response — see freshness.go, and the projection in runDiscover that
 			// took that accident away.
-			return withFreshness(c, "discover", map[string]string{
+			return withFreshness("discover", map[string]string{
 				"floor": c.Cfg("floor"),
 				"scope": c.Cfg("scope"),
 			})
@@ -613,6 +613,15 @@ func stepDiscover3GPP() *Step {
 			var series []string
 			if err := json.Unmarshal(b, &series); err != nil {
 				return fmt.Errorf("series.json is not a JSON array: %w", err)
+			}
+			// The projection is an output of this step and a MANDATORY input of
+			// enrich, so this step is where its absence must be caught. enrich
+			// refuses to run without it; this is the other end of that contract, and
+			// it fails on the step that could have produced it rather than three
+			// edges downstream.
+			if !fileNonEmpty(c.statePath(catalogProjection)) {
+				return fmt.Errorf("%s is missing or empty: the catalogue overlay has no source",
+					c.statePath(catalogProjection))
 			}
 			return nil
 		},

@@ -323,13 +323,28 @@ phase_embed() {
 phase_enrich() {
   PHASE=enrich
   [ -s "$DB_OUT" ] || die "pas de DB ($DB_OUT)"
-  local sf="$LOCAL_DIR/status-report.htm" asn
+  local sf="$LOCAL_DIR/status-report.htm" cat_tsv="$LOCAL_DIR/catalog-specs.tsv" asn
   # OBLIGATOIRE, pas optionnel : sans lui doc_type reste "TS" en dur pour TOUTES
   # les specs (rust/parse force la valeur), working_group et title restent vides,
   # et le gate --max-empty-meta de cmd/validate echoue.
+  #
+  # ingest-catalog lit la PROJECTION, plus le HTML : www.3gpp.org renvoie a chaque
+  # requete un nonce CSP, un jeton CSRF, un id de session et des adresses
+  # re-obfusquees, donc le rapport n'est jamais egal a lui-meme. `enrich` le
+  # declarait en entree et rejouait tout le cote ecriture toutes les 6 h. Le
+  # pipeline passe par `discover --emit-catalog` ; ce script fait pareil, sinon les
+  # deux chemins ecriraient le catalogue depuis deux sources differentes.
   log "overlay catalogue DynaReport (doc_type TS/TR, working_group, freeze_date)"
   if [ -s "$sf" ]; then
-    run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" --status-report "$sf" \
+    if "$RUST_BIN/discover" --status-file "$sf" --emit-catalog > "$cat_tsv.tmp" 2>"$LOG_DIR/emit-catalog.err" && [ -s "$cat_tsv.tmp" ]; then
+      mv -f "$cat_tsv.tmp" "$cat_tsv"
+    else
+      rm -f "$cat_tsv.tmp"
+      warn "discover --emit-catalog a echoue -- voir $LOG_DIR/emit-catalog.err"
+    fi
+  fi
+  if [ -s "$cat_tsv" ]; then
+    run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" --catalog "$cat_tsv" \
       || warn "ingest-catalog a echoue -- doc_type restera 'TS' partout"
   else
     run "$RUST_BIN/ingest-catalog" --db "$DB_OUT" \

@@ -11,9 +11,17 @@ import (
 )
 
 // TestRustIngestCatalogE2E proves the Rust DynaReport overlay (Phase 7): Go ingest creates
-// a spec with no title/WG; the Rust `ingest-catalog` binary parses status-report.htm +
-// Releases.aspx and overlays authoritative title/TS-or-TR/WG onto the spec and freeze_date
-// onto its version; Go reads the enriched rows back. Additive + cite-or-silent.
+// a spec with no title/WG; the Rust `ingest-catalog` binary reads the catalogue projection
+// `discover --emit-catalog` derives from status-report.htm, plus Releases.aspx, and overlays
+// authoritative title/TS-or-TR/WG onto the spec and freeze_date onto its version; Go reads
+// the enriched rows back. Additive + cite-or-silent.
+//
+// IT FEEDS THE PROJECTION, not the report. The overlay took `--status-report` until
+// 2026-09-12, and the reason it does not any more is that the report cannot be equal to
+// itself twice (a fresh CSP nonce, CSRF token, GDPR session id and Cloudflare e-mail
+// obfuscation on every response), which made `enrich` dirty on a 6 h clock and replayed
+// the whole 3GPP write side behind it. The four fields below are the whole of what this
+// overlay consumes — that is why projecting onto them is safe.
 //
 // Skipped unless RUST_INGEST_CATALOG points at the built binary.
 func TestRustIngestCatalogE2E(t *testing.T) {
@@ -41,13 +49,10 @@ func TestRustIngestCatalogE2E(t *testing.T) {
 	}
 	_ = s.Close()
 
-	statusReport := filepath.Join(dir, "status-report.htm")
-	if err := os.WriteFile(statusReport, []byte(`<html><body>
-<a name="activeRel-19"></a>
-<table>
-  <tr><th>Type</th><th>Spec num</th><th>Title</th><th>Vers</th><th>WG</th></tr>
-  <tr><td>TS</td><td>23.501</td><td>System architecture for the 5G System</td><td>19.5.0</td><td>S2</td></tr>
-</table></body></html>`), 0o644); err != nil {
+	// The projection, in the shape `discover --emit-catalog` writes it: spec_id,
+	// doc_type, working_group, title — tab separated, one line per spec.
+	catalog := filepath.Join(dir, "catalog-specs.tsv")
+	if err := os.WriteFile(catalog, []byte("23.501\tTS\tS2\tSystem architecture for the 5G System\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	releases := filepath.Join(dir, "releases.htm")
@@ -57,7 +62,7 @@ func TestRustIngestCatalogE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := exec.Command(bin, "--db", db, "--status-report", statusReport, "--releases", releases).CombinedOutput()
+	out, err := exec.Command(bin, "--db", db, "--catalog", catalog, "--releases", releases).CombinedOutput()
 	if err != nil {
 		t.Fatalf("rust ingest-catalog: %v\n%s", err, out)
 	}

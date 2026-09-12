@@ -65,7 +65,7 @@ func stepDiscoverETSI() *Step {
 		// Doing it through the same helper is what stops the two halves from
 		// drifting apart again. See freshness.go.
 		Extra: func(c *Ctx) (map[string]string, error) {
-			return withFreshness(c, "discover-etsi", map[string]string{
+			return withFreshness("discover-etsi", map[string]string{
 				"etsi_scope": strings.Join(etsiScopeArgs(c.Cfg("etsi_scope")), " "),
 			})
 		},
@@ -93,8 +93,7 @@ func stepDiscoverETSI() *Step {
 			n := countLines(c.statePath("etsi-worklist.tsv"))
 			c.Log.Printf("ETSI work list: %d deliverable(s)", n)
 			c.Checkpoint("etsi_deliverables", strconv.Itoa(n))
-			// Stamped last, like its twin: a failed enumeration is not a visit.
-			return recordVisit(c, "discover-etsi")
+			return nil
 		},
 	}
 }
