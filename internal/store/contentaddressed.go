@@ -148,8 +148,25 @@ func (s *Store) ParagraphLineage(ctx context.Context, specID, clausePath string)
 	for i, r := range ordered {
 		rank[r] = i
 	}
+	// The same yardstick ClauseLineage uses, and for the same reason: the axis is
+	// the CATALOGUE's list of releases, and a filing there can be bookkeeping with
+	// no document behind it. Measured on the corpus published 2026-09-12, before
+	// any repair: trace_clause(29.675, 4) answered `obsolete=true` for a clause
+	// nobody removed, because 29.675 is filed under Rel-20 at its Rel-19 version
+	// and no Rel-20 document exists. Absence of text is not evidence of removal.
+	//
+	// Only on the release axis: on the version axis every value the axis carries
+	// comes from a document, so the catalogue cannot get ahead of the text.
 	newest := ""
-	if len(ordered) > 0 {
+	if axis == "release" {
+		n, err := s.newestReleaseWithText(ctx, specID)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := rank[n]; ok {
+			newest = n
+		}
+	} else if len(ordered) > 0 {
 		newest = ordered[len(ordered)-1]
 	}
 

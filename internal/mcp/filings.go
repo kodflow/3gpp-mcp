@@ -32,6 +32,25 @@ import (
 //
 // Served here rather than in Store.GetClauses: internal/store is in the Impl of
 // the validate steps, and the fold is a presentation rule, not a query.
+//
+// AMENDING #347's ONE LEFT-AS-MEASURED CASE. This file shipped saying of 26.510
+// v18.4.0, filed under Rel-20 with its text stored only there: "That is what the
+// DynaReport row says; changing it is a write-side decision, not a serve-time
+// one." The second half held. The first did not. Measured 2026-09-12: today's
+// status report does not file 26.510 under Rel-20 at all. The corpus was
+// carrying a filing the catalogue had WITHDRAWN — 74 rows had a release their
+// version's major contradicts, 56 of them still attested and legitimate (a
+// 3.x.y Rel-99 document filed under Rel-4 that Rel-4 never re-issued IS the
+// Rel-4 text), and 16 not. So it was never a catalogue fact reported faithfully;
+// it was an append-only corpus holding a fact the catalogue had dropped, because
+// nothing in the write path retires a filing.
+//
+// PR #350 stopped new ones being written, and cmd/repair-release-filing moved
+// the twelve that carried text — 4 112 occurrences, in every case the only copy
+// of that version in the corpus — to the release each version names. 26.510
+// v18.4.0 now serves 364 clauses under Rel-18, and Rel-20 keeps the catalogue's
+// bookkeeping row with no text behind it. The fold below is unchanged: it was
+// never the thing at fault. See docs/diagnostics/release-filing-anomaly.md.
 
 // oneFiling returns the clauses of a single filing of one version, and — when
 // the version is filed under more than one release — every release it is filed

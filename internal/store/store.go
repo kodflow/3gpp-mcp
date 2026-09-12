@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -1094,9 +1095,49 @@ func (s *Store) ClauseLineage(ctx context.Context, specID, prefix string) (map[s
 	for i, r := range ordered {
 		rank[r] = i
 	}
+	// OBSOLETE MEANS "GONE", AND ONLY TEXT CAN SAY THAT.
+	//
+	// The axis comes from spec_versions, which is the CATALOGUE's list of releases
+	// the spec is filed under — and a filing can be pure bookkeeping, a row 3GPP
+	// wrote with no document behind it. Measured on the corpus published
+	// 2026-09-12, before any repair: 8 filings are catalogue rows with no
+	// occurrence at all, and trace_clause(29.675, 4) answered
+	// `last_seen=Rel-19 obsolete=true` for a clause nobody has removed — 29.675 is
+	// simply filed under Rel-20 at its Rel-19 version, with no Rel-20 document in
+	// existence. "Absent from a release the corpus has no text for" is not evidence
+	// of removal; it is the absence of evidence.
+	//
+	// So the yardstick is the newest release this spec has TEXT under. The axis
+	// itself is unchanged: axis_values still reports what the catalogue files, and
+	// present_in still reports where the text is. Only the claim that something was
+	// REMOVED now needs a release to have been removed FROM.
+	//
+	// Computed for the whole spec, never for the prefix the caller filtered by: a
+	// trace_clause on one subtree would otherwise take that subtree's own newest
+	// release as the yardstick and call nothing obsolete, which is the same defect
+	// facing the other way.
+	//
+	// Only on the release axis. On the version axis every value the axis carries
+	// came from a document, so the catalogue cannot get ahead of the text and the
+	// newest value is already the right yardstick.
 	newest := ""
 	if len(ordered) > 0 {
 		newest = ordered[len(ordered)-1]
+	}
+	if axis, _, aErr := s.LineageAxis(ctx, specID); aErr != nil {
+		return nil, aErr
+	} else if axis == "release" {
+		n, nErr := s.newestReleaseWithText(ctx, specID)
+		if nErr != nil {
+			return nil, nErr
+		}
+		// A release the text names but the catalogue does not file this spec under
+		// cannot be ranked, so it makes no removal claim at all.
+		if _, ok := rank[n]; ok {
+			newest = n
+		} else {
+			newest = ""
+		}
 	}
 	out := make(map[string]model.Lineage, len(avail))
 	for _, cr := range avail {
@@ -1114,6 +1155,31 @@ func (s *Store) ClauseLineage(ctx context.Context, specID, prefix string) (map[s
 		}
 	}
 	return out, nil
+}
+
+// newestReleaseWithText returns the newest release the corpus holds clause text
+// for, for one spec, or "" when it holds none. The yardstick ClauseLineage
+// measures obsolescence against — see the comment there for why it cannot be the
+// catalogue's newest.
+//
+// Reads clause_occ directly on a converted corpus: `clauses` is a VIEW that joins
+// bodies and rebuilds every paragraph, and this question needs neither.
+func (s *Store) newestReleaseWithText(ctx context.Context, specID string) (string, error) {
+	from := "clauses"
+	if s.contentAddressed {
+		from = "clause_occ"
+	}
+	var newest sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT release FROM `+from+` WHERE spec_id = ? AND release IS NOT NULL AND release <> ''
+		 ORDER BY `+releaseRecencySQL("release")+` DESC LIMIT 1`, specID).Scan(&newest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("newest release with text for %s: %w", specID, err)
+	}
+	return newest.String, nil
 }
 
 // releaseRecencySQL builds a SQL expression yielding a release label's recency
