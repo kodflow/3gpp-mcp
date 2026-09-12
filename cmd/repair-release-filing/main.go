@@ -111,8 +111,15 @@ func (f filing) verdict() (move bool, why string) {
 }
 
 // run reports, and with apply=true writes. It opens READ-ONLY until it knows
-// there is work: a second pass over a repaired corpus must leave the file
-// identical to the byte, and opening DuckDB read-write is itself a write.
+// there is work, so a second pass over a repaired corpus cannot touch the file
+// at all — it is run by hand on a 23 GB corpus whose every byte is an image layer.
+//
+// Measured, because the obvious justification for this turned out to be false:
+// opening that corpus read-write and closing it without executing a statement
+// leaves it identical to the byte on this DuckDB build. So the read-only open is
+// a guarantee, not a repair of something observed — and TestASecondPassIsANoOp
+// cannot falsify it, which is why the test asserts the file bytes rather than how
+// the file was opened.
 func run(dbPath string, apply bool, out *os.File) error {
 	ro, err := store.OpenReadOnly(dbPath)
 	if err != nil {
