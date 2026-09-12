@@ -232,10 +232,7 @@ func runDiscover(c *Ctx) error {
 	c.Log.Printf("delta: %d series to (re)index — %s", len(names), strings.Join(names, " "))
 	c.Log.Printf("worklist: %d (spec, release) pairs", strings.Count(wl, "\n")+1)
 	c.Checkpoint("series", strconv.Itoa(len(names)))
-
-	// LAST, and only on the way out: the stamp says we looked, and a run that died
-	// halfway did not. See freshness.go.
-	return recordVisit(c, "discover")
+	return nil
 }
 
 // proportionateWorklist reports whether the fetch work list should be the

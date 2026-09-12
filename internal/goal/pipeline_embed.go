@@ -632,13 +632,26 @@ func stepEnrich(t corpusTarget) *Step {
 			// spec, working_group and title stay empty, and cmd/validate's
 			// --max-empty-meta gate fails.
 			//
+			// SO A MISSING PROJECTION IS AN ERROR, not a skipped overlay. The old
+			// shape ran ingest-catalog with no source, wrote no metadata, and
+			// returned success — the failure surfaced hours later in `validate`, as
+			// a count of empty titles, with nothing saying why. It was survivable
+			// when the source was an HTTP cache that a dead network could leave
+			// behind; it is not now, because `discover` produces this file inside
+			// this same pipeline and validates it before it finishes. Its absence is
+			// a bug in us, and it says so here. (CodeRabbit, PR #352.)
+			//
 			// THE FILE IT IS HANDED IS THE FILE IT DECLARES. Reading the report while
 			// declaring the projection would be the same defect one level down: the
 			// overlay would write from something this step does not watch.
-			args := []string{"--db", db}
-			if fileNonEmpty(catalog) {
-				args = append(args, "--catalog", catalog)
+			if !fileNonEmpty(catalog) {
+				return fmt.Errorf("the catalogue projection %s is missing or empty — `discover` "+
+					"writes it and validates it, so run that first (`make build/discover`); "+
+					"without it every spec keeps doc_type \"TS\" and an empty title, and the "+
+					"failure would surface much later as validate's --max-empty-meta count",
+					catalog)
 			}
+			args := []string{"--db", db, "--catalog", catalog}
 			c.Log.Printf("catalogue overlay (doc_type, working_group, freeze_date)")
 			if err := c.Run(Cmd{Name: c.rbin("ingest-catalog"), Args: args, Echo: true}); err != nil {
 				return err

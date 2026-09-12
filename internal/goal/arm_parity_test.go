@@ -1,11 +1,11 @@
 package goal
 
 import (
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // armShared records the steps that are legitimately not per corpus, each with the
@@ -518,36 +518,59 @@ func TestBothArmsEnumerateOnTheSameClock(t *testing.T) {
 	}
 }
 
-// THE STAMP IS NOT AN OUTPUT. It moves on every visit by construction, so a step
-// that declared it would make its dependants replay on the clock — which is the
-// cascade this whole change exists to stop, reintroduced one edge lower.
-func TestTheVisitStampIsNotDeclaredAsAnOutput(t *testing.T) {
+// THE RECORDED FINGERPRINT MUST BE THE ONE THE NEXT PLAN COMPUTES.
+//
+// This is the defect Qodo found on PR #352, and it is invisible unless you follow
+// the value through the ledger. The runner fingerprints a step BEFORE its Run and
+// records that with the success. The first design here stamped the visit inside
+// the Run and bucketed the stamp's AGE, so the recorded fingerprint held the age
+// read before the visit ("never") and the next plan read the age after it ("0") —
+// two different values, so the enumeration ran again immediately, inside the
+// window it had just refreshed. Twice per TTL, for ever.
+//
+// A window (floor(now/TTL)) is a pure function of the clock, so the value is the
+// same on both sides of the Run. That is what this test asserts, and it asserts it
+// the way the defect would show: read the determinant, run nothing, read it again.
+func TestTheFreshnessDeterminantDoesNotMoveAcrossARun(t *testing.T) {
 	c, _ := newTestCtx(t)
+	byName := map[string]*Step{}
 	for _, s := range Pipeline() {
-		if s.Outputs == nil {
-			continue
+		byName[s.Name] = s
+	}
+	for _, name := range []string{"discover", "discover-etsi"} {
+		s := byName[name]
+		if s == nil || s.Extra == nil {
+			t.Fatalf("%s has no Extra", name)
 		}
-		for _, out := range s.Outputs(c) {
-			if strings.Contains(filepath.ToSlash(out), "/visits/") {
-				t.Errorf("%s declares the visit stamp %s as an output: every dependant would "+
-					"replay every time this step looked upstream", s.Name, out)
-			}
+		before, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Whatever a successful Run does, the determinant is a function of the clock
+		// alone: nothing the step writes can move it.
+		after, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before[freshnessKey] != after[freshnessKey] {
+			t.Errorf("%s buckets to %q then %q with no time passed: the fingerprint the ledger "+
+				"records is not the one the next plan computes, and the step re-runs immediately",
+				name, before[freshnessKey], after[freshnessKey])
+		}
+		if before[freshnessKey] == "" {
+			t.Errorf("%s declares no %s", name, freshnessKey)
 		}
 	}
 }
 
-// A VISIT IS RECORDED ONLY BY A RUN THAT FINISHED. recordVisit is called on the
-// way out of both enumerations; this pins the property the bucket rests on — a
-// stamp that is written, then read back as a bucket, moves the bucket off "never".
-func TestAStampedVisitLeavesNever(t *testing.T) {
-	c, _ := newTestCtx(t)
-	if got := visitBucket(c, "discover"); got != "never" {
-		t.Fatalf("an unstamped step bucketed to %q, want \"never\"", got)
+// THE WINDOW MUST ACTUALLY EXPIRE. A determinant that never moves is the
+// discover-etsi defect restated: the step would stop looking upstream for ever.
+func TestTheFreshnessWindowMovesWithTheClock(t *testing.T) {
+	now := time.Now()
+	if a, b := visitWindow(now), visitWindow(now.Add(time.Minute)); a != b {
+		t.Errorf("the window moved after a minute (%q -> %q): every build would re-enumerate", a, b)
 	}
-	if err := recordVisit(c, "discover"); err != nil {
-		t.Fatal(err)
-	}
-	if got := visitBucket(c, "discover"); got != "0" {
-		t.Errorf("a step stamped just now bucketed to %q, want \"0\"", got)
+	if a, b := visitWindow(now), visitWindow(now.Add(2*discoverTTL)); a == b {
+		t.Errorf("the window did not move after two TTLs (%q): upstream would never be looked at again", a)
 	}
 }
