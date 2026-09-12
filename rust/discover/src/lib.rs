@@ -1667,9 +1667,22 @@ mod catalog_projection_tests {
 </body></html>"#
             )
         };
-        let a = chrome("YTJlOWViOTEw", "2462a529d96587a1", "r4b4tue9lfde10", "127b7c747d52");
-        let b = chrome("NDZjN2Q3Y2Ez", "e88ce9608b9167e1", "hfiep7hqisgnf5", "bad3d4dcd5fa");
-        assert_ne!(a, b, "the fixture must differ in bytes, or this proves nothing");
+        let a = chrome(
+            "YTJlOWViOTEw",
+            "2462a529d96587a1",
+            "r4b4tue9lfde10",
+            "127b7c747d52",
+        );
+        let b = chrome(
+            "NDZjN2Q3Y2Ez",
+            "e88ce9608b9167e1",
+            "hfiep7hqisgnf5",
+            "bad3d4dcd5fa",
+        );
+        assert_ne!(
+            a, b,
+            "the fixture must differ in bytes, or this proves nothing"
+        );
         assert_eq!(
             emit_catalog(&a),
             emit_catalog(&b),
@@ -1684,9 +1697,13 @@ mod catalog_projection_tests {
     #[test]
     fn a_changed_catalogue_changes_the_projection() {
         let before = emit_catalog(STATUS_HTML);
-        let after = emit_catalog(&STATUS_HTML.replace("5GS arch", "System architecture for the 5G System"));
+        let after =
+            emit_catalog(&STATUS_HTML.replace("5GS arch", "System architecture for the 5G System"));
         assert_ne!(before, after);
-        assert!(after.contains("System architecture for the 5G System"), "got: {after}");
+        assert!(
+            after.contains("System architecture for the 5G System"),
+            "got: {after}"
+        );
     }
 
     #[test]
@@ -1699,7 +1716,10 @@ mod catalog_projection_tests {
         let out = emit_catalog(&html);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "one line per spec, got: {out}");
-        assert!(lines[0].starts_with("21.905\t"), "sorted by spec_id, got: {out}");
+        assert!(
+            lines[0].starts_with("21.905\t"),
+            "sorted by spec_id, got: {out}"
+        );
         assert_eq!(lines[0], "21.905\tTR\tS1\tVocabulary");
         for l in &lines {
             assert_eq!(l.split('\t').count(), 4, "four fields, got: {l}");
