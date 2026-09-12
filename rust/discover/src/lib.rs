@@ -43,6 +43,59 @@ pub fn parse_status(html: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(out)
 }
 
+/// emit_catalog projects the status report down to the four fields the catalogue
+/// overlay actually writes: spec_id, doc_type, working_group, title. One line per
+/// spec, tab separated, sorted by spec_id.
+///
+/// IT EXISTS BECAUSE THE REPORT ITSELF CANNOT BE COMPARED. www.3gpp.org serves
+/// status-report.htm through Joomla behind Cloudflare, and every response carries
+/// a fresh CSP nonce (22 of them), a fresh CSRF token, a fresh GDPR session id and
+/// e-mail addresses re-obfuscated under a fresh key. So two downloads of an
+/// UNCHANGED catalogue differ in bytes, always — measured 2026-09-12, 5 180 736 vs
+/// 5 180 734 bytes eight hours apart, identical once those four things are
+/// neutralised.
+///
+/// `enrich` declared the HTML as an input, and `discover` re-downloads it on a 6 h
+/// TTL, so the 3GPP arm replayed enrich -> paragraphs -> sparse -> compact -> index
+/// -> validate -> smoke -> publish on a CLOCK: ~18 min of corpus work and a
+/// re-pushed image, to produce an image with the identical digest. The ETSI arm,
+/// having no such input, sat still. That asymmetry is the whole reason this
+/// function is here.
+///
+/// Chasing the volatile patterns one by one would be a list that upstream can
+/// extend without telling us. Projecting onto what is READ cannot be: anything
+/// absent from these four fields is, by construction, incapable of replaying the
+/// overlay.
+pub fn emit_catalog(html: &str) -> String {
+    let (specs, _) = parse3gpp::catalog::parse_status_report(html);
+    let mut rows: BTreeMap<String, String> = BTreeMap::new();
+    for s in &specs {
+        rows.insert(
+            s.spec_id.clone(),
+            format!(
+                "{}\t{}\t{}\t{}",
+                clean_field(&s.spec_id),
+                clean_field(&s.doc_type),
+                clean_field(&s.working_group),
+                clean_field(&s.title)
+            ),
+        );
+    }
+    let mut out = String::new();
+    for line in rows.values() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// clean_field keeps a field on one line and inside one column. A title carrying a
+/// tab or a newline would otherwise shift every field after it, and the projection
+/// would parse back as a different catalogue than the one it describes.
+fn clean_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ").trim().to_string()
+}
+
 /// delta_series returns the set of 2-digit series needing (re)indexing, comparing
 /// live site versions against the published index PER (spec, release). A missing
 /// key (new release, or a lower-release maintenance bump never indexed) counts as
@@ -1553,5 +1606,138 @@ mod repair_tests {
         let (lines, c) = emit_repair_worklist(&site, &idx, &holes, 0, "");
         assert_eq!(c.emitted, 1);
         assert!(lines.contains("29558-j50.zip"), "got: {lines}");
+    }
+}
+
+// The catalogue projection, in a module of its own: `tests` and `repair_tests`
+// each own their fixtures, and this one owns the HTML whose page chrome moves.
+#[cfg(test)]
+mod catalog_projection_tests {
+    use super::*;
+
+    // The same three-release fixture `tests` uses, restated here rather than
+    // shared: a test that reaches into another module's fixture breaks when that
+    // module edits it for a reason of its own.
+    const STATUS_HTML: &str = r#"<!DOCTYPE html><html><body>
+<a name="activeRel-19"></a>
+<table>
+  <tr><th>type</th><th>spec&nbsp;num</th><th>title</th><th>vers</th><th>WG</th></tr>
+  <tr><td>TS</td><td><a href="/x">23.501</a></td><td>5GS arch</td><td>19.7.0</td><td>S2</td></tr>
+</table>
+<a name="activeRel-18"></a>
+<table>
+  <tr><th>type</th><th>spec&nbsp;num</th><th>title</th><th>vers</th><th>WG</th></tr>
+  <tr><td>TS</td><td><a href="/x">23.501</a></td><td>5GS arch</td><td>18.13.0</td><td>S2</td></tr>
+</table>
+</body></html>"#;
+    // ---------------------------------------------------------- emit_catalog
+
+    // THE PROJECTION IS THE POINT: two downloads of one unchanged catalogue must
+    // project identically.
+    //
+    // www.3gpp.org serves status-report.htm through Joomla behind Cloudflare, and
+    // every response carries a fresh CSP nonce, a fresh CSRF token, a fresh GDPR
+    // session id and e-mail addresses re-obfuscated under a fresh key. The bytes
+    // therefore differ on every single download — measured 2026-09-12, 5 180 736 vs
+    // 5 180 734 bytes eight hours apart, identical once those four are neutralised.
+    // `enrich` declared those bytes, so the 3GPP arm replayed enrich -> paragraphs
+    // -> sparse -> compact -> index -> validate -> smoke -> publish every 6 h and
+    // re-pushed an image with the same digest, while the ETSI arm, which has no
+    // such input, sat still.
+    //
+    // This test is the guarantee that projecting fixes it. It does not enumerate
+    // the volatile patterns — a list upstream can extend without telling us — it
+    // asserts the property they were only ever evidence of.
+    #[test]
+    fn a_report_that_differs_only_in_page_chrome_projects_identically() {
+        let chrome = |nonce: &str, csrf: &str, sess: &str, cfemail: &str| {
+            format!(
+                r#"<!DOCTYPE html><html><head>
+<style nonce="{nonce}">div{{color:red}}</style>
+<script nonce="{nonce}">var gdprJSessVal='{sess}';</script>
+<script type="application/json" class="joomla-script-options new" nonce="{nonce}">{{"csrf.token":"{csrf}"}}</script>
+<a href="/cdn-cgi/l/email-protection#{cfemail}"><span class="__cf_email__" data-cfemail="{cfemail}">[email&#160;protected]</span></a>
+<input type="hidden" name="{csrf}" value="1">
+</head><body>
+<a name="activeRel-19"></a>
+<table>
+  <tr><th>type</th><th>spec&nbsp;num</th><th>title</th><th>vers</th><th>WG</th></tr>
+  <tr><td>TS</td><td><a href="/x">23.501</a></td><td>5GS arch</td><td>19.7.0</td><td>S2</td></tr>
+</table>
+</body></html>"#
+            )
+        };
+        let a = chrome(
+            "YTJlOWViOTEw",
+            "2462a529d96587a1",
+            "r4b4tue9lfde10",
+            "127b7c747d52",
+        );
+        let b = chrome(
+            "NDZjN2Q3Y2Ez",
+            "e88ce9608b9167e1",
+            "hfiep7hqisgnf5",
+            "bad3d4dcd5fa",
+        );
+        assert_ne!(
+            a, b,
+            "the fixture must differ in bytes, or this proves nothing"
+        );
+        assert_eq!(
+            emit_catalog(&a),
+            emit_catalog(&b),
+            "the catalogue projection moved when only the page chrome did: enrich would go \
+             dirty on discover's clock again, and the whole 3GPP write side behind it"
+        );
+    }
+
+    // A CHANGED CATALOGUE MUST STILL MOVE THE PROJECTION — the negative control. A
+    // projection that never changes would be worse than the bytes it replaced: the
+    // overlay would stop seeing a re-titled or re-assigned spec for ever.
+    #[test]
+    fn a_changed_catalogue_changes_the_projection() {
+        let before = emit_catalog(STATUS_HTML);
+        let after =
+            emit_catalog(&STATUS_HTML.replace("5GS arch", "System architecture for the 5G System"));
+        assert_ne!(before, after);
+        assert!(
+            after.contains("System architecture for the 5G System"),
+            "got: {after}"
+        );
+    }
+
+    #[test]
+    fn the_projection_is_four_sorted_tab_separated_fields_one_line_per_spec() {
+        let html = STATUS_HTML.replace(
+            r#"<tr><td>TS</td><td><a href="/x">23.501</a></td><td>5GS arch</td><td>19.7.0</td><td>S2</td></tr>"#,
+            r#"<tr><td>TS</td><td><a href="/x">23.501</a></td><td>5GS arch</td><td>19.7.0</td><td>S2</td></tr>
+  <tr><td>TR</td><td><a href="/x">21.905</a></td><td>Vocabulary</td><td>19.1.0</td><td>S1</td></tr>"#,
+        );
+        let out = emit_catalog(&html);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per spec, got: {out}");
+        assert!(
+            lines[0].starts_with("21.905\t"),
+            "sorted by spec_id, got: {out}"
+        );
+        assert_eq!(lines[0], "21.905\tTR\tS1\tVocabulary");
+        for l in &lines {
+            assert_eq!(l.split('\t').count(), 4, "four fields, got: {l}");
+        }
+        // 23.501 appears under three release sections and is ONE spec: the overlay
+        // writes per spec, not per (spec, release), and a projection that repeated
+        // it would make the file's size depend on how many releases a spec is in.
+        assert_eq!(lines[1], "23.501\tTS\tS2\t5GS arch");
+    }
+
+    // A TAB IN A TITLE MUST NOT SHIFT A COLUMN. ingest-catalog refuses a line that
+    // is not exactly four fields, so an unescaped tab would not corrupt the
+    // overlay quietly — it would stop the build. Neither is acceptable.
+    #[test]
+    fn a_title_carrying_a_tab_stays_in_its_column() {
+        let out = emit_catalog(&STATUS_HTML.replace("5GS arch", "5GS\tarch"));
+        let line = out.lines().next().unwrap();
+        assert_eq!(line.split('\t').count(), 4, "got: {line}");
+        assert!(line.ends_with("5GS arch"), "got: {line}");
     }
 }

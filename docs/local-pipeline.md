@@ -123,8 +123,28 @@ has run once, the register exists and the check is a real gate.
 | `build-embedder` | GPU dense embedder (ONNX Runtime + CUDA) | ~1 min |
 | `seed` | adopt the published 3GPP snapshot — the one named BY DIGEST in `contracts/corpus-pin.txt`, never `latest` (see below) — and **derive its delta anchor from it** (`cmd/derive-anchor`, 0.99 s, byte-identical to what the fold writes), replacing an anchor of another generation. Declines when a corpus is already on disk (and derives an anchor only if it has none) | one-off; ~1 s decline |
 | `seed-etsi` | adopt the published `etsi-corpus` snapshot, pinned the same way. There is no ETSI anchor to adopt with it, which is why discovery below still re-enumerates | one-off; ~0 s decline |
-| `discover` | diff the live DynaReport catalogue against the local anchor | ~3 s |
+| `discover` | diff the live DynaReport catalogue against the local anchor; publish `catalog-specs.tsv`, the four-field projection `enrich` reads | ~3 s |
 | `discover-etsi` | re-enumerate `/deliver` and compare against `etsi-index.json` — not the 3GPP anchor, which is a 3GPP artefact | ~3 s |
+
+**Both enumerations run on the same 6 h clock, and neither drags the corpus behind
+it** (`internal/goal/freshness.go`, 2026-09-12). Each stamps
+`.local/state/visits/<step>.stamp` after a successful visit and buckets its age;
+inside the window the fingerprint is stable and the step skips.
+
+Before that, the two halves behaved completely differently under paired names.
+`discover-etsi` had NO time determinant, so once the ETSI work list existed its
+fingerprint could not move: a deliverable published on etsi.org after the last
+enumeration was unreachable, for ever, with every gate green. `discover` had one
+— and it worked by accident, on the age of its own HTTP cache, which only moved
+because 3gpp.org re-nonces every response. That same volatility made `enrich`
+(which declared the report as an input) dirty every six hours and replayed
+`paragraphs`, `sparse`, `compact`, `index`, `validate`, `smoke` and `publish`
+behind it: **~18 min of corpus work and a re-pushed image, to publish the byte-identical
+digest `74e60bb9…` twice on 2026-09-12**. `enrich` now declares the projection —
+measured that day on two real downloads eight hours apart, 5 180 736 vs 5 180 734
+bytes, **365 860 bytes of projection, identical** — so a report that says the same
+thing costs nothing. Pinned by `TestBothArmsEnumerateOnTheSameClock` and
+`catalog_projection_tests` in `rust/discover`.
 | `fetch` | download + convert the 3GPP delta (LibreOffice) | minutes |
 | `fetch-etsi` | download + convert the work list (pdftotext), and **record which deliverables it could not convert** into `.local/state/etsi-absences.tsv` | hours cold; **3m54 warm** (skip pass over 11 822) |
 | `ingest` / `ingest-etsi` | parse HTML into the corpus DB — per-series shards folded into `3gpp.duckdb` on the 3GPP arm (the fold is skipped when no shard gained a clause), `etsi.duckdb` directly on the ETSI arm. Both DECLINE when there is nothing to add: the 3GPP arm after the parse (no shard gained a clause), the ETSI arm before touching the file (`ingest --etsi --plan`, read-only: no pending deliverable yields a clause and the HNSW is frozen) — otherwise the restore and the index rebuild rewrote `etsi.duckdb` and replayed the whole ETSI chain. The ETSI resume key must be read with the SAME reader as the ingest (`html_bytes::read_html`, windows-1252 fallback): reading it as strict UTF-8 re-ingested the two non-UTF-8 files of 11 822 on **every** build, +566 clauses each time, for fifteen builds | minutes/series; ~10 min ETSI |

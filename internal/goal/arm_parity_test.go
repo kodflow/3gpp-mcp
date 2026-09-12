@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // armShared records the steps that are legitimately not per corpus, each with the
@@ -453,5 +454,143 @@ func TestSharedStepsTreatBothArmsAlike(t *testing.T) {
 				t.Errorf("%s depends on %s and not on %s", s.Name, d, other)
 			}
 		}
+	}
+}
+
+// BOTH ARMS ENUMERATE ON THE SAME CLOCK.
+//
+// The step list has paired since #326, and every gate stayed green while the two
+// halves behaved completely differently underneath those names:
+//
+//	discover       re-enumerated every 6 h (report_bucket), which was correct, and
+//	               dragged enrich -> paragraphs -> sparse -> compact -> index ->
+//	               validate -> smoke -> publish behind it every time, which was not:
+//	               ~18 min of corpus work and a re-pushed image, to publish the same
+//	               digest twice on 2026-09-12.
+//	discover-etsi  had NO time determinant at all. Its fingerprint could not move
+//	               once the worklist existed, so a deliverable published on
+//	               etsi.org after the last enumeration was unreachable — for ever,
+//	               silently, with every gate green.
+//
+// Pairing by NAME cannot see either of those. This test reads the determinant.
+//
+// The 3GPP side of the cascade is fixed elsewhere (the catalogue projection in
+// runDiscover, so a re-downloaded report that says the same thing no longer makes
+// enrich dirty); this pins the half that belongs to the step list: if one arm
+// enumerates on a clock, so does the other, and it is the SAME clock.
+func TestBothArmsEnumerateOnTheSameClock(t *testing.T) {
+	c, _ := newTestCtx(t)
+	byName := map[string]*Step{}
+	for _, s := range Pipeline() {
+		byName[s.Name] = s
+	}
+
+	bucketOf := func(name string) (string, bool) {
+		s := byName[name]
+		if s == nil {
+			t.Fatalf("%s is not in the pipeline", name)
+		}
+		if s.Extra == nil {
+			return "", false
+		}
+		m, err := s.Extra(c)
+		if err != nil {
+			t.Fatalf("%s.Extra: %v", name, err)
+		}
+		v, ok := m[freshnessKey]
+		return v, ok
+	}
+
+	for _, pair := range [][2]string{{"discover", "discover-etsi"}} {
+		a, aOK := bucketOf(pair[0])
+		b, bOK := bucketOf(pair[1])
+		if aOK != bOK {
+			t.Errorf("%s declares %q=%v and %s declares %q=%v: one arm re-enumerates on a "+
+				"clock and the other cannot notice upstream at all",
+				pair[0], freshnessKey, aOK, pair[1], freshnessKey, bOK)
+		}
+		if aOK && bOK && a != b {
+			// Both stamps are absent in a fresh context, so both read "never". A
+			// difference here means the two arms measure different things.
+			t.Errorf("%s buckets to %q and %s to %q from the same empty state: the two arms "+
+				"are not reading the same clock", pair[0], a, pair[1], b)
+		}
+	}
+}
+
+// THE RECORDED FINGERPRINT MUST BE THE ONE THE NEXT PLAN COMPUTES.
+//
+// This is the defect Qodo found on PR #352, and it is invisible unless you follow
+// the value through the ledger. The runner fingerprints a step BEFORE its Run and
+// records that with the success. The first design here stamped the visit inside
+// the Run and bucketed the stamp's AGE, so the recorded fingerprint held the age
+// read before the visit ("never") and the next plan read the age after it ("0") —
+// two different values, so the enumeration ran again immediately, inside the
+// window it had just refreshed. Twice per TTL, for ever.
+//
+// A window (floor(now/TTL)) is a pure function of the clock, so the value is the
+// same on both sides of the Run. That is what this test asserts, and it asserts it
+// the way the defect would show: read the determinant, run nothing, read it again.
+func TestTheFreshnessDeterminantDoesNotMoveAcrossARun(t *testing.T) {
+	c, _ := newTestCtx(t)
+	byName := map[string]*Step{}
+	for _, s := range Pipeline() {
+		byName[s.Name] = s
+	}
+	for _, name := range []string{"discover", "discover-etsi"} {
+		s := byName[name]
+		if s == nil || s.Extra == nil {
+			t.Fatalf("%s has no Extra", name)
+		}
+		before, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Whatever a successful Run does, the determinant is a function of the clock
+		// alone: nothing the step writes can move it.
+		after, err := s.Extra(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before[freshnessKey] != after[freshnessKey] {
+			t.Errorf("%s buckets to %q then %q with no time passed: the fingerprint the ledger "+
+				"records is not the one the next plan computes, and the step re-runs immediately",
+				name, before[freshnessKey], after[freshnessKey])
+		}
+		if before[freshnessKey] == "" {
+			t.Errorf("%s declares no %s", name, freshnessKey)
+		}
+	}
+}
+
+// THE WINDOW MUST ACTUALLY EXPIRE. A determinant that never moves is the
+// discover-etsi defect restated: the step would stop looking upstream for ever.
+//
+// THE INSTANT IS FIXED, NOT time.Now(). Written with the wall clock, this test
+// failed for one minute in every six hours: a `now` in the last minute of a window
+// puts `now.Add(time.Minute)` in the next one, and the assertion fired on a
+// visitWindow that was entirely correct. A test that is right 99.7 % of the time is
+// a test nobody will trust the day it goes red. (CodeRabbit, PR #352.)
+//
+// So: the exact middle of a known window, which leaves half a TTL of slack on
+// either side of the minute this test adds.
+func TestTheFreshnessWindowMovesWithTheClock(t *testing.T) {
+	ttl := int64(discoverTTL.Seconds())
+	mid := time.Unix(1000*ttl+ttl/2, 0).UTC()
+
+	if a, b := visitWindow(mid), visitWindow(mid.Add(time.Minute)); a != b {
+		t.Errorf("the window moved after a minute (%q -> %q): every build would re-enumerate", a, b)
+	}
+	if a, b := visitWindow(mid), visitWindow(mid.Add(2*discoverTTL)); a == b {
+		t.Errorf("the window did not move after two TTLs (%q): upstream would never be looked at again", a)
+	}
+	// And the boundaries are where they are claimed to be: the last instant of the
+	// window is still in it, the first instant of the next is not.
+	start := time.Unix(1000*ttl, 0).UTC()
+	if a, b := visitWindow(start), visitWindow(start.Add(discoverTTL-time.Second)); a != b {
+		t.Errorf("the window is shorter than its TTL (%q -> %q)", a, b)
+	}
+	if a, b := visitWindow(start), visitWindow(start.Add(discoverTTL)); a == b {
+		t.Errorf("the window did not end after exactly one TTL (%q)", a)
 	}
 }

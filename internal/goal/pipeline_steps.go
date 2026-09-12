@@ -18,6 +18,13 @@ import (
 
 const statusReportURL = "https://www.3gpp.org/DynaReport/status-report.htm"
 
+// catalogProjection is the file discover derives from the status report and enrich
+// reads: spec_id, doc_type, working_group, title — one line per spec, tab
+// separated, sorted. It is the ONLY thing the catalogue overlay takes from the
+// report, and naming it once here is what keeps the writer and the reader from
+// drifting onto two different paths.
+const catalogProjection = "catalog-specs.tsv"
+
 // runDiscover refreshes the 3GPP status report and recomputes the delta.
 //
 // It writes series.json ATOMICALLY and only after the discover binary succeeded,
@@ -104,6 +111,44 @@ func runDiscover(c *Ctx) error {
 	if strings.TrimSpace(series) == "" {
 		series = "[]"
 	}
+
+	// THE CATALOGUE PROJECTION — the only part of this report anything downstream
+	// reads.
+	//
+	// `enrich` used to declare status-report.htm itself, and that file cannot be
+	// equal to itself twice: 3gpp.org serves it through Joomla behind Cloudflare
+	// with a per-response CSP nonce (22 of them), CSRF token, GDPR session id and
+	// re-obfuscated e-mail addresses. Measured 2026-09-12, eight hours apart on an
+	// unchanged catalogue: 5 180 736 vs 5 180 734 bytes, byte-identical once those
+	// four are neutralised. WriteAtomic above cannot help — the bytes really do
+	// differ.
+	//
+	// So this step re-downloaded on its 6 h TTL, enrich went dirty, and paragraphs,
+	// sparse, compact, index, validate, smoke and publish replayed behind it: ~18
+	// min of corpus work and a re-pushed image, on a clock, to produce the same
+	// digest (74e60bb9…, twice on 2026-09-12). The ETSI arm has no such input and
+	// sat still — the two halves of one pipeline behaving differently for a reason
+	// nobody chose.
+	//
+	// Publishing what the overlay READS makes the question decidable: four fields
+	// per spec, sorted, written through WriteAtomic. Neutralising the volatile
+	// patterns instead would be a list upstream can extend without telling us.
+	proj, err := c.Output(Cmd{Name: c.rbin("discover"), Args: []string{"--status-file", report, "--emit-catalog"}})
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(proj) == "" {
+		return fmt.Errorf("the catalogue projection came back empty — the status report parsed, so this is a projection bug, not an upstream change")
+	}
+	// Trailing newline, like worklist.txt beside it: c.Output trims what the binary
+	// printed, and a text file this pipeline writes ends in a newline. Measured on
+	// the first real run (2026-09-13 01:02): 365 859 bytes against the 365 860 the
+	// binary emits, the last of 3 695 lines unterminated.
+	proj = strings.TrimRight(proj, "\n") + "\n"
+	if err := WriteAtomic(c.statePath(catalogProjection), []byte(proj)); err != nil {
+		return err
+	}
+	c.Log.Printf("catalogue projection: %d spec(s)", strings.Count(proj, "\n"))
 	// series.json is written AFTER the work list, not here: in repair mode the work
 	// list can reach series the delta never flagged, and ingest walks series.json.
 	// See the union below.
