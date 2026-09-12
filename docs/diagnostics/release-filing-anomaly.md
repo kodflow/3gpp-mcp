@@ -285,6 +285,27 @@ each, which is two copies and not a move; drafts.
 | paragraph attestation | `paragraphs=3789493 bodies=897556 body_seq=8404379 clause_occ=2751918` | **identical**, `migrate-paragraphs --attested` exits 0 |
 | destinations with no archive URL | 6 of 12 | **0 of 12** |
 
+**The corpus still keeps its own contract.** `validate` with the full 3GPP flag set
+(`--require-fts --require-hnsw --require-embed-complete --require-no-reingest
+--require-sparse`) passes every gate on the repaired copy, identically to the
+original — `clauses=2751918`, `null_at_floor=0`, `hnsw_state="frozen"`,
+`sparse_model="b13103bce7ae"`. And `anchorcheck`, against the published anchor:
+
+| | original | repaired |
+|---|---:|---:|
+| indexed | 20 053 | 20 041 |
+| **non_content** (bookkeeping) | 4 | **16** |
+| **missing_content** (a hole) | **0** | **0** |
+| over_claim / unaccounted | 0 | 0 |
+
+The twelve flip from `Indexed` to `NonContent`, which is the verdict the tool
+already has a name for — *"3GPP routinely lists a spec's Rel-N entry at the
+Rel-(N-1) version, so this is bookkeeping, not a gap"*. **`missing_content` stays
+0**, so the repair opens no hole and the repair-plan loop will never try to
+re-acquire what it moved. That is the property the whole "move, keep the carrying
+row" design exists for: deleting the carrying row instead would have left twelve
+anchor keys with nothing to resolve to.
+
 **Idempotence.** A second `--apply` reports `0 to move … corpus untouched` and leaves
 the file identical by sha256; so does a dry run afterwards. The tool opens read-only
 until it knows there is work. (Measured honestly: opening this corpus read-write and
