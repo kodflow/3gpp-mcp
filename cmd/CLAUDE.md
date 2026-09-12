@@ -23,6 +23,7 @@ cmd/
 │   └── bootstrap.go
 ├── validate/        # assert a baked DB meets the data contract (dense|+sparse|+etsi)
 ├── repair-reingest/ # remove the occurrences a deliverable written twice left behind
+├── repair-release-filing/ # move a document to the release its own version names (internal/refile)
 ├── bench/           # offline retrieval benchmark (IR metrics); never shipped
 ├── li-audit/        # cross-check an external LI event catalogue vs indexed text (read-only)
 ├── dbcount/         # row-count utility over a DB (read-only)
@@ -39,6 +40,7 @@ cmd/
 | `server` | MCP server (stdio/HTTP); `serve` / `bootstrap` / `version` subcommands; opens the DB read-only (`--writable` maintenance hatch) | ✅ user-facing |
 | `validate` | Gate a baked DB against the data contract (`--require-embed-complete` / `--require-sparse` / `--require-etsi` / `--require-no-reingest` / `--require-worklist`) | CI |
 | `repair-reingest` | Delete the extra occurrences of a deliverable ingested more than once; **dry run unless `--apply`**. Keeps the first block of `chunk_id`s, not one row per distinct clause — a document may legitimately repeat one — and refuses a group whose count is not an exact multiple of its multiplicity | tooling |
+| `repair-release-filing` | Move a stored document to the release its own version number names, when the corpus files it under one that number contradicts; **dry run unless `--apply`**, `--report json`. MOVES, never deletes: an UPDATE of `clause_occ.release` plus the destination `spec_versions` row, all of them in one transaction. Keeps the carrying row — with its text gone it is the `NonContent` bookkeeping `anchorcheck` expects. Decisions live in `internal/refile` | tooling |
 | `bench` | Score lexical/hybrid/rerank on a graded query set (axis #7) | tooling |
 | `li-audit` | Verify/relocate LI events against normative text → markdown report (read-only) | tooling |
 | `dbcount` | Print row counts for a DB (read-only) | tooling |

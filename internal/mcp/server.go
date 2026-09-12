@@ -571,9 +571,15 @@ func (h *handlers) getSpec(ctx context.Context, r mcp.CallToolRequest) (*mcp.Cal
 	clauses, filedUnder := oneFiling(clauses, release)
 	// SAY WHICH FILING WAS SERVED. The release asked for is not always one the
 	// version's clauses are filed under — the baseline, on a version of another
-	// release; or a catalogue row with no clauses behind it, as 26.510 18.4.0 has
-	// under Rel-18 while its text is filed under Rel-20. The answer then names the
-	// release it actually served rather than the one requested (Qodo, #347).
+	// release; or a catalogue row with no clauses behind it. 26.510 18.4.0 was the
+	// example written here and is now the other way round: the repair of
+	// 2026-09-12 moved its 364 clauses to Rel-18, where the version number says
+	// they belong, and left Rel-20 holding the catalogue's bookkeeping row with
+	// nothing behind it (cmd/repair-release-filing, and filings.go for why). The
+	// branch still earns its keep — the corpus carries 8 filings that are
+	// catalogue rows with no text, and a baseline scope routinely lands on a
+	// version of another release. The answer names the release it actually served
+	// rather than the one requested (Qodo, #347).
 	servedNote := ""
 	if served := clauses[0].Release; served != release && sameRelease(clauses) {
 		if release != "" && len(filedUnder) == 0 {
