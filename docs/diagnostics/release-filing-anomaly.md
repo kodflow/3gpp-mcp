@@ -194,7 +194,14 @@ recorded:
 | lines filed under Rel-20 | **16** | **0** (16 re-filed) |
 | `26510-i40.zip` | `Rel-20 …` | `Rel-18 …` |
 
-## 4. The existing corpus: repair and price
+## 4. The existing corpus: the price, as it was quoted
+
+**Historical — this is the estimate that was put to the orchestrator, before the
+repair was authorised. §5 is what was actually done, and it differs in two ways:
+the repair took 2 s rather than the ~1 h this section feared, because it turned out
+to need no re-derivation at all; and it does NOT drop the four empty carrying rows
+this section proposed dropping.** Kept as written because the decision was taken on
+these numbers.
 
 The 16 rows are **not repaired here**, and deleting them would be wrong: 12 of them
 hold the only copy of 4 112 clauses. The correct repair is a **re-filing**, not a
@@ -203,7 +210,9 @@ deletion:
 ```
 UPDATE the filing's release from Rel-20 to the release its version major names
   (Rel-18 / Rel-19) — 12 rows with text, 4 112 clause occurrences;
-then drop the 4 now-duplicate empty Rel-20 rows.
+then drop the 4 now-duplicate empty Rel-20 rows.        <- NOT DONE, see §5:
+                                                           they are the catalogue's
+                                                           bookkeeping and are kept
 ```
 
 Six of the twelve already have a waiting bookkeeping row at the target release
@@ -223,6 +232,12 @@ corpus layer is re-pushed in full (22 GB on the wire, `publish` 22m39 measured o
 
 That is a trade for the orchestrator to make, not for this PR to make silently. The
 change here costs nothing and stops the population from growing.
+
+*(The trade was taken. What the estimate above got wrong: it priced `enrich` and a
+full replay of `paragraphs`, `sparse`, `compact` and `index` because it assumed any
+corpus write must re-derive. It does not — the repair moves rows between releases
+and creates none, so the paragraph attestation holds and every derived table is
+untouched. The 22 GB layer push is the whole of the cost. See §5.)*
 
 ## 5. The repair, as taken (2026-09-12)
 
