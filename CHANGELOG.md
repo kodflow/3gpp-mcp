@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased] — the two arms enumerate on the same clock (2026-09-12)
+
+### Fixed
+
+- **`enrich` no longer replays because 3gpp.org re-nonced a page.** `discover`
+  re-downloads `status-report.htm` on a 6 h TTL, and `enrich` declared that file
+  as an input — but www.3gpp.org serves it through Joomla behind Cloudflare and
+  every response carries a fresh CSP nonce (22 of them), CSRF token, GDPR session
+  id and re-obfuscated e-mail addresses. The file could not be equal to itself
+  twice, so the whole 3GPP write side replayed on a clock: `enrich` →
+  `paragraphs` → `sparse` → `compact` → `index` → `validate` → `smoke` →
+  `publish`, **~18 min of corpus work and a re-pushed image** — measured on
+  2026-09-12, which published the identical digest `74e60bb9…` twice in fourteen
+  hours. The ETSI arm, which has no such input, sat still: one pipeline, two
+  behaviours, paired step names hiding it.
+
+  `discover --emit-catalog` now publishes `catalog-specs.tsv` — the four fields
+  the overlay actually writes (spec_id, doc_type, working_group, title), one line
+  per spec, sorted — and `ingest-catalog` takes `--catalog` instead of
+  `--status-report`. Measured on two real downloads eight hours apart: 5 180 736
+  vs 5 180 734 bytes of HTML, **365 860 bytes of projection over 3 695 specs,
+  byte-identical**. Neutralising the volatile patterns one by one was the other
+  option and it is a list upstream can extend without telling us; projecting onto
+  what is READ cannot be.
+
+- **`discover-etsi` can see what ETSI publishes.** Its only determinant was the
+  scope, and a scope nobody types does not move — so once the ETSI work list
+  existed, the step's fingerprint could never change again and a new version of,
+  say, TS 103 221-1 was unreachable for ever. Nothing failed; the corpus was just
+  quietly out of date in the half nobody watched. Both enumerations now bucket the
+  age of their last visit through one helper (`internal/goal/freshness.go`), and
+  the stamp is deliberately NOT an output — one that moved on every visit would
+  replay `fetch` and `ingest` on the clock, the same cascade one edge lower.
+
+  `discover`'s own bucket was the age of its HTTP cache and only worked BY
+  ACCIDENT: `WriteAtomic` leaves an unchanged file untouched, so the bucket would
+  have stayed expired and re-run on every invocation. It was the nonce that kept
+  it honest — fixing the cascade would have broken the clock.
+
+### Added
+
+- **`TestBothArmsEnumerateOnTheSameClock`** reads the determinant, not the step
+  name. `arm_parity_test.go` has paired the two arms by name since #326 and every
+  gate stayed green while they behaved differently underneath those names; this is
+  the invariant one level down. With `TestTheVisitStampIsNotDeclaredAsAnOutput`
+  and the `catalog_projection_tests` module in `rust/discover`, which asserts the
+  property rather than enumerating the patterns: a report differing only in page
+  chrome must project identically, and a changed catalogue must still move.
+
 ## [Unreleased] — the changelog gets a writer (2026-09-10)
 
 ### Added

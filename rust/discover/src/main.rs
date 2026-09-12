@@ -42,6 +42,7 @@ enum Mode {
     DraftLedger,
     ListDrift,
     SparseCheck,
+    EmitCatalog,
     RepairPlan,
 }
 
@@ -86,6 +87,7 @@ fn parse_args() -> Args {
             "--all" => a.all = true,
             "--include-legacy-gsm" => a.include_legacy_gsm = true,
             "--emit-worklist" => a.mode = Mode::Worklist,
+            "--emit-catalog" => a.mode = Mode::EmitCatalog,
             "--emit-draft-ledger" => a.mode = Mode::DraftLedger,
             "--list-drift" => a.mode = Mode::ListDrift,
             "--sparse-check" => a.mode = Mode::SparseCheck,
@@ -141,6 +143,14 @@ fn main() {
     });
 
     match a.mode {
+        Mode::EmitCatalog => {
+            // The projection is printed, not written: the caller publishes it
+            // through WriteAtomic, so an unchanged catalogue does not touch the
+            // file and `enrich` stays clean.
+            let rows = emit_catalog(&html);
+            print!("{rows}");
+            eprintln!("emit-catalog: {} spec(s) projected", rows.lines().count());
+        }
         Mode::Worklist => {
             let (lines, c) = emit_worklist(&site, floor_major, &a.series);
             print!("{lines}");
