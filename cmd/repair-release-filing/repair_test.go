@@ -227,6 +227,47 @@ func TestWhatItRefusesToMove(t *testing.T) {
 		"every refused filing must be exactly where it was")
 }
 
+// TWO FILINGS OF ONE VERSION, ONE DESTINATION. The candidate snapshot is read
+// once, before anything moves, so "the destination already holds this version" is
+// answered against the corpus as it WAS. A second filing of the same (spec,
+// version) would pass that test on a destination the first one has just filled and
+// merge two documents' text under one release. It does not happen on the published
+// corpus — which is why it needs a guard rather than a measurement: nothing would
+// catch it the day it does.
+func TestTwoFilingsOfOneVersionCannotBothMoveToOneDestination(t *testing.T) {
+	db := fixture(t)
+	ctx := context.Background()
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 29.486 is filed at 18.3.0 under Rel-19 AND Rel-20 on the real corpus; give
+	// both filings text, so both are candidates for Rel-18.
+	for _, q := range []string{
+		`INSERT INTO spec_versions (spec_id, release, version, docx_url) VALUES
+			('29.486','Rel-18','18.0.0','https://x/29486-i00.zip'),
+			('29.486','Rel-19','18.3.0','https://x/29486-i30.zip'),
+			('29.486','Rel-20','18.3.0','https://x/29486-i30.zip')`,
+		`INSERT INTO clause_occ (chunk_id, spec_id, release, version, clause_path, is_normative, body_id) VALUES
+			(900,'29.486','Rel-18','18.0.0','1',true,1),
+			(901,'29.486','Rel-19','18.3.0','1',true,1),
+			(902,'29.486','Rel-20','18.3.0','1',true,1)`,
+	} {
+		if _, err := st.DB().ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = st.Close()
+
+	out := apply(t, db, true)
+	if !strings.Contains(out, "two filings, one destination") {
+		t.Errorf("the second filing must be refused and say why; got:\n%s", out)
+	}
+	got := joined(rows(t, db, `SELECT release, version, count(*)::VARCHAR FROM clause_occ WHERE spec_id='29.486' GROUP BY 1,2 ORDER BY 1,2`))
+	eq(t, got, []string{"Rel-18 18.0.0 1", "Rel-18 18.3.0 1", "Rel-20 18.3.0 1"},
+		"exactly one filing moved; the other stayed where it was rather than piling onto the same destination")
+}
+
 // A SECOND PASS MUST WRITE NOTHING. The orchestrator runs this by hand on a 23 GB
 // corpus; a tool that shifts bytes on a no-op re-pushes an image layer for
 // nothing. It also must not open the corpus read-write to discover it has no work.

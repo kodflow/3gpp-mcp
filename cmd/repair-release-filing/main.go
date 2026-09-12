@@ -134,8 +134,28 @@ func run(dbPath string, apply bool, out *os.File) error {
 
 	var moving []filing
 	var occ int
+	// TWO FILINGS OF ONE VERSION CAN AIM AT THE SAME DESTINATION. The candidate
+	// snapshot is read once, before anything moves, so "the destination already
+	// holds occurrences of this version" is answered against the corpus as it was —
+	// and a second filing of the same (spec, version) would pass that test on a
+	// destination the first one has just filled, merging two documents' text under
+	// one release. It does not happen on the corpus published 2026-09-12 (29.486 is
+	// filed at 18.3.0 under both Rel-19 and Rel-20, but the Rel-19 filing carries no
+	// text and is refused before this), which is exactly why it needs a guard rather
+	// than a measurement: nothing would catch it the day it does.
+	claimed := map[string]string{}
 	for _, f := range filings {
-		if ok, why := f.verdict(); ok {
+		ok, why := f.verdict()
+		if ok {
+			dest := f.SpecID + "|" + f.Target + "|" + f.Version
+			if from, taken := claimed[dest]; taken {
+				ok, why = false, fmt.Sprintf("%s %s is already being moved to %s from %s — two filings, one destination",
+					f.SpecID, f.Version, f.Target, from)
+			} else {
+				claimed[dest] = f.Release
+			}
+		}
+		if ok {
 			moving = append(moving, f)
 			occ += f.Occ
 			where := "its filing is already there"
