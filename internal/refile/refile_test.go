@@ -1,10 +1,9 @@
-package main
+package refile
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,21 +78,47 @@ func fixture(t *testing.T) string {
 	return dbPath
 }
 
+// apply plans and, when write is true, carries the plan out. It returns the plan
+// rendered the way the CLI renders it, so a test can assert on the reasons the
+// package produced without reaching into the CLI.
 func apply(t *testing.T, dbPath string, write bool) string {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "out")
+	ctx := context.Background()
+	ro, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := run(dbPath, write, false, f); err != nil {
-		t.Fatalf("run(apply=%v): %v", write, err)
-	}
-	_ = f.Close()
-	b, err := os.ReadFile(f.Name())
+	plan, err := Plan(ctx, ro.DB())
+	_ = ro.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(b)
+	var b strings.Builder
+	moving := 0
+	for _, d := range plan {
+		if d.Move {
+			moving++
+			fmt.Fprintf(&b, "  MOVE %-11s %-7s %-9s -> %-7s %5d occurrence(s), %s\n",
+				d.SpecID, d.Release, d.Version, d.Target, d.Occ, d.Detail())
+		} else {
+			fmt.Fprintf(&b, "  KEEP %-11s %-7s %-9s    %s\n", d.SpecID, d.Release, d.Version, d.Why)
+		}
+	}
+	fmt.Fprintf(&b, "%d to move, %d left alone\n", moving, len(plan)-moving)
+	if !write {
+		return b.String()
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, occ, err := Apply(ctx, st.DB(), plan)
+	_ = st.Close()
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	fmt.Fprintf(&b, "moved %d filing(s), %d occurrence(s)\n", moved, occ)
+	return b.String()
 }
 
 func rows(t *testing.T, dbPath, q string) [][]string {
@@ -282,8 +307,8 @@ func TestASecondPassIsANoOp(t *testing.T) {
 	}
 
 	out := apply(t, db, true)
-	if !strings.Contains(out, "nothing to move — corpus untouched") {
-		t.Errorf("the second pass must say it found nothing; got:\n%s", out)
+	if !strings.Contains(out, "0 to move") {
+		t.Errorf("the second pass must find nothing to move; got:\n%s", out)
 	}
 	after, err := os.ReadFile(db)
 	if err != nil {
@@ -302,11 +327,11 @@ func TestADryRunWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := apply(t, db, false)
-	if !strings.Contains(out, "DRY RUN — pass --apply to write") {
-		t.Errorf("a dry run must say so; got:\n%s", out)
-	}
 	if !strings.Contains(out, "2 to move") {
-		t.Errorf("a dry run must report the work it would do; got:\n%s", out)
+		t.Errorf("planning must report the work it would do; got:\n%s", out)
+	}
+	if strings.Contains(out, "moved ") {
+		t.Errorf("planning must not move anything; got:\n%s", out)
 	}
 	after, err := os.ReadFile(db)
 	if err != nil {
@@ -334,85 +359,31 @@ func TestAFailedMoveCommitsNothing(t *testing.T) {
 	}
 	// Two filings move. Make the SECOND one fail the count check by adding an
 	// occurrence to it after the plan was read — the shape of any mid-run failure.
-	plan, err := candidates(ctx, st.DB())
+	plan, err := Plan(ctx, st.DB())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var moving []filing
-	for _, f := range plan {
-		if ok, _ := f.verdict(); ok {
-			moving = append(moving, f)
+	moves := 0
+	for i := range plan {
+		if !plan[i].Move {
+			continue
+		}
+		moves++
+		if moves == 2 {
+			plan[i].Occ++ // the count check will not match, mid-transaction
 		}
 	}
-	if len(moving) != 2 {
-		t.Fatalf("the fixture must plan exactly two moves, got %d", len(moving))
+	if moves != 2 {
+		t.Fatalf("the fixture must plan exactly two moves, got %d", moves)
 	}
-	moving[1].Occ++ // the count check will not match, mid-transaction
 
-	if err := moveAll(ctx, st.DB(), moving); err == nil {
-		t.Fatal("moveAll must fail when a move does not affect the rows it planned to")
+	if _, _, err := Apply(ctx, st.DB(), plan); err == nil {
+		t.Fatal("Apply must fail when a move does not affect the rows it planned to")
 	}
 	_ = st.Close()
 
 	after := joined(rows(t, db, `SELECT release, version, count(*)::VARCHAR FROM clause_occ GROUP BY 1,2 ORDER BY 1,2`))
 	eq(t, after, before, "the FIRST move must have been rolled back too")
-}
-
-// --report json is the documented machine-readable form (cmd/CLAUDE.md), and it
-// must be a self-contained response on every path — including the one where the
-// repair fails, where a caller parsing stdout would otherwise see nothing at all.
-func TestTheJSONReportCarriesEveryDecision(t *testing.T) {
-	db := fixture(t)
-	var buf bytes.Buffer
-	f, err := os.CreateTemp(t.TempDir(), "out")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := run(db, false, true, f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
-	text, err := os.ReadFile(f.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(text) != 0 {
-		t.Errorf("json mode must not also print the text report; got %q", string(text))
-	}
-	if err := writeJSONTo(&buf, res); err != nil {
-		t.Fatal(err)
-	}
-	var got result
-	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
-		t.Fatalf("the report must parse as json: %v\n%s", err, buf.String())
-	}
-	if got.Candidates != len(got.Filings) {
-		t.Errorf("every candidate must carry a decision: %d candidates, %d filings", got.Candidates, len(got.Filings))
-	}
-	if got.Moved != 0 {
-		t.Errorf("a dry run has moved nothing, got moved=%d", got.Moved)
-	}
-	moves, keeps := 0, 0
-	for _, fl := range got.Filings {
-		switch fl.Action {
-		case "move":
-			moves++
-			if fl.Destination == "" {
-				t.Errorf("a move must say what it does with the destination filing: %+v", fl)
-			}
-		case "keep":
-			keeps++
-			if fl.Reason == "" {
-				t.Errorf("a refusal without a reason is indistinguishable from a miss: %+v", fl)
-			}
-		default:
-			t.Errorf("unknown action %q", fl.Action)
-		}
-	}
-	if moves != 2 || keeps != got.LeftAlone {
-		t.Errorf("got moves=%d keeps=%d left_alone=%d", moves, keeps, got.LeftAlone)
-	}
 }
 
 // THE ATTESTATION SURVIVES. cmd/migrate-paragraphs attests the corpus with four
