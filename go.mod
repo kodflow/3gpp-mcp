@@ -5,10 +5,10 @@ go 1.26.3
 require (
 	github.com/klauspost/compress v1.20.0
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
-	github.com/mark3labs/mcp-go v1.0.0
+	github.com/mark3labs/mcp-go v1.1.0
 	github.com/sugarme/tokenizer v0.3.0
 	github.com/yalue/onnxruntime_go v1.30.1
-	golang.org/x/net v0.58.0
+	golang.org/x/net v0.59.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -45,6 +45,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20260527015227-08cc5374adb3 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
