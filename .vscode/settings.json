@@ -2,7 +2,7 @@
   "explorer.fileNesting.enabled": true,
   "explorer.fileNesting.expand": false,
   "explorer.fileNesting.patterns": {
-    "CLAUDE.md": "AGENTS.md, agent.toml, agent.yaml, agent.yml, .pr_agent.toml, .codacy.yaml, .codacy.yml, .coderabbit.yaml, .coderabbit.yml, mcp.json, mcp.json.tpl, RTK.md, MEMORY.md",
+    "CLAUDE.md": "AGENTS.md, agent.toml, agent.yaml, agent.yml, .pr_agent.toml, .coderabbit.yaml, .coderabbit.yml, mcp.json, mcp.json.tpl, RTK.md, MEMORY.md",
     "README.md": "README.*.md, CHANGELOG.md, CHANGELOG, CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, LICENSE, LICENSE.*, AUTHORS, NOTICE, CITATION.cff",
     ".gitignore": ".gitattributes, .gitmodules, .gitkeep, .mailmap, .dockerignore, .helmignore, .npmignore, .prettierignore, .eslintignore, .rsyncignore, .stylelintignore, .fdignore, .rgignore",
     ".env": ".env.*, .envrc, .env.example, .flaskenv",
