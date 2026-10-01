@@ -175,11 +175,6 @@ out/
 .devcontainer/claude-assets.tar.gz
 .devcontainer/devcontainer-lock.json
 
-# ============================================
-# Ignore vscode AI rules
-# ============================================
-.github/instructions/codacy.instructions.md
-.codacy/
 # Agent-managed planning scratchpad — but NOT test fixtures that happen to live
 # under a directory named "plans/" (e.g. tests/fixtures/refine/plans/*.md).
 # Anchor the ignore to the agent locations so fixtures stay tracked.

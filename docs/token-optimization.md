@@ -27,7 +27,7 @@ RTK transparently rewrites CLI commands to compress their output. Integrated via
 | Multiple related API calls | Bandwidth-sensitive operations |
 | Need consistent response format | RTK can compress the output |
 
-**Rule:** MCP-first for GitHub/GitLab/Codacy operations. CLI+RTK for everything else.
+**Rule:** MCP-first for GitHub/GitLab operations. CLI+RTK for everything else.
 
 ## 3. Model Routing
 
