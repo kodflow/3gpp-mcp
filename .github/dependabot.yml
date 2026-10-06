@@ -4,7 +4,10 @@ updates:
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Europe/Paris
     labels:
       - "dependencies"
     commit-message:
@@ -22,7 +25,10 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Europe/Paris
     labels:
       - "dependencies"
     commit-message:
