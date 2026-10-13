@@ -478,7 +478,7 @@ oublie de transmettre ce plancher recale un corpus complet.
 ├── .github/           # CI (crons corpus désactivés, cf. §13)
 ├── .githooks/
 ├── .vscode/
-├── .mcp.json          # branchement client du serveur local
+├── mcp.json.tmpl      # modèle du branchement client, copié en .mcp.json (jamais suivi)
 ├── AGENTS.md          # specs des agents IA utilisés
 ├── CLAUDE.md          # ce fichier
 ├── Makefile           # build, ingest, serve, test

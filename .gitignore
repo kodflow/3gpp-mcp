@@ -54,7 +54,10 @@ Thumbs.db
 .env.local
 .env.*.local
 **/.env
-/mcp.json
+# MCP configs can carry tokens: never tracked, at any depth. The tracked
+# template is mcp.json.tmpl, copied to .mcp.json by each developer.
+mcp.json
+.mcp.json
 
 # VPN configs and credentials (never commit)
 *.ovpn

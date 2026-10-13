@@ -11,6 +11,10 @@ import (
 // TestMCPJsonWiresBothONNXRuntimes pins the wiring a human actually uses.
 //
 // `.mcp.json` is how Claude Code starts this server on a developer's machine. It
+// is never tracked (an MCP config can carry tokens): the tree ships
+// `mcp.json.tmpl`, which a developer copies to `.mcp.json`. The template's
+// wiring is checked everywhere; the local copy, when there is one, is also
+// checked against the files it points at. The config once
 // set ORT_DYLIB_PATH alone, and the server came up with:
 //
 //	The requested API version [25] is not available, only API versions [1, 20]
@@ -34,10 +38,27 @@ func TestMCPJsonWiresBothONNXRuntimes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(root, ".mcp.json"))
-	if err != nil {
-		t.Skipf("no .mcp.json in this tree (%v)", err)
-	}
+	t.Run("mcp.json.tmpl", func(t *testing.T) {
+		b, err := os.ReadFile(filepath.Join(root, "mcp.json.tmpl"))
+		if err != nil {
+			t.Fatalf("the tracked template mcp.json.tmpl is missing: %v", err)
+		}
+		checkMCPJsonWiring(t, root, "mcp.json.tmpl", b, false)
+	})
+	t.Run(".mcp.json", func(t *testing.T) {
+		b, err := os.ReadFile(filepath.Join(root, ".mcp.json"))
+		if err != nil {
+			t.Skipf("no local .mcp.json in this tree (%v)", err)
+		}
+		checkMCPJsonWiring(t, root, ".mcp.json", b, true)
+	})
+}
+
+// checkMCPJsonWiring checks one config. With onDisk, every path it names must
+// also exist: only a local copy is expected to sit next to a corpus and a
+// built server, a fresh clone has neither.
+func checkMCPJsonWiring(t *testing.T, root, name string, b []byte, onDisk bool) {
+	t.Helper()
 	var cfg struct {
 		MCPServers map[string]struct {
 			Command string            `json:"command"`
@@ -46,11 +67,11 @@ func TestMCPJsonWiresBothONNXRuntimes(t *testing.T) {
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf(".mcp.json is not valid JSON: %v", err)
+		t.Fatalf("%s is not valid JSON: %v", name, err)
 	}
 	srv, ok := cfg.MCPServers["3gpp"]
 	if !ok {
-		t.Fatal(`.mcp.json declares no "3gpp" server`)
+		t.Fatalf(`%s declares no "3gpp" server`, name)
 	}
 
 	for _, k := range []string{"ORT_DYLIB_PATH", "ONNXRUNTIME_SHARED_LIBRARY_PATH"} {
@@ -61,8 +82,10 @@ func TestMCPJsonWiresBothONNXRuntimes(t *testing.T) {
 				"embedder, ONNXRUNTIME_SHARED_LIBRARY_PATH feeds the Go cross-encoder", k)
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(root, v)); err != nil {
-			t.Errorf("%s points at %q, which is not in the tree: %v", k, v, err)
+		if onDisk {
+			if _, err := os.Stat(filepath.Join(root, v)); err != nil {
+				t.Errorf("%s points at %q, which is not in the tree: %v", k, v, err)
+			}
 		}
 	}
 	// The two must be DIFFERENT files: pointing both at one runtime is the state
@@ -71,6 +94,9 @@ func TestMCPJsonWiresBothONNXRuntimes(t *testing.T) {
 		t.Errorf("both ONNX variables point at %q — one runtime cannot satisfy both pins", a)
 	}
 
+	if !onDisk {
+		return
+	}
 	// The paths the server needs at all, so a missing corpus is named here rather
 	// than as an opaque startup failure inside the client.
 	need := []string{srv.Command}
@@ -84,7 +110,7 @@ func TestMCPJsonWiresBothONNXRuntimes(t *testing.T) {
 	}
 	for _, p := range need {
 		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
-			t.Errorf(".mcp.json references %q, which is not in the tree: %v", p, err)
+			t.Errorf("%s references %q, which is not in the tree: %v", name, p, err)
 		}
 	}
 }

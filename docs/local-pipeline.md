@@ -392,7 +392,9 @@ for them if they are missing and nothing says so:
 ## Serving the finished corpus
 
 `smoke` proves the server starts, so the same command line is what a client
-should use. `.mcp.json` at the repo root wires it into any `mcpServers` client:
+should use. `mcp.json.tmpl` at the repo root, copied to the git-ignored
+`.mcp.json`, wires it into any `mcpServers` client (no `mcp.json` or
+`.mcp.json` is ever tracked: an MCP config can carry tokens):
 
 ```json
 { "mcpServers": { "3gpp": { "type": "stdio",
