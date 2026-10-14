@@ -233,8 +233,28 @@ runtimes — aucun accès réseau à l'exécution, rien à télécharger au dém
 
 ### B. Depuis ce dépôt, avec le corpus local
 
-Le `.mcp.json` du dépôt est **déjà écrit et suivi dans git** : ouvrir ce dossier
-avec Claude Code suffit. Ce qu'il contient, et pourquoi :
+Aucun fichier `mcp.json` ni `.mcp.json` n'est suivi par git, parce qu'une
+configuration MCP peut porter des jetons. Le dépôt livre donc un **modèle**,
+`mcp.json.tmpl`, et chacun crée sa configuration une fois :
+
+```bash
+cp mcp.json.tmpl .mcp.json     # ignoré par git, lu par Claude Code à la racine
+```
+
+Ou, pour l'avoir dans tous les projets, en portée utilisateur (chemins absolus,
+puisque la commande ne part plus de ce dossier) :
+
+```bash
+claude mcp add --scope user 3gpp -- "$PWD/.local/bin/server-full.exe" serve \
+  --db "$PWD/data/3gpp.duckdb" --etsi-db "$PWD/data/etsi.duckdb"
+```
+
+(les variables `EMBED_MODEL*`, `ORT_DYLIB_PATH` et
+`ONNXRUNTIME_SHARED_LIBRARY_PATH` du modèle se passent alors par `--env`).
+
+**Ce que la règle coûte** : ouvrir ce dossier avec Claude Code ne branche plus
+le serveur tout seul. Sans cette copie, la configuration de projet automatique
+est perdue. Ce que contient le modèle, et pourquoi :
 
 ```jsonc
 {
@@ -282,8 +302,9 @@ il le dit précisément :
                      initialization failed: Error setting ORT API base: 2"}
 ```
 
-`TestMCPJsonWiresBothONNXRuntimes` lit ce fichier et échoue si une variable
-manque ou si les deux pointent le même runtime.
+`TestMCPJsonWiresBothONNXRuntimes` lit le modèle et échoue si une variable
+manque ou si les deux pointent le même runtime. Il lit aussi votre `.mcp.json`
+quand il existe, et vérifie alors que chaque chemin nommé est bien présent.
 
 ### C. Le binaire seul
 

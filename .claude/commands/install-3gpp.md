@@ -25,9 +25,10 @@ auth, no local data layer — the corpus + vectors live on the server.
 claude mcp add --transport http 3gpp https://labs.making.codes/mcp
 ```
 
-> The repo's project `.mcp.json` already ships this HTTP transport, so teammates who
-> open the repo get the server on workspace-trust with nothing to run. This skill is
-> for a user-scope install or an explicit re-add. The `/mcp` data plane is open (no
+> The repo ships no project `.mcp.json` (no `mcp.json` or `.mcp.json` is tracked:
+> an MCP config can carry tokens), so opening the repo no longer wires the server
+> by itself. Run this command, or copy `mcp.json.tmpl` to `.mcp.json` for the
+> local stdio server. The `/mcp` data plane is open (no
 > token); only the `/dashboard*` admin routes are token-gated.
 
 Readiness: `GET https://labs.making.codes/healthz` → `{"status":"ready"}`.
