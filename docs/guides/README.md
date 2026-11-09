@@ -24,7 +24,6 @@ code devcontainer-template
 /plan                        # Design approach
 # ... implement ...
 /review                      # Self-review
-/git --commit                # Commit with conventional format
 ```
 
 ### Code Review
@@ -53,6 +52,5 @@ code devcontainer-template
 | `/do` | Execute approved plan |
 | `/docs` | Documentation server |
 | `/review` | Code review |
-| `/git` | Git automation |
 | `/lint` | Intelligent linting |
 | `/test` | E2E testing with Playwright |

@@ -87,4 +87,4 @@ sequenceDiagram
 | **ktn-linter** | Code linting (image fragment) | None |
 | **Playwright** | Browser automation, E2E tests (browser feature) | None |
 
-**MCP-first rule**: commands always use MCP tools before CLIs. Example: `/git --pr` uses `mcp__github__create_pull_request` instead of `gh pr create`.
+**MCP-first rule**: commands always use MCP tools before CLIs. Example: opening a PR uses `mcp__github__create_pull_request` instead of `gh pr create`.
