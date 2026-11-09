@@ -500,8 +500,6 @@ Le projet est conçu pour être développé **avec** Claude Code, pas malgré lu
 | Démarrer une session | `/warmup` |
 | Nouvelle fonctionnalité | `/plan "..."` → review → `/do` |
 | Doc / recherche normative | `/search "..."` (local-first sur `~/.claude/docs/`, fallback web) |
-| Commits conventionnels | `/git --commit` |
-| PR GitHub | `/git --pr` (auto-détection GitHub) |
 | Code review en local | `/review` (5 agents specialists en parallèle) |
 | Linting Go | `/lint` (golangci-lint piloté par hooks) |
 | Sync template | `/update` (tarball + merge `devcontainer.local.json`) |

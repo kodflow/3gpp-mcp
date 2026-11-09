@@ -10,7 +10,6 @@
 | Code review | `/review` |
 | Plan implementation | `/plan` |
 | Execute plan | `/do` |
-| Commit changes | `/git --commit` |
 | Run tests | `make test` or language-specific |
 
 ## Project Initialization

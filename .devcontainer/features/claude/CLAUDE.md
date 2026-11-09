@@ -16,7 +16,7 @@ curl -sL https://raw.githubusercontent.com/kodflow/devcontainer-template/main/.d
 | Component | Description |
 |-----------|-------------|
 | Claude CLI | AI coding assistant |
-| Commands | /git, /search, /prompt |
+| Commands | /search, /prompt |
 | Hooks | format, lint, security, test |
 | status-line | Git branch/status display |
 

@@ -464,7 +464,7 @@ Chaque ligne est citée (`TS 33.128 v19.6.0 §<clause>` + URL d'archive).
 
 ## Workflow dev (assumé AI-first)
 
-Le projet est développé **avec** Claude Code. Les skills `/plan`, `/do`, `/review`, `/lint`, `/git`, `/secret`, `/update` sont les commandes principales.
+Le projet est développé **avec** Claude Code. Les skills `/plan`, `/do`, `/review`, `/lint`, `/secret`, `/update` sont les commandes principales.
 
 | Commande | Usage |
 |---|---|
@@ -473,9 +473,6 @@ Le projet est développé **avec** Claude Code. Les skills `/plan`, `/do`, `/rev
 | `/do` | Exécute le plan, itère jusqu'à succès |
 | `/review` | Revue de code par 5 agents specialists en parallèle |
 | `/lint` | Linting Go via ktn-linter |
-| `/git --commit` | Commit conventionnel |
-| `/git --pr` | Pull request GitHub (auto-détecté depuis l'origine) |
-| `/git --commit` | Commit conventionnel + push |
 | `/update` | Sync devcontainer-template (`devcontainer.local.json` préservé) |
 
 Voir [`CLAUDE.md`](./CLAUDE.md) pour les verrouillages architecturaux et les pièges identifiés.

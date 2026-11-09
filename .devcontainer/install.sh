@@ -52,7 +52,7 @@ Installation Location:
 What Gets Installed:
   - Claude CLI (if not already installed)
   - 82 specialist agents
-  - 20+ slash commands (/git, /review, /plan, etc.)
+  - 20+ slash commands (/review, /plan, etc.)
   - 31 hook scripts (security, lint, format, etc.)
   - tmux (optional, enables Agent Teams split-pane mode)
   - 155+ design patterns (unless --minimal)
@@ -453,7 +453,7 @@ download_commands() {
 
     if [ -z "$commands" ]; then
         echo "  ⚠ Could not discover commands via API, using fallback"
-        commands="git.md review.md plan.md do.md search.md update.md"
+        commands="review.md plan.md do.md search.md update.md"
     fi
 
     local count=0
@@ -1288,7 +1288,6 @@ main() {
     echo "  Installation directory: $TARGET_DIR"
     echo ""
     echo "  Available commands:"
-    echo "    /git      - Git workflow (commit, branch, PR)"
     echo "    /review   - AI-powered code review"
     echo "    /plan     - Planning mode"
     echo "    /do       - Iterative task execution"

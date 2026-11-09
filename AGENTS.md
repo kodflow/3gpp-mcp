@@ -14,7 +14,6 @@
 | Spécialiste Go | `developer-specialist-go` | Implémentation, refacto, idiomatique |
 | Code review | `/review` (T1, 5 sub-agents) | Avant merge request |
 | Linting bloquant | `/lint` (ktn-linter) | Hooks PostToolUse, CI |
-| Commits + MR | `/git --commit` puis `/git --pr` | Sortie de feature |
 | Recherche docs | `/search` | Standards 3GPP, libs Go |
 | Secrets | `/secret` | Lecture du vault `3gpp-mcp` |
 

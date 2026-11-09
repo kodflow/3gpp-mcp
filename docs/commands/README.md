@@ -18,7 +18,6 @@ flowchart TD
     Q -->|Plan code| B["/plan"]
     Q -->|Execute a plan| C["/do"]
     Q -->|Validate code| D["/review"]
-    Q -->|Commit / PR| E["/git"]
     Q -->|Test in a browser| F["/test"]
     Q -->|Fix code style| G["/lint"]
     Q -->|Search documentation| H["/search"]
@@ -38,7 +37,6 @@ flowchart TD
 | `/plan "desc"` | task description | Analyzes the codebase, consults patterns, proposes a step-by-step plan |
 | `/do` | `--step`, `--max N` | Executes the approved plan. Iterates until tests + lint pass (max 50 iterations) |
 | `/review` | `--pr N`, `--loop` | Launches 5 analysis agents in parallel (correctness, security, design, quality, shell) |
-| `/git` | `--commit`, `--push`, `--pr`, `--merge` | Conventional branch, signed commit, PR via MCP GitHub |
 | `/feature` | `--add`, `--edit`, `--del`, `--list`, `--checkup` | Feature tracking (RTM) with audit and auto-learn |
 
 ### Quality

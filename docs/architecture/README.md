@@ -37,7 +37,7 @@ flowchart TB
         end
 
         subgraph CLAUDE["Claude Code"]
-            CMD[17 commands<br/>/plan /do /review /git]
+            CMD[17 commands<br/>/plan /do /review]
             AGT[79 agents<br/>orchestrators → specialists → executors]
             HK[8 Claude hooks<br/>format, lint, test, security]
         end
