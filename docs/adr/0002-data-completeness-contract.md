@@ -1,5 +1,8 @@
 # ADR 0002 — Data-completeness contract gates the pullable image
 
+- Area: scripts, deploy, cmd
+- Need: constraint
+
 Status: accepted (2026-06-15)
 
 ## Context

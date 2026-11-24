@@ -1,5 +1,8 @@
 # ADR 0001 — Rust writes the corpus, Go reads and serves it
 
+- Area: rust, internal
+- Need: decision
+
 Status: accepted 2026-06-19 (`arch-change`), **reconstructed 2026-08-23**
 
 > **Reconstructed record.** The decision was taken and implemented, but its
