@@ -1,5 +1,8 @@
 # ADR 0003 — The corpus pipeline is a local, fingerprinted state machine
 
+- Area: scripts, rust
+- Need: decision
+
 Status: accepted (2026-08-23)
 Supersedes operationally: the scheduled `corpus-*` GitHub workflows and the
 Kaggle GPU campaigns (kept in the tree, triggers disabled).
