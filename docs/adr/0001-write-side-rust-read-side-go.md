@@ -2,8 +2,8 @@
 
 - Area: rust, internal
 - Need: decision
-
-Status: accepted 2026-06-19 (`arch-change`), **reconstructed 2026-08-23**
+- Status: accepted 2026-06-19 (`arch-change`), **reconstructed 2026-08-23**
+- Date: 2026-06-19
 
 > **Reconstructed record.** The decision was taken and implemented, but its
 > authoritative document never entered the repository: `CLAUDE.md:27` cites a plan

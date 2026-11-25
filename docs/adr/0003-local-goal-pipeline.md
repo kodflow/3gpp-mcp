@@ -2,8 +2,9 @@
 
 - Area: scripts, rust
 - Need: decision
+- Status: accepted (2026-08-23)
+- Date: 2026-08-23
 
-Status: accepted (2026-08-23)
 Supersedes operationally: the scheduled `corpus-*` GitHub workflows and the
 Kaggle GPU campaigns (kept in the tree, triggers disabled).
 
