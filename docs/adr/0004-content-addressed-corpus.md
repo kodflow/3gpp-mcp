@@ -2,8 +2,9 @@
 
 - Area: rust, internal
 - Need: decision
+- Status: accepted, 2026-08-26
+- Date: 2026-08-26
 
-**Status**: accepted, 2026-08-26
 **Supersedes the deferral in** ADR 0003 (“vectors remain stored per clause … to
 be done once the chain is green”). The chain went green on 2026-08-26.
 

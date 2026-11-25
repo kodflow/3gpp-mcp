@@ -2,8 +2,8 @@
 
 - Area: scripts, deploy, cmd
 - Need: constraint
-
-Status: accepted (2026-06-15)
+- Status: accepted (2026-06-15)
+- Date: 2026-06-15
 
 ## Context
 
